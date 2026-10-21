@@ -283,8 +283,8 @@ fn verdict<N: Rem>(b: &Rt2<N>, s: u32, from: Option<Held<N>>, seeded: bool, l1: 
     let (shape, keys, cells) = lookup_keys(b, p.side.level, seeded, p.side.keys)?;
     let (key, cell) = (keys[0], cells[0]);
     let node = match key {
-        Some(k) => format!("node shape {shape:#x} key {:#x}:{:#x} cell {cell} {:?}", k.0, k.1, super::pos_graph::cell_xy(cell)),
-        None => format!("shape {shape:#x}, a code the tree never stored, cell {cell} {:?}", super::pos_graph::cell_xy(cell)),
+        Some(k) => format!("node shape {shape:#x} key {:#x}:{:#x} cell {cell} {:?}", k.0, k.1, crate::storage::cells::cell_xy(cell)),
+        None => format!("shape {shape:#x}, a code the tree never stored, cell {cell} {:?}", crate::storage::cells::cell_xy(cell)),
     };
     // The forward's filters run at every flush, so on every step but the
     // start (the initial block is never flushed).
@@ -296,7 +296,7 @@ fn verdict<N: Rem>(b: &Rt2<N>, s: u32, from: Option<Held<N>>, seeded: bool, l1: 
         }
         if let Some(f) = route.filter {
             let mut row = lookup_view(b, seeded)?;
-            crate::frame::widen_rt2_to(&mut row, p.side.level);
+            row.widen_to(p.side.level);
             if !f.allowed(&row, s)?[0] {
                 return Ok((
                     forward(format!(

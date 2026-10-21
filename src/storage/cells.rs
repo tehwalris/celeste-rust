@@ -78,12 +78,6 @@ pub(crate) fn whole_range_col<N: Arithmetic>(rt2: &Rt2<N>, cell: u32) -> Option<
     }
 }
 
-/// The block's player object (`player`, else `player_spawn`): one per
-/// block, its lanes share structure.
-pub(crate) fn player_object<N: Arithmetic>(rt2: &Rt2<N>) -> Option<u32> {
-    rt2.position_object()
-}
-
 /// Per-lane cell of a block (`room.x`/`room.y` must be numbers; no player or
 /// a non-numeric position: `NO_CELL`); the start room is its cache's.
 pub fn block_cells<N: Arithmetic>(rt2: &Rt2<N>) -> Result<Vec<u32>> {
@@ -97,7 +91,7 @@ pub fn block_cells<N: Arithmetic>(rt2: &Rt2<N>) -> Result<Vec<u32>> {
     let (Some(rx), Some(ry)) = (axis(room, ids.f_x), axis(room, ids.f_y)) else {
         return Err(anyhow!("block_cells: room.x/room.y are not numbers"));
     };
-    let Some(obj) = player_object(rt2) else {
+    let Some(obj) = rt2.position_object() else {
         return Ok(vec![NO_CELL; lanes]);
     };
     let (Some(px), Some(py)) = (axis(obj, ids.f_x), axis(obj, ids.f_y)) else {

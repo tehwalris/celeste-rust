@@ -49,7 +49,7 @@ use std::path::Path;
 
 use celeste_engine::exact::Key;
 
-use crate::search::pos_graph::cell_xy;
+use crate::storage::cells::cell_xy;
 use crate::storage::layer::{bits, last_frame, Tree};
 
 /// One forward frame's stats: a `forward.tsv` row under the UI's names;

@@ -101,10 +101,10 @@ fn cr_sin(x: f64) -> f64 {
 }
 
 /// The report: each variant's name and the frame `inputs` first wins on
-/// (`dual::first_win`, the run's float tool and seeds), glibc's first.
+/// (`Replay::exit_frame`, the run's float tool and seeds), glibc's first.
 pub fn report(inputs: &[u8], s: &Settings, random: u64) -> Result<Vec<(String, Option<u32>)>> {
     lib()?;
-    let run = |n: SinNudge| with_sin_nudge(n, || super::dual::first_win::<LuaF64>(inputs, s));
+    let run = |n: SinNudge| with_sin_nudge(n, || -> Result<Option<u32>> { Ok(super::replay::Replay::<LuaF64>::of(inputs, None, s)?.exit_frame(s.clock())) });
     let mut out = vec![("glibc".to_string(), run(SinNudge::Off)?)];
     out.push(("correctly rounded (MPFR)".to_string(), run(SinNudge::Replaced(cr_sin))?));
     for n in [SinNudge::Up, SinNudge::Down].into_iter().chain((1..=random).map(SinNudge::Random)) {

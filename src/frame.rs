@@ -60,13 +60,13 @@ pub(crate) fn exits_of<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Setting
     let ids = crate::compiled::ids();
     let lanes = rt2.width;
     if let Some((txl, txh, tyl, tyh)) = win_rect(s) {
-        let Some(obj) = crate::search::pos_graph::player_object(rt2) else {
+        let Some(obj) = rt2.position_object() else {
             return Ok(vec![false; lanes]);
         };
         // An interval position wins where it meets the target.
         let axis = |f: u32| {
             rt2.obj_field_cell(obj, f)
-                .and_then(|c| crate::search::pos_graph::whole_range_col(rt2, c))
+                .and_then(|c| crate::storage::cells::whole_range_col(rt2, c))
         };
         return Ok(match (axis(ids.f_x), axis(ids.f_y)) {
             (Some(xs), Some(ys)) => xs
@@ -312,11 +312,6 @@ impl<'a, N: Arithmetic> MarkFilter<'a, N> {
 }
 
 
-/// `rt2` projected IN PLACE onto `level`, as its kernels would store it.
-pub fn widen_rt2_to<N: Arithmetic>(rt2: &mut Rt2<N>, level: crate::abstraction::Level) {
-    rt2.widen_to(level);
-}
-
 /// Each lane's `(shape, key, cell)` at the `coarser` level (its node there)
 /// in the key space `keys` (`None`: a code the space lacks - no node).
 pub(crate) fn widened_keys<N: Arithmetic>(
@@ -325,10 +320,10 @@ pub(crate) fn widened_keys<N: Arithmetic>(
     keys: &celeste_engine::exact::KeySpace<N>,
 ) -> Result<(u64, Vec<Option<(u64, u64)>>, Vec<u32>)> {
     let mut w = rt2.clone_block();
-    widen_rt2_to(&mut w, coarser);
+    w.widen_to(coarser);
     w.canonical();
     let keys = keys.lookup_keys(&w);
-    let cells = crate::search::pos_graph::block_cells(&w)?;
+    let cells = crate::storage::cells::block_cells(&w)?;
     anyhow::ensure!(
         keys.len() == rt2.width && cells.len() == rt2.width,
         "the widening changed the lane count"
@@ -559,7 +554,7 @@ impl<N: Rem> ForwardState<N> {
 
     /// The forward as it stood after frame `last` of the tree in `dir`,
     /// READ-ONLY: later frames are ignored, not discarded (`resume` discards
-    /// them first), so `bench_wave` from here is the real forward's frame
+    /// them first), so `step` from here is the real forward's frame
     /// `last + 1`. Refused under other settings or at another `level`.
     pub fn at(dir: &std::path::Path, last: u32, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
         s.check(dir, level)?;
@@ -1097,13 +1092,13 @@ mod tests {
                 after += 1;
             }
         }
-        widen_rt2_to(&mut row, level);
+        row.widen_to(level);
         row
     }
 
     /// Does `registry` run `r`'s one lane (else its kernel declines)?
     fn kernel_runs(registry: &Registry<P8>, r: &Rt2, level: Level, s: &Settings) -> bool {
-        let cells = crate::search::pos_graph::block_cells(r).expect("cells");
+        let cells = crate::storage::cells::block_cells(r).expect("cells");
         let visited = crate::storage::visited::VisitedSet::new(crate::storage::GEOMETRY);
         let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
         let prov = celeste_engine::exact::Provisional::default();
@@ -1124,7 +1119,7 @@ mod tests {
         let coarse = Level::parse("r0sxh").expect("level");
         // The coarse key space holds the projection's codes.
         let mut w = block.clone_block();
-        widen_rt2_to(&mut w, coarse);
+        w.widen_to(coarse);
         w.canonical();
         let mut space = celeste_engine::exact::KeySpace::new();
         space.absorb(&[&w]);
@@ -1218,7 +1213,7 @@ mod tests {
                 // (A full hull is not stored: it holds everything.)
                 if let Some(info) = st.visited().state(sk.region, sk.key, sk.local as u32) {
                     assert_eq!(info.layer as u32, layer, "f{t}: the state's recorded layer");
-                    for (y, xs) in r.slabs() {
+                    for (y, xs) in r.as_ref().slabs() {
                         assert!(info.hull.y.contains_seg(y), "f{t}: a reached y segment outside the hull");
                         for x in xs {
                             assert!(info.hull.x.contains_seg(x), "f{t}: a reached x segment outside the hull");
@@ -1434,7 +1429,7 @@ mod tests {
             r
         };
         let runs = |r: &Rt2| -> bool {
-            let cells = crate::search::pos_graph::block_cells(r).expect("cells");
+            let cells = crate::storage::cells::block_cells(r).expect("cells");
             assert!(grid.of_cell(cells[0]).is_some(), "the lane has a region");
             kernel_runs(&registry, r, level, &s)
         };

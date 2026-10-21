@@ -494,7 +494,7 @@ impl<N: Rem> crate::frame::FrameStep<N> for RefFrameStep<N> {
             let rows = crate::storage::wave::par_map(chunk, n, |&lane| self.engine().run_lane(block, lane));
             for (&lane, rows) in chunk.iter().zip(rows) {
                 for (b, pair) in rows? {
-                    sink.emit_row(&b, lane, crate::search::pos_graph::block_cells(&b)?[0], pair)?;
+                    sink.emit_row(&b, lane, crate::storage::cells::block_cells(&b)?[0], pair)?;
                 }
             }
         }
@@ -752,7 +752,7 @@ mod tests {
     fn inputs_agreeing_on_the_buttons_read_make_the_same_successors() {
         let inputs = crate::concrete::read_inputs("tas/room_1_0_exit_frame_99.txt").expect("the exit's inputs");
         let mut eng = RefEngine::new(&Default::default()).expect("ref engine");
-        let exact = |bs: Vec<Rt2>| -> Vec<(celeste_engine::exact::ExactRow, u32)> { bs.iter().map(|b| (celeste_engine::exact::exact_rows(b).swap_remove(0), crate::search::pos_graph::block_cells(&b).expect("cells")[0])).collect() };
+        let exact = |bs: Vec<Rt2>| -> Vec<(celeste_engine::exact::ExactRow, u32)> { bs.iter().map(|b| (celeste_engine::exact::exact_rows(b).swap_remove(0), crate::storage::cells::block_cells(&b).expect("cells")[0])).collect() };
         let mut row = eng.initial().expect("initial state");
         let (mut runs, mut checked) = (0, 0);
         for (f, &byte) in inputs.iter().enumerate() {
@@ -791,9 +791,9 @@ mod tests {
             bs.iter()
                 .map(|b| {
                     let mut w = b.clone_block();
-                    crate::frame::widen_rt2_to(&mut w, level);
+                    w.widen_to(level);
                     w.canonical();
-                    (celeste_engine::exact::exact_rows(&w).swap_remove(0), crate::search::pos_graph::block_cells(&w).expect("cells")[0])
+                    (celeste_engine::exact::exact_rows(&w).swap_remove(0), crate::storage::cells::block_cells(&w).expect("cells")[0])
                 })
                 .collect()
         };
@@ -805,7 +805,7 @@ mod tests {
         for (f, &byte) in inputs.iter().enumerate() {
             if f % stride == 0 {
                 let mut abs = row.clone_block();
-                crate::frame::widen_rt2_to(&mut abs, level);
+                abs.widen_to(level);
                 if !objects_of_type(&from_block(&abs, 0, &eng.fn_info, &eng.base).expect("state").0, what).is_empty() {
                     with += 1;
                 }

@@ -13,7 +13,7 @@ use celeste_engine::runtime2::{Col, Rt2, AV};
 use super::arcs::{Circle, Seg, Transfer};
 use super::rem::{Point, Rem, Xfer};
 use crate::abstraction::Level;
-use crate::frame::{widen_rt2_to, widened_keys};
+use crate::frame::widened_keys;
 use crate::storage::edges::EdgeStore;
 use crate::storage::layer::Tree;
 use crate::storage::Sk;
@@ -92,7 +92,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
         // As the kernels read it: projected onto the level (the start row is
         // stored exact), then the probe's remainder.
         let mut rt2 = row.clone_block();
-        widen_rt2_to(&mut rt2, level);
+        rt2.widen_to(level);
         if let Some((cx, cy)) = rem_cells(&rt2) {
             rt2.cols[cx] = Col::U(AV::Num(N::at_point(rem.0)));
             rt2.cols[cy] = Col::U(AV::Num(N::at_point(rem.1)));

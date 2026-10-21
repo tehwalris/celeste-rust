@@ -37,7 +37,7 @@ impl RegionGrid {
 
     /// The region of a row's input cell; `None` for a row without a player.
     pub fn of_cell(&self, cell: u32) -> Option<Region> {
-        crate::search::pos_graph::cell_xy(cell).map(|(x, y)| self.of(x, y))
+        crate::storage::cells::cell_xy(cell).map(|(x, y)| self.of(x, y))
     }
 
     /// The bounds a region's kernel is traced under, by path under `pl` (16.16

@@ -349,12 +349,12 @@ pub(crate) mod exact {
                         for &(i, x) in &inc[start[d as usize] as usize..start[d as usize + 1] as usize] {
                             let (tx, ty) = pairs[x as usize];
                             tmp.clear();
-                            cur_ref[i as usize].1.push(tx, ty, tmp);
+                            cur_ref[i as usize].1.as_ref().push(tx, ty, tmp);
                             v.extend_from_slice(tmp);
                             if v.len() > lim {
                                 let u = union(v, scratch)?;
                                 v.clear();
-                                u.pieces(v);
+                                u.as_ref().pieces(v);
                                 lim = (2 * v.len()).max(256);
                             }
                         }
@@ -425,7 +425,7 @@ mod tests {
             let si = tree.shapes.iter().position(|&h| h == shape).expect("a tree shape") as u32;
             let sk = crate::storage::Sk::at(&geo, si, keys[0].expect("a tree key"), cells[0]);
             let q = super::super::concrete::rem_of(&row).expect("rem");
-            let hit = sets[t].iter().find(|c| c.0 == sk).map(|c| c.1.contains(q.0, q.1));
+            let hit = sets[t].iter().find(|c| c.0 == sk).map(|c| c.1.as_ref().contains(q.0, q.1));
             assert_eq!(hit, Some(true), "f{t}: the known route's state is not reached with its exact remainder");
         }
         // The start is reached at frame 0 only, and every frame up to the win

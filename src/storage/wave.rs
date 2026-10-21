@@ -1144,7 +1144,7 @@ fn layer_wins<N: Rem>(visited: &VisitedSet<N>, next: &Layer<N>, frame: u32, s: &
         let rt2 = super::decode::decode_rows(&visited.keys, skel, &rows)?;
         if s.diag.key_check {
             crate::compiled::asm_kernel::key_check_block(&rt2, &visited.keys);
-            for (c, r) in crate::search::pos_graph::block_cells(&rt2)?.into_iter().zip(rows.iter()) {
+            for (c, r) in crate::storage::cells::block_cells(&rt2)?.into_iter().zip(rows.iter()) {
                 ensure!(c == r.1, "frame {frame}: a state of r{region} decoded at cell {c}, not its own {}", r.1);
             }
         }
@@ -1346,7 +1346,7 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start
     let mut skels: FxHashMap<u64, super::layer::SkelRecord<N>> = FxHashMap::default();
     for r in canon.iter_mut() {
         let keys: Vec<Key> = visited.keys.lookup_keys(r).into_iter().map(|k| k.expect("seeded codes")).collect();
-        let cells = crate::search::pos_graph::block_cells(r)?;
+        let cells = crate::storage::cells::block_cells(r)?;
         r.row_keys = keys.clone();
         super::decode::check_piece(&visited.keys, r, &cells).map_err(|e| e.context("frame 0"))?;
         let rec = super::layer::SkelRecord::of(r)?;
@@ -1439,7 +1439,7 @@ mod tests {
         for s in cases {
             let start = crate::engines::reference::RefEngine::new(&s).expect("engine").initial().expect("start").canonicalized();
             let mut view = start.clone_block();
-            crate::frame::widen_rt2_to(&mut view, crate::abstraction::Level::EXACT);
+            view.widen_to(crate::abstraction::Level::EXACT);
             view.canonical();
             assert_ne!(celeste_engine::exact::exact_rows(&view), celeste_engine::exact::exact_rows(&start), "room {:?}: the start is its own view", s.room);
             let mut visited = VisitedSet::new(GEOMETRY);
@@ -1449,7 +1449,7 @@ mod tests {
             assert_eq!(sks.len(), 1, "room {:?}: frame 0 is one state", s.room);
             assert_eq!(
                 (celeste_engine::exact::exact_rows(row), sks[0].cell(&GEOMETRY)),
-                (celeste_engine::exact::exact_rows(&start), crate::search::pos_graph::block_cells(&start).expect("cell")[0]),
+                (celeste_engine::exact::exact_rows(&start), crate::storage::cells::block_cells(&start).expect("cell")[0]),
                 "room {:?}: frame 0 is not the start",
                 s.room
             );

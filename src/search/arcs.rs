@@ -305,30 +305,6 @@ impl<C: Circle> Region<C> {
     pub(crate) fn n_segs(&self) -> usize {
         self.xs.len()
     }
-    #[cfg(test)]
-    pub(crate) fn slabs(&self) -> impl Iterator<Item = (Seg<C::P>, impl Iterator<Item = Seg<C::P>> + '_)> + '_ {
-        self.as_ref().slabs()
-    }
-    #[cfg(test)]
-    pub(crate) fn contains(&self, x: C::P, y: C::P) -> bool {
-        self.as_ref().contains(x, y)
-    }
-    #[cfg(test)]
-    pub(crate) fn pieces(&self, out: &mut Vec<Piece<C::P>>) {
-        self.as_ref().pieces(out)
-    }
-    #[cfg(test)]
-    pub(crate) fn push(&self, x: Transfer<C>, y: Transfer<C>, out: &mut Vec<Piece<C::P>>) {
-        self.as_ref().push(x, y, out)
-    }
-    #[cfg(test)]
-    pub(crate) fn clip_into(&self, p: Piece<C::P>, out: &mut Vec<Piece<C::P>>) {
-        self.as_ref().clip_into(p, out)
-    }
-    #[cfg(test)]
-    pub(crate) fn pull(&self, x: Transfer<C>, y: Transfer<C>, out: &mut Vec<Piece<C::P>>) {
-        self.as_ref().pull(x, y, out)
-    }
     /// The union of `pieces`, canonical (one sweep over y). `pieces` is
     /// left in an unspecified order.
     pub(crate) fn from_pieces(pieces: &mut [Piece<C::P>], scratch: &mut Vec<Seg<C::P>>) -> Self {
@@ -692,7 +668,7 @@ mod tests {
             let inside = |x: u32, y: u32| orig.iter().any(|p| p.x.lo <= x && x < p.x.hi && p.y.lo <= y && y < p.y.hi);
             for &x in &probes {
                 for &y in &probes {
-                    assert_eq!(r.contains(x, y), inside(x, y), "({x}, {y})");
+                    assert_eq!(r.as_ref().contains(x, y), inside(x, y), "({x}, {y})");
                 }
             }
             // Canonical: the same set from the pieces in another order.
@@ -709,7 +685,7 @@ mod tests {
             };
             let (tx, ty) = (transfer(&mut s), transfer(&mut s));
             let mut out = Vec::new();
-            r.pull(tx, ty, &mut out);
+            r.as_ref().pull(tx, ty, &mut out);
             let pr = Region::<Fixed16>::from_pieces(&mut out, &mut Vec::new());
             let mut pp: Vec<u32> = probes.iter().flat_map(|&v| {
                 let back = |t: Transfer| match t.act {
@@ -722,42 +698,42 @@ mod tests {
             pp.dedup();
             for &x in &pp {
                 for &y in &pp {
-                    let want = tx.takes(x) && ty.takes(y) && r.contains(apply(tx, x), apply(ty, y));
-                    assert_eq!(pr.contains(x, y), want, "pull at ({x}, {y})");
+                    let want = tx.takes(x) && ty.takes(y) && r.as_ref().contains(apply(tx, x), apply(ty, y));
+                    assert_eq!(pr.as_ref().contains(x, y), want, "pull at ({x}, {y})");
                 }
             }
             // push: a point q is in the image iff some point of r inside the
             // guards maps to it - checked from both sides: every probed point
             // of r maps into the image, and the image's points pull back into r.
             let mut out = Vec::new();
-            r.push(tx, ty, &mut out);
+            r.as_ref().push(tx, ty, &mut out);
             let img = Region::<Fixed16>::from_pieces(&mut out, &mut Vec::new());
             for &x in &pp {
                 for &y in &pp {
-                    if tx.takes(x) && ty.takes(y) && r.contains(x, y) {
-                        assert!(img.contains(apply(tx, x), apply(ty, y)), "push misses the image of ({x}, {y})");
+                    if tx.takes(x) && ty.takes(y) && r.as_ref().contains(x, y) {
+                        assert!(img.as_ref().contains(apply(tx, x), apply(ty, y)), "push misses the image of ({x}, {y})");
                     }
                 }
             }
             let mut back = Vec::new();
-            img.pull(tx, ty, &mut back);
+            img.as_ref().pull(tx, ty, &mut back);
             let mut inter = Vec::new();
             for p in back {
-                r.clip_into(p, &mut inter);
+                r.as_ref().clip_into(p, &mut inter);
             }
             let back = Region::<Fixed16>::from_pieces(&mut inter, &mut Vec::new());
             let mut again = Vec::new();
-            back.push(tx, ty, &mut again);
+            back.as_ref().push(tx, ty, &mut again);
             assert_eq!(Region::<Fixed16>::from_pieces(&mut again, &mut Vec::new()), img, "the image is exactly the image of its preimage in r");
             // clip_into is the intersection.
             let q = Piece { y: seg(&mut s), x: seg(&mut s) };
             let mut cl = Vec::new();
-            r.clip_into(q, &mut cl);
+            r.as_ref().clip_into(q, &mut cl);
             let cr = Region::<Fixed16>::from_pieces(&mut cl, &mut Vec::new());
             for &x in &probes {
                 for &y in &probes {
                     let inq = q.x.lo <= x && x < q.x.hi && q.y.lo <= y && y < q.y.hi;
-                    assert_eq!(cr.contains(x, y), inq && r.contains(x, y), "clip at ({x}, {y})");
+                    assert_eq!(cr.as_ref().contains(x, y), inq && r.as_ref().contains(x, y), "clip at ({x}, {y})");
                 }
             }
         }

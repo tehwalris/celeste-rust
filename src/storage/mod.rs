@@ -1,7 +1,8 @@
 //! STORAGE (plans/architecture.md, "The forward: hulls and storage" and "The
-//! recorded graph"): the state set, the wave, and the tree's files in one
-//! container (`file`): frame (`layer`, with its frontier: `hulls`) and
-//! edge (`bundle`, `edges`) files; and its one text record (`record`).
+//! recorded graph"): the player-position cells (`cells`), the state set,
+//! the wave, and the tree's files in one container (`file`): frame
+//! (`layer`, with its frontier: `hulls`) and edge (`bundle`, `edges`)
+//! files; and its one text record (`record`).
 //!
 //! A state is `(shape, key, cell)` (`Sk`; the key holds no position:
 //! `exact::Code::pos`) everywhere: the edges, the frame files, the
@@ -10,6 +11,7 @@
 
 pub mod bench;
 pub(crate) mod bundle;
+pub mod cells;
 pub(crate) mod codec;
 pub(crate) mod decode;
 pub mod edges;
@@ -25,7 +27,7 @@ pub(crate) mod unit;
 pub(crate) mod visited;
 pub mod wave;
 
-use crate::search::pos_graph::{GRID, NO_CELL};
+use cells::{GRID, NO_CELL};
 
 /// THE TREE'S FINGERPRINT (`rewrite ckhash`), over CONTENT
 /// (`exact::ContentHash`: any dictionary order): per frame its states'
@@ -167,7 +169,7 @@ mod tests {
         for side in [8, 16] {
             let g = Geometry::new(side);
             for (x, y) in [(-64, -64), (-1, 0), (0, -1), (5, 7), (127, 127), (200, 40), (447, 447)] {
-                let cell = crate::search::pos_graph::cell_of(x, y).unwrap();
+                let cell = crate::storage::cells::cell_of(x, y).unwrap();
                 let (slot, local) = g.slot_local(cell);
                 assert!(slot < g.no_cell_slot() && local < side * side);
                 assert_eq!(g.cell(slot, local), cell);

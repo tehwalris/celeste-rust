@@ -4,9 +4,8 @@
 //! a header (the segments by region; per target region the SOURCE regions
 //! its edges leave), then per TARGET region its bundles (`storage::bundle`)
 //! in SEGMENTS, a wave's slices, each a zstd block. Transfers are global
-//! ids into `edges/xfer.bin`, CANONICAL (`XferTable::canonical`; a bundle
-//! holding a new one waits for it, as for a provisional target:
-//! `route::reencode`): a function of the search, not of slice order.
+//! ids into `edges/xfer.bin`, final at each slice's gather
+//! (`XferTable::merge`): a function of the search, not of the threads.
 
 use anyhow::{ensure, Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -666,14 +665,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("celeste-storage-edges-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let geo = GEOMETRY;
-        let cell = |x: i32, y: i32| crate::search::pos_graph::cell_of(x, y).unwrap();
+        let cell = |x: i32, y: i32| crate::storage::cells::cell_of(x, y).unwrap();
         let st = |shape: u32, k: u64, c: u32| Sk::at(&geo, shape, (0, k), c);
         let a = st(0, 5, cell(3, 4));
         let b = st(0, 5, cell(4, 4));
         let t1 = st(1, 9, cell(5, 4));
         let t2 = st(1, 9, cell(6, 4));
         let far = st(1, 2, cell(100, 40));
-        let none = st(0, 7, crate::search::pos_graph::NO_CELL);
+        let none = st(0, 7, crate::storage::cells::NO_CELL);
         let extra = (st(0, 6, cell(2, 4)), t1, 2);
         let edges = vec![(a, t1, 3), (b, t2, 3), (a, t2, 4), (a, far, 3), (none, t1, 0), (t1, none, 1), extra];
         let pairs: Vec<Pair> = (0..5)

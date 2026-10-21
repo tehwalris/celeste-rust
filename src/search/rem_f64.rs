@@ -578,12 +578,12 @@ mod tests {
             let r = Region::<Doubles>::from_pieces(&mut ps, &mut Vec::new());
             let (tx, ty) = (pieces[(lcg(&mut s) % pieces.len() as u64) as usize], pieces[(lcg(&mut s) % pieces.len() as u64) as usize]);
             let mut out = Vec::new();
-            r.pull(tx.transfer(), ty.transfer(), &mut out);
+            r.as_ref().pull(tx.transfer(), ty.transfer(), &mut out);
             let pr = Region::<Doubles>::from_pieces(&mut out, &mut Vec::new());
             let around = |v: u64| [v.wrapping_sub(1), v, v + 1].into_iter().filter(|&p| p < POINTS);
             let mut px: Vec<u64> = vec![tx.lo, tx.hi - 1, near(&mut s), near(&mut s)];
             let mut py: Vec<u64> = vec![ty.lo, ty.hi - 1, near(&mut s), near(&mut s)];
-            for (y, xs) in pr.slabs() {
+            for (y, xs) in pr.as_ref().slabs() {
                 py.extend(around(y.lo).chain(around(y.hi)));
                 for x in xs {
                     px.extend(around(x.lo).chain(around(x.hi)));
@@ -592,8 +592,8 @@ mod tests {
             for &x in &px {
                 for &y in &py {
                     let takes = |a: &Axis, p: u64| a.lo <= p && p < a.hi;
-                    let want = takes(&tx, x) && takes(&ty, y) && r.contains(tx.apply(x), ty.apply(y));
-                    assert_eq!(pr.contains(x, y), want, "pull at ({x}, {y}) through {tx:?} {ty:?}");
+                    let want = takes(&tx, x) && takes(&ty, y) && r.as_ref().contains(tx.apply(x), ty.apply(y));
+                    assert_eq!(pr.as_ref().contains(x, y), want, "pull at ({x}, {y}) through {tx:?} {ty:?}");
                 }
             }
         }

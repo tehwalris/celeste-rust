@@ -429,14 +429,14 @@ mod tests {
             let mut acc = HullAcc::default();
             let pushed = h.push(&(tx, ty), &mut acc);
             let mut img = Vec::new();
-            h.to_region().push(tx, ty, &mut img);
+            h.to_region().as_ref().push(tx, ty, &mut img);
             let img = Region::<Fixed16>::from_pieces(&mut img, &mut Vec::new());
             assert_eq!(pushed, !img.is_empty(), "{h:?} {tx:?} {ty:?}");
             assert_eq!(acc.is_empty(), !pushed);
             let Some(got) = acc.hull() else { continue };
             // Every point of the image is in the hull: probed at the image's
             // slab and segment ends.
-            for (ys, xs) in img.slabs() {
+            for (ys, xs) in img.as_ref().slabs() {
                 for x in xs {
                     for (px, py) in [(x.lo, ys.lo), (x.hi - 1, ys.hi - 1), (x.lo, ys.hi - 1), (x.hi - 1, ys.lo)] {
                         assert!(got.contains(px, py), "{h:?} {tx:?} {ty:?}: ({px}, {py}) of the image is not in {got:?}");
@@ -462,8 +462,8 @@ mod tests {
                 // Skipped: the old push's image already holds the new one.
                 assert!(was.push(&(tx, ty), &mut old), "skipped a push whose old image was empty");
                 let (mut img_new, mut img_old) = (Vec::new(), Vec::new());
-                h.to_region().push(tx, ty, &mut img_new);
-                was.to_region().push(tx, ty, &mut img_old);
+                h.to_region().as_ref().push(tx, ty, &mut img_new);
+                was.to_region().as_ref().push(tx, ty, &mut img_old);
                 assert_eq!(Region::<Fixed16>::from_pieces(&mut img_new, &mut Vec::new()), Region::<Fixed16>::from_pieces(&mut img_old, &mut Vec::new()), "{was:?} -> {h:?} {tx:?} {ty:?}: skipped a push whose image grew");
             }
         }

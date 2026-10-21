@@ -302,7 +302,7 @@ impl<N: Rem> Concrete for Single<'_, '_, N> {
 
     fn start(&self, eng: &mut Self::Engine) -> Result<(Rt2<N>, u32)> {
         let start = eng.initial()?.canonicalized();
-        let cell = crate::search::pos_graph::block_cells(&start)?[0];
+        let cell = crate::storage::cells::block_cells(&start)?[0];
         Ok((start, cell))
     }
 
@@ -311,7 +311,7 @@ impl<N: Rem> Concrete for Single<'_, '_, N> {
         let mut out = Vec::new();
         for b in succ {
             *steps += 1;
-            let cell = crate::search::pos_graph::block_cells(&b)?[0];
+            let cell = crate::storage::cells::block_cells(&b)?[0];
             if self.0.wins(&b)? {
                 out.push(Next::Win(cell));
                 continue;
@@ -346,7 +346,7 @@ impl Witness {
     pub(crate) fn save(&self, path: &std::path::Path) -> Result<()> {
         let mut text = format!("inputs {}\n", inputs_text(&self.inputs));
         for (f, &c) in self.cells.iter().enumerate() {
-            match super::pos_graph::cell_xy(c) {
+            match crate::storage::cells::cell_xy(c) {
                 Some((x, y)) => text += &format!("{f} {x} {y}\n"),
                 None => text += &format!("{f} - -\n"),
             }

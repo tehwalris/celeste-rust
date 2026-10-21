@@ -356,7 +356,7 @@ impl<N: Arithmetic> Rt2<N> {
     }
 
     /// The POSITION object: the first player instance, else the first
-    /// `player_spawn` (`search::pos_graph::player_object`'s rule: its
+    /// `player_spawn` (`storage::cells::block_cells`' rule: its
     /// whole-pixel `x`/`y` make the row's cell).
     pub fn position_object(&self) -> Option<u32> {
         self.player_objects().first().copied().or_else(|| self.objects_of_type(names().player_spawn).first().copied())

@@ -27,6 +27,7 @@ use celeste_engine::runtime2::Rt2;
 use super::driver::Arcs;
 use super::concrete::{concrete_engines, dfs_budget, exact_state, Concrete, Next, NodeKeys, Side};
 use super::rem::Rem;
+use super::replay::Replay;
 
 use crate::settings::Settings;
 use crate::engines::reference::ReferenceEngine;
@@ -108,7 +109,7 @@ impl<X: Rem, F: Rem> Concrete for Pairs<'_, X, F> {
                         Fate::Win if fixed.iter().any(|(x, _)| x.is_none()) => {}
                         Fate::Win => fixed.push((None, true)),
                         Fate::Inside => {
-                            let cell = crate::search::pos_graph::block_cells(&b)?[0];
+                            let cell = crate::storage::cells::block_cells(&b)?[0];
                             let exact = exact_state(&b, cell);
                             fixed.push((Some((b, exact)), false));
                         }
@@ -133,7 +134,7 @@ impl<X: Rem, F: Rem> Concrete for Pairs<'_, X, F> {
                     }
                 }
                 Fate::Inside => {
-                    let cell = crate::search::pos_graph::block_cells(&b)?[0];
+                    let cell = crate::storage::cells::block_cells(&b)?[0];
                     let exact = exact_state(&b, cell);
                     for (x, fixed_won) in &fixed {
                         let (fixed_row, fixed_key) = match x {
@@ -185,42 +186,15 @@ pub(crate) fn search<X: Rem, F: Rem>(fixed: &Half<X>, float: &Half<F>, bound: u3
     Ok(Some(DualWitness { inputs: path.inputs, fixed_exit }))
 }
 
-/// The first frame some lineage of `inputs` wins on from `s`'s start, a
-/// concrete run (`Settings::concrete`), every `rnd` leaf followed.
-pub(crate) fn first_win<N: Rem>(inputs: &[u8], s: &Settings) -> Result<Option<u32>> {
-    Ok(super::replay::Replay::<N>::of(inputs, None, s)?.exit_frame(s.clock()))
-}
-
-/// The player's cell at every frame of `inputs` (the start's first;
-/// `pos_graph::NO_CELL` without a player) along its first winning lineage,
-/// a concrete run of `s`: the UI's path of a dual witness's float half.
-pub(crate) fn path_cells<N: Rem>(inputs: &[u8], s: &Settings) -> Result<Vec<u32>> {
-    let run = super::replay::Replay::<N>::of(inputs, None, s)?;
-    let (step, won) = run.exit.as_ref().ok_or_else(|| anyhow!("the path never wins"))?;
-    let (parent, leaf) = &won[0];
-    let clock = s.clock();
-    let last = run.layers.len() - 1;
-    let idx = run.lineage(last, *parent as usize);
-    let mut cells = Vec::new();
-    for (t, &i) in idx.iter().enumerate() {
-        if clock.boundary(t as u32) {
-            cells.push(crate::search::pos_graph::block_cells(&run.layers[t][i].1)?[0]);
-        }
-    }
-    ensure!(clock.boundary(*step), "the path wins mid-frame");
-    cells.push(crate::search::pos_graph::block_cells(&leaf)?[0]);
-    Ok(cells)
-}
-
 /// THE WITNESS, REPLAYED (a guard, not trusted), each half on its own
 /// through its reference engine, every `rnd` leaf followed: the float half
 /// must first win on the last frame (the file's length), the fixed half by
 /// `fixed_exit` (some leaf: real play's `rnd` is the stated best case).
 pub(crate) fn replay<X: Rem, F: Rem>(w: &DualWitness, fixed: &Settings, float: &Settings) -> Result<()> {
     let c = w.inputs.len() as u32;
-    let f = first_win::<F>(&w.inputs, float)?;
+    let f = Replay::<F>::of(&w.inputs, None, float)?.exit_frame(float.clock());
     ensure!(f == Some(c), "the dual witness replayed: the float half first wins at {f:?}, not f{c}");
-    let x = first_win::<X>(&w.inputs, fixed)?;
+    let x = Replay::<X>::of(&w.inputs, None, fixed)?.exit_frame(fixed.clock());
     ensure!(x.is_some_and(|x| x <= w.fixed_exit), "the dual witness replayed: the fixed half first wins at {x:?}, not by f{} as the search found", w.fixed_exit);
     Ok(())
 }

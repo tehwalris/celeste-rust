@@ -351,12 +351,12 @@ pub(crate) fn prefixes(list: &str) -> Vec<String> {
 
 /// A player position's cell (`--cell x,y`).
 pub(crate) fn cell_at((x, y): (i32, i32)) -> Result<u32> {
-    celeste_rust::search::pos_graph::cell_of(x, y)
+    celeste_rust::storage::cells::cell_of(x, y)
 }
 
 /// A cell, for reading: the player's position.
 pub(crate) fn where_(c: u32) -> String {
-    celeste_rust::search::pos_graph::cell_xy(c).map(|(x, y)| format!("({x}, {y})")).unwrap_or_else(|| "no player".to_string())
+    celeste_rust::storage::cells::cell_xy(c).map(|(x, y)| format!("({x}, {y})")).unwrap_or_else(|| "no player".to_string())
 }
 
 /// The kernels of a level (`compiled::Kernels::new`), for the commands

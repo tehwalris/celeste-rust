@@ -236,14 +236,13 @@ pub(crate) struct RouteState<N: Rem = P8> {
     pub(crate) segs: Vec<((u8, u32), Segment)>,
     /// The source regions its edges leave.
     pub(crate) sources: FxHashSet<u32>,
-    /// Records taken (emissions) and edge pushes merged.
-    pub(crate) recs: u64,
+    /// Edge pushes merged.
     pub(crate) pushes: u64,
 }
 
 impl<N: Rem> RouteState<N> {
     pub(crate) fn new(shape: u64, slot: u32, region: Option<u32>) -> Self {
-        RouteState { shape, slot, region, touched: Touched::default(), prov_keys: FxHashSet::default(), prov: Vec::new(), segs: Vec::new(), sources: FxHashSet::default(), recs: 0, pushes: 0 }
+        RouteState { shape, slot, region, touched: Touched::default(), prov_keys: FxHashSet::default(), prov: Vec::new(), segs: Vec::new(), sources: FxHashSet::default(), pushes: 0 }
     }
 
     /// Does the frame's end owe it anything: states pushed into, or edges?
@@ -490,8 +489,6 @@ impl Default for JobScratch {
 /// wait: `RouteState::prov`).
 #[inline(never)]
 pub(crate) fn run_route<N: Rem>(st: &mut RouteState<N>, slice: u32, chunks: &[&Chunk<N>], cx: &RegionCtx, sc: &mut JobScratch) -> Result<()> {
-    let n: usize = chunks.iter().map(|c| c.bundles.len()).sum();
-    st.recs += n as u64;
     let record = cx.record;
     sc.tbs.clear();
     sc.s_idx.clear();

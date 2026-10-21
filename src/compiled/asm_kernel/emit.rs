@@ -310,13 +310,13 @@ pub(super) enum PosSrc {
 }
 
 /// The sources of a row's cell: player x/y and room x/y (`None`: no
-/// numeric player position, `NO_CELL`, as `pos_graph::block_cells`).
+/// numeric player position, `NO_CELL`, as `cells::block_cells`).
 pub(super) type PosSet = Option<[PosSrc; 4]>;
 
 /// The cells of the lanes `need` of a position set (`start`: the kernel's
-/// room), as `pos_graph::block_cells` labels them (`room_offset`).
+/// room), as `cells::block_cells` labels them (`room_offset`).
 fn cells_of<N: KernelLanes>(set: &PosSet, buf: &[u8], half: usize, need: u16, start: (i16, i16), out: &mut [u32; 16]) {
-    use crate::search::pos_graph::{cell_of, room_offset, NO_CELL};
+    use crate::storage::cells::{cell_of, room_offset, NO_CELL};
     let Some(srcs) = set else {
         *out = [NO_CELL; 16];
         return;

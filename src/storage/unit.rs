@@ -760,16 +760,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         }
     }
 
-    /// ONE EMISSION: `emit_body` of one lane, the state `(shape, key, cell)`
-    /// reached from unit lane `lane` with transfer `xfer`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn emit(&mut self, shape: u64, cell: u32, key: Key, lane: usize, xfer: u32, init: impl Fn() -> Rt2<N>, mut push: impl FnMut(&mut RowBuf<N>)) -> Result<()> {
-        let mut targets = Targets::default();
-        self.targets(shape, &[cell; 16], 1, &[lane], &mut targets);
-        let e = BodyEmits { shape, take: 1, keys: &[key; 16], targets: &targets, xfers: &[xfer; 16] };
-        self.emit_body(&e, init, |b, _| push(b))
-    }
-
     /// A BODY'S EMISSIONS into their routes' bundles. `init`: the shape's
     /// skeleton (`Skeletons`); `push(buf, i)` appends lane `i`'s row to a
     /// buffer when one is looked at (a verdict, the key check, the guard).
@@ -852,22 +842,16 @@ impl<'a, N: Rem> UnitSink<'a, N> {
                 Some(p) if (p.0, p.1, p.2, p.3, p.4) == b => p.5 |= 1u64 << t.local[i],
                 _ => {
                     if let Some((r, k, s, x, o, m)) = pending {
-                        self.bundle(r, k, s, x, o, m);
+                        self.bundles.insert(r, k, s, x, o, m);
                     }
                     pending = Some((b.0, b.1, b.2, b.3, b.4, 1u64 << t.local[i]));
                 }
             }
         }
         if let Some((r, k, s, x, o, m)) = pending {
-            self.bundle(r, k, s, x, o, m);
+            self.bundles.insert(r, k, s, x, o, m);
         }
         Ok(())
-    }
-
-    /// OR `m` (target cells) into bundle `(route, t_key; s, x, o)`.
-    #[inline]
-    fn bundle(&mut self, route: u32, t_key: Key, s: u32, x: u32, o: u32, m: u64) {
-        self.bundles.insert(route, t_key, s, x, o, m);
     }
 
     /// `--key-check` of the rows in `check[i]`: each one's key is the
@@ -894,7 +878,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     pub(crate) fn row_key(&mut self, row: &Rt2<N>) -> (Rt2<N>, Key) {
         let level = crate::abstraction::Level { held: self.level.held, ..crate::abstraction::Level::EXACT };
         let mut w = row.clone_block();
-        crate::frame::widen_rt2_to(&mut w, level);
+        w.widen_to(level);
         w.canonical();
         if self.keys.shape(w.shape_hash).is_none() {
             self.note_shape(&celeste_engine::exact::ShapeRecord::of(&w));
@@ -937,9 +921,13 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             b.shape_hash = w.shape_hash;
             b
         };
+        // One lane's `emit_body`: the state reached from unit lane `lane`.
         let xfer = self.xfers.id(self.worker, pair);
+        let mut targets = Targets::default();
+        self.targets(w.shape_hash, &[cell; 16], 1, &[lane], &mut targets);
+        let e = BodyEmits { shape: w.shape_hash, take: 1, keys: &[key; 16], targets: &targets, xfers: &[xfer; 16] };
         self.guards.reference = true;
-        let r = self.emit(w.shape_hash, cell, key, lane, xfer, init, |b| b.push_row(&w, key, cell));
+        let r = self.emit_body(&e, init, |b, _| b.push_row(&w, key, cell));
         self.guards.reference = false;
         r
     }

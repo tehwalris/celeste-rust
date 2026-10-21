@@ -13,7 +13,6 @@ pub mod hull_replay;
 pub mod inspect;
 pub(crate) mod known;
 pub mod level_minus_one;
-pub mod pos_graph;
 pub(crate) mod reach;
 pub(crate) mod replay;
 pub mod rem;

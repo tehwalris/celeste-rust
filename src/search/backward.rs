@@ -1301,7 +1301,7 @@ pub(crate) mod tests {
                     let mut pieces = Vec::new();
                     for e in edges.iter().filter(|e| e.0 == i) {
                         if let Some(r) = &want[t as usize + 1][e.1 as usize] {
-                            r.pull(e.2, e.3, &mut pieces);
+                            r.as_ref().pull(e.2, e.3, &mut pieces);
                         }
                     }
                     Some(Region::from_pieces(&mut pieces, &mut Vec::new())).filter(|r| !r.is_empty())

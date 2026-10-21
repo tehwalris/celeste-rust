@@ -115,7 +115,7 @@ pub fn ckhash(run: &Settings, a: CkhashArgs) -> Result<()> {
         let mut v: Vec<(u32, usize)> = by_cell.into_iter().collect();
         v.sort_by_key(|&(c, n)| (std::cmp::Reverse(n), c));
         for (c, n) in v.into_iter().take(top) {
-            match celeste_rust::search::pos_graph::cell_xy(c) {
+            match celeste_rust::storage::cells::cell_xy(c) {
                 Some((x, y)) => println!("cell {c}: player ({x},{y}) x{n}"),
                 None => println!("cell {c}: no player x{n}"),
             }
@@ -318,8 +318,8 @@ pub fn trajectory(cfg: &Settings, a: TrajectoryArgs) -> Result<()> {
                 // the real-PICO-8 replay settles it.
                 for block in eng.step(st, byte)? {
                     tried += 1;
-                    let cell = celeste_rust::search::pos_graph::block_cells(&block)?[0];
-                    let pos = celeste_rust::search::pos_graph::cell_xy(cell);
+                    let cell = celeste_rust::storage::cells::block_cells(&block)?[0];
+                    let pos = celeste_rust::storage::cells::cell_xy(cell);
                     if let Some(w) = want {
                         if pos != Some(*w) {
                             *reached.entry(pos).or_default() += 1;

@@ -7,7 +7,7 @@
 use anyhow::Result;
 use celeste_engine::runtime2::Rt2;
 use celeste_rust::abstraction::Level;
-use celeste_rust::frame::{widen_rt2_to, wins_of, FrameStep};
+use celeste_rust::frame::{wins_of, FrameStep};
 use celeste_rust::search::inspect::{brief, cell_names, project_all, project_onto, project_row, Proj};
 use celeste_rust::search::rem::Rem;
 use celeste_rust::search::tree::TreeDir;
@@ -265,7 +265,7 @@ where
         for mut b in next {
             agree(reference, &b)?;
             if a.row.is_some() {
-                let (cells, names) = (celeste_rust::search::pos_graph::block_cells(&b)?, cell_names(&b, ids));
+                let (cells, names) = (celeste_rust::storage::cells::block_cells(&b)?, cell_names(&b, ids));
                 for i in 0..b.width {
                     let p = project_row(&b, &names, i as u32, &[]);
                     let changed: Vec<String> = p.iter().filter(|(k, v)| me.get(*k) != Some(*v)).map(|(k, v)| format!("{k}={v}")).collect();
@@ -276,7 +276,7 @@ where
         }
         // The reference engine's, from the row projected onto the level.
         let mut input = rt2.clone_block();
-        widen_rt2_to(&mut input, level);
+        input.widen_to(level);
         let mut rset: std::collections::BTreeSet<Proj> = Default::default();
         let leaves = match reference.run_lane(&input, 0) {
             Err(e) if e.downcast_ref::<celeste_rust::engines::reference::TooManyPaths>().is_some() => {
@@ -354,7 +354,7 @@ where
         let mut a = rt2.clone_block();
         a.canonical();
         let mut b = rt2.clone_block();
-        widen_rt2_to(&mut b, level);
+        b.widen_to(level);
         b.canonical();
         let (ea, eb) = (celeste_engine::exact::exact_rows(&a), celeste_engine::exact::exact_rows(&b));
         for l in 0..rt2.width {

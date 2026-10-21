@@ -177,7 +177,7 @@ fn dual(spec: &SearchSpec, float: &Settings, levels: &[Level], res: &mut SearchR
     }
     // The UI's path: the float half's cells along the witness.
     if let Some(out) = spec.save_marks {
-        let cells = super::dual::path_cells::<LuaF64>(&w.inputs, float)?;
+        let cells = super::replay::Replay::<LuaF64>::of(&w.inputs, None, float)?.win_cells(float.clock())?;
         let path = out.join("witness.txt");
         Witness { inputs: w.inputs.clone(), cells }.save(&path)?;
         let label = format!("label dual witness, valid in both arithmetics: {} exits on frame {f}, real play on frame {} (the float half's path)\n", float.arith, w.fixed_exit);

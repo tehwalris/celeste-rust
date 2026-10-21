@@ -50,7 +50,7 @@ impl<N: Rem> Replay<N> {
                         won.push((p as u32, c));
                         continue;
                     }
-                    match seen.entry(exact_state(&c, crate::search::pos_graph::block_cells(&c)?[0])) {
+                    match seen.entry(exact_state(&c, crate::storage::cells::block_cells(&c)?[0])) {
                         std::collections::hash_map::Entry::Occupied(e) => more.push((*e.get(), p as u32)),
                         std::collections::hash_map::Entry::Vacant(e) => {
                             e.insert(next.len() as u32);
@@ -74,6 +74,24 @@ impl<N: Rem> Replay<N> {
     /// The first frame a leaf wins in (`None`: none).
     pub(crate) fn exit_frame(&self, clock: crate::settings::Clock) -> Option<u32> {
         self.exit.as_ref().map(|e| clock.frame_of(e.0))
+    }
+
+    /// The player's cell at every frame along the first winning lineage
+    /// (the start's first; `cells::NO_CELL` without a player): the UI's
+    /// path of a dual witness's float half.
+    pub(crate) fn win_cells(&self, clock: crate::settings::Clock) -> Result<Vec<u32>> {
+        let (step, won) = self.exit.as_ref().ok_or_else(|| anyhow::anyhow!("the path never wins"))?;
+        let (parent, leaf) = &won[0];
+        let idx = self.lineage(self.layers.len() - 1, *parent as usize);
+        let mut cells = Vec::new();
+        for (t, &i) in idx.iter().enumerate() {
+            if clock.boundary(t as u32) {
+                cells.push(crate::storage::cells::block_cells(&self.layers[t][i].1)?[0]);
+            }
+        }
+        anyhow::ensure!(clock.boundary(*step), "the path wins mid-frame");
+        cells.push(crate::storage::cells::block_cells(leaf)?[0]);
+        Ok(cells)
     }
 
     /// The state indices of the lineage ending at step `step`'s state `i`,

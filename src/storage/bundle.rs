@@ -16,7 +16,7 @@ use anyhow::{anyhow, ensure, Result};
 
 use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128, wide};
 use super::visited::Key;
-use crate::search::pos_graph::{GRID, NO_CELL};
+use crate::storage::cells::{GRID, NO_CELL};
 
 /// One bundle; `mask` over the target region's 64 cells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
