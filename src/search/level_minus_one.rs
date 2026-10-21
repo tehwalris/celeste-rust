@@ -1092,7 +1092,7 @@ fn cost_to_go(spd_px: i32, threads: usize, s: &crate::settings::Settings) -> Res
 /// container's: `storage::file`); bump it when what a file holds changes.
 const CACHE_FORMAT: u32 = 2;
 
-/// A tree's own table, beside its record (`TreeFilter`): the table its
+/// A tree's own table, beside its record (`TreeL1`): the table its
 /// frames were filtered by, whatever binary extends or reads the tree.
 pub(crate) const TABLE_FILE: &str = "l1-table.bin";
 

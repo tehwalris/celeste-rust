@@ -227,7 +227,7 @@ fn run_levels<N: KernelLanes>(
         let filter = prev.as_ref().map(|(m, l)| MarkFilter::new(m, *l, cfg.clock()));
         if let Some((m, _)) = &prev {
             // The tree's record says what its forward was filtered for.
-            let key = format!("steps {steps} level-1 {want:?} marks {} {:016x}", m.len(), m.filter_fingerprint());
+            let key = format!("steps {steps} level-1 {} marks {} {:016x}", crate::frame::MinusOne::text(want.as_ref()), m.len(), m.filter_fingerprint());
             let have = crate::storage::record::Record::read(&dir).ok().flatten().and_then(|r| r.get("filtered_for").map(str::to_string));
             if have.as_deref() != Some(key.as_str()) {
                 if dir.exists() {
@@ -410,13 +410,13 @@ pub(crate) fn solve<N: crate::compiled::KernelLanes>(
     let side = if keyed { Some(Side { w: &w, node: NodeKeys::new(&w, &shapes)?, keys: &space, level, s, seeded: s.concrete().1 }) } else { None };
     let known = match (known, &side) {
         (Some(route), Some(side)) => {
-            let minus_one = crate::frame::TreeFilter::of_tree(dir)?;
+            let l1 = crate::frame::TreeL1::read(dir)?;
             // The hull forward's claim keys every step's state: whole frames only.
             if route.hulls && s.split_frame {
                 eprintln!("[known] the hull forward's claim is checked on whole frames only: not under --split-frame");
             }
             let hulls = (route.hulls && !s.split_frame).then(|| super::known::Hulls::open(dir, horizon, s)).transpose()?;
-            let p = super::known::Pruning { side, horizon, start, reached: arc_marks.as_ref(), minus_one, dir, hulls: hulls.as_ref() };
+            let p = super::known::Pruning { side, horizon, start, reached: arc_marks.as_ref(), l1, dir, hulls: hulls.as_ref() };
             super::known::check(route, &p)?
         }
         _ => None,

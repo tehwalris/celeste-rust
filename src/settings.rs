@@ -175,7 +175,7 @@ pub struct Settings {
     // NOT recorded.
     /// The level -1 filter "H,S": H in game frames (the search's horizon),
     /// S the table's speed bound (the tree records it, H in steps, as
-    /// `frame::TreeFilter`: `minus_one`).
+    /// `frame::TreeL1`: `minus_one`).
     #[arg(long, global = true, value_parser = parse_minus_one)]
     pub level_minus_one: Option<(u32, i32)>,
     /// The balloons' phases of the concrete phase only (a tasdatabase file's
@@ -405,7 +405,7 @@ impl Settings {
 
     /// THE SETTINGS OF A FINISHED TREE, for a command that reads it: its
     /// record read back (each line its flag's text) and its level -1 filter
-    /// (`frame::TreeFilter`), with the run's own settings from `run` (the
+    /// (`frame::TreeL1`), with the run's own settings from `run` (the
     /// threads, the concrete phase's seeds, the diagnostics). The tree's
     /// level with them.
     pub fn of_tree(dir: &Path, run: &Settings) -> Result<(Settings, crate::abstraction::Level)> {
@@ -425,13 +425,12 @@ impl Settings {
         // The filter's H, recorded in steps, as `--level-minus-one` takes it
         // (frames).
         let per_frame = flags.s.clock().per_frame;
-        let minus_one = match crate::frame::TreeFilter::read(dir)? {
-            Some(crate::frame::TreeFilter::MinusOne { m, .. }) => {
+        let minus_one = match crate::frame::TreeL1::recorded(dir)? {
+            Some((m, _)) => {
                 anyhow::ensure!(m.h % per_frame == 0, "{}: the level -1 horizon {} steps is no whole frame", dir.display(), m.h);
                 Some((m.h / per_frame, m.speed))
             }
-            Some(crate::frame::TreeFilter::Off) => None,
-            None => anyhow::bail!("{}: no level -1 record (a tree from before records)", dir.display()),
+            None => None,
         };
         let s = Settings {
             level_minus_one: minus_one,

@@ -469,10 +469,10 @@ struct Guards<N: Rem> {
     last_shape: u64,
 }
 
-/// LEVEL -1 at emission: the table of `--level-minus-one` and its horizon,
-/// resolved once, and the last (shape, cell) asked.
+/// LEVEL -1 at emission: the tree's filter, and the last (shape, cell)
+/// asked.
 struct Drops {
-    l1: Option<(&'static crate::search::level_minus_one::CostToGo, u32)>,
+    l1: Option<crate::frame::TreeL1>,
     last: Option<((u64, u32), bool)>,
 }
 
@@ -480,13 +480,13 @@ impl Drops {
     /// Does it drop every row of (`shape`, `cell`) at frame `frame`?
     #[inline]
     fn drops(&mut self, shape: u64, cell: u32, frame: u32) -> bool {
-        let Some((table, h)) = self.l1 else { return false };
+        let Some(l1) = self.l1 else { return false };
         if let Some((at, r)) = self.last {
             if at == (shape, cell) {
                 return r;
             }
         }
-        let r = table.admitted_from(shape, cell, frame) > h;
+        let r = l1.drops(shape, cell, frame);
         self.last = Some(((shape, cell), r));
         r
     }
@@ -634,7 +634,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             xfers: Xfers::new(base, xfer_tab),
             routes: RouteIds::new(routes),
             pusher: Pusher::default(),
-            drops: Drops { l1: filters.minus_one.map(|m| (m.table, m.h)), last: None },
+            drops: Drops { l1: filters.l1, last: None },
             verdicts: Verdicts { marks: filters.marks, of: Default::default(), bufs: Vec::new(), at: Vec::new(), disallowed: false },
             guards: Guards { key_check: s.diag.key_check, check: Vec::new(), noted: Default::default(), registered: Default::default(), guarded: Default::default(), reference: false, last_shape: 0 },
             bundles: UnitBundles::default(),

@@ -2,7 +2,7 @@
 //! "Checks"; `check known`, and `search --prefer` when it wins by the
 //! horizon): a wrong pruning step drops real winners silently, so the route
 //! is stepped through the reference engine and checked at every step `s`:
-//! * level -1 (the filter the TREE recorded, `TreeFilter::of_tree`) and the
+//! * level -1 (the filter the TREE recorded, `TreeL1::read`) and the
 //!   ladder's filter (`MarkFilter::allowed`; mid-frame steps pass by
 //!   construction) keep it, at every step past the start;
 //! * at a frame boundary (mid-frame rows carry the split frame's cut
@@ -65,8 +65,8 @@ pub(super) struct Pruning<'a, N: Rem = P8> {
     /// This level's reached nodes (the next level's filter), if it has one.
     pub(crate) reached: Option<&'a Visited<N>>,
     /// The level -1 filter the tree was built under, with the tree's table
-    /// (`TreeFilter::of_tree`).
-    pub(crate) minus_one: Option<crate::frame::L1>,
+    /// (`TreeL1::read`).
+    pub(crate) l1: Option<crate::frame::TreeL1>,
     /// The tree's directory, for the report (read on a miss).
     pub(crate) dir: &'a std::path::Path,
     /// The hull forward's claim, checked at every step (`Route::hulls`).
@@ -85,7 +85,6 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
         return Ok(None);
     };
     let frame = clock.frame_of(*exit);
-    let l1 = p.minus_one.map(|m| (m.h, m.table));
     // Per step and state: the first check it fails (`None`: it passes), and
     // where the tree holds it (with `hulls`: its state and remainder).
     let mut verdicts: Vec<Vec<Option<Miss>>> = Vec::with_capacity(run.layers.len());
@@ -94,7 +93,7 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
         let (mut v, mut h) = (Vec::with_capacity(layer.len()), Vec::with_capacity(layer.len()));
         for (parent, b) in layer {
             let from = if s == 0 { None } else { held[s - 1][*parent as usize] };
-            let (miss, at) = verdict(b, s as u32, from, seeded, l1, route, p)?;
+            let (miss, at) = verdict(b, s as u32, from, seeded, route, p)?;
             v.push(miss);
             h.push(at);
         }
@@ -118,7 +117,7 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
             [
                 Some("node and W at every frame boundary"),
                 p.hulls.map(|_| "in the tree, inside its hull, by a recorded edge at every step"),
-                l1.map(|_| "level -1"),
+                p.l1.map(|_| "level -1"),
                 route.filter.map(|_| "the ladder's filter"),
                 p.reached.map(|_| "reached (the next level's filter)"),
             ]
@@ -278,8 +277,7 @@ fn hull_claim<N: Rem>(b: &Rt2<N>, s: u32, sk: Option<Sk>, from: Option<Held<N>>,
 
 /// The first check state `b` at step `s` (its parent held at `from`) fails,
 /// and where the tree holds it (with `hulls`).
-#[allow(clippy::too_many_arguments)]
-fn verdict<N: Rem>(b: &Rt2<N>, s: u32, from: Option<Held<N>>, seeded: bool, l1: Option<(u32, &crate::search::level_minus_one::CostToGo)>, route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<(Option<Miss>, Option<Held<N>>)> {
+fn verdict<N: Rem>(b: &Rt2<N>, s: u32, from: Option<Held<N>>, seeded: bool, route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<(Option<Miss>, Option<Held<N>>)> {
     let (shape, keys, cells) = lookup_keys(b, p.side.level, seeded, p.side.keys)?;
     let (key, cell) = (keys[0], cells[0]);
     let node = match key {
@@ -289,9 +287,9 @@ fn verdict<N: Rem>(b: &Rt2<N>, s: u32, from: Option<Held<N>>, seeded: bool, l1: 
     // The forward's filters run at every flush, so on every step but the
     // start (the initial block is never flushed).
     if s > 0 {
-        if let Some((h, table)) = l1 {
-            if table.too_late(shape, cell, s, h) {
-                return Ok((forward(format!("LEVEL -1 drops it: d {:?} from step {s} exceeds its horizon {h} ({node})", table.d_of(shape, cell))), None));
+        if let Some(l1) = p.l1 {
+            if l1.drops(shape, cell, s) {
+                return Ok((forward(format!("LEVEL -1 drops it: d {:?} from step {s} exceeds its horizon {} ({node})", l1.table.d_of(shape, cell), l1.h)), None));
             }
         }
         if let Some(f) = route.filter {

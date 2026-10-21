@@ -306,8 +306,6 @@ pub(crate) struct WaveCtx<'a, N: Rem = P8> {
     pub(crate) edges: Option<&'a super::edges::EdgeFiles>,
     /// The forward's skeletons, registered by the emissions: the next layer's.
     pub(crate) skeletons: &'a Skeletons<N>,
-    /// The tree's ceiling (its level -1 horizon), for `frame::not_expanded`.
-    pub(crate) ceiling: Option<u32>,
 }
 
 #[derive(Default)]
@@ -318,7 +316,8 @@ struct UnitScratch {
 }
 
 /// ONE KERNEL UNIT: its states DECODED, `frame::not_expanded` (decided here,
-/// fresh or resumed) left out, the rest through the engine with their hulls.
+/// fresh or resumed; `ceiling`: the orb cut's, `TreeL1::orb_ceiling`) left
+/// out, the rest through the engine with their hulls.
 #[allow(clippy::too_many_arguments)]
 fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<usize>, state: usize, layer: &Layer<N>, hulls: &[HullOf<N>], starts: &[usize], shapes: &[u64], sink: &mut UnitSink<'_, N>, sc: &mut UnitScratch, layer_frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<()> {
     let geo = GEOMETRY;
@@ -413,7 +412,7 @@ struct Shared<'a, N: Rem> {
     record: bool,
     /// The tree's transfers before the frame (new ones from here).
     xfers_before: u32,
-    ceiling: Option<u32>,
+    filters: Filters<'a, N>,
 }
 
 /// ONE WAVE WORKER (`pipeline`): a region job first (the oldest slice's,
@@ -468,7 +467,7 @@ fn worker<N: Rem>(sh: &Shared<N>, sink: &mut UnitSink<N>, sc: &mut super::route:
             let t = Instant::now();
             match &plan.units[u] {
                 UnitSpec::Kernel { entries, state, .. } => {
-                    run_unit(sh.engine, u as u32, entries.clone(), *state, &sh.front.new, &sh.front.hulls, &plan.starts, sh.shapes, sink, &mut us, frame - 1, sh.ceiling, sh.s)?;
+                    run_unit(sh.engine, u as u32, entries.clone(), *state, &sh.front.new, &sh.front.hulls, &plan.starts, sh.shapes, sink, &mut us, frame - 1, sh.filters.l1.map(|l| l.orb_ceiling()), sh.s)?;
                 }
                 UnitSpec::Repush { layer, frame: f, segs, .. } => {
                     let tr = sink.stats.tick_start();
@@ -519,7 +518,7 @@ struct Piped<N: Rem> {
 /// one sink each (`UnitSink`), no barrier but its end; then the workers'
 /// transfers and stats collected.
 #[allow(clippy::too_many_arguments)]
-fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, front: &Frontier<N>, plan: &Plan, visited: &VisitedSet<N>, base: &XferTable<N>, skeletons: &Skeletons<N>, prov: &Provisional<N>, filters: Filters<N>, frame: u32, files: Option<&super::edges::EdgeFiles>, spool: Option<&super::scratch::Scratch>, record: bool, ceiling: Option<u32>) -> Result<Piped<N>> {
+fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, front: &Frontier<N>, plan: &Plan, visited: &VisitedSet<N>, base: &XferTable<N>, skeletons: &Skeletons<N>, prov: &Provisional<N>, filters: Filters<N>, frame: u32, files: Option<&super::edges::EdgeFiles>, spool: Option<&super::scratch::Scratch>, record: bool) -> Result<Piped<N>> {
     let (level, s) = (engine.level(), &engine.settings());
     let workers = s.threads();
     let routes = Routes::default();
@@ -544,7 +543,7 @@ fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, front: &Frontier<N>, plan: &Plan,
     };
     let shapes: Vec<u64> = visited.shapes().to_vec();
     let index = grown_index(&front.old);
-    let sh = Shared { engine, s, frame, plan, front, pipe: &pipe, routes: &routes, visited, shapes: &shapes, files, index: &index, base, spool, record, xfers_before: xfers_before as u32, ceiling };
+    let sh = Shared { engine, s, frame, plan, front, pipe: &pipe, routes: &routes, visited, shapes: &shapes, files, index: &index, base, spool, record, xfers_before: xfers_before as u32, filters };
     std::thread::scope(|scope| -> Result<()> {
         let handles: Vec<_> = sinks
             .iter_mut()
@@ -737,7 +736,7 @@ fn next_layer<N: Rem>(new: Vec<super::route::Sealed<N>>, frame: u32, threads: us
 /// ladder's filter, the visited set absorbing, the next layer and its wins.
 pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveCtx<N>) -> Result<Wave<N>> {
     use std::time::Instant;
-    let WaveCtx { visited, xfers, filters, frame, edges_dir, edges, skeletons, ceiling } = cx;
+    let WaveCtx { visited, xfers, filters, frame, edges_dir, edges, skeletons } = cx;
     // A platforms-unknown level knows only `PLATFORM_WORLD_FRAMES` worlds.
     let (level, s) = (engine.level(), &engine.settings());
     let game_frame = s.clock().frame_of(frame);
@@ -778,7 +777,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
         crate::metrics::mem_phase(&format!("f{frame} start"));
     }
     let t_pipeline = Instant::now();
-    let Piped { mut states, fresh, stats } = pipeline(engine, &front, &plan, visited, xfers, skeletons, &prov, filters, frame, edges, spool.as_deref(), record, ceiling)?;
+    let Piped { mut states, fresh, stats } = pipeline(engine, &front, &plan, visited, xfers, skeletons, &prov, filters, frame, edges, spool.as_deref(), record)?;
     st.add_time(S::Wave, t_pipeline.elapsed());
     st.merge(&stats);
     st.set_idle(workers);
@@ -1415,7 +1414,7 @@ pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Rt2<N>>, frame: u3
     let s = engine.settings();
     let start = seed(&mut visited, &rows, HullOf::<N>::full(), &s)?.frontier();
     visited.forget_states();
-    let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, filters: Filters::default(), frame, edges_dir: None, edges: None, skeletons: &skeletons, ceiling: None };
+    let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, filters: Filters::default(), frame, edges_dir: None, edges: None, skeletons: &skeletons };
     let wave = run_wave(engine, start, cx)?;
     Ok(super::layer::decode_states(&wave.next, &visited.keys, visited.shapes(), usize::MAX, &|_| true)?.into_iter().map(|(_, rt2)| rt2).collect())
 }
