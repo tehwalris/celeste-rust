@@ -131,6 +131,36 @@ settled here. Evidence is file:line at develop 19869c5d.
 - The runner also passed `--room` to export-ui, which refuses it, so its UI
   step failed on every improvement.
 
+## C13. HIGH: platform worlds may cover only ~64 frames under the split frame
+- `platform_worlds` steps the reference engine 128 times with `step_one`
+  (concrete.rs:121); under `--split-frame` a step is HALF a frame, while the
+  horizon guard compares GAME frames against the same 127 (wave.rs:743-745).
+  Past frame ~64 a real platform position may be missing from the table, and
+  a `p` state's successors (a union over it) would then drop real ones.
+- Affected if so: split `p` searches past f64, e.g. room (6,0) any% 70
+  ("frames 64-69 refuted") and nodiag 73 ("`--to 69` refuted"); possibly the
+  cause of C3 if that comparison ran past f64.
+- Found by reading (2026-10-21, /var/tmp/audit3/concepts.md); history:
+  the worlds date from 82d98b79, the guard moved to game frames in 8ff30b84.
+- Cheap check: count `platform_worlds(127, s)` with and without
+  `--split-frame` in room (6,0).
+
+## C14. Checks that can pass with nothing compared
+- `check ref` and `check arcs` pass when every sample was skipped over the
+  path cap (check.rs:335): a green check that compared nothing. Make "no
+  comparison" a failure (or a loud SKIPPED that fails the tier).
+- Identities as `Debug` strings: walk.rs:266/:666, driver.rs:230.
+- `l1 check` looks the table up by the UNWIDENED shape
+  (level_minus_one.rs:1961); likely agrees with the forward, unproven.
+- `rewrite l1 check` under `--split-frame` compares steps with a frame
+  horizon (level_minus_one.rs:1971, l1.rs:94): a valid route on (6,0)/(6,1)
+  is reported UNSOUND past mid-route (loud; fix `clock.steps(a.frames)`).
+- `l1 probe` reads a tree with the command line's settings instead of the
+  tree's record: a wrong `--room` silently probes the wrong room.
+- `--override-settings` exists only for `--region`, but `--region off` also
+  turns off the no-player exploration (walk.rs:526-529): either the grid does
+  not change a tree (then don't record it) or overriding it is unsound.
+
 ## C10. Smaller items
 - `rnd` is a free interval per call (stated best-case caveat); the original
   also consumes the stream in removed code (clouds, particles, smoke's
