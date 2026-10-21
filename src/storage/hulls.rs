@@ -121,7 +121,7 @@ fn cuts<N: Rem>(front: &Frontier<N>) -> Vec<(bool, usize, std::ops::Range<usize>
 
 /// Old layer `i`'s states `r` as frontier states.
 fn grown_of<N: Rem>(front: &Frontier<N>, i: usize, r: std::ops::Range<usize>) -> Vec<Grown<N>> {
-    front.old[i].range(r).map(|o| Grown { sk: o.sk, layer: o.layer, hull: o.hull }).collect()
+    front.old[i].range(r).map(Grown::from).collect()
 }
 
 /// `front`'s blocks ENCODED: its new states' hulls (in the frame's state

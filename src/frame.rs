@@ -797,119 +797,137 @@ pub(crate) fn append_forward_stats(dir: &std::path::Path, row: &[(&str, String)]
     Ok(())
 }
 
-/// Changes a resume holds before it upserts them (`restore_visited`): ~1 GB.
-const RESUME_CHANGES: usize = 1 << 25;
+/// Frame-file states a resume merges at once (`restore_visited`): ~1 GB of
+/// changes.
+const RESUME_STATES: usize = 1 << 25;
+
+/// A frame file as a resume merges it: its layer, new states (with their
+/// hulls, in its state order) and grown states (by state).
+struct FrameIn<N: Rem> {
+    layer: u16,
+    new: crate::storage::layer::Layer<N>,
+    hulls: Vec<crate::search::hull::HullOf<N>>,
+    grown: Vec<crate::storage::hulls::Grown<N>>,
+}
+
+/// `frames` merged into `visited` at once (`VisitedSet::absorb`: by region,
+/// a region's in frame order; a state stored twice an error).
+fn absorb_frames<N: Rem>(visited: &mut crate::storage::visited::VisitedSet<N>, frames: &[FrameIn<N>], threads: usize) -> Result<()> {
+    use crate::storage::visited::Part;
+    let empty = crate::storage::set::PlainTable::default();
+    let mut parts: Vec<Part<N, crate::storage::hulls::Grown<N>>> = Vec::new();
+    for fr in frames {
+        let (tables, mut regions) = (fr.new.set.tables(), Vec::new());
+        regions.extend(tables.iter().map(|t| t.0).chain(fr.grown.iter().map(|g| g.sk.region)));
+        regions.sort_unstable();
+        regions.dedup();
+        let (mut t, mut at, mut g) = (0usize, 0usize, 0usize);
+        for region in regions {
+            let new = match tables.get(t) {
+                Some((r, table)) if *r == region => {
+                    t += 1;
+                    table
+                }
+                _ => &empty,
+            };
+            let n = new.states() as usize;
+            let k = g + fr.grown[g..].partition_point(|x| x.sk.region == region);
+            parts.push(Part { region, new, hulls: &fr.hulls[at..at + n], grown: &fr.grown[g..k], layer: fr.layer });
+            (at, g) = (at + n, k);
+        }
+    }
+    // By region, a region's parts in frame order.
+    parts.sort_by_key(|p| p.region);
+    let held = visited.absorb(&parts, threads)?.held_new;
+    anyhow::ensure!(held == 0, "{held} states stored twice");
+    Ok(())
+}
 
 /// The VISITED SET of a tree's frames `0..=last`, rebuilt from its frame
-/// files (a state stored twice is an error), their frontiers replayed in
-/// order (a state's layer and hull are its last frame's); its first win;
-/// frame `last`'s FRONTIER (its new states, and the states whose hull grew
-/// there with the hull they held before: their `was`); and the skeletons
-/// registry as the emissions left it. Changes are upserted per region a
-/// batch of frames at a time (`RESUME_CHANGES`).
+/// files, merged in as the forward merged them (`VisitedSet::absorb`, a
+/// batch of frames at a time: `RESUME_STATES`); its first win; frame
+/// `last`'s FRONTIER (its new states, and the states whose hull grew there
+/// with the hull they held before: their `was`); and the skeletons registry
+/// as the emissions left it.
 #[allow(clippy::type_complexity)]
 pub(crate) fn restore_visited<N: Rem>(dir: &std::path::Path, last: u32, room: (i16, i16), threads: usize) -> Result<(crate::storage::visited::VisitedSet<N>, Option<u32>, Frontier<N>, crate::storage::decode::Skeletons<N>)> {
-    use crate::storage::set::Change;
     let tree = crate::storage::layer::Tree::<N>::open(dir, last)?;
     let mut visited = crate::storage::visited::VisitedSet::<N>::new();
     for (i, &h) in tree.shapes.iter().enumerate() {
         visited.restore_shape(i as u32, h)?;
     }
     visited.keys = tree.space.clone();
-    use crate::storage::visited::StateInfo;
     let mut frontier = Frontier::<N>::default();
     // The emissions' skeletons: every frame file's from frame 1 on (a
     // layer's are the registry's; frame 0's are the start's reference rows').
     let skeletons = crate::storage::decode::Skeletons::<N>::default();
-    // Per region its changes not yet upserted, in frame order.
-    let mut pending: rustc_hash::FxHashMap<u32, Vec<Change<N>>> = Default::default();
-    let mut held = 0usize;
-    // The pending changes upserted: per region by state, a state's last
-    // change kept (its last file's layer and hull), NEW where any was (two
-    // NEW: the state stored twice).
-    let flush = |pending: &mut rustc_hash::FxHashMap<u32, Vec<Change<N>>>, visited: &mut crate::storage::visited::VisitedSet<N>, held: &mut usize| -> Result<()> {
-        let mut per: Vec<(u32, Vec<Change<N>>)> = std::mem::take(pending).into_iter().collect();
-        per.sort_unstable_by_key(|x| x.0);
-        let per: Vec<std::sync::Mutex<(u32, Vec<Change<N>>)>> = per.into_iter().map(std::sync::Mutex::new).collect();
-        let sorted = crate::storage::wave::par_map(&per, threads, |m| -> Result<(u32, Vec<Change<N>>)> {
-            let (region, mut v) = std::mem::take(&mut *m.lock().expect("a region's changes"));
-            v.sort_by_key(|c| (c.key, c.cell));
-            let mut out: Vec<Change<N>> = Vec::with_capacity(v.len());
-            for c in v {
-                match out.last_mut() {
-                    Some(l) if (l.key, l.cell) == (c.key, c.cell) => {
-                        anyhow::ensure!(!(l.new && c.new), "{}: a state of region {region} stored twice", dir.display());
-                        *l = Change { new: l.new || c.new, ..c };
-                    }
-                    _ => out.push(c),
-                }
-            }
-            Ok((region, out))
-        });
-        let per: Vec<(u32, Vec<Change<N>>)> = sorted.into_iter().collect::<Result<_>>()?;
-        *held += visited.upsert_all(per, threads)?.held_new as usize;
-        Ok(())
-    };
+    let mut batch: Vec<FrameIn<N>> = Vec::new();
     for f in 0..=last {
         for r in tree.file(f).filter(|_| f > 0).iter().flat_map(|x| x.header.skeletons.iter().chain(&x.header.emitted)) {
             skeletons.register(&r.rt2_in(room))?;
         }
         // Past a frontier that died: no frame.
         let Some(file) = tree.file(f) else { continue };
-        let (layer, _) = tree.layer(f, (f == last).then_some(room), threads)?;
-        let (hulls, grown) = file.frontier(threads).with_context(|| format!("{}: frame {f}'s frontier", dir.display()))?;
-        let f16 = u16::try_from(f).map_err(|_| anyhow::anyhow!("frame {f}: past a u16 layer"))?;
-        // The new states, in the layer's order (its hulls').
-        let mut h = hulls.iter();
-        for (region, t) in layer.set.tables() {
-            let v = pending.entry(*region).or_default();
-            for (key, mask) in t.iter() {
-                for c in crate::storage::layer::bits(mask) {
-                    let hull = *h.next().expect("counted above");
-                    v.push(Change { key, cell: c as u8, info: Some(StateInfo { hull, layer: f16 }), new: true });
-                }
-            }
-        }
+        let (new, _) = tree.layer(f, (f == last).then_some(room), threads)?;
+        let (hulls, mut grown) = file.frontier(threads).with_context(|| format!("{}: frame {f}'s frontier", dir.display()))?;
+        let layer = u16::try_from(f).map_err(|_| anyhow::anyhow!("frame {f}: past a u16 layer"))?;
+        anyhow::ensure!(grown.iter().all(|g| g.layer < layer), "{}: a grown state of a layer past frame {f} in its frontier", dir.display());
         if f == last {
-            // What the last frame's old states pushed before it: the visited
-            // set before its growth.
-            flush(&mut pending, &mut visited, &mut held)?;
-            // Read by region, each region's walked with its states sorted.
-            let mut by: Vec<(u32, crate::storage::visited::Key, u8, usize)> = grown.iter().enumerate().map(|(i, g)| (g.sk.region, g.sk.key, g.sk.local, i)).collect();
-            by.sort_unstable();
-            let mut was: Vec<Option<StateInfo<N>>> = vec![None; grown.len()];
-            for run in by.chunk_by(|a, b| a.0 == b.0) {
-                let Some(t) = visited.table(run[0].0) else { continue };
-                let mut c = t.cursor::<N>();
-                for &(_, key, local, i) in run {
-                    was[i] = c.seek(key)?.and_then(|e| e.info(local as u32));
-                }
-            }
-            let mut old: crate::storage::wave::ByLayer<N> = Vec::new();
-            for (&crate::storage::hulls::Grown { sk, layer, hull }, was) in grown.iter().zip(was) {
-                anyhow::ensure!(layer < f16, "{}: a grown state of layer {layer} in frame {f}'s hulls", dir.display());
-                let i = was.ok_or_else(|| anyhow::anyhow!("{}: an old state of frame {f}'s frontier without a hull before", dir.display()))?;
-                anyhow::ensure!(i.layer == layer, "{}: an old state's layer {layer} in frame {f}'s hulls, {} before", dir.display(), i.layer);
-                if old.last().is_none_or(|x| x.layer != layer) {
-                    // Each layer's room exactly (the grown states are by layer).
-                    let n = grown.partition_point(|g| g.layer <= layer) - grown.partition_point(|g| g.layer < layer);
-                    old.push(crate::storage::wave::OldLayer::new(layer, n));
-                }
-                old.last_mut().expect("pushed").push(&crate::storage::wave::Old { sk, layer, hull, was: i.hull });
-            }
-            frontier = Frontier { new: layer, hulls: hulls.clone(), old };
+            // Its new states with the batch; then its old states, with what
+            // they held before it, merged on their own.
+            let mut frames = std::mem::take(&mut batch);
+            frames.push(FrameIn { layer, new, hulls, grown: Vec::new() });
+            absorb_frames(&mut visited, &frames, threads).with_context(|| dir.display().to_string())?;
+            let fr = frames.pop().expect("pushed");
+            let old = old_layers(&visited, &grown).with_context(|| format!("{}: frame {f}'s frontier", dir.display()))?;
+            grown.sort_by_key(|g| g.sk);
+            let grown_in = FrameIn { layer, new: crate::storage::layer::Layer::default(), hulls: Vec::new(), grown };
+            absorb_frames(&mut visited, std::slice::from_ref(&grown_in), threads).with_context(|| dir.display().to_string())?;
+            frontier = Frontier { new: fr.new, hulls: fr.hulls, old };
+            break;
         }
-        // The grown ones: older states.
-        for &crate::storage::hulls::Grown { sk, layer, hull } in &grown {
-            pending.entry(sk.region).or_default().push(Change { key: sk.key, cell: sk.local, info: Some(StateInfo { hull, layer }), new: false });
-        }
-        if f == last || pending.values().map(Vec::len).sum::<usize>() >= RESUME_CHANGES {
-            flush(&mut pending, &mut visited, &mut held)?;
+        // By state: a stable sort, which takes the file's runs (by layer,
+        // then state) as they are.
+        grown.sort_by_key(|g| g.sk);
+        batch.push(FrameIn { layer, new, hulls, grown });
+        if batch.iter().map(|b| b.hulls.len() + b.grown.len()).sum::<usize>() >= RESUME_STATES {
+            absorb_frames(&mut visited, &std::mem::take(&mut batch), threads).with_context(|| dir.display().to_string())?;
         }
     }
-    anyhow::ensure!(held == 0, "{}: {held} states stored twice", dir.display());
+    // Frames before a frontier that died before `last`.
+    absorb_frames(&mut visited, &batch, threads).with_context(|| dir.display().to_string())?;
     anyhow::ensure!(visited.infos() <= visited.len() as u64, "{}: {} states, {} with a hull stored", dir.display(), visited.len(), visited.infos());
     Ok((visited, tree.first_win(), frontier, skeletons))
+}
+
+/// A frame's grown states (`grown`, by layer and state) as a frontier's old
+/// states, each with the hull it held before the frame (`visited`'s, which
+/// holds every frame before it): `was`.
+fn old_layers<N: Rem>(visited: &crate::storage::visited::VisitedSet<N>, grown: &[crate::storage::hulls::Grown<N>]) -> Result<crate::storage::wave::ByLayer<N>> {
+    use crate::storage::wave::{Old, OldLayer};
+    // Read by region, each region's walked with its states sorted.
+    let mut by: Vec<(u32, crate::storage::visited::Key, u8, usize)> = grown.iter().enumerate().map(|(i, g)| (g.sk.region, g.sk.key, g.sk.local, i)).collect();
+    by.sort_unstable();
+    let mut was: Vec<Option<crate::storage::visited::StateInfo<N>>> = vec![None; grown.len()];
+    for run in by.chunk_by(|a, b| a.0 == b.0) {
+        let Some(t) = visited.table(run[0].0) else { continue };
+        let mut c = t.cursor::<N>();
+        for &(_, key, local, i) in run {
+            was[i] = c.seek(key)?.and_then(|e| e.info(local as u32));
+        }
+    }
+    let mut old: crate::storage::wave::ByLayer<N> = Vec::new();
+    for (g, was) in grown.iter().zip(was) {
+        let i = was.ok_or_else(|| anyhow::anyhow!("an old state without a hull before"))?;
+        anyhow::ensure!(i.layer == g.layer, "an old state's layer {} in the hulls, {} before", g.layer, i.layer);
+        if old.last().is_none_or(|x| x.layer != g.layer) {
+            // Each layer's room exactly (the grown states are by layer).
+            let n = grown.partition_point(|x| x.layer <= g.layer) - grown.partition_point(|x| x.layer < g.layer);
+            old.push(OldLayer::new(g.layer, n));
+        }
+        old.last_mut().expect("pushed").push(&Old { sk: g.sk, layer: g.layer, hull: g.hull, was: i.hull });
+    }
+    Ok(old)
 }
 
 /// One row of a marks file: `(shape, cell, key.0, key.1, dist)`.

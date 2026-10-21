@@ -34,6 +34,12 @@ pub(crate) struct Old<N: Rem = P8> {
     pub(crate) was: HullOf<N>,
 }
 
+impl<N: Rem> From<Old<N>> for Grown<N> {
+    fn from(o: Old<N>) -> Grown<N> {
+        Grown { sk: o.sk, layer: o.layer, hull: o.hull }
+    }
+}
+
 /// OLD states by layer (ascending; no empty layer), each layer's sorted.
 pub(crate) type ByLayer<N = P8> = Vec<OldLayer<N>>;
 
@@ -131,7 +137,7 @@ impl<N: Rem> Frontier<N> {
 
     /// Its states, layers, hulls, made at `frame`: the new, then the grown.
     pub fn states(&self, frame: u32) -> impl Iterator<Item = Grown<N>> + '_ {
-        super::hulls::frontier_states(&self.new, &self.hulls, frame, self.old.iter().flat_map(OldLayer::<N>::iter).map(|o| Grown { sk: o.sk, layer: o.layer, hull: o.hull }))
+        super::hulls::frontier_states(&self.new, &self.hulls, frame, self.old.iter().flat_map(OldLayer::<N>::iter).map(Grown::from))
     }
 }
 
@@ -825,8 +831,8 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     // Into the visited set: the new states (new: none held) with their
     // layer and hull, the grown states' hulls.
     let layer16 = u16::try_from(frame).map_err(|_| anyhow!("frame {frame}: past a u16 layer"))?;
-    let parts: Vec<(u32, &super::set::PlainTable, &[HullOf<N>], &[Old<N>])> = new.iter().map(|sl| (sl.region, &sl.table, sl.hulls.as_slice(), sl.grown.as_slice())).collect();
-    let up = visited.absorb(&parts, layer16, s.threads())?;
+    let parts: Vec<super::visited::Part<N, Old<N>>> = new.iter().map(|sl| super::visited::Part { region: sl.region, new: &sl.table, hulls: &sl.hulls, grown: &sl.grown, layer: layer16 }).collect();
+    let up = visited.absorb(&parts, s.threads())?;
     drop(parts);
     ensure!(up.held_new == 0, "frame {frame}: {} of the next layer's states the visited set held already", up.held_new);
     for (k, n) in [(S::AbsorbAdded, up.added), (S::AbsorbKept, up.kept), (S::AbsorbDecoded, up.decoded), (S::AbsorbMade, up.made)] {
@@ -1357,14 +1363,14 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start
         i = j;
     }
     let hulls = vec![start; next.states() as usize];
-    let mut parts: Vec<(u32, &super::set::PlainTable, &[HullOf<N>], &[Old<N>])> = Vec::new();
+    let mut parts: Vec<super::visited::Part<N, Old<N>>> = Vec::new();
     let mut at = 0usize;
     for (region, t) in next.set.tables() {
         let n = t.states() as usize;
-        parts.push((*region, t, &hulls[at..at + n], &[]));
+        parts.push(super::visited::Part { region: *region, new: t, hulls: &hulls[at..at + n], grown: &[], layer: 0 });
         at += n;
     }
-    let held = visited.absorb(&parts, 0, s.threads())?.held_new;
+    let held = visited.absorb(&parts, s.threads())?.held_new;
     drop(parts);
     ensure!(held == 0, "frame 0 into a visited set that held {held} of its states");
     for (h, rec) in skels {
