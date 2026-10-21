@@ -285,6 +285,44 @@ pub struct Compiled {
     pub halves: bool,
 }
 
+/// What the shared lowering (`Lower::lower_common`) asks of an
+/// arithmetic's lanes: a literal's value and the masks' width.
+trait LaneArith: GraphArith {
+    const LANES: Lanes;
+    fn konst(lit: Self::Lit) -> NumVal;
+}
+
+impl LaneArith for Fixed {
+    const LANES: Lanes = Lanes::L16;
+    fn konst(lit: i32) -> NumVal {
+        NumVal::ConstI32(lit)
+    }
+}
+
+impl LaneArith for Float {
+    const LANES: Lanes = Lanes::L8;
+    fn konst(lit: u64) -> NumVal {
+        NumVal::ConstQ(lit)
+    }
+}
+
+/// A mask's lanes: 16 of 32 bits (16.16) or 8 of 64 (the doubles' half).
+#[derive(Clone, Copy)]
+enum Lanes {
+    L16,
+    L8,
+}
+
+impl Lanes {
+    /// `k1` to a vector mask of these lanes.
+    fn expand(self) -> &'static str {
+        match self {
+            Lanes::L16 => "vpmovm2d",
+            Lanes::L8 => "vpmovm2q",
+        }
+    }
+}
+
 /// A broadcast constant's lane word: 32 bits (16.16, a vector mask) or 64
 /// (a double's bits).
 #[derive(Clone, Copy)]
@@ -337,7 +375,7 @@ struct Lower<'a, A: GraphArith> {
     memo: HashMap<Key, Vreg>,
 }
 
-impl<A: GraphArith> Lower<'_, A> {
+impl<A: LaneArith> Lower<'_, A> {
     fn fresh(&mut self) -> Vreg {
         let v = self.next_vreg;
         self.next_vreg += 1;
@@ -573,12 +611,49 @@ impl<A: GraphArith> Lower<'_, A> {
         }
     }
 
+    /// The lane mask at input byte `off` as a vector mask (`A::LANES` wide).
+    fn load_mask(&mut self, off: u32) -> Vreg {
+        match A::LANES {
+            Lanes::L16 => self.pure(Key::LoadMask(off), move |d| Inst::LoadMask { dst: d, off }),
+            Lanes::L8 => self.pure(Key::LoadMask8(off), move |d| Inst::LoadMask8 { dst: d, off }),
+        }
+    }
+
     /// The ops every arithmetic lowers alike (the boolean layer, selects,
     /// interval ends, pass-throughs); `None` for the arithmetic's own.
     fn lower_common(&mut self, id: NodeId) -> Result<Option<Value>> {
         let node = self.g.get(id);
         let a = node.args.clone();
         Ok(Some(match &node.op {
+            Op::Const(lo, hi) if lo == hi => Value::Num(A::konst(*lo)),
+            Op::Const(lo, hi) => Value::Ival([A::konst(*lo), A::konst(*hi)]),
+            Op::Cell(c) => {
+                let off = *self.cell_off.get(c).expect("input cell offset assigned before lowering");
+                let load = |l: &mut Self, off: u32| l.pure(Key::Load(off), move |d| Inst::Load { dst: d, off });
+                match self.g.cell_kind(*c) {
+                    Ty::Num => Value::Num(NumVal::Reg(load(self, off))),
+                    Ty::Bool => Value::Bool([MaskVal::Reg(self.load_mask(off)), MaskVal::Const(true)]),
+                    Ty::UBool => {
+                        let val = self.load_mask(off);
+                        Value::Bool([MaskVal::Reg(val), MaskVal::Reg(self.load_mask(off + 2))])
+                    }
+                    // Two number planes: lo at +0, hi at +64.
+                    Ty::Ival => {
+                        let lo = load(self, off);
+                        Value::Ival([NumVal::Reg(lo), NumVal::Reg(load(self, off + 64))])
+                    }
+                }
+            }
+            // Equality of two booleans: `val = ~(pv ^ qv)`, `known = pk & qk`.
+            Op::Eq if self.g.ty(a[0]).is_bool() => {
+                let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
+                let x = self.m_xor(p[0], q[0]);
+                let val = self.m_not(x);
+                let known = self.m_and(p[1], q[1]);
+                Value::Bool([val, known])
+            }
+            // A boolean is decided where its known plane is.
+            Op::Known if self.g.ty(a[0]).is_bool() => Value::Bool([self.as_bool(a[0])?[1], MaskVal::Const(true)]),
             Op::ConstBool(b) => Value::Bool([MaskVal::Const(*b), MaskVal::Const(true)]),
             // Undecided in every lane: the known plane is all zeros.
             Op::UnknownBool(_) => Value::Bool([MaskVal::Const(false), MaskVal::Const(false)]),
@@ -881,45 +956,6 @@ impl Lower<'_, Fixed> {
         let node = self.g.get(id);
         let a = node.args.clone();
         let val = match &node.op {
-            Op::Const(lo, hi) => {
-                if lo == hi {
-                    Value::Num(NumVal::ConstI32(*lo))
-                } else {
-                    Value::Ival([NumVal::ConstI32(*lo), NumVal::ConstI32(*hi)])
-                }
-            }
-            Op::Cell(c) => {
-                let off = *self
-                    .cell_off
-                    .get(c)
-                    .expect("input cell offset assigned before lowering");
-                match self.g.cell_kind(*c) {
-                    Ty::Num => {
-                        let dst =
-                            self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off });
-                        Value::Num(NumVal::Reg(dst))
-                    }
-                    Ty::Bool => {
-                        let dst =
-                            self.pure(Key::LoadMask(off), move |d| Inst::LoadMask { dst: d, off });
-                        Value::Bool([MaskVal::Reg(dst), MaskVal::Const(true)])
-                    }
-                    Ty::UBool => {
-                        let known_off = off + 2;
-                        let val = self.pure(Key::LoadMask(off), move |d| Inst::LoadMask { dst: d, off });
-                        let known = self.pure(Key::LoadMask(known_off), move |d| Inst::LoadMask { dst: d, off: known_off });
-                        Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
-                    }
-                    Ty::Ival => {
-                        // Two number planes: lo at +0, hi at +64.
-                        let hi_off = off + 64;
-                        let lo_r = self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off });
-                        let hi_r =
-                            self.pure(Key::Load(hi_off), move |d| Inst::Load { dst: d, off: hi_off });
-                        Value::Ival([NumVal::Reg(lo_r), NumVal::Reg(hi_r)])
-                    }
-                }
-            }
             op @ (Op::Add | Op::Sub | Op::Min | Op::Max) => {
                 if self.wide(a[0]) || self.wide(a[1]) {
                     let (ia, ib) = (self.as_ival(a[0])?, self.as_ival(a[1])?);
@@ -1094,14 +1130,6 @@ impl Lower<'_, Fixed> {
                         let known = self.dbin(ROp::OrD, both, disjoint);
                         Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
                     }
-                    Ty::Bool | Ty::UBool => {
-                        let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
-                        // val = ~(pv ^ qv), known = pk & qk
-                        let x = self.m_xor(p[0], q[0]);
-                        let val = self.m_not(x);
-                        let known = self.m_and(p[1], q[1]);
-                        Value::Bool([val, known])
-                    }
                     _ => {
                         let x = self.as_num(a[0])?;
                         let y = self.as_num(a[1])?;
@@ -1129,10 +1157,7 @@ impl Lower<'_, Fixed> {
                     }
                 }
                 match self.g.ty(inner) {
-                    Ty::Bool | Ty::UBool => {
-                        let b = self.as_bool(inner)?;
-                        Value::Bool([b[1], MaskVal::Const(true)])
-                    }
+                    Ty::Bool | Ty::UBool => unreachable!("a boolean's `Known` is `lower_common`'s"),
                     Ty::Ival => {
                         // A number is decided iff lo == hi.
                         let iv = self.as_ival(inner)?;
@@ -1781,6 +1806,77 @@ impl<'a> Emitter<'a> {
         }
     }
 
+    /// `dst = a OP b` (AT&T: `mn b, a, dst`; `b` a register or a broadcast
+    /// constant).
+    fn binop(&mut self, mn: &str, dst: Vreg, a: Vreg, b: Src) {
+        let ra = self.use_reg(a, OPA);
+        let bop = self.src_operand(b, OPB);
+        let d = self.def_reg(dst);
+        writeln!(self.out, "    {mn} {bop}, %zmm{ra}, %zmm{d}").unwrap();
+        self.store_def(dst, d);
+    }
+
+    /// `dst = OP a`, with an immediate (`mn $imm, a, dst`) or without.
+    fn unop(&mut self, mn: &str, imm: Option<u8>, dst: Vreg, a: Vreg) {
+        let ra = self.use_reg(a, OPA);
+        let d = self.def_reg(dst);
+        match imm {
+            Some(imm) => writeln!(self.out, "    {mn} ${imm}, %zmm{ra}, %zmm{d}").unwrap(),
+            None => writeln!(self.out, "    {mn} %zmm{ra}, %zmm{d}").unwrap(),
+        }
+        self.store_def(dst, d);
+    }
+
+    /// `dst = a PRED b` as a vector mask (AT&T: `mn $imm, b, a, %k1`, then
+    /// `k1` expanded to the lanes).
+    fn compare(&mut self, mn: &str, lanes: Lanes, imm: u8, dst: Vreg, a: Vreg, b: Src) {
+        let ra = self.use_reg(a, OPA);
+        let bop = self.src_operand(b, OPB);
+        let d = self.def_reg(dst);
+        writeln!(self.out, "    {mn} ${imm}, {bop}, %zmm{ra}, %k1").unwrap();
+        writeln!(self.out, "    {} %k1, %zmm{d}", lanes.expand()).unwrap();
+        self.store_def(dst, d);
+    }
+
+    /// The lane mask at `at` (a memory operand) into `dst` as a vector mask.
+    fn mask_load(&mut self, lanes: Lanes, dst: Vreg, at: &str) {
+        if self.skip_def(dst) {
+            return;
+        }
+        let d = self.def_reg(dst);
+        let (zx, kmov) = match lanes {
+            Lanes::L16 => ("movzwl", "kmovw"),
+            Lanes::L8 => ("movzbl", "kmovb"),
+        };
+        writeln!(self.out, "    {zx} {at}, %eax").unwrap();
+        writeln!(self.out, "    {kmov} %eax, %k1").unwrap();
+        writeln!(self.out, "    {} %k1, %zmm{d}", lanes.expand()).unwrap();
+        self.store_def(dst, d);
+    }
+
+    /// Vector mask `src` as a lane mask at byte `off` of the output buffer.
+    fn mask_store(&mut self, lanes: Lanes, src: Vreg, off: u32) {
+        let rs = self.use_reg(src, OPA);
+        let (to_k, kmov, mov) = match lanes {
+            Lanes::L16 => ("vpmovd2m", "kmovw", "movw %ax"),
+            Lanes::L8 => ("vpmovq2m", "kmovb", "movb %al"),
+        };
+        writeln!(self.out, "    {to_k} %zmm{rs}, %k1").unwrap();
+        writeln!(self.out, "    {kmov} %k1, %eax").unwrap();
+        writeln!(self.out, "    {mov}, {off}(%r14)").unwrap();
+    }
+
+    /// A map call-out's first four C arguments: the collision env, the
+    /// result buffer `resbuf`, the coordinates' argument buffers.
+    fn map_call_args(&mut self, resbuf: u32) {
+        let arg = |i: u32| self.argbuf_off + i * 64;
+        let (x, y) = (arg(0), arg(1));
+        writeln!(self.out, "    movq {}(%r15), %rdi", CTX_ENV).unwrap();
+        writeln!(self.out, "    leaq {}(%rsp), %rsi", resbuf).unwrap();
+        writeln!(self.out, "    leaq {}(%rsp), %rdx", x).unwrap();
+        writeln!(self.out, "    leaq {}(%rsp), %rcx", y).unwrap();
+    }
+
     fn emit_inst(&mut self, k: usize, inst: &Inst) {
         match inst {
             Inst::Load { dst, off } => {
@@ -1791,16 +1887,7 @@ impl<'a> Emitter<'a> {
                 writeln!(self.out, "    vmovdqu64 {}(%r13), %zmm{}", off, d).unwrap();
                 self.store_def(*dst, d);
             }
-            Inst::LoadMask { dst, off } => {
-                if self.skip_def(*dst) {
-                    return;
-                }
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    movzwl {}(%r13), %eax", off).unwrap();
-                writeln!(self.out, "    kmovw %eax, %k1").unwrap();
-                writeln!(self.out, "    vpmovm2d %k1, %zmm{}", d).unwrap();
-                self.store_def(*dst, d);
-            }
+            Inst::LoadMask { dst, off } => self.mask_load(Lanes::L16, *dst, &format!("{off}(%r13)")),
             Inst::BcastD { dst, val } => {
                 if self.skip_def(*dst) {
                     return;
@@ -1809,9 +1896,6 @@ impl<'a> Emitter<'a> {
                 self.constant(Word::D(*val), d);
             }
             Inst::RBin { dst, op, a, b } => {
-                let ra = self.use_reg(*a, OPA);
-                let bop = self.src_operand(*b, OPB);
-                let d = self.def_reg(*dst);
                 let mn = match op {
                     ROp::AddD => "vpaddd",
                     ROp::SubD => "vpsubd",
@@ -1822,8 +1906,7 @@ impl<'a> Emitter<'a> {
                     ROp::XorD => "vpxord",
                     ROp::AndnD => "vpandnd",
                 };
-                writeln!(self.out, "    {} {}, %zmm{}, %zmm{}", mn, bop, ra, d).unwrap();
-                self.store_def(*dst, d);
+                self.binop(mn, *dst, *a, *b);
             }
             Inst::Neg { dst, a } => {
                 let ra = self.use_reg(*a, OPA);
@@ -1832,12 +1915,7 @@ impl<'a> Emitter<'a> {
                 writeln!(self.out, "    vpsubd %zmm{}, %zmm{}, %zmm{}", ra, ZERO, d).unwrap();
                 self.store_def(*dst, d);
             }
-            Inst::Abs { dst, a } => {
-                let ra = self.use_reg(*a, OPA);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vpabsd %zmm{}, %zmm{}", ra, d).unwrap();
-                self.store_def(*dst, d);
-            }
+            Inst::Abs { dst, a } => self.unop("vpabsd", None, *dst, *a),
             Inst::Muldq { dst, a, b } => {
                 let ra = self.use_reg(*a, OPA);
                 let rb = self.use_reg(*b, OPB);
@@ -1845,24 +1923,9 @@ impl<'a> Emitter<'a> {
                 writeln!(self.out, "    vpmuldq %zmm{}, %zmm{}, %zmm{}", rb, ra, d).unwrap();
                 self.store_def(*dst, d);
             }
-            Inst::Sraq { dst, a, imm } => {
-                let ra = self.use_reg(*a, OPA);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vpsraq ${}, %zmm{}, %zmm{}", imm, ra, d).unwrap();
-                self.store_def(*dst, d);
-            }
-            Inst::Sllq { dst, a, imm } => {
-                let ra = self.use_reg(*a, OPA);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vpsllq ${}, %zmm{}, %zmm{}", imm, ra, d).unwrap();
-                self.store_def(*dst, d);
-            }
-            Inst::ShrD { dst, a, imm, arith } => {
-                let ra = self.use_reg(*a, OPA);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    {} ${}, %zmm{}, %zmm{}", if *arith { "vpsrad" } else { "vpsrld" }, imm, ra, d).unwrap();
-                self.store_def(*dst, d);
-            }
+            Inst::Sraq { dst, a, imm } => self.unop("vpsraq", Some(*imm), *dst, *a),
+            Inst::Sllq { dst, a, imm } => self.unop("vpsllq", Some(*imm), *dst, *a),
+            Inst::ShrD { dst, a, imm, arith } => self.unop(if *arith { "vpsrad" } else { "vpsrld" }, Some(*imm), *dst, *a),
             Inst::BlendImm { dst, mask, a, b } => {
                 let ra = self.use_reg(*a, OPA);
                 let rb = self.use_reg(*b, OPB);
@@ -1873,14 +1936,7 @@ impl<'a> Emitter<'a> {
                 writeln!(self.out, "    vpblendmd %zmm{}, %zmm{}, %zmm{}{{%k1}}", rb, ra, d).unwrap();
                 self.store_def(*dst, d);
             }
-            Inst::Cmp { dst, imm, a, b } => {
-                let ra = self.use_reg(*a, OPA);
-                let bop = self.src_operand(*b, OPB);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vpcmpd ${}, {}, %zmm{}, %k1", imm, bop, ra).unwrap();
-                writeln!(self.out, "    vpmovm2d %k1, %zmm{}", d).unwrap();
-                self.store_def(*dst, d);
-            }
+            Inst::Cmp { dst, imm, a, b } => self.compare("vpcmpd", Lanes::L16, *imm, *dst, *a, *b),
             Inst::Ternlog { dst, a, b, c, imm } => {
                 let ra = self.use_reg(*a, OPA);
                 let rb = self.use_reg(*b, OPB);
@@ -1908,7 +1964,8 @@ impl<'a> Emitter<'a> {
                     writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%rsp)", r, self.save_off + r * 64)
                         .unwrap();
                 }
-                let arg = |i: u32| self.argbuf_off + i * 64;
+                let argbuf = self.argbuf_off;
+                let arg = |i: u32| argbuf + i * 64;
                 // 3. C args; `stack_arg`: tile_flag's pushed 7th scalar.
                 let (ctx_off, stack_arg): (u32, bool) = match op {
                     CallOp::Div | CallOp::Rem | CallOp::Sin | CallOp::FSin => {
@@ -1926,17 +1983,11 @@ impl<'a> Emitter<'a> {
                         (c, false)
                     }
                     CallOp::Mget | CallOp::FMget => {
-                        writeln!(self.out, "    movq {}(%r15), %rdi", CTX_ENV).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rsi", resbuf).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rdx", arg(0)).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rcx", arg(1)).unwrap();
+                        self.map_call_args(resbuf);
                         (if matches!(op, CallOp::FMget) { CTX_FMGET } else { CTX_MGET }, false)
                     }
                     CallOp::TileFlag | CallOp::FTileFlag => {
-                        writeln!(self.out, "    movq {}(%r15), %rdi", CTX_ENV).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rsi", resbuf).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rdx", arg(0)).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rcx", arg(1)).unwrap();
+                        self.map_call_args(resbuf);
                         writeln!(self.out, "    movl ${}, %r8d", scalars[0]).unwrap();
                         writeln!(self.out, "    movl ${}, %r9d", scalars[1]).unwrap();
                         writeln!(self.out, "    subq $16, %rsp").unwrap();
@@ -1944,10 +1995,7 @@ impl<'a> Emitter<'a> {
                         (if matches!(op, CallOp::FTileFlag) { CTX_FTILE } else { CTX_TILE }, true)
                     }
                     CallOp::TileFlagLanes | CallOp::FTileFlagLanes => {
-                        writeln!(self.out, "    movq {}(%r15), %rdi", CTX_ENV).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rsi", resbuf).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rdx", arg(0)).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rcx", arg(1)).unwrap();
+                        self.map_call_args(resbuf);
                         writeln!(self.out, "    leaq {}(%rsp), %r8", arg(2)).unwrap();
                         writeln!(self.out, "    leaq {}(%rsp), %r9", arg(3)).unwrap();
                         writeln!(self.out, "    subq $16, %rsp").unwrap();
@@ -1970,28 +2018,19 @@ impl<'a> Emitter<'a> {
                 if self.last_neg.is_some_and(|n| n > k) {
                     writeln!(self.out, "    vpxorq %zmm{Z}, %zmm{Z}, %zmm{Z}", Z = ZERO).unwrap();
                 }
-                // 6. read the result into dst.
-                let d = self.def_reg(*dst);
-                if matches!(op, CallOp::TileFlag | CallOp::TileFlagLanes) {
-                    writeln!(self.out, "    movzwl {}(%rsp), %eax", resbuf).unwrap();
-                    writeln!(self.out, "    kmovw %eax, %k1").unwrap();
-                    writeln!(self.out, "    vpmovm2d %k1, %zmm{}", d).unwrap();
-                } else if matches!(op, CallOp::FTileFlag | CallOp::FTileFlagLanes) {
-                    // An 8-lane mask, as 64-bit lanes.
-                    writeln!(self.out, "    movzbl {}(%rsp), %eax", resbuf).unwrap();
-                    writeln!(self.out, "    kmovb %eax, %k1").unwrap();
-                    writeln!(self.out, "    vpmovm2q %k1, %zmm{}", d).unwrap();
-                } else {
-                    writeln!(self.out, "    vmovdqu64 {}(%rsp), %zmm{}", resbuf, d).unwrap();
+                // 6. read the result into dst (a tile test's: a lane mask).
+                let at = format!("{resbuf}(%rsp)");
+                match op {
+                    CallOp::TileFlag | CallOp::TileFlagLanes => self.mask_load(Lanes::L16, *dst, &at),
+                    CallOp::FTileFlag | CallOp::FTileFlagLanes => self.mask_load(Lanes::L8, *dst, &at),
+                    _ => {
+                        let d = self.def_reg(*dst);
+                        writeln!(self.out, "    vmovdqu64 {at}, %zmm{d}").unwrap();
+                        self.store_def(*dst, d);
+                    }
                 }
-                self.store_def(*dst, d);
             }
-            Inst::StoreMask { off, src } => {
-                let rs = self.use_reg(*src, OPA);
-                writeln!(self.out, "    vpmovd2m %zmm{}, %k1", rs).unwrap();
-                writeln!(self.out, "    kmovw %k1, %eax").unwrap();
-                writeln!(self.out, "    movw %ax, {}(%r14)", off).unwrap();
-            }
+            Inst::StoreMask { off, src } => self.mask_store(Lanes::L16, *src, *off),
             Inst::Store { off, src } => {
                 let r = match src {
                     Src::Reg(v) => self.use_reg(*v, OPA),
@@ -2001,12 +2040,7 @@ impl<'a> Emitter<'a> {
                 };
                 writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%r14)", r, off).unwrap();
             }
-            Inst::StoreMask8 { off, src } => {
-                let rs = self.use_reg(*src, OPA);
-                writeln!(self.out, "    vpmovq2m %zmm{}, %k1", rs).unwrap();
-                writeln!(self.out, "    kmovb %k1, %eax").unwrap();
-                writeln!(self.out, "    movb %al, {}(%r14)", off).unwrap();
-            }
+            Inst::StoreMask8 { off, src } => self.mask_store(Lanes::L8, *src, *off),
             Inst::BcastQ { dst, val } => {
                 if self.skip_def(*dst) {
                     return;
@@ -2014,49 +2048,19 @@ impl<'a> Emitter<'a> {
                 let d = self.def_reg(*dst);
                 self.constant(Word::Q(*val), d);
             }
-            Inst::LoadMask8 { dst, off } => {
-                if self.skip_def(*dst) {
-                    return;
-                }
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    movzbl {}(%r13), %eax", off).unwrap();
-                writeln!(self.out, "    kmovb %eax, %k1").unwrap();
-                writeln!(self.out, "    vpmovm2q %k1, %zmm{}", d).unwrap();
-                self.store_def(*dst, d);
-            }
+            Inst::LoadMask8 { dst, off } => self.mask_load(Lanes::L8, *dst, &format!("{off}(%r13)")),
             Inst::FBin { dst, op, a, b } => {
-                let ra = self.use_reg(*a, OPA);
-                let bop = self.src_operand(*b, OPB);
-                let d = self.def_reg(*dst);
                 let mn = match op {
                     FOp::Add => "vaddpd",
                     FOp::Sub => "vsubpd",
                     FOp::Mul => "vmulpd",
                     FOp::Div => "vdivpd",
                 };
-                // AT&T: `dst = a op b`.
-                writeln!(self.out, "    {} {}, %zmm{}, %zmm{}", mn, bop, ra, d).unwrap();
-                self.store_def(*dst, d);
+                self.binop(mn, *dst, *a, *b);
             }
-            Inst::FRnd { dst, a, imm } => {
-                let ra = self.use_reg(*a, OPA);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vrndscalepd ${}, %zmm{}, %zmm{}", imm, ra, d).unwrap();
-                self.store_def(*dst, d);
-            }
-            Inst::FCmp { dst, imm, a, b } => {
-                let ra = self.use_reg(*a, OPA);
-                let bop = self.src_operand(*b, OPB);
-                let d = self.def_reg(*dst);
-                // AT&T: `k1 = a pred b`.
-                writeln!(self.out, "    vcmppd ${}, {}, %zmm{}, %k1", imm, bop, ra).unwrap();
-                writeln!(self.out, "    vpmovm2q %k1, %zmm{}", d).unwrap();
-                self.store_def(*dst, d);
-            }
+            Inst::FRnd { dst, a, imm } => self.unop("vrndscalepd", Some(*imm), *dst, *a),
+            Inst::FCmp { dst, imm, a, b } => self.compare("vcmppd", Lanes::L8, *imm, *dst, *a, *b),
             Inst::QBin { dst, op, a, b } => {
-                let ra = self.use_reg(*a, OPA);
-                let bop = self.src_operand(*b, OPB);
-                let d = self.def_reg(*dst);
                 let mn = match op {
                     QOp::Add => "vpaddq",
                     QOp::Sub => "vpsubq",
@@ -2064,17 +2068,9 @@ impl<'a> Emitter<'a> {
                     QOp::Or => "vporq",
                     QOp::Xor => "vpxorq",
                 };
-                writeln!(self.out, "    {} {}, %zmm{}, %zmm{}", mn, bop, ra, d).unwrap();
-                self.store_def(*dst, d);
+                self.binop(mn, *dst, *a, *b);
             }
-            Inst::QCmp { dst, imm, a, b } => {
-                let ra = self.use_reg(*a, OPA);
-                let bop = self.src_operand(*b, OPB);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vpcmpq ${}, {}, %zmm{}, %k1", imm, bop, ra).unwrap();
-                writeln!(self.out, "    vpmovm2q %k1, %zmm{}", d).unwrap();
-                self.store_def(*dst, d);
-            }
+            Inst::QCmp { dst, imm, a, b } => self.compare("vpcmpq", Lanes::L8, *imm, *dst, *a, *b),
         }
     }
 }
@@ -2231,7 +2227,7 @@ pub fn compile<A: GraphArith>(
 
 /// `compile` with the arithmetic's lowering (`lower`, one node) and lane
 /// layout (`halves`).
-fn compile_with<A: GraphArith>(
+fn compile_with<A: LaneArith>(
     g: &Graph<A>,
     roots: &[NodeId],
     sym: &str,

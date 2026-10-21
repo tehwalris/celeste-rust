@@ -320,35 +320,6 @@ impl Lower<'_, Float> {
         let a = node.args.clone();
         let wide = |l: &Self, k: usize| l.wide(a[k]);
         let val = match &node.op {
-            Op::Const(lo, hi) => {
-                if lo == hi {
-                    Value::Num(NumVal::ConstQ(*lo))
-                } else {
-                    Value::Ival([NumVal::ConstQ(*lo), NumVal::ConstQ(*hi)])
-                }
-            }
-            Op::Cell(c) => {
-                let off = *self.cell_off.get(c).expect("input cell offset assigned before lowering");
-                match self.g.cell_kind(*c) {
-                    Ty::Num => Value::Num(NumVal::Reg(self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off }))),
-                    Ty::Bool => {
-                        let v = self.pure(Key::LoadMask8(off), move |d| Inst::LoadMask8 { dst: d, off });
-                        Value::Bool([MaskVal::Reg(v), MaskVal::Const(true)])
-                    }
-                    Ty::UBool => {
-                        let known_off = off + 2;
-                        let v = self.pure(Key::LoadMask8(off), move |d| Inst::LoadMask8 { dst: d, off });
-                        let kn = self.pure(Key::LoadMask8(known_off), move |d| Inst::LoadMask8 { dst: d, off: known_off });
-                        Value::Bool([MaskVal::Reg(v), MaskVal::Reg(kn)])
-                    }
-                    Ty::Ival => {
-                        let hi_off = off + 64;
-                        let lo = self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off });
-                        let hi = self.pure(Key::Load(hi_off), move |d| Inst::Load { dst: d, off: hi_off });
-                        Value::Ival([NumVal::Reg(lo), NumVal::Reg(hi)])
-                    }
-                }
-            }
             op @ (Op::Add | Op::Sub) => {
                 let fop = if matches!(op, Op::Add) { FOp::Add } else { FOp::Sub };
                 if wide(self, 0) || wide(self, 1) {
@@ -457,14 +428,7 @@ impl Lower<'_, Float> {
             }
             op @ (Op::Lt | Op::Le | Op::Gt | Op::Ge) => self.compare(op, [a[0], a[1]])?,
             Op::Eq => {
-                if self.g.ty(a[0]).is_bool() {
-                    let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
-                    // val = ~(pv ^ qv), known = pk & qk
-                    let x = self.m_xor(p[0], q[0]);
-                    let val = self.m_not(x);
-                    let known = self.m_and(p[1], q[1]);
-                    Value::Bool([val, known])
-                } else if wide(self, 0) || wide(self, 1) {
+                if wide(self, 0) || wide(self, 1) {
                     // As `refdomain`: two points (each end's bits one) by
                     // value, apart intervals unequal, else unknown.
                     let (x, y) = (self.as_ival(a[0])?, self.as_ival(a[1])?);
@@ -509,10 +473,7 @@ impl Lower<'_, Float> {
                     }
                 }
                 match self.g.ty(inner) {
-                    Ty::Bool | Ty::UBool => {
-                        let b = self.as_bool(inner)?;
-                        Value::Bool([b[1], MaskVal::Const(true)])
-                    }
+                    Ty::Bool | Ty::UBool => unreachable!("a boolean's `Known` is `lower_common`'s"),
                     // A number is decided where its ends are one value's bits
                     // (`Graph::eval`'s `as_point`).
                     Ty::Ival => {
