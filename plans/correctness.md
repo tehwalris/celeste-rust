@@ -186,15 +186,29 @@ settled here. Evidence is file:line at develop 19869c5d.
 - Since 8ff30b84 (09-29) for the split part.
 - No witness is affected (each stays 25+ px from every platform in uncovered
   frames), but these REFUTATIONS are unproven: room (6,0) any% 70 (horizons
-  65-69), (6,0) nodiag 73 (`--to 69`, bounds 68/73), (2,1) any% 82 and
-  nodiag 85; (6,0) 100% 75 (open) must not run until fixed. (1,2) and (6,1)
-  are unaffected.
+  65-69), (6,0) nodiag 73 (`--to 69`, bounds 68/73); (6,0) 100% 75 (open)
+  must not run until fixed. (1,2) and (6,1) are unaffected.
+- (2,1) RE-PROVEN without `p` (2026-10-21, 35b93f4e, /var/tmp/clock-measure):
+  `search --level r0sxhn` alone, the platform exact, no table, no level -1.
+  any% 82: forward 22 min, 8.9 GB, 35.5M states at f82 (641M visited, 63 key
+  bits; new states per frame +16% at f56 falling to +2% at f82); arc bound
+  82 in 2 s; concrete win at 82 in 0.2 s. nodiag 85: forward 10.5 min,
+  6.3 GB; arc bound 85; concrete win at 85. Both witnesses equal the stored
+  routes; `--prefer` finds no pruning step that drops either. An exact
+  platform is a clock (no merge across frames), affordable here.
+- (6,0) exact: FATAL at step 9, 128 key bits (10 platforms, each field its
+  own dictionary). Every platform is a function of the frame count, so
+  coding the platform fields JOINTLY (one dictionary for the tuple, ~7 bits)
+  would fit; its cost (split, no merge across frames) is unmeasured. If it
+  is affordable, `p`, the table, its guard and `sides()` can go, with (1,2)
+  and (6,1) re-run without `p`.
 - C3 is NOT explained by this (proven: its comparison stayed within f34, and
   (2,1)'s split and unsplit tables are identical).
 - Fix (not applied): count game frames (`s.clock().steps(frames)`); make the
   generator immune to the idle player (step only the platforms, or refuse
   loudly on a restart or freeze during generation); have `platform_worlds`
-  return the frames it covers and guard on THAT. Then re-run the four results.
+  return the frames it covers and guard on THAT. Then re-run (6,0)'s two
+  results.
 
 ## C14. Checks that can pass with nothing compared
 - `check ref` and `check arcs` pass when every sample was skipped over the

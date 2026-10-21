@@ -40,7 +40,7 @@ is the first level whose first win equals H. (3,3) is the first arc result.
 | (7,0) | 800 m | 84 | TAS8, offset 23, seed 0 | rechecked 10-02: `r0sxhn..r4sxhn, r4sxh..r15sxh, rxsx`, level -1 (84,5); h83 refuted at level 10 | `room_7_0_exit_frame_84.txt` (seeds 0, 0.25) | 10-01 | `c76bf10` | the floor-collision join bug `7f6b96e`; the `n` level |
 | (0,1) | 900 m | 100 | TAS9, offset 27 | `r0sxhn, r1sxhn, r1sxh..r15sxh, rxsx` at h100; first win 100 from level 10 | `room_0_1_exit_frame_100.txt` | 10-01 | `b97fa9a` | objects abstract one rem rung longer: level 0 40M -> 14.8M states, the first exact level 26.5M -> 88k |
 | (1,1) | 1000 m | 94 | TAS10, offset 25 | `r0sxhn..r8sxhn, r8sxh..r15sxh, rxsx` at h94; first win 94 from level 11 | `room_1_1_exit_frame_94.txt` | 10-01 | `267b136` | floors abstract through rem 8; stale edge runs of a killed level (fixed: a fresh forward clears its dirs) |
-| (2,1) | 1100 m | 82 | TAS11, offset 24 | `r0sxhnp, r0sxhn, r1sxhn..r8sxhn, r8sxh..r15sxh, rxsx` at h82; first win 82 from level 8 | `room_2_1_exit_frame_82.txt` | 10-01 | `029b1c0` | an exact platform is a frame counter; the balloon's bob `y` doubled every state |
+| (2,1) | 1100 m | 82 | TAS11, offset 24 | `r0sxhnp, r0sxhn, r1sxhn..r8sxhn, r8sxh..r15sxh, rxsx` at h82; first win 82 from level 8. RE-PROVEN 10-21 by `search --level r0sxhn` alone (the platform exact, no `p`: correctness.md C13): arc bound 82, 22 min | `room_2_1_exit_frame_82.txt` | 10-01 | `029b1c0` | an exact platform is a frame counter; the balloon's bob `y` doubled every state |
 | (3,1) | 1200 m | 71 | TAS12, offset 25 | `r0sxhf..r5sxhf, r5sxh..r15sxh, rxsx` at h71; first win 71 from level 4 | `room_3_1_exit_frame_71.txt` | 10-01 | `4b2a0f4` | ice modelled (`4f1ed71`: only tile flag 0 was) |
 | (4,1) | 1300 m | 95 | TAS13, offset 25, its seeds | `r0sxhn..r8sxhn, r8sxh..r15sxh, rxsx` at h95; first win 95 from level 9 | `room_4_1_exit_frame_95.txt` (TAS13's seeds, rnd) | 10-01 | `f8ea434` | abstract balloons held a spurious 91 through rem 8 (marks 2.9M -> 121M); the first exact level refuted it at once |
 | (5,1) | 1400 m | 104 | TAS14, offset 25 | `r0sxhn..r4sxhn, r4sxh..r15sxh, rxsx` at h104, level -1 (104,5) from f88; first win 104 from level 5 | `room_5_1_exit_frame_104.txt` | 10-01 | `39f35db` | the spring's speeds (2,903 `spd.x` values) handled by level -1, not buckets |
@@ -98,7 +98,7 @@ level; witnesses `tas/room_X_Y_nodiag_frame_N.txt`, uploads
 | (6,0) 700m | 70 | 74 (TAS7) | **73, -1** | split, `r0sxhfp,r0sxh,r0sx`, no level -1: bounds 68, 73; `--to 69` refuted |
 | (7,0) 800m | 84 | 99 (TAS8) | 99, tie | bound 99 at both levels |
 | (0,1) 900m | 100 | 108 (TAS9) | 108, tie | bounds 106, 108 |
-| (2,1) 1100m | 82 | 87 (TAS11) | **85, -2** | `r0sxhnp,r0sxhn`, no level -1: bounds 82, 85 |
+| (2,1) 1100m | 82 | 87 (TAS11) | **85, -2** | `r0sxhnp,r0sxhn`, no level -1: bounds 82, 85. RE-PROVEN 10-21 by `r0sxhn` alone (no `p`, C13): bound 85, 11 min |
 | (5,1) 1400m | 104 | 121 (TAS14) | **119, -2** | level -1 (121,5): bounds 100, 119; level 0 1.02G visited, 62.5M kept at its widest; 60 GB |
 | (6,1) 1500m | 89 | 93 (TAS15) | **92, -1** | split, `r0sxhn`, level -1 (186,5) steps: bound 90; `--to 91` no concrete win (exhaustive); `--to 92` wins |
 | (0,2) 1700m | 81 | 89 (TAS17) | **87, -2** | bound 87 at level 0 |
