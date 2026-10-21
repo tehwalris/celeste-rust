@@ -21,9 +21,6 @@ use super::walk::{room_constant_lattice, Region, Walk};
 pub struct Lowered<A: GraphArith = Fixed> {
     /// One per output shape, with each field's `konst_av`.
     pub(crate) outs: Vec<OutFields<A>>,
-    /// The distinct (outcome, roots) bodies of the fused graph (a size
-    /// measure).
-    pub bodies: usize,
     /// THE specialization (`lower::specialize_frame`): the fused graph and its
     /// bodies, computed once.
     pub(crate) spec: (Graph<A>, Vec<Body>),
@@ -131,7 +128,7 @@ pub fn lower_frame<A: GraphArith>(
     bound: &Bound<A>,
     room: Option<crate::transpile::graph::Room>,
     build_trace: bool,
-) -> Result<Lowered<A>> {
+) -> Lowered<A> {
     let (graph, outcomes, forks) = (&bound.graph, &bound.outcomes, bound.forks);
     let mut e = Emit::bare(graph.clone());
     e.room = room;
@@ -160,8 +157,7 @@ pub fn lower_frame<A: GraphArith>(
         })
         .collect();
     let spec = crate::transpile::lower::lower_outcomes(&e, &mut outs, build_trace);
-    let bodies = spec.1.len();
-    Ok(Lowered { outs: outs.into_iter().map(|o| o.of).collect(), bodies, spec })
+    Lowered { outs: outs.into_iter().map(|o| o.of).collect(), spec }
 }
 
 /// One traced frame, bound and lowered: what the kernel registry assembles.
@@ -171,32 +167,6 @@ pub struct LoweredFrame<A: GraphArith = Fixed> {
     pub lowered: Lowered<A>,
     pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
 }
-
-/// Restate a lowering failure with its `Cell(n)`s named by interface path.
-fn name_cells<A: GraphArith>(f: &super::frame::Frame<A>, e: anyhow::Error) -> anyhow::Error {
-    let msg = format!("{:#}", e);
-    let mut seen: std::collections::BTreeSet<u32> = Default::default();
-    let mut at = msg.as_str();
-    while let Some(i) = at.find("Cell(") {
-        at = &at[i + 5..];
-        let end = at.find(')').unwrap_or(0);
-        if let Ok(n) = at[..end].parse::<u32>() {
-            seen.insert(n);
-        }
-    }
-    let mut lines = Vec::new();
-    for c in seen {
-        let name = f
-            .in_cells
-            .iter()
-            .position(|x| *x == c)
-            .map(|i| super::iface::show(&f.iface.slots[i]))
-            .unwrap_or_else(|| "not an input of this frame".to_string());
-        lines.push(format!("  Cell({}) = {}", c, name));
-    }
-    anyhow::anyhow!("{}\nwhere\n{}", msg, lines.join("\n"))
-}
-
 
 /// The constant-lattice walk's frames for the start room, lowered, in walk
 /// order. A frame that fails to bind or lower is FATAL.
@@ -220,7 +190,7 @@ pub(crate) fn lattice_kernel_refs<A: GraphArith>(
     let slots: Vec<std::sync::Mutex<Option<(Option<Region>, super::frame::Frame<A>, Bound<A>)>>> = frames.into_iter().map(|x| std::sync::Mutex::new(Some(x))).collect();
     let refs = crate::par::Pool::per_core().stack(128 << 20).map(slots.len(), |i| {
         let (key, f, bound) = slots[i].lock().expect("a frame's slot").take().expect("each frame is lowered once");
-        let lowered = super::lower::lower_frame(&bound, Some(room.clone()), s.diag.build_trace).map_err(|e| anyhow::anyhow!("lattice frame {} ({:?}) lower: {:#}", i, key, name_cells(&f, e)))?;
+        let lowered = super::lower::lower_frame(&bound, Some(room.clone()), s.diag.build_trace);
         Ok((key, LoweredFrame { frame: f, bound, lowered, cache: cache.clone() }))
     })?;
     Ok(refs)

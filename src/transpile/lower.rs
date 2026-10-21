@@ -11,10 +11,7 @@ use super::garith::GraphArith;
 use super::graph::{Eval, Graph, NodeId, Op};
 use super::kernel::{Body, Emit, OutFields, Roots};
 
-pub(crate) const BUILD_PHASES: [&str; 9] = [
-    "fixpoint trace",
-    "fixpoint successors",
-    "bind",
+pub(crate) const BUILD_PHASES: [&str; 6] = [
     "specialize",
     "decide: interval fold",
     "decide: boolean simplification",
@@ -25,7 +22,7 @@ pub(crate) const BUILD_PHASES: [&str; 9] = [
 
 /// Build-time accounting: nanoseconds per phase of `BUILD_PHASES`, summed
 /// over workers and builds since the last `build_profile`.
-static BUILD_NS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+static BUILD_NS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 pub(crate) fn build_add(phase: usize, t: std::time::Instant) {
     BUILD_NS[phase].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -252,7 +249,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
 
     let t_spec = t0.elapsed();
 
-    build_add_duration(3, t_spec);
+    build_add_duration(0, t_spec);
     let n_cands = cands.len();
     let t1 = std::time::Instant::now();
     // 3. Decide the boolean layer, on the RESOLVED graph.
@@ -261,7 +258,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
         let t_phase = std::time::Instant::now();
         let (g1, m1, _) =
             crate::transpile::ival::fold(&sp, &all, room).expect("interval fold");
-        build_add(4, t_phase);
+        build_add(1, t_phase);
         let r1: Vec<NodeId> = all.iter().map(|x| m1[*x as usize]).collect();
         // DIAGNOSTIC (--build-trace): a body whose `error` folded to true while
         // live somewhere declines every lane it takes: the leaves of its `error`
@@ -317,7 +314,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
         let t_phase = std::time::Instant::now();
         let (g2, m2, bst) =
             crate::transpile::bdd::simplify_local(&g1, &r1, crate::transpile::bdd::LOCAL_CAP, crate::transpile::bdd::LOCAL_EXPAND);
-        build_add(5, t_phase);
+        build_add(2, t_phase);
         if trace {
             eprintln!(
                 "[build]   boolean simplification: {:.2} s, {} -> {} nodes, {} constants, {} to atoms, {} merged ({} simple complements), {} duplicate leaves dropped, {} unanalysed (local table full)",
@@ -336,7 +333,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
         let t_phase = std::time::Instant::now();
         let (g3, m3, _) =
             crate::transpile::ival::fold(&g2, &r2, room).expect("interval fold 2");
-        build_add(6, t_phase);
+        build_add(3, t_phase);
         for c in cands.iter_mut() {
             c.roots = c.roots.map(|r| m3[m2[m1[r as usize] as usize] as usize]);
         }

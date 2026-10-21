@@ -29,7 +29,7 @@ use crate::storage::unit::lanes_of;
 
 /// One per-row field of a key: its cell (the shape's dictionary), output
 /// slot, its type and whether it is a position coordinate (its code
-/// `exact::Code::pos`).
+/// `exact::Code::of_pos`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct KeyField {
     pub cell: u32,

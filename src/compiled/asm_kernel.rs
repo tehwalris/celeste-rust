@@ -1144,11 +1144,11 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, si:
         });
     }
     let slot = |n: crate::transpile::graph::NodeId| slot_of[&n];
-    crate::transpile::lower::build_add(7, t_fuse);
+    crate::transpile::lower::build_add(4, t_fuse);
     let t_asm = std::time::Instant::now();
     let (compiled, loaded) = crate::transpile::asm::compile_and_load(fused, &flat_roots, &format!("k{shape:016x}{tag}"), build.asm)
     .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
-    crate::transpile::lower::build_add(8, t_asm);
+    crate::transpile::lower::build_add(5, t_asm);
 
     // Which fused nodes read the canonical output unknown (`may_unknown`).
     let reads_unknown_output: Vec<bool> = {

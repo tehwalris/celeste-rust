@@ -5,7 +5,7 @@
 //!
 //!   * every value cell is a key field (`exact::ShapeKeys::value_cells`);
 //!   * the position's `x`/`y` keep only their fraction in the key
-//!     (`Code::pos`); the whole pixels are the cell's, less the room offset
+//!     (`Code::of_pos`); the whole pixels are the cell's, less the room offset
 //!     (`pos_graph::room_offset` of the row's own `room.x/y`);
 //!   * the code merges `Num(n)` and `Ival(n, n)` (producers disagree), so
 //!     the skeleton keeps each value column's `Repr`.

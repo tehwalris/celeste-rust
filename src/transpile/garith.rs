@@ -117,8 +117,6 @@ pub trait GraphArith: Arithmetic {
         let (lo, hi) = (p.iter().map(|q| q.0).reduce(End::least)?, p.iter().map(|q| q.1).reduce(End::most)?);
         Some((Self::end_lit(lo)?, Self::end_lit(hi)?))
     }
-    /// A literal interval as raw 16.16, where the arithmetic is 16.16's.
-    fn lit_raw_fixed(lo: Self::Lit, hi: Self::Lit) -> Option<(i32, i32)>;
     /// Is `v` the only number of its VALUE, so a box whose ends are `v`
     /// holds `v`'s bits on every lane (`ival`'s point fold)? A double's
     /// zero is not: `-0 == 0`, and a lane of `-0` lies in `[0, 0]`.
@@ -562,9 +560,6 @@ impl GraphArith for Fixed {
         w.max(1)
     }
 
-    fn lit_raw_fixed(lo: i32, hi: i32) -> Option<(i32, i32)> {
-        Some((lo, hi))
-    }
     fn alone_in_its_value(_v: Pico8Num) -> bool {
         true
     }
@@ -704,9 +699,6 @@ impl GraphArith for Float {
         (w as i64).max(1)
     }
 
-    fn lit_raw_fixed(_lo: u64, _hi: u64) -> Option<(i32, i32)> {
-        None
-    }
     fn alone_in_its_value(v: LuaF64) -> bool {
         v.value() != 0.0
     }
