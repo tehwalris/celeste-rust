@@ -277,40 +277,8 @@ impl<N: KernelLanes> AsmKernel<N> {
             // Only expanded lanes reach a slice: an unexpanded row's (an
             // exit, a lost berry) error would be no decline.
             if live & error & valid != 0 {
-                // Declined (fatal in the caller): report the lanes.
-                let declined = live & error & valid;
-                let ids = crate::compiled::ids();
-                let mut rows = String::new();
-                let mut m = declined;
-                while m != 0 {
-                    let i = m.trailing_zeros() as usize;
-                    m &= m - 1;
-                    let lane = lanes[i];
-                    let mut desc = format!("lane {lane}:");
-                    for obj in chunk.player_objects() {
-                        for (name, f) in [("rem", ids.f_rem), ("spd", ids.f_spd)] {
-                            if let Some(pc) = chunk.obj_field_cell(obj, f) {
-                                if let Col::U(AV::Ptr(sub)) = chunk.cols[pc as usize] {
-                                    for (axis, g) in [("x", ids.f_x), ("y", ids.f_y)] {
-                                        if let Some(c) = chunk.obj_field_cell(sub, g) {
-                                            desc.push_str(&format!(" {name}.{axis}={:?}", chunk.cols[c as usize].at(lane)));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    rows.push_str(&desc);
-                    rows.push('\n');
-                }
-                eprintln!(
-                    "[kernel] shape {:#x} body of outcome {} declined lanes {:#06x} (live {:#06x} error {:#06x}):\n{rows}",
-                    chunk.shape_hash, body.outcome, declined, live, error
-                );
-                match self.flat_roots.get(body.error_root) {
-                    Some(&error_node) => self.explain_error(chunk, lanes[declined.trailing_zeros() as usize], error_node),
-                    None => eprintln!("[kernel] rerun with --kernel-explain for the error the lane holds"),
-                }
+                // Declined: fatal in the caller.
+                self.report_decline(chunk, lanes, body, live, error, live & error & valid);
                 sc.put_back();
                 return false;
             }
@@ -345,7 +313,41 @@ impl<N: KernelLanes> AsmKernel<N> {
         true
     }
 
-    /// On a decline: print the `error` disjuncts not false for `lane`.
+    /// A decline (`declined`: the lanes `live & error`): the lanes, their
+    /// player's `rem` and `spd`, and (`--kernel-explain`) why the first
+    /// one's `error` holds.
+    #[cold]
+    fn report_decline(&self, chunk: &Rt2<N>, lanes: &[usize], body: &AsmBody, live: u16, error: u16, declined: u16) {
+        let ids = crate::compiled::ids();
+        let mut rows = String::new();
+        for i in crate::storage::unit::lanes_of(declined) {
+            let lane = lanes[i];
+            rows.push_str(&format!("lane {lane}:"));
+            for obj in chunk.player_objects() {
+                for (name, f) in [("rem", ids.f_rem), ("spd", ids.f_spd)] {
+                    let Some(Col::U(AV::Ptr(sub))) = chunk.obj_field_cell(obj, f).map(|pc| &chunk.cols[pc as usize]) else { continue };
+                    for (axis, g) in [("x", ids.f_x), ("y", ids.f_y)] {
+                        if let Some(c) = chunk.obj_field_cell(*sub, g) {
+                            rows.push_str(&format!(" {name}.{axis}={:?}", chunk.cols[c as usize].at(lane)));
+                        }
+                    }
+                }
+            }
+            rows.push('\n');
+        }
+        eprintln!(
+            "[kernel] shape {:#x} body of outcome {} declined lanes {:#06x} (live {:#06x} error {:#06x}):\n{rows}",
+            chunk.shape_hash, body.outcome, declined, live, error
+        );
+        match self.flat_roots.get(body.error_root) {
+            Some(&error_node) => self.explain_error(chunk, lanes[declined.trailing_zeros() as usize], error_node),
+            None => eprintln!("[kernel] rerun with --kernel-explain for the error the lane holds"),
+        }
+    }
+
+    /// Why `error_node` holds on `lane`: its disjuncts not false, each
+    /// followed down to its first undecided condition, and its failing
+    /// premises.
     fn explain_error(&self, chunk: &Rt2<N>, lane: usize, error_node: crate::transpile::graph::NodeId) {
         use crate::transpile::graph::{Op, Val};
         let mut cells: std::collections::HashMap<u32, Val<N>> = Default::default();
@@ -360,108 +362,68 @@ impl<N: KernelLanes> AsmKernel<N> {
                 return;
             }
         };
-        let mut stack = vec![error_node];
-        let mut seen = std::collections::HashSet::new();
-        let mut shown = 0;
-        while let Some(n) = stack.pop() {
-            if !seen.insert(n) {
-                continue;
-            }
-            let node = self.fused.get(n);
-            if matches!(node.op, Op::Or) {
-                stack.extend(node.args.iter().copied());
-                continue;
-            }
-            if vals[n as usize] != Val::Bool(Some(false)) && shown < 6 {
-                shown += 1;
-                let args: Vec<String> = node
-                    .args
-                    .iter()
-                    .map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize]))
-                    .collect();
-                eprintln!("[kernel]   error disjunct {} {:?} = {:?}; args {}", n, node.op, vals[n as usize], args.join(", "));
-                // Follow Sels (and undecided booleans) to the first undecided condition.
-                let mut cur = n;
-                for _ in 0..12 {
-                    let nd = self.fused.get(cur);
-                    let next = match nd.op {
-                        Op::Sel => match vals[nd.args[0] as usize] {
-                            Val::Bool(Some(true)) => Some(nd.args[1]),
-                            Val::Bool(Some(false)) => Some(nd.args[2]),
-                            _ => {
-                                let c = nd.args[0];
-                                let cn = self.fused.get(c);
-                                let cargs: Vec<String> = cn
-                                    .args
-                                    .iter()
-                                    .map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize]))
-                                    .collect();
-                                eprintln!("[kernel]     undecided condition {} {:?} = {:?}; args {}", c, cn.op, vals[c as usize], cargs.join(", "));
-                                // and one level into the comparison's operands
-                                for &a in &cn.args {
-                                    let an = self.fused.get(a);
-                                    if matches!(an.op, Op::Sel) {
-                                        let aargs: Vec<String> = an.args.iter().map(|&b| format!("{}={:?}<{:?}>", b, self.fused.get(b).op, vals[b as usize])).collect();
-                                        eprintln!("[kernel]       operand {} Sel; args {}", a, aargs.join(", "));
-                                    }
-                                }
-                                None
-                            }
-                        },
-                        Op::Le | Op::Ge | Op::Lt | Op::Gt | Op::Eq | Op::Same | Op::ForkOk(..) => {
-                            nd.args.iter().copied().find(|&a| matches!(self.fused.get(a).op, Op::Sel))
-                        }
-                        // An undecided boolean: down its first undecided operand.
-                        Op::And | Op::Or | Op::Not => nd.args.iter().copied().find(|&a| vals[a as usize] == Val::Bool(None)),
+        let g = &self.fused;
+        let why = crate::transpile::why::Explain { g, vals: Some(&vals) };
+        let val = |n: crate::transpile::graph::NodeId| vals[n as usize];
+        for n in why.disjuncts(error_node).into_iter().filter(|&n| val(n) != Val::Bool(Some(false))).take(6) {
+            eprintln!("[kernel]   error disjunct {}", why.with_args(n));
+            // Down Sels (and undecided booleans) to the first undecided condition.
+            let chain = why.chain(n, 12, |cur| {
+                let nd = g.get(cur);
+                match nd.op {
+                    Op::Sel => match val(nd.args[0]) {
+                        Val::Bool(Some(b)) => Some(nd.args[if b { 1 } else { 2 }]),
                         _ => None,
-                    };
-                    match next {
-                        Some(x) => cur = x,
-                        None => {
-                            // Where the walk stops: the undecided node itself.
-                            if !matches!(nd.op, Op::Sel) {
-                                let args: Vec<String> = nd.args.iter().map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize])).collect();
-                                eprintln!("[kernel]     undecided at {} {:?} = {:?}; args {}", cur, nd.op, vals[cur as usize], args.join(", "));
-                                eprintln!("[kernel]       = {}", crate::trace::lower::show_tree(&self.fused, cur, 6));
-                            }
-                            break;
-                        }
-                    }
+                    },
+                    Op::Le | Op::Ge | Op::Lt | Op::Gt | Op::Eq | Op::Same | Op::ForkOk(..) => nd.args.iter().copied().find(|&a| g.get(a).op == Op::Sel),
+                    Op::And | Op::Or | Op::Not => nd.args.iter().copied().find(|&a| val(a) == Val::Bool(None)),
+                    _ => None,
                 }
-                // The FAILING premise: false conjuncts through the strict
-                // merges down to the leaves decided false.
-                let mut stack = vec![n];
-                let mut walked = std::collections::HashSet::new();
-                let mut leaves = 0;
-                while let Some(x) = stack.pop() {
-                    if !walked.insert(x) || leaves >= 8 {
-                        continue;
+            });
+            let end = chain[chain.len() - 1];
+            if chain.len() <= 12 {
+                let nd = g.get(end);
+                if nd.op == Op::Sel {
+                    // Its condition is undecided, and one level into the comparison's operands.
+                    let c = nd.args[0];
+                    eprintln!("[kernel]     undecided condition {}", why.with_args(c));
+                    for &a in g.get(c).args.iter().filter(|&&a| g.get(a).op == Op::Sel) {
+                        eprintln!("[kernel]       operand {}", why.with_args(a));
                     }
-                    let nd = self.fused.get(x);
-                    match nd.op {
-                        Op::And | Op::Or => stack.extend(nd.args.iter().copied().filter(|&a| vals[a as usize] == Val::Bool(Some(false)))),
-                        Op::Sel => match vals[nd.args[0] as usize] {
-                            Val::Bool(Some(true)) => stack.push(nd.args[1]),
-                            Val::Bool(Some(false)) => stack.push(nd.args[2]),
-                            _ => {}
-                        },
-                        _ => {
-                            leaves += 1;
-                            let args: Vec<String> = nd.args.iter().map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize])).collect();
-                            eprintln!("[kernel]     failing premise {} {:?} = {:?}; args {}", x, nd.op, vals[x as usize], args.join(", "));
-                            // A `Known` premise: its undecided operands.
-                            if matches!(nd.op, Op::Known) {
-                                let mut todo = vec![(nd.args[0], 0usize)];
-                                let mut shown = std::collections::HashSet::new();
-                                while let Some((y, depth)) = todo.pop() {
-                                    if depth > 6 || !shown.insert(y) || vals[y as usize] != Val::Bool(None) {
-                                        continue;
-                                    }
-                                    let yn = self.fused.get(y);
-                                    let yargs: Vec<String> = yn.args.iter().map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize])).collect();
-                                    eprintln!("[kernel]       undecided {}{} {:?}; args {}", "  ".repeat(depth), y, yn.op, yargs.join(", "));
-                                    todo.extend(yn.args.iter().map(|&a| (a, depth + 1)));
+                } else {
+                    eprintln!("[kernel]     undecided at {}", why.with_args(end));
+                    eprintln!("[kernel]       = {}", why.tree(end, 6));
+                }
+            }
+            // The FAILING premise: false conjuncts through the strict
+            // merges down to the leaves decided false.
+            let mut stack = vec![n];
+            let mut walked = std::collections::HashSet::new();
+            let mut leaves = 0;
+            while let Some(x) = stack.pop() {
+                if !walked.insert(x) || leaves >= 8 {
+                    continue;
+                }
+                let nd = g.get(x);
+                match nd.op {
+                    Op::And | Op::Or => stack.extend(nd.args.iter().copied().filter(|&a| val(a) == Val::Bool(Some(false)))),
+                    Op::Sel => match val(nd.args[0]) {
+                        Val::Bool(Some(b)) => stack.push(nd.args[if b { 1 } else { 2 }]),
+                        _ => {}
+                    },
+                    _ => {
+                        leaves += 1;
+                        eprintln!("[kernel]     failing premise {}", why.with_args(x));
+                        // A `Known` premise: its undecided operands.
+                        if nd.op == Op::Known {
+                            let mut todo = vec![(nd.args[0], 0usize)];
+                            let mut shown = std::collections::HashSet::new();
+                            while let Some((y, depth)) = todo.pop() {
+                                if depth > 6 || !shown.insert(y) || val(y) != Val::Bool(None) {
+                                    continue;
                                 }
+                                eprintln!("[kernel]       undecided {}{}", "  ".repeat(depth), why.with_args(y));
+                                todo.extend(g.get(y).args.iter().map(|&a| (a, depth + 1)));
                             }
                         }
                     }

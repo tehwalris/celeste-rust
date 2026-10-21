@@ -24,19 +24,6 @@ pub struct Lowered<A: GraphArith = Fixed> {
     pub(crate) bodies: Vec<Body>,
 }
 
-/// A node's subtree, to a bounded depth, as text (for diagnostics).
-pub fn show_tree<A: GraphArith>(g: &Graph<A>, root: NodeId, depth: usize) -> String {
-    let nd = g.get(root);
-    if depth == 0 {
-        return format!("{:?}#{}", nd.op, root);
-    }
-    if nd.args.is_empty() {
-        return format!("{:?}", nd.op);
-    }
-    let kids: Vec<String> = nd.args.iter().map(|a| show_tree(g, *a, depth - 1)).collect();
-    format!("{:?}({})", nd.op, kids.join(", "))
-}
-
 /// One output shape of a traced frame: its stored fields, and what it
 /// computes (`roots`, over the engine's cells; `roots.fields` parallel to
 /// `fields`).
@@ -110,7 +97,7 @@ pub fn bind<A: GraphArith>(f: &crate::trace::frame::Frame<A>, g: &Graph<A>) -> R
     if let Some(n) = (0..graph.len() as NodeId).find(|n| reach[*n as usize] && matches!(graph.get(*n).op, crate::transpile::graph::Op::UnknownNum { .. })) {
         // Name the roots that read it: the field, the guard or the error.
         let reaches = |r: NodeId| graph.cone(&[r]).contains(&n);
-        let which: Vec<String> = roots.iter().enumerate().filter(|(_, r)| reaches(**r)).map(|(i, r)| format!("#{i} {}", show_tree(&graph, *r, 4))).collect();
+        let which: Vec<String> = roots.iter().enumerate().filter(|(_, r)| reaches(**r)).map(|(i, r)| format!("#{i} {}", crate::transpile::why::Explain::of(&graph).tree(*r, 4))).collect();
         anyhow::bail!("an unknown number reaches the kernel: node {n} is read by root(s)\n{}\nwhere the roots are\n{}", which.join("\n"), root_legend(f))
     }
     Ok(Bound { graph, forks: f.forks, outcomes })

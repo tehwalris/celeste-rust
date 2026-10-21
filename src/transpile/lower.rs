@@ -250,47 +250,20 @@ pub(crate) fn specialize_frame<A: GraphArith>(
     // live somewhere declines every lane it takes: the leaves of its `error`
     // Or-tree the interval evaluator decided true.
     if trace {
-        let cells = crate::transpile::ival::seed_cells(&sp);
-        let vals = sp.eval(&cells, Eval::Fold, room).expect("the fold's eval");
-        let mut shown = 0;
-        for c in &cands {
-            let (error, live) = (c.roots.error, c.roots.live);
-            let error_true = matches!(g1.get(m1[error as usize]).op, Op::ConstBool(true));
-            let live_false = matches!(g1.get(m1[live as usize]).op, Op::ConstBool(false));
-            if !error_true || live_false || shown >= 3 {
-                continue;
-            }
-            shown += 1;
-            let mut stack = vec![error];
+        let vals = sp.eval(&crate::transpile::ival::seed_cells(&sp), Eval::Fold, room).expect("the fold's eval");
+        let why = crate::transpile::why::Explain { g: &sp, vals: Some(&vals) };
+        let (top_lo, top_hi) = A::bounds(A::unknown());
+        let is_top = |n: &NodeId| matches!(vals[*n as usize], crate::transpile::graph::Val::Num(iv) if A::bounds(iv).0 == top_lo || A::bounds(iv).1 == top_hi);
+        let declines = |c: &&Body| matches!(g1.get(m1[c.roots.error as usize]).op, Op::ConstBool(true)) && !matches!(g1.get(m1[c.roots.live as usize]).op, Op::ConstBool(false));
+        for c in cands.iter().filter(declines).take(3) {
             let mut leaves = Vec::new();
-            while let Some(n) = stack.pop() {
-                let nd = sp.get(n);
-                if matches!(nd.op, Op::Or) {
-                    stack.extend(nd.args.iter().copied());
-                } else if matches!(vals[n as usize], crate::transpile::graph::Val::Bool(Some(true))) {
-                    leaves.push(format!("{n}={:?}({})", nd.op, nd.args.iter().map(|a| format!("{a}={:?}={:?}", sp.get(*a).op, vals[*a as usize])).collect::<Vec<_>>().join(", ")));
-                    // Where an unbounded value came from: down the first full-range
-                    // operand to the node that made it.
-                    let (top_lo, top_hi) = A::bounds(A::unknown());
-                    let is_top = |v: &crate::transpile::graph::Val<A>| matches!(v, crate::transpile::graph::Val::Num(iv) if A::bounds(*iv).0 == top_lo || A::bounds(*iv).1 == top_hi);
-                    for a in nd.args.iter().copied() {
-                        let mut cur = a;
-                        let mut chain = Vec::new();
-                        for _ in 0..40 {
-                            let cn = sp.get(cur);
-                            chain.push(format!("{cur}={:?}", cn.op));
-                            match cn.args.iter().copied().find(|x| is_top(&vals[*x as usize])) {
-                                Some(x) => cur = x,
-                                None => {
-                                    chain.push(format!("<- args {}", cn.args.iter().map(|x| format!("{x}={:?}={:?}", sp.get(*x).op, vals[*x as usize])).collect::<Vec<_>>().join(", ")));
-                                    break;
-                                }
-                            }
-                        }
-                        if chain.len() > 1 {
-                            leaves.push(format!("top source: {}", chain.join(" <- ")));
-                        }
-                    }
+            for n in why.disjuncts(c.roots.error).into_iter().filter(|n| vals[*n as usize] == crate::transpile::graph::Val::Bool(Some(true))) {
+                leaves.push(why.with_args(n));
+                // Where an unbounded value came from: down the first full-range
+                // operand to the node that made it.
+                for &a in &sp.get(n).args {
+                    let chain = why.chain(a, 40, |cur| sp.get(cur).args.iter().copied().find(is_top));
+                    leaves.push(format!("top source: {} <- {}", why.show_chain(&chain), why.with_args(chain[chain.len() - 1])));
                 }
             }
             eprintln!("[build]   outcome {} cfg {:?}: error folds TRUE while live; true disjuncts: {}", c.outcome, c.splits, leaves.join(" | "));

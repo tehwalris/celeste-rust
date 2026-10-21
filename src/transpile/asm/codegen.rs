@@ -502,64 +502,27 @@ impl<A: GraphArith> Lower<'_, A> {
         match self.vals[id as usize] {
             Some(Value::Num(n)) => Ok(n),
             _ => bail!(
-                "node {} (op {:?}, {:?}; args {}) is not a numeric value where one was needed; interval source: {}",
-                id,
-                self.g.get(id).op,
-                self.g.ty(id),
-                self.g
-                    .get(id)
-                    .args
-                    .iter()
-                    .map(|&a| format!("{a}={:?}/{:?}", self.g.get(a).op, self.g.ty(a)))
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                "node {} is not a numeric value where one was needed; interval source: {}",
+                crate::transpile::why::Explain::of(self.g).with_args(id),
                 self.interval_source(id)
             ),
         }
     }
 
-    /// `id`'s subtree to `depth`, with domains (for errors).
-    fn describe(&self, id: NodeId, depth: usize) -> String {
-        let node = self.g.get(id);
-        let known = match self.vals[id as usize] {
-            Some(Value::Bool([_, MaskVal::Const(true)])) => "K",
-            Some(Value::Bool(_)) => "?",
-            _ => "",
-        };
-        if depth == 0 || node.args.is_empty() {
-            return format!("{id}={:?}/{:?}{known}", node.op, self.g.ty(id));
-        }
-        format!(
-            "{id}={:?}/{:?}{known}({})",
-            node.op,
-            self.g.ty(id),
-            node.args.iter().map(|&a| self.describe(a, depth - 1)).collect::<Vec<_>>().join(", ")
-        )
-    }
-
-    /// The chain of interval operands that made `id` an interval.
+    /// The chain of interval operands that made `id` an interval (a select's
+    /// arm; where no arm is, its condition).
     fn interval_source(&self, id: NodeId) -> String {
-        let mut out = Vec::new();
-        let mut cur = id;
-        for _ in 0..64 {
-            let node = self.g.get(cur);
-            out.push(format!("{cur}={:?}", node.op));
-            let next = match node.op {
-                Op::Sel => {
-                    let arm = node.args[1..].iter().copied().find(|&x| self.wide(x));
-                    if arm.is_none() {
-                        out.push(format!("<- condition {}", self.describe(node.args[0], 5)));
-                    }
-                    arm
-                }
-                _ => node.args.iter().copied().find(|&x| self.wide(x)),
-            };
-            match next {
-                Some(x) => cur = x,
-                None => break,
-            }
+        let why = crate::transpile::why::Explain::of(self.g);
+        let chain = why.chain(id, 64, |n| {
+            let node = self.g.get(n);
+            let from = if node.op == Op::Sel { 1 } else { 0 };
+            node.args[from..].iter().copied().find(|&x| self.wide(x))
+        });
+        let last = self.g.get(chain[chain.len() - 1]);
+        match last.op {
+            Op::Sel if chain.len() <= 64 => format!("{} <- condition {}", why.show_chain(&chain), why.tree(last.args[0], 5)),
+            _ => why.show_chain(&chain),
         }
-        out.join(" <- ")
     }
 
     fn as_bool(&self, id: NodeId) -> Result<[MaskVal; 2]> {
@@ -1202,7 +1165,7 @@ impl Lower<'_, Fixed> {
                         "node {}: NoWrap of {:?} with no literal operand (`{}`) is not modelled: no kernel computes whether it overflows",
                         id,
                         op,
-                        self.describe(x, 2)
+                        crate::transpile::why::Explain::of(self.g).tree(x, 2)
                     ),
                 };
                 Value::Bool([ok, MaskVal::Const(true)])

@@ -564,7 +564,7 @@ impl<A: GraphArith> Table<'_, A> {
         let roots: Vec<Roots> = roots_old.iter().map(|r| Roots { live: m(&r.live), error: m(&r.error), xy: r.xy.map(|(x, y)| (m(&x), m(&y))), fields: r.fields.iter().map(m).collect() }).collect();
         let cone = Cone { graph: cone, roots, forks, arities, n_forks: f.forks };
         let plain = cone.specialize();
-        let operands: Vec<String> = cone.forks.iter().map(|(k, (at, op))| format!("fork {k} ({at:?}): {}", crate::trace::lower::show_tree(&cone.graph, *op, 3))).collect();
+        let operands: Vec<String> = cone.forks.iter().map(|(k, (at, op))| format!("fork {k} ({at:?}): {}", crate::transpile::why::Explain::of(&cone.graph).tree(*op, 3))).collect();
         let stats = format!(
             "{} slots ({} pinned, {} interval), {} outcomes, forks {:?}, {} configurations ({} distinct), cone {} nodes, specialized {} nodes, trace {:.1} s, specialize {:.1} s",
             n_slots,
@@ -894,7 +894,7 @@ fn culprit<A: GraphArith>(g: &Graph<A>, vals: &[Val<A>], mut n: NodeId) -> Strin
             },
             _ => {}
         }
-        return format!("{} = {:?}, operands {:?}", crate::trace::lower::show_tree(g, n, 4), vals[n as usize], nd.args.iter().map(|a| vals[*a as usize]).collect::<Vec<_>>());
+        return format!("{} = {:?}, operands {:?}", crate::transpile::why::Explain::of(g).tree(n, 4), vals[n as usize], nd.args.iter().map(|a| vals[*a as usize]).collect::<Vec<_>>());
     }
 }
 
