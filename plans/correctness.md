@@ -78,6 +78,28 @@ settled here. Evidence is file:line at develop 19869c5d.
 - Fix: restore `jbuffer` in the minimal cart (one 0..4 field) and re-run
   every room (results can only stay or improve).
 
+- Scope, refined (2026-10-21): the `h` level widens `p_jump`/`p_dash` (read
+  both ways), so at `h` a jump at u needs only the input at u: the tree, W
+  and the ARC BOUND include every buffered-jump behaviour, and the lower
+  bound is sound for the real game. The CONCRETE search runs the cart exactly
+  (no buffer) and so rejects exactly those behaviours. Hence:
+  - final level has `h` and its arc bound == the found optimum: proven for
+    the real game (bound covers the buffer; the witness is real);
+  - final level has `h`, bound < found: NOT proven (the gap may be a
+    buffered-pair route the concrete search rejected), e.g. (6,1) 90 vs 92;
+  - proved without `h` (`r0sx`): NOT proven, e.g. any% (1,0) 99, the
+    Summit 57, (6,0) (ladder ends at `r0sx`; `r0sxh` bound 68 vs 73), (1,2).
+- Removing button state from the cart is SAFE for the abstract levels (an
+  over-approximation; `h` already does it) but UNSAFE for the concrete
+  search, which must be the real game exactly: missing behaviour gives false
+  optima, extra behaviour (stateless buttons: holding jump retriggers, three
+  jumps on consecutive updates) gives fake wins.
+- Proposed fix: the cart gets the original's button semantics exactly
+  (`p_jump`, `p_dash`, the 4-update `jbuffer`); every abstract level widens
+  button memory (`h` always, extended to `jbuffer`); the concrete search runs
+  it exactly. Then re-prove the at-risk rooms (results only stay or improve);
+  `canonical_jumps` re-timing becomes unnecessary (TAS files play directly).
+
 ## C8. Death and exit in the same update counts as a win
 - `kill_player` (orig 121-122) then `next_room()` (orig 305) in one update:
   the search's win test is the room alone (frame.rs:189-212), so a dying exit
