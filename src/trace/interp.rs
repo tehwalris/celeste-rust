@@ -558,18 +558,7 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     fn join_value(&mut self, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> Value<D> {
-        match (a, b) {
-            // As `state::join`.
-            (Value::Num(x), Value::Num(y)) => Value::Num(match self.d.join_num_independent(cond, x, y) {
-                Some(j) => j,
-                None => self.d.sel_num(cond, x, y),
-            }),
-            (Value::Bool(x), Value::Bool(y)) => Value::Bool(match self.d.join_bool_independent(cond, x, y) {
-                Some(j) => j,
-                None => self.d.sel_bool(cond, x, y),
-            }),
-            (x, _) => x.clone(),
-        }
+        super::state::join(&mut self.d, cond, a, b).expect("`joinable` values join")
     }
 
     /// Numeric `for`; a symbolic bound is unrolled (`run_for_symbolic`).

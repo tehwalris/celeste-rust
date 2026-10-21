@@ -75,6 +75,11 @@ pub enum Eval {
 /// In a `splits` vector: leave this fork standing.
 pub const OPEN: u8 = u8::MAX;
 
+/// The image of a node a rebuild did not build (`Graph::rebuild_into`).
+/// Deliberately not 0: an out-of-range id panics in `Graph::get`, where
+/// node 0 would quietly be some unrelated constant.
+pub const UNBUILT: NodeId = NodeId::MAX;
+
 /// OR-ed into a `splits` fragment index: that fragment with validity TRUE, for
 /// a DEAD fork whose fragments all give the same row (the OR of their
 /// validities is the lane covered).
@@ -481,36 +486,45 @@ impl<A: GraphArith> Graph<A> {
         matches!(node.op, Op::Fork(Cut::Floors | Cut::Ints, _)) && matches!(self.get(node.args[0]).op, Op::Const(lo, hi) if lo != hi)
     }
 
-    /// Rebuild into `out` with forks RESOLVED per `splits` (`OPEN` leaves one
-    /// standing), over a SUBSET (`need[i]` false maps `i` to `UNBUILT`),
-    /// folding as it goes; returns old -> new. `out` is shared and hash-consed,
-    /// so configurations computing the same thing share node ids.
-    pub fn specialize_subset_into(&self, splits: &[u8], need: Option<&[bool]>, out: &mut Graph<A>) -> Vec<NodeId> {
-        out.fork_ways = self.fork_ways.clone();
-        const UNBUILT: NodeId = NodeId::MAX;
-        let mut map: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
+    /// REBUILD into `out` the nodes `need` holds (every node for `None`),
+    /// in id order (an operand before its user): each one `special`'s image
+    /// of it from its operands' images, else `out.fold`ed from them. Returns
+    /// old -> new, `UNBUILT` where not built.
+    pub fn rebuild_into(
+        &self,
+        need: Option<&[bool]>,
+        out: &mut Graph<A>,
+        mut special: impl FnMut(NodeId, &Node<A>, &[NodeId], &mut Graph<A>) -> Option<NodeId>,
+    ) -> Vec<NodeId> {
+        let mut map = vec![UNBUILT; self.nodes.len()];
         for (i, node) in self.nodes.iter().enumerate() {
-            if let Some(need) = need {
-                if !need[i] {
-                    map.push(UNBUILT);
-                    continue;
-                }
+            if need.is_some_and(|n| !n[i]) {
+                continue;
             }
-            let arg = |map: &Vec<NodeId>, k: usize| map[node.args[k] as usize];
-            let s = splits;
-            let id = match node.op.clone() {
-                Op::Fork(cut, d) if s[d as usize] != OPEN => out.fold(Op::Frag(cut, s[d as usize] & !ANY_VALID), vec![arg(&map, 0)]),
-                Op::ForkValid(_, d) if s[d as usize] != OPEN && s[d as usize] & ANY_VALID != 0 => out.leaf(Op::ConstBool(true)),
-                Op::ForkValid(grid, d) if s[d as usize] != OPEN => out.fold(Op::FragOk(grid, s[d as usize]), vec![arg(&map, 0)]),
-                _ => {
-                    let args: Vec<NodeId> =
-                        node.args.iter().map(|a| map[*a as usize]).collect();
-                    out.fold(node.op.clone(), args)
-                }
+            let args: Vec<NodeId> = node.args.iter().map(|a| map[*a as usize]).collect();
+            map[i] = match special(i as NodeId, node, &args, out) {
+                Some(n) => n,
+                None => out.fold(node.op.clone(), args),
             };
-            map.push(id);
         }
         map
+    }
+
+    /// Rebuild into `out` with forks RESOLVED per `splits` (`OPEN` leaves one
+    /// standing), over a SUBSET (`rebuild_into`'s `need`), folding as it
+    /// goes; returns old -> new. `out` is shared and hash-consed, so
+    /// configurations computing the same thing share node ids.
+    pub fn specialize_subset_into(&self, splits: &[u8], need: Option<&[bool]>, out: &mut Graph<A>) -> Vec<NodeId> {
+        out.fork_ways = self.fork_ways.clone();
+        self.rebuild_into(need, out, |_, node, args, out| {
+            let s = |d: u8| splits[d as usize];
+            Some(match node.op {
+                Op::Fork(cut, d) if s(d) != OPEN => out.fold(Op::Frag(cut, s(d) & !ANY_VALID), vec![args[0]]),
+                Op::ForkValid(_, d) if s(d) != OPEN && s(d) & ANY_VALID != 0 => out.leaf(Op::ConstBool(true)),
+                Op::ForkValid(grid, d) if s(d) != OPEN => out.fold(Op::FragOk(grid, s(d)), vec![args[0]]),
+                _ => return None,
+            })
+        })
     }
 
     /// Is operand order meaningless (a canonical order, since interning is the
@@ -757,7 +771,7 @@ impl<A: GraphArith> Graph<A> {
     }
 
     /// Is `y` the negation of `x` (`Not(x)` or the opposite comparison)?
-    fn complements(&self, x: NodeId, y: NodeId) -> bool {
+    pub(crate) fn complements(&self, x: NodeId, y: NodeId) -> bool {
         let (nx, ny) = (&self.nodes[x as usize], &self.nodes[y as usize]);
         if (nx.op == Op::Not && nx.args[0] == y) || (ny.op == Op::Not && ny.args[0] == x) {
             return true;

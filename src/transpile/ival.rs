@@ -19,9 +19,6 @@ use anyhow::Result;
 use super::garith::GraphArith;
 use super::graph::{Eval, Graph, NodeId, Op, Room, Val};
 
-/// The image of a node `fold` did not reach.
-pub use super::bdd::UNREACHABLE;
-
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
     pub before: usize,
@@ -34,7 +31,7 @@ pub struct Stats {
 
 /// Every node the interval evaluator can pin down, replaced by that
 /// constant, and the graph rebuilt over the nodes `roots` reach. Returns the
-/// new graph, a FULL-length node map (`UNREACHABLE` where a node was not
+/// new graph, a FULL-length node map (`graph::UNBUILT` where a node was not
 /// reached), and what it found.
 pub fn fold<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], room: Option<&Room>) -> Result<(Graph<A>, Vec<NodeId>, Stats)> {
     let mut out = g.like();
@@ -68,35 +65,24 @@ pub fn fold_into<A: GraphArith>(
     let need = g.reachable(roots);
     let cells = seed_cells(g);
     let vals = g.eval(&cells, Eval::Fold, room)?;
-    let mut map: Vec<NodeId> = vec![UNREACHABLE; g.len()];
     let mut st = Stats {
         before: need.iter().filter(|x| **x).count(),
         ..Default::default()
     };
-    for id in 0..g.len() {
-        if !need[id] {
-            continue;
+    let map = g.rebuild_into(Some(&need), out, |id, node, _, out| match vals[id as usize] {
+        Val::Bool(Some(b)) if !matches!(node.op, Op::ConstBool(_)) => {
+            st.bools += 1;
+            Some(out.leaf(Op::ConstBool(b)))
         }
-        let node = g.get(id as NodeId);
-        let new = match vals[id] {
-            Val::Bool(Some(b)) if !matches!(node.op, Op::ConstBool(_)) => {
-                st.bools += 1;
-                out.leaf(Op::ConstBool(b))
-            }
-            // A point whose bits its value fixes (not a double's zero: a
-            // lane may hold the other one, `GraphArith::alone_in_its_value`).
-            Val::Num(i) if A::as_point(i).is_some_and(A::alone_in_its_value) && !matches!(node.op, Op::Const(..)) => {
-                st.nums += 1;
-                let raw = A::lit(A::as_point(i).expect("guarded above"));
-                out.leaf(Op::Const(raw, raw))
-            }
-            _ => {
-                let args: Vec<NodeId> = node.args.iter().map(|x| map[*x as usize]).collect();
-                out.fold(node.op.clone(), args)
-            }
-        };
-        map[id] = new;
-    }
+        // A point whose bits its value fixes (not a double's zero: a
+        // lane may hold the other one, `GraphArith::alone_in_its_value`).
+        Val::Num(i) if A::as_point(i).is_some_and(A::alone_in_its_value) && !matches!(node.op, Op::Const(..)) => {
+            st.nums += 1;
+            let raw = A::lit(A::as_point(i).expect("guarded above"));
+            Some(out.leaf(Op::Const(raw, raw)))
+        }
+        _ => None,
+    });
     st.after = out.len();
     Ok((map, st))
 }

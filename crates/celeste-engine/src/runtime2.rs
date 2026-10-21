@@ -88,6 +88,20 @@ pub enum Cell2<N = P8> {
     Bi(u32),
 }
 
+impl<N> Cell2<N> {
+    /// What the cell is, for messages.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Cell2::Val => "value",
+            Cell2::Obj(_) => "object",
+            Cell2::Arr(_) => "array",
+            Cell2::Unk => "unknown table",
+            Cell2::Clo(..) => "closure",
+            Cell2::Bi(_) => "builtin",
+        }
+    }
+}
+
 /// The names the engine reads itself, as their ids (`celeste_names`): the
 /// POSITION OBJECT (the player, else the player spawn, in `objects` by its
 /// `type`) and its fields. The game's other names are its caller's.

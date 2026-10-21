@@ -433,7 +433,7 @@ impl<D: Domain> Joined<D> {
 
 /// Merge one slot. Only numbers and booleans can differ (the shapes agreed),
 /// so this is where `Sel` nodes come from; `Graph::fold` collapses equal arms.
-fn join<D: Domain>(d: &mut D, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> Result<Value<D>> {
+pub(crate) fn join<D: Domain>(d: &mut D, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> Result<Value<D>> {
     Ok(match (a, b) {
         // A condition no lane decides, over values every lane holds alike: the
         // join, not a select (`Domain::join_num_independent`).

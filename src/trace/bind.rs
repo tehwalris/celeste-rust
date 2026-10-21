@@ -21,17 +21,6 @@ pub fn resolve<N: Arithmetic>(rt2: &Rt2<N>, p: &[Step]) -> Result<u32> {
     slots::resolve_steps(rt2, p).map_err(|e| anyhow!("{}", e))
 }
 
-fn kind<N: Arithmetic>(c: &Cell2<N>) -> &'static str {
-    match c {
-        Cell2::Val => "value",
-        Cell2::Obj(_) => "object",
-        Cell2::Arr(_) => "array",
-        Cell2::Unk => "unknown table",
-        Cell2::Clo(..) => "closure",
-        Cell2::Bi(_) => "builtin",
-    }
-}
-
 /// How the first root that reaches `target` does so, as a chain of ops.
 fn why_reached<A: GraphArith>(
     g: &crate::transpile::graph::Graph<A>,
@@ -77,7 +66,8 @@ fn why_reached<A: GraphArith>(
 /// input cells densely, `Op::Cell(0..n)` in `Iface` order; the emitter needs
 /// the engine's sparse canonical ids. `canon` must be INJECTIVE (checked), or
 /// two input slots silently become one cell. Returns the graph over what
-/// `roots` reach and the old -> new node map (defined on that cone).
+/// `roots` reach and the old -> new node map (`graph::UNBUILT` off that
+/// cone).
 pub fn renumber_cells<A: GraphArith>(
     g: &crate::transpile::graph::Graph<A>,
     canon: &[u32],
@@ -92,48 +82,21 @@ pub fn renumber_cells<A: GraphArith>(
     }
     // Only what the ROOTS reach: the arena is shared between frames, whose
     // `Op::Cell` ids are each frame's own.
-    let mut live = vec![false; g.len()];
-    let mut stack: Vec<NodeId> = roots.to_vec();
-    while let Some(n) = stack.pop() {
-        if live[n as usize] {
-            continue;
-        }
-        live[n as usize] = true;
-        stack.extend(g.get(n).args.iter().copied());
+    let live = g.reachable(roots);
+    if let Some((id, i)) = (0..g.len()).filter(|&id| live[id]).find_map(|id| match g.get(id as NodeId).op {
+        Op::Cell(i) if canon.get(i as usize).is_none() => Some((id, i)),
+        _ => None,
+    }) {
+        bail!("Op::Cell({}) is not an interface slot ({} slots), reached by {}", i, canon.len(), why_reached(g, roots, id as NodeId));
     }
-
     let mut out = g.like();
     // The kinds follow the cells to their engine numbers.
     let kinds: Vec<(u32, crate::transpile::graph::Ty)> = g.cell_kinds().filter_map(|(c, k)| Some((*canon.get(c as usize)?, k))).collect();
     out.set_cell_kinds(kinds);
-    let mut map: Vec<NodeId> = Vec::with_capacity(g.len());
-    for id in 0..g.len() {
-        if !live[id] {
-            // Never read: an arg of a live node is live, and args have
-            // smaller ids, so nothing maps through this.
-            map.push(0);
-            continue;
-        }
-        let node = g.get(id as NodeId);
-        let new = match node.op {
-            Op::Cell(i) => {
-                let c = *canon.get(i as usize).ok_or_else(|| {
-                    anyhow!(
-                        "Op::Cell({}) is not an interface slot ({} slots), reached by {}",
-                        i,
-                        canon.len(),
-                        why_reached(g, roots, id as NodeId)
-                    )
-                })?;
-                out.leaf(Op::Cell(c))
-            }
-            _ => {
-                let args: Vec<NodeId> = node.args.iter().map(|a| map[*a as usize]).collect();
-                out.fold(node.op.clone(), args)
-            }
-        };
-        map.push(new);
-    }
+    let map = g.rebuild_into(Some(&live), &mut out, |_, node, _, out| match node.op {
+        Op::Cell(i) => Some(out.leaf(Op::Cell(canon[i as usize]))),
+        _ => None,
+    });
     Ok((out, map))
 }
 
@@ -150,7 +113,7 @@ pub fn resolve_all<N: Arithmetic>(rt2: &Rt2<N>, paths: &[Path]) -> Result<Vec<u3
         // A slot holds a VALUE; writing to an object cell would overwrite
         // the pointer topology.
         if !matches!(rt2.structure[*c as usize], Cell2::Val) {
-            bail!("{} resolves to a {}, not a value cell", show(&paths[i]), kind(&rt2.structure[*c as usize]));
+            bail!("{} resolves to a {}, not a value cell", show(&paths[i]), rt2.structure[*c as usize].kind_name());
         }
         if let Some(j) = seen.insert(*c, i) {
             bail!(
@@ -306,7 +269,7 @@ mod tests {
                 matches!(rt2.structure[c as usize], Cell2::Val),
                 "{} resolved to a {}",
                 show(&p),
-                kind(&rt2.structure[c as usize])
+                rt2.structure[c as usize].kind_name()
             );
             if let Some(other) = seen.insert(c, p.clone()) {
                 panic!("{} and {} are the same cell {}", show(&other), show(&p), c);

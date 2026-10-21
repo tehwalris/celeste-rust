@@ -101,24 +101,13 @@ pub fn resolve_steps<N: Arithmetic>(rt2: &Rt2<N>, p: &[Step]) -> Result<u32, Str
                         })?
                     }
                     (cell, step) => {
-                        return Err(format!("{:?}: no such step in a {}", step, kind(cell)))
+                        return Err(format!("{:?}: no such step in a {}", step, cell.kind_name()))
                     }
                 }
             }
         });
     }
     cur.ok_or_else(|| "empty path".to_string())
-}
-
-fn kind<N>(c: &Cell2<N>) -> &'static str {
-    match c {
-        Cell2::Val => "value",
-        Cell2::Obj(_) => "object",
-        Cell2::Arr(_) => "array",
-        Cell2::Unk => "unknown table",
-        Cell2::Clo(..) => "closure",
-        Cell2::Bi(_) => "builtin",
-    }
 }
 
 /// A fresh block with the same SHAPE as `src` and a new width.
