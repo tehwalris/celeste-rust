@@ -253,6 +253,10 @@ fn input_bytes(ty: Ty) -> u32 {
 /// The assembly text plus the buffer layouts a caller packs.
 pub struct Compiled {
     pub asm: String,
+    /// The text's digest, its `#@k` provenance comments aside (the same with
+    /// `--metrics` or without), kept once the text is dropped: what the
+    /// `[asm build]` line fingerprints a kernel set by.
+    pub text_digest: u64,
     /// Input cells, in ascending order (layout: by type, `input_bytes`).
     pub input_cells: Vec<u32>,
     /// Byte offset of each input cell (parallel to `input_cells`).
@@ -2463,8 +2467,17 @@ fn compile_with<A: GraphArith>(
         }
     }
 
+    let text_digest = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for line in asm.lines().filter(|l| !l.starts_with("#@")) {
+            line.hash(&mut h);
+        }
+        h.finish()
+    };
     Ok(Compiled {
         asm,
+        text_digest,
         input_cells: lo.input_cells,
         input_offsets,
         input_reprs,

@@ -997,15 +997,27 @@ impl<N: KernelLanes> Registry<N> {
         }
         unify(&mut kernels)?;
         eprintln!(
-            "[asm build] {} kernels: trace {:.2}s, assemble {:.2}s ({} workers)",
+            "[asm build] {} kernels: trace {:.2}s, assemble {:.2}s ({} workers); kernel text {:016x}",
             kernels.len(),
             trace_s,
             t_asm.elapsed().as_secs_f64(),
             n_workers,
+            text_digest(&kernels),
         );
         eprintln!("[asm build]   phases, summed over workers and concurrent builds: {}", crate::transpile::lower::build_profile());
         Ok(Registry { kernels, grid })
     }
+}
+
+/// A kernel set's text, fingerprinted: each kernel's (shape, region) and
+/// text digest (`Compiled::text_digest`), in key order.
+fn text_digest<N: KernelLanes>(kernels: &HashMap<(u64, Option<Region>), AsmKernel<N>>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut all: Vec<((u64, Option<Region>), u64)> = kernels.iter().map(|(k, v)| (*k, v.compiled.text_digest)).collect();
+    all.sort_unstable();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    all.hash(&mut h);
+    h.finish()
 }
 
 /// The type of a typed column (or of a uniform value one could hold).
