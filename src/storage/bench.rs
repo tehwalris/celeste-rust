@@ -190,7 +190,7 @@ pub fn load_average() -> f64 {
 /// budget (workers x wall); a wall's hardware counts where counted. Quote
 /// the min, with the load.
 pub fn print_cost(frame: u32, reps: &[Rep]) {
-    use super::stats::{Unit, ALL, S};
+    use super::stats::{Registry, Unit, ALL, S};
     let Some(r0) = reps.first() else { return };
     let col = |s: S| reps.iter().map(|r| r.stats.get(s) as f64).collect::<Vec<f64>>();
     let mm = |v: &[f64]| (v.iter().copied().fold(f64::INFINITY, f64::min), v.iter().copied().fold(f64::NEG_INFINITY, f64::max));
@@ -200,7 +200,7 @@ pub fn print_cost(frame: u32, reps: &[Rep]) {
     let budget = mm(&reps.iter().map(|r| r.stats.get(S::Wave) as f64 * r.workers as f64).collect::<Vec<_>>()).0;
     let counted = reps.iter().all(|r| r.counts.is_some());
     eprintln!("[cost] {:<28} {:>9} {:>9}  {:>6}  {:>27}  per element (the min)", "time", "s min", "s max", "share", if counted { "G ins, user cyc, kernel cyc" } else { "" });
-    for s in ALL {
+    for &s in ALL {
         let secs: Vec<f64> = match s.unit() {
             Unit::Wall | Unit::Work => col(s).iter().map(|v| v / 1e9).collect(),
             Unit::Ticks => col(s).iter().map(|v| v / super::stats::tsc_hz()).collect(),

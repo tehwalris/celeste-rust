@@ -493,7 +493,7 @@ pub(crate) struct RegionArena<C: Circle = Fixed16> {
     at: Vec<u64>,
     /// A chunk's words at most (`CHUNK_WORDS`; tests seal smaller ones).
     chunk: usize,
-    sealed: Vec<Words<C::W>>,
+    sealed: Vec<crate::storage::scratch::Words<C::W>>,
     open: Vec<C::W>,
     /// Words in the sealed chunks, and in those of them mapped.
     sealed_words: u64,
@@ -501,20 +501,63 @@ pub(crate) struct RegionArena<C: Circle = Fixed16> {
     spill: Option<std::path::PathBuf>,
 }
 
-enum Words<W> {
-    Mem(Vec<W>),
-    Map(memmap2::Mmap),
+/// SETS ONCE: an arena of sets and their index by hash. A set equal to
+/// one held is found; a new one is pushed (a hash collision with a
+/// different set: pushed apart, the index keeps the first).
+#[derive(Default)]
+pub(crate) struct Interner<C: Circle = Fixed16> {
+    arena: RegionArena<C>,
+    index: rustc_hash::FxHashMap<u64, u32>,
 }
 
-impl<W> Words<W> {
-    fn words(&self) -> &[W] {
-        match self {
-            Words::Mem(v) => v,
-            // SAFETY: a map starts on a page (aligned for any word) and holds
-            // whole words (`seal` writes them); words are plain data.
-            Words::Map(m) => unsafe { std::slice::from_raw_parts(m.as_ptr().cast::<W>(), m.len() / std::mem::size_of::<W>()) },
-        }
+impl<C: Circle> Interner<C> {
+    /// Set `r` (its hash `h`, `region_hash`), if held.
+    pub(crate) fn find(&self, r: RegionRef<C>, h: u64) -> Option<u32> {
+        self.index.get(&h).copied().filter(|&s| self.arena.get(s) == r)
     }
+    /// Set `r` held once: found, or pushed.
+    pub(crate) fn intern(&mut self, r: RegionRef<C>) -> u32 {
+        let h = region_hash(r);
+        self.find(r, h).unwrap_or_else(|| self.push_hashed(r, h))
+    }
+    /// Set `r` pushed (a copy kept apart if held), its hash indexed if free.
+    pub(crate) fn push(&mut self, r: RegionRef<C>) -> u32 {
+        self.push_hashed(r, region_hash(r))
+    }
+    fn push_hashed(&mut self, r: RegionRef<C>, h: u64) -> u32 {
+        let s = self.arena.push(r);
+        self.index.entry(h).or_insert(s);
+        s
+    }
+    pub(crate) fn get(&self, i: u32) -> RegionRef<'_, C> {
+        self.arena.get(i)
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.arena.len()
+    }
+    /// The bytes its sets take (`RegionArena::bytes`).
+    pub(crate) fn bytes(&self) -> usize {
+        self.arena.bytes()
+    }
+    pub(crate) fn mapped_bytes(&self) -> usize {
+        self.arena.mapped_bytes()
+    }
+    /// Seal its full chunks into scratch files in `dir` (`RegionArena::spill_to`).
+    pub(crate) fn spill_to(&mut self, dir: &std::path::Path) {
+        self.arena.spill_to(dir)
+    }
+    /// Its arena, the index dropped.
+    pub(crate) fn into_arena(self) -> RegionArena<C> {
+        self.arena
+    }
+}
+
+/// A set's hash (`Interner`'s index).
+pub(crate) fn region_hash<C: Circle>(r: RegionRef<C>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hs = rustc_hash::FxHasher::default();
+    r.hash(&mut hs);
+    hs.finish()
 }
 
 /// The set whose record starts `w`.
@@ -562,18 +605,11 @@ impl<C: Circle> RegionArena<C> {
         let open = std::mem::take(&mut self.open);
         self.sealed_words += open.len() as u64;
         let w = match &self.spill {
-            None => Words::Mem(open),
+            None => crate::storage::scratch::Words::Mem(open),
             Some(dir) => {
                 let path = dir.join(format!("sets-{:05}.bin", self.sealed.len()));
-                let map = || -> anyhow::Result<memmap2::Mmap> {
-                    let f = crate::storage::scratch::Scratch::create(&path)?;
-                    // SAFETY: plain words as their bytes.
-                    f.put(unsafe { std::slice::from_raw_parts(open.as_ptr().cast::<u8>(), std::mem::size_of_val(&open[..])) })?;
-                    f.map()
-                };
-                let m = map().unwrap_or_else(|e| panic!("FATAL: the arc phase's set chunk {}: {e:#}", path.display()));
                 self.mapped_words += open.len() as u64;
-                Words::Map(m)
+                crate::storage::scratch::Words::spill(&path, open).unwrap_or_else(|e| panic!("FATAL: the arc phase's set chunk {}: {e:#}", path.display()))
             }
         };
         self.sealed.push(w);
@@ -581,7 +617,7 @@ impl<C: Circle> RegionArena<C> {
     pub(crate) fn get(&self, i: u32) -> RegionRef<'_, C> {
         let a = self.at[i as usize];
         let c = (a >> 32) as usize;
-        let w = if c == self.sealed.len() { &self.open[..] } else { self.sealed[c].words() };
+        let w = if c == self.sealed.len() { &self.open[..] } else { &self.sealed[c][..] };
         record::<C>(&w[a as u32 as usize..])
     }
     /// The bytes its sets take (their records and places).

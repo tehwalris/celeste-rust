@@ -8,14 +8,14 @@
 //!
 //! The blocks (each `Block` in the frame file's header): the new states'
 //! hulls in runs of `NEW_BLOCK` (`HullOf::BYTES` each: 8 in 16.16), then
-//! the grown states in runs of `GROWN_BLOCK`, each its layer, region, key
-//! (deltas from the previous state where they share the fields before),
-//! cell and hull.
+//! the grown states in runs of `GROWN_BLOCK`, each its layer (a delta) and
+//! state (`codec::put_sk` after the previous state of its layer), and its
+//! hull.
 
 use crate::search::hull::HullOf;
 use anyhow::{ensure, Context, Result};
 
-use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128, wide};
+use super::codec::{get_sk, get_varint, put_sk, put_varint};
 use super::file::{self, At, Mapped};
 use super::wave::Frontier;
 use super::Sk;
@@ -62,29 +62,20 @@ pub(crate) struct Block {
 fn encode_grown<N: Rem>(states: impl Iterator<Item = Grown<N>>, n: usize) -> Vec<u8> {
     let mut raw = Vec::with_capacity(n * 14 + 8);
     put_varint(&mut raw, n as u64);
-    let mut prev: Option<(u16, u32, u128)> = None;
-    for Grown { sk: s, layer, hull: h } in states {
-        let k = wide(s.key);
+    let mut prev: Option<(u16, Sk)> = None;
+    for g in states {
         match prev {
-            Some((pl, pr, pk)) if pl == layer => {
+            Some((pl, ps)) if pl == g.layer => {
                 put_varint(&mut raw, 0);
-                if pr == s.region {
-                    put_varint(&mut raw, 0);
-                    put_varint128(&mut raw, k - pk);
-                } else {
-                    put_varint(&mut raw, (s.region - pr) as u64);
-                    put_varint128(&mut raw, k);
-                }
+                put_sk(&mut raw, ps, g.sk);
             }
             _ => {
-                put_varint(&mut raw, layer as u64 - prev.map_or(0, |p| p.0 as u64) + prev.is_none() as u64);
-                put_varint(&mut raw, s.region as u64);
-                put_varint128(&mut raw, k);
+                put_varint(&mut raw, g.layer as u64 - prev.map_or(0, |p| p.0 as u64) + prev.is_none() as u64);
+                put_sk(&mut raw, Sk::default(), g.sk);
             }
         }
-        raw.push(s.local);
-        h.to_bytes(&mut raw);
-        prev = Some((layer, s.region, k));
+        g.hull.to_bytes(&mut raw);
+        prev = Some((g.layer, g.sk));
     }
     raw
 }
@@ -94,31 +85,23 @@ fn decode_grown<N: Rem>(raw: &[u8], want: usize) -> Result<Vec<Grown<N>>> {
     let n = get_varint(raw, &mut pos) as usize;
     ensure!(n == want, "{n} grown states, the index says {want}");
     let mut out: Vec<Grown<N>> = Vec::with_capacity(n);
-    let mut prev: Option<(u16, u32, u128)> = None;
+    let mut prev: Option<(u16, Sk)> = None;
     for _ in 0..n {
         ensure!(pos < raw.len(), "cut short");
         let dl = get_varint(raw, &mut pos);
-        let (layer, region, key) = match prev {
-            Some((pl, pr, pk)) if dl == 0 => {
-                let dr = get_varint(raw, &mut pos);
-                if dr == 0 {
-                    (pl, pr, pk + get_varint128(raw, &mut pos))
-                } else {
-                    (pl, pr + dr as u32, get_varint128(raw, &mut pos))
-                }
-            }
+        let (layer, sk) = match prev {
+            Some((pl, ps)) if dl == 0 => (pl, get_sk(raw, &mut pos, ps)),
             _ => {
                 let layer = prev.map_or(0, |p| p.0 as u64) + dl - prev.is_none() as u64;
                 ensure!(layer <= u16::MAX as u64, "a layer past u16");
-                (layer as u16, get_varint(raw, &mut pos) as u32, get_varint128(raw, &mut pos))
+                (layer as u16, get_sk(raw, &mut pos, Sk::default()))
             }
         };
-        ensure!(pos + 1 + HullOf::<N>::BYTES <= raw.len(), "cut short");
-        let local = raw[pos];
-        let h = HullOf::<N>::from_bytes(&raw[pos + 1..pos + 1 + HullOf::<N>::BYTES]);
-        pos += 1 + HullOf::<N>::BYTES;
-        out.push(Grown { sk: Sk { region, key: narrow(key), local }, layer, hull: h });
-        prev = Some((layer, region, key));
+        ensure!(pos + HullOf::<N>::BYTES <= raw.len(), "cut short");
+        let hull = HullOf::<N>::from_bytes(&raw[pos..pos + HullOf::<N>::BYTES]);
+        pos += HullOf::<N>::BYTES;
+        out.push(Grown { sk, layer, hull });
+        prev = Some((layer, sk));
     }
     ensure!(pos == raw.len(), "bytes past its states");
     Ok(out)

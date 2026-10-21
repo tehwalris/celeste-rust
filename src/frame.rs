@@ -755,7 +755,8 @@ fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Resu
 /// and the walls' totals (`metrics`).
 fn log_frame(dir: &std::path::Path, frame: u32, st: &Stats) -> Result<()> {
     eprintln!("[fwd] f{frame:03} {}", st.line());
-    for s in crate::storage::stats::ALL {
+    use crate::storage::stats::Registry;
+    for &s in crate::storage::stats::ALL {
         if s.unit() == crate::storage::stats::Unit::Wall {
             crate::metrics::record(s.name(), st.time(s));
         }
