@@ -50,17 +50,12 @@ impl EdgeHashes {
                     bad = true;
                     return;
                 };
-                let mut m = r.mask;
-                while m != 0 {
-                    let c = m.trailing_zeros();
-                    m &= m - 1;
-                    let tc = crate::storage::cells::cell(slot, c);
-                    let sc = super::bundle::source_cell(tc, r.o);
+                super::bundle::edges(r.mask, slot, r.o, |_, tc, sc| {
                     let t = mix(th[r.t as usize] ^ (tc as u64) << 1);
                     let s = mix(sh[r.s as usize] ^ (sc as u64) << 1);
                     *acc = acc.wrapping_add(mix(t ^ s.rotate_left(21) ^ p.rotate_left(42)));
                     *n += 1;
-                }
+                });
             })?;
             ensure!(!bad, "f{frame}: an edge without its transfer");
             Ok(())

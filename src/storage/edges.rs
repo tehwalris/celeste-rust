@@ -324,14 +324,7 @@ pub struct Edge {
 /// The edges of bundle `b` of target region `region`: `f(source, target)` each.
 #[inline]
 pub(crate) fn expand(region: u32, b: &Bundle, mut f: impl FnMut(Sk, Sk)) {
-    let slot = region % crate::storage::cells::SLOTS;
-    let mut m = b.mask;
-    while m != 0 {
-        let c = m.trailing_zeros();
-        m &= m - 1;
-        let s_cell = bundle::source_cell(crate::storage::cells::cell(slot, c), b.o);
-        f(Sk::at(b.s_shape, b.s_key, s_cell), Sk { region, key: b.t_key, local: c as u8 });
-    }
+    bundle::edges(b.mask, region % crate::storage::cells::SLOTS, b.o, |c, _, s_cell| f(Sk::at(b.s_shape, b.s_key, s_cell), Sk { region, key: b.t_key, local: c as u8 }));
 }
 
 pub(crate) struct Decoder {
@@ -349,7 +342,7 @@ impl Decoder {
     /// Segment `s`'s raw block, opened (its dictionaries read).
     pub(crate) fn open<'a>(&'a mut self, s: &SegRef) -> Result<bundle::Block<'a>> {
         file::decompress(s.bytes, s.raw, &mut self.z, &mut self.raw)?;
-        bundle::Block::open(&self.raw, &bundle::ORDER)
+        bundle::Block::open(&self.raw)
     }
 
     pub(crate) fn bundles(&mut self, s: &SegRef, f: impl FnMut(Bundle)) -> Result<()> {
@@ -529,9 +522,8 @@ impl<N: Rem> EdgeStore<N> {
         let mut dec = Decoder::default();
         for s in self.segments(frame, target.region) {
             dec.bundles(&s, |b| {
-                if b.t_key == target.key && b.mask >> target.local & 1 == 1 {
-                    let s_cell = bundle::source_cell(crate::storage::cells::cell(target.region % crate::storage::cells::SLOTS, target.local as u32), b.o);
-                    out.push((Sk::at(b.s_shape, b.s_key, s_cell), b.x));
+                if b.t_key == target.key {
+                    bundle::edges(b.mask & 1u64 << target.local, target.region % crate::storage::cells::SLOTS, b.o, |_, _, s_cell| out.push((Sk::at(b.s_shape, b.s_key, s_cell), b.x)));
                 }
             })?;
         }

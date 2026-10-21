@@ -561,15 +561,11 @@ impl<'a, N: Rem> Backward<'a, N> {
                                 let sources = &blk.sources;
                                 blk.records(|r| {
                                     let (m, at) = ranks[r.t as usize];
-                                    let mut hit = m & r.mask;
-                                    while hit != 0 {
-                                        let c = hit.trailing_zeros();
-                                        hit &= hit - 1;
+                                    crate::storage::bundle::edges(m & r.mask, slot, r.o, |c, _, s_cell| {
                                         let set = targets[at as usize..].iter().find(|x| x.1 as u32 == c).expect("a changed cell").2;
                                         let (s_shape, s_key) = sources[r.s as usize];
-                                        let s_cell = crate::storage::bundle::source_cell(crate::storage::cells::cell(slot, c), r.o);
                                         emits.push(Emit { p: Sk::at(s_shape, s_key, s_cell), set, xfer: r.x, layer: (f - 1) as u16 });
-                                    }
+                                    });
                                 })?;
                             }
                             stats.add(A::InEdges, (emits.len() - before) as u64);

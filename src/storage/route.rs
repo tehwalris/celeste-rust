@@ -683,7 +683,7 @@ pub(crate) fn reencode(seg: &Segment, region: u32, finals: &FxHashMap<Key, Key>,
     super::file::decompress(bytes, seg.raw as usize, &mut dz, &mut raw)?;
     let mut v: Vec<Bundle> = Vec::with_capacity(seg.bundles as usize);
     let mut missing = false;
-    bundle::Block::open(&raw, &bundle::ORDER)?.bundles(|mut b| {
+    bundle::Block::open(&raw)?.bundles(|mut b| {
         if is_provisional(b.t_key) {
             match finals.get(&b.t_key) {
                 Some(&k) => b.t_key = k,

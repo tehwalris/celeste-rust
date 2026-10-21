@@ -1008,7 +1008,6 @@ impl<N: Rem> Default for RepushScratch<N> {
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn run_repush<N: Rem>(u: u32, layer: &OldLayer<N>, index: &rustc_hash2::FxHashMap<(u32, Key), Vec<(u32, u32)>>, files: &super::edges::EdgeFiles, frame: u32, segs: &[(u32, u32)], visited: &VisitedSet<N>, base: &XferTable<N>, sink: &mut UnitSink<'_, N>, sc: &mut RepushScratch<N>) -> Result<u64> {
-    use super::bundle::source_cell;
     sink.begin(u);
     sc.accs.clear();
     let mut edges = 0u64;
@@ -1036,17 +1035,13 @@ fn run_repush<N: Rem>(u: u32, layer: &OldLayer<N>, index: &rustc_hash2::FxHashMa
             let Some(cs) = cands[r.s as usize] else { return };
             used += 1;
             let shape = blk.sources[r.s as usize].0;
-            let mut m = r.mask & !dropped;
-            while m != 0 {
-                let c = m.trailing_zeros();
-                m &= m - 1;
-                let s_cell = source_cell(crate::storage::cells::cell(t_slot, c), r.o);
+            super::bundle::edges(r.mask & !dropped, t_slot, r.o, |c, _, s_cell| {
                 let (s_slot, s_local) = crate::storage::cells::slot_local(s_cell);
                 let s_region = super::region_of(shape, s_slot);
-                let Some(&(_, ei)) = cs.iter().find(|x| x.0 == s_region) else { continue };
+                let Some(&(_, ei)) = cs.iter().find(|x| x.0 == s_region) else { return };
                 let e = layer.entries[ei as usize];
                 if e.cells >> s_local & 1 == 0 {
-                    continue;
+                    return;
                 }
                 edges += 1;
                 let [hull, was] = &layer.hulls[e.first as usize + (e.cells & ((1u64 << s_local) - 1)).count_ones() as usize];
@@ -1055,7 +1050,7 @@ fn run_repush<N: Rem>(u: u32, layer: &OldLayer<N>, index: &rustc_hash2::FxHashMa
                     let mut a = AccOf::<N>::default();
                     hull.push_grown(was, &xfer, &mut a).then_some(a)
                 }) else {
-                    continue;
+                    return;
                 };
                 let t = match t_of[r.t as usize] {
                     u32::MAX => {
@@ -1067,7 +1062,7 @@ fn run_repush<N: Rem>(u: u32, layer: &OldLayer<N>, index: &rustc_hash2::FxHashMa
                     t => t,
                 };
                 accs.merge(t, c, &acc);
-            }
+            });
         })?;
         sc.read[2] += seen;
         sc.read[3] += used;
