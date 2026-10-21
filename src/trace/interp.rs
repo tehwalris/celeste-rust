@@ -25,7 +25,6 @@ impl<D: Domain> Flow<D> {
     fn is_normal(&self) -> bool {
         matches!(self, Flow::Normal)
     }
-
 }
 
 /// Can these two values be joined? Only numbers and booleans may differ.
@@ -573,7 +572,6 @@ impl<'a, D: Domain> Interp<'a, D> {
         }
     }
 
-
     /// Numeric `for`; a symbolic bound is unrolled (`run_for_symbolic`).
     fn exec_for(&mut self, f: &'a ast::NumericFor, st: State<D>) -> Result<Outcome<D>> {
         if f.step().is_some() {
@@ -711,8 +709,6 @@ impl<'a, D: Domain> Interp<'a, D> {
         done.extend(running);
         Ok(done)
     }
-
-
 
     fn truthy(&mut self, v: &Value<D>) -> D::Bool {
         // Lua: only nil and false are falsy.
@@ -995,8 +991,6 @@ impl<'a, D: Domain> Interp<'a, D> {
         });
         Ok((v, None))
     }
-
-
 
     fn read_name(&mut self, name: &str, st: &State<D>) -> Value<D> {
         if let Some(v) = st.heap.lookup(st.scope, name) {
@@ -1827,7 +1821,6 @@ mod tests {
     fn parse(src: &str) -> full_moon::ast::Ast {
         full_moon::parse(src).expect("parse")
     }
-
 
     fn run<'a, D: Domain>(d: D, ast: &'a full_moon::ast::Ast) -> (Interp<'a, D>, Value<D>) {
         let mut it = Interp::new(d);

@@ -1,7 +1,7 @@
 //! Graph -> the fused, fork-free frame: `specialize_frame` resolves every
 //! fork configuration of the traced graph into ONE hash-consed arena, and
 //! `lower_outcomes` reads the per-outcome constants the kernel needs off the
-//! result. The ASM backend (`trace::lower::asm_fused_from`) assembles it.
+//! result. The kernel registry (`compiled::asm_kernel`) assembles it.
 
 use std::collections::BTreeMap;
 

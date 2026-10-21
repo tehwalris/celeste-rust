@@ -1,8 +1,8 @@
 //! The graph IR: one traced frame as a pure, hash-consed DAG of `(op,
-//! [operand ids])` over input cells and literals. It describes ONE lane, has
-//! no effects (a body's `live` and `error` are boolean nodes), and no types
-//! beyond bool/number: exactness is a property of the value, so one op
-//! covers every width.
+//! [operand ids])` over input cells and literals. It describes ONE lane and
+//! has no effects (a body's `live` and `error` are boolean nodes). Every node
+//! has a lane TYPE (`Ty`: a boolean, a number, an interval), set by its op's
+//! signature (`Graph::type_of`) and an input cell's kind.
 
 use std::collections::HashMap;
 
@@ -63,7 +63,7 @@ pub enum Eval {
     /// `Exact`, so the two cannot diverge).
     Lenient,
     /// `Lenient`, `mget` over interval coordinates read as the SET of tiles
-    /// the rectangle holds (`TileSet::over`), and `defined` (`eval_full`):
+    /// the rectangle holds (`TileSet::over`), and `defined` (`Graph::eval`):
     /// the interval fold (`transpile::ival`).
     Fold,
     /// Forks resolved via `Frag`, an unmodelled node (`Mget`, roomless
@@ -296,7 +296,6 @@ impl Graph<Fixed> {
 }
 
 impl<A: GraphArith> Graph<A> {
-
     /// An empty graph on the same fork grid and cell kinds.
     pub fn like(&self) -> Self {
         Graph {
@@ -434,6 +433,14 @@ impl<A: GraphArith> Graph<A> {
         &self.nodes[id as usize]
     }
 
+    /// The value of node `n` if it is a literal POINT.
+    pub fn point(&self, n: NodeId) -> Option<A> {
+        match self.nodes[n as usize].op {
+            Op::Const(lo, hi) if lo == hi => Some(A::from_lit(lo)),
+            _ => None,
+        }
+    }
+
     /// Per node of the arena: does one of `roots` read it?
     pub fn reachable(&self, roots: &[NodeId]) -> Vec<bool> {
         let mut need = vec![false; self.len()];
@@ -560,11 +567,7 @@ impl<A: GraphArith> Graph<A> {
             }
             // Two literal points are the same bits or not.
             Op::Same => {
-                let point = |g: &Graph<A>, i: usize| match g.nodes[args[i] as usize].op {
-                    Op::Const(lo, hi) if lo == hi => Some(A::from_lit(lo)),
-                    _ => None,
-                };
-                if let (Some(x), Some(y)) = (point(self, 0), point(self, 1)) {
+                if let (Some(x), Some(y)) = (self.point(args[0]), self.point(args[1])) {
                     return self.leaf(Op::ConstBool(A::bits(x) == A::bits(y)));
                 }
             }
@@ -588,11 +591,7 @@ impl<A: GraphArith> Graph<A> {
             // and what a specialization or a substitution folds overflows
             // nowhere.
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Min | Op::Max => {
-                let point = |g: &Graph<A>, i: usize| match g.nodes[args[i] as usize].op {
-                    Op::Const(lo, hi) if lo == hi => Some(A::from_lit(lo)),
-                    _ => None,
-                };
-                if let (Some(x), Some(y)) = (point(self, 0), point(self, 1)) {
+                if let (Some(x), Some(y)) = (self.point(args[0]), self.point(args[1])) {
                     let r = match op {
                         Op::Add => checked::<A>("+", A::add(x, y), x, y),
                         Op::Sub => checked::<A>("-", A::sub(x, y), x, y),
@@ -606,26 +605,19 @@ impl<A: GraphArith> Graph<A> {
                 }
             }
             Op::Neg | Op::Abs | Op::Flr => {
-                if let Op::Const(lo, hi) = self.nodes[args[0] as usize].op {
-                    if lo == hi {
-                        let x = A::from_lit(lo);
-                        let r = match op {
-                            Op::Neg => checked::<A>("unary -", A::neg(x), x, x),
-                            Op::Abs => checked::<A>("abs", A::abs(x), x, x),
-                            _ => A::flr(x),
-                        };
-                        let l = A::lit(r);
-                        return self.leaf(Op::Const(l, l));
-                    }
+                if let Some(x) = self.point(args[0]) {
+                    let r = match op {
+                        Op::Neg => checked::<A>("unary -", A::neg(x), x, x),
+                        Op::Abs => checked::<A>("abs", A::abs(x), x, x),
+                        _ => A::flr(x),
+                    };
+                    let l = A::lit(r);
+                    return self.leaf(Op::Const(l, l));
                 }
             }
             // A comparison of two literal POINTS is a constant.
             Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => {
-                let point = |g: &Graph<A>, i: usize| match g.nodes[args[i] as usize].op {
-                    Op::Const(lo, hi) if lo == hi => Some(A::from_lit(lo)),
-                    _ => None,
-                };
-                if let (Some(x), Some(y)) = (point(self, 0), point(self, 1)) {
+                if let (Some(x), Some(y)) = (self.point(args[0]), self.point(args[1])) {
                     let r = match op {
                         Op::Lt => A::lt(x, y),
                         Op::Le => A::le(x, y),
@@ -779,28 +771,18 @@ impl<A: GraphArith> Graph<A> {
 
     /// Evaluate every node from the input cells in one forward pass, as
     /// `mode` says (`room`: the map, for `mget` and `tile_flag_at`).
+    ///
+    /// `defined` (`Eval::Fold`, `Eval::NarrowTop`): an operation's value need
+    /// cover only the lanes where it is DEFINED (`abs` of a hull holding MIN
+    /// is `[0, MAX]`, the MIN lane in error). Sound where that error is
+    /// charged to whatever reads the value: once the outcomes' errors are
+    /// derived and are roots of the graph evaluated (the lowering's fold), or
+    /// where the premises are taken as holding (level -1). NOT in the tracer,
+    /// which decides comparisons BEFORE the errors are derived: a decided one
+    /// would no longer reach the `abs`.
     pub fn eval(&self, cells: &HashMap<u32, Val<A>>, mode: Eval, room: Option<&Room>) -> Result<Vec<Val<A>>> {
         let (lenient, defined) = (matches!(mode, Eval::Lenient | Eval::Fold), matches!(mode, Eval::Fold | Eval::NarrowTop));
-        self.eval_full(cells, lenient, mode == Eval::Exact, room, mode == Eval::Fold, defined)
-    }
-
-    /// `defined` (`Eval::Fold`, `Eval::NarrowTop`): an operation's value need cover only the lanes
-    /// where it is DEFINED (`abs` of a hull holding MIN is `[0, MAX]`, the MIN
-    /// lane in error). Sound where that error is charged to whatever reads the
-    /// value: once the outcomes' errors are derived and are roots of the graph
-    /// evaluated (the lowering's fold), or where the premises are taken as
-    /// holding (level -1). NOT in the tracer, which decides comparisons BEFORE
-    /// the errors are derived: a decided one would no longer reach the `abs`.
-    fn eval_full(
-        &self,
-        cells: &HashMap<u32, Val<A>>,
-        frag_lenient: bool,
-        strict_err: bool,
-        room: Option<&Room>,
-        mget_sets: bool,
-        defined: bool,
-    ) -> Result<Vec<Val<A>>> {
-        let lenient = frag_lenient;
+        let (strict_err, mget_sets) = (mode == Eval::Exact, mode == Eval::Fold);
         // Per `Mget` node read as a set: the tiles its coordinates' rectangle holds.
         let mut tiles: HashMap<NodeId, TileSet> = HashMap::new();
         let full = Val::Num(A::unknown());
@@ -1037,48 +1019,16 @@ impl<A: GraphArith> Graph<A> {
                 }
                 })
             })();
-                // The ONE place `lenient` acts: TOP for its kind is sound.
+            // What it cannot compute is TOP for its type (sound), but `Exact`.
             let v = match computed {
                 Ok(v) => v,
-                Err(e) => {
-                    if strict_err {
-                        return Err(e);
-                    }
-                    Self::top_of(&node.op, &node.args, &out, full)
-                }
+                Err(e) if strict_err => return Err(e),
+                Err(_) if self.ty(i as NodeId).is_bool() => Val::Bool(None),
+                Err(_) => full,
             };
             out.push(v);
         }
         Ok(out)
-    }
-
-    /// The weakest value of this op: `Bool(None)` for booleans, the full
-    /// range for numbers; `Sel` follows its arms.
-    fn top_of(op: &Op<A>, args: &[NodeId], out: &[Val<A>], full: Val<A>) -> Val<A> {
-        match op {
-            Op::ConstBool(_)
-            | Op::ForkValid(..)
-            | Op::ForkOk(..)
-            | Op::NoWrap
-            | Op::FragOk(..)
-            | Op::Same
-            | Op::Lt
-            | Op::Le
-            | Op::Gt
-            | Op::Ge
-            | Op::Eq
-            | Op::Not
-            | Op::And
-            | Op::Or
-            | Op::Known
-            | Op::UnknownBool(_)
-            | Op::TileFlagAt => Val::Bool(None),
-            Op::Sel => match args.get(1).map(|x| out[*x as usize]) {
-                Some(Val::Bool(_)) => Val::Bool(None),
-                _ => full,
-            },
-            _ => full,
-        }
     }
 
     /// `tile_flag_at` over INTERVALS: FALSE if the UNION of the rectangles holds

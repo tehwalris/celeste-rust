@@ -527,9 +527,9 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
     anyhow::ensure!(first.len() == platforms.len(), "a platform world has {} platforms, the state {}", first.len(), platforms.len());
     fn konst<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, p: &Path) -> Result<A> {
         match iface::get(st, p) {
-            Some(Value::Num(n)) => match d.graph.get(n).op {
-                Op::Const(a, b) if a == b => Ok(A::from_lit(a)),
-                ref o => bail!("{}: a platform's {} is not a known constant ({o:?})", iface::show(p), iface::show(p)),
+            Some(Value::Num(n)) => match d.graph.point(n) {
+                Some(v) => Ok(v),
+                None => bail!("{}: a platform's {} is not a known constant ({:?})", iface::show(p), iface::show(p), d.graph.get(n).op),
             },
             _ => bail!("{}: not a number", iface::show(p)),
         }

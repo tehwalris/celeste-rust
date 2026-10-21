@@ -540,7 +540,7 @@ pub(super) fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: 
         // must store the `state` it narrowed to). The other side learns nothing.
         let narrowed = {
             let node = d.graph.get(atom);
-            let point = |n: NodeId| matches!(d.graph.get(n).op, Op::Const(lo, hi) if lo == hi);
+            let point = |n: NodeId| d.graph.point(n).is_some();
             match (node.op == Op::Eq, node.args.first().copied(), node.args.get(1).copied()) {
                 (true, Some(a), Some(b)) if point(b) && d.abstract_beneath_lane_ops(a) => Some((a, b)),
                 (true, Some(a), Some(b)) if point(a) && d.abstract_beneath_lane_ops(b) => Some((b, a)),

@@ -227,11 +227,7 @@ impl<N: Arithmetic> Rt2<N> {
             row_keys: Vec::new(),
         }
     }
-
-
-
 }
-
 
 impl<N: Arithmetic> Rt2<N> {
     /// The cell a table-valued global points at, if any.
@@ -513,7 +509,6 @@ impl<N: Arithmetic> Rt2<N> {
         self.cols = new_cols;
     }
 
-
     /// The block as it is, CANONICAL (ids, shape hash; no widening): what a
     /// key space keys (`exact::KeySpace::row_keys`, `exact::exact_rows`).
     pub fn canonical(&mut self) {
@@ -607,7 +602,6 @@ impl<N: Arithmetic> Rt2<N> {
             row_keys: self.row_keys.clone(),
         }
     }
-
 }
 
 impl<N: Arithmetic> Rt2<N> {

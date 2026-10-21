@@ -219,7 +219,6 @@ pub trait Domain: Clone + Default {
     /// where `at` holds; its error holds only there.
     fn evaluated_at(&mut self, _n: &Self::Num, _at: &Self::Bool) {}
 
-
     /// The join of a merge on a condition NO LANE can decide, with arms every
     /// lane holds alike: the hull of two literals, or the unknown number.
     /// `None` keeps the ordinary select.
@@ -246,7 +245,6 @@ pub trait Domain: Clone + Default {
         false
     }
 
-
     /// `__split_by_flr` of a literal interval: its integer fragments, run as
     /// separate trace states and rejoined when the call returns; with
     /// `round`, `__split_by_round`'s (where `flr(v + 1/2)` is one integer:
@@ -272,7 +270,6 @@ pub trait Domain: Clone + Default {
     fn escaped_atom(&mut self, _b: &Self::Bool, _since: u32, _origin: &dyn Fn(&Self) -> String) -> Option<Self::Bool> {
         None
     }
-
 }
 
 /// How many atoms an escaping value may read before its fork is left
@@ -871,7 +868,7 @@ impl<A: GraphArith> Symbolic<A> {
         unknown: impl FnOnce(&mut Self, bool) -> NodeId,
         again: impl Fn(&mut Self, &[NodeId]) -> Result<NodeId>,
     ) -> Result<Option<NodeId>> {
-        if let Some(xs) = args.iter().map(|a| self.as_point(*a)).collect::<Option<Vec<_>>>() {
+        if let Some(xs) = args.iter().map(|a| self.graph.point(*a)).collect::<Option<Vec<_>>>() {
             return point(self, &xs).map(Some);
         }
         if args.iter().any(|a| self.is_unknown_num(*a)) {
@@ -894,12 +891,6 @@ impl<A: GraphArith> Symbolic<A> {
     fn konst(&mut self, v: A) -> NodeId {
         let l = A::lit(v);
         self.graph.leaf(Op::Const(l, l))
-    }
-    fn as_point(&self, n: NodeId) -> Option<A> {
-        match self.graph.get(n).op {
-            Op::Const(lo, hi) if lo == hi => Some(A::from_lit(lo)),
-            _ => None,
-        }
     }
 }
 
@@ -1036,7 +1027,6 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         self.graph.ty(*v) == Ty::Ival
     }
 
-
     /// A literal interval is refused at the rounds: every lane would take
     /// each fragment (the interpreter splits a literal first:
     /// `literal_fragments`).
@@ -1158,7 +1148,6 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         self.unknown_atoms
     }
 
-
     fn escaped_atom(&mut self, b: &NodeId, since: u32, origin: &dyn Fn(&Self) -> String) -> Option<NodeId> {
         // Only with unknowns, and never a countdown's atom (`countdown_atom`):
         // those stay three-valued (decided where read); forking adds a
@@ -1246,7 +1235,7 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     }
 
     fn as_const(&self, v: &NodeId) -> Option<A> {
-        self.as_point(*v)
+        self.graph.point(*v)
     }
 
     fn describe(&self, v: &NodeId) -> String {

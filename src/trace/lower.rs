@@ -61,7 +61,6 @@ pub struct Bound<A: GraphArith = Fixed> {
     pub outcomes: Vec<FrameOutcome<A>>,
 }
 
-
 /// What each root of the frame's outcomes, flattened (`Roots::flat`), is:
 /// for error messages.
 fn root_legend<A: GraphArith>(f: &crate::trace::frame::Frame<A>) -> String {

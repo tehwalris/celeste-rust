@@ -73,7 +73,6 @@ fn why_reached<A: GraphArith>(
     "no root".to_string()
 }
 
-
 /// Rebuild a traced graph with the ENGINE's cell ids: the tracer numbers
 /// input cells densely, `Op::Cell(0..n)` in `Iface` order; the emitter needs
 /// the engine's sparse canonical ids. `canon` must be INJECTIVE (checked), or

@@ -11,7 +11,7 @@ use std::fmt::Write;
 
 use anyhow::{bail, Result};
 
-use celeste_core::arith::{Fixed, Float};
+use celeste_core::arith::{Arithmetic, Fixed, Float};
 
 use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{self, Cut, Graph, NodeId, Op, Ty};
@@ -83,7 +83,7 @@ const FLR_MASK: i32 = 0xffff_0000u32 as i32;
 
 type Vreg = u32;
 
-/// A numeric (ZN) node value: a live register or a broadcast constant.
+/// A numeric node value: a live register or a broadcast constant.
 #[derive(Clone, Copy, PartialEq)]
 enum NumVal {
     Reg(Vreg),
@@ -117,7 +117,7 @@ enum Src {
     BQ(u64),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ROp {
     AddD,
     SubD,
@@ -172,7 +172,7 @@ enum Key {
     Load(u32),
     LoadMask(u32),
     BcastD(i32),
-    RBin(u8, Vreg, SrcKey),
+    RBin(ROp, Vreg, SrcKey),
     Neg(Vreg),
     Abs(Vreg),
     Muldq(Vreg, Vreg),
@@ -262,7 +262,7 @@ pub struct Compiled {
     /// Byte offset of each input cell (parallel to `input_cells`).
     pub input_offsets: Vec<u32>,
     /// Each input cell's type (the graph's `cell_kind`).
-    pub input_reprs: Vec<Ty>,
+    pub input_types: Vec<Ty>,
     pub input_bytes: u32,
     pub n_roots: usize,
     /// Root byte offsets: bools first (4 B: `val` u16, `known` at +2), then
@@ -285,25 +285,43 @@ pub struct Compiled {
     pub halves: bool,
 }
 
+/// A broadcast constant's lane word: 32 bits (16.16, a vector mask) or 64
+/// (a double's bits).
+#[derive(Clone, Copy)]
+enum Word {
+    D(i32),
+    Q(u64),
+}
+
+impl Word {
+    /// Its broadcast mnemonic, and the `{1toN}` of a memory operand.
+    fn bcast(self) -> (&'static str, &'static str) {
+        match self {
+            Word::D(_) => ("vpbroadcastd", "1to16"),
+            Word::Q(_) => ("vpbroadcastq", "1to8"),
+        }
+    }
+}
+
+/// The text's constants, a `.rodata` pool per word size.
 #[derive(Default)]
 struct Pool {
     d: Vec<i32>,
     q: Vec<u64>,
 }
 impl Pool {
-    fn d(&mut self, v: i32) -> String {
-        let i = self.d.iter().position(|x| *x == v).unwrap_or_else(|| {
-            self.d.push(v);
-            self.d.len() - 1
-        });
-        format!(".LCd{i}")
-    }
-    fn q(&mut self, v: u64) -> String {
-        let i = self.q.iter().position(|x| *x == v).unwrap_or_else(|| {
-            self.q.push(v);
-            self.q.len() - 1
-        });
-        format!(".LCq{i}")
+    /// `w`'s label, pooled on first use.
+    fn label(&mut self, w: Word) -> String {
+        fn at<T: PartialEq>(pool: &mut Vec<T>, v: T) -> usize {
+            pool.iter().position(|x| *x == v).unwrap_or_else(|| {
+                pool.push(v);
+                pool.len() - 1
+            })
+        }
+        match w {
+            Word::D(v) => format!(".LCd{}", at(&mut self.d, v)),
+            Word::Q(v) => format!(".LCq{}", at(&mut self.q, v)),
+        }
     }
 }
 
@@ -366,28 +384,22 @@ impl<A: GraphArith> Lower<'_, A> {
 
     /// A memoized 32-bit-lane binary op (`And/Or/Xor` operands canonical).
     fn dbin(&mut self, op: ROp, a: Vreg, b: Vreg) -> Vreg {
-        let tag = match op {
-            ROp::AddD => 0u8,
-            ROp::SubD => 1,
-            ROp::MinSD => 2,
-            ROp::MaxSD => 3,
-            ROp::AndD => 4,
-            ROp::OrD => 5,
-            ROp::XorD => 6,
-            ROp::AndnD => 7,
-        };
         let (a, b) = if matches!(op, ROp::AndD | ROp::OrD | ROp::XorD) && b < a {
             (b, a)
         } else {
             (a, b)
         };
-        let key = Key::RBin(tag, a, SrcKey::Reg(b));
+        let key = Key::RBin(op, a, SrcKey::Reg(b));
         self.pure(key, move |d| Inst::RBin { dst: d, op, a, b: Src::Reg(b) })
     }
 
+    /// A 32-bit-lane binary op with a broadcast CONSTANT second operand.
+    fn dbin_c(&mut self, op: ROp, a: Vreg, c: i32) -> Vreg {
+        self.pure(Key::RBin(op, a, SrcKey::I32(c)), move |d| Inst::RBin { dst: d, op, a, b: Src::BI32(c) })
+    }
+
     fn not_mask(&mut self, a: Vreg) -> Vreg {
-        let key = Key::RBin(6, a, SrcKey::I32(-1));
-        self.pure(key, move |d| Inst::RBin { dst: d, op: ROp::XorD, a, b: Src::BI32(-1) })
+        self.dbin_c(ROp::XorD, a, -1)
     }
 
     fn ternlog(&mut self, a: Vreg, b: Vreg, c: Vreg, imm: u8) -> Vreg {
@@ -560,7 +572,7 @@ impl<A: GraphArith> Lower<'_, A> {
     fn as_ival(&self, id: NodeId) -> Result<[NumVal; 2]> {
         match self.vals[id as usize] {
             Some(Value::Ival(i)) => Ok(i),
-            // A number is the degenerate interval [x, x] (zi_of_zn).
+            // A number is the degenerate interval [x, x].
             Some(Value::Num(n)) => Ok([n, n]),
             _ => bail!("node {} is not an interval where one was needed", id),
         }
@@ -689,8 +701,8 @@ impl Lower<'_, Fixed> {
 
     /// `s` if `id` is the literal `2^(16+s)`, `0 <= s <= 14` (`div_pow2`'s).
     fn pow2_divisor(&self, id: NodeId) -> Option<u8> {
-        match self.g.get(id).op {
-            Op::Const(lo, hi) if lo == hi && lo > 0 && (lo as u32).is_power_of_two() => {
+        match self.g.point(id).map(Fixed::lit) {
+            Some(lo) if lo > 0 && (lo as u32).is_power_of_two() => {
                 let m = (lo as u32).trailing_zeros();
                 (16..=30).contains(&m).then(|| (m - 16) as u8)
             }
@@ -702,10 +714,7 @@ impl Lower<'_, Fixed> {
     /// PICO-8's `%` is `rem_euclid` on the raw bits, which for a positive power
     /// of two is the low bits, negatives included.
     fn pow2_modulus_mask(&self, id: NodeId) -> Option<i32> {
-        match self.g.get(id).op {
-            Op::Const(lo, hi) if lo == hi && lo > 0 && (lo as u32).is_power_of_two() => Some(lo - 1),
-            _ => None,
-        }
+        self.g.point(id).map(Fixed::lit).filter(|&lo| lo > 0 && (lo as u32).is_power_of_two()).map(|lo| lo - 1)
     }
 
     fn blend_imm(&mut self, mask: u16, a: Vreg, b: Vreg) -> Vreg {
@@ -728,34 +737,13 @@ impl Lower<'_, Fixed> {
         self.pure(Key::Cmp(imm, a, b.key()), move |d| Inst::Cmp { dst: d, imm, a, b })
     }
 
-    // The interval layer: a ZI is two i32 planes.
-
-    /// A 32-bit-lane binary op with a broadcast CONSTANT second operand.
-    fn dbin_c(&mut self, op: ROp, a: Vreg, c: i32) -> Vreg {
-        let tag = match op {
-            ROp::AddD => 0u8,
-            ROp::SubD => 1,
-            ROp::MinSD => 2,
-            ROp::MaxSD => 3,
-            ROp::AndD => 4,
-            ROp::OrD => 5,
-            ROp::XorD => 6,
-            ROp::AndnD => 7,
-        };
-        self.pure(Key::RBin(tag, a, SrcKey::I32(c)), move |d| Inst::RBin {
-            dst: d,
-            op,
-            a,
-            b: Src::BI32(c),
-        })
-    }
     fn neg(&mut self, a: Vreg) -> Vreg {
         self.pure(Key::Neg(a), move |d| Inst::Neg { dst: d, a })
     }
     fn absd(&mut self, a: Vreg) -> Vreg {
         self.pure(Key::Abs(a), move |d| Inst::Abs { dst: d, a })
     }
-    /// `zn_flr`: `x & 0xffff_0000`.
+    /// `flr`: `x & 0xffff_0000`.
     fn flr(&mut self, a: Vreg) -> Vreg {
         self.dbin_c(ROp::AndD, a, FLR_MASK)
     }
@@ -764,6 +752,8 @@ impl Lower<'_, Fixed> {
     fn mask_eq(&mut self, a: Vreg, b: Vreg) -> Vreg {
         self.cmp(0, a, Src::Reg(b))
     }
+
+    // The interval layer: an interval is two i32 planes.
 
     /// Interval `+`. An overflowing endpoint WRAPS to garbage: the op's own
     /// error (`Op::NoWrap`).
@@ -890,17 +880,8 @@ impl Lower<'_, Fixed> {
 
     /// `id`'s raw value if a positive constant (the only monotone scale/divisor).
     fn pos_const_scalar(&self, id: NodeId) -> Option<i32> {
-        match self.g.get(id).op {
-            Op::Const(lo, hi) if lo == hi && lo > 0 => Some(lo),
-            _ => None,
-        }
+        self.g.point(id).map(Fixed::lit).filter(|&lo| lo > 0)
     }
-
-
-
-
-
-
 
     fn lower_node(&mut self, id: NodeId) -> Result<()> {
         if let Some(v) = self.lower_common(id)? {
@@ -940,7 +921,7 @@ impl Lower<'_, Fixed> {
                         Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
                     }
                     Ty::Ival => {
-                        // Two ZN planes: lo at +0, hi at +64.
+                        // Two number planes: lo at +0, hi at +64.
                         let hi_off = off + 64;
                         let lo_r = self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off });
                         let hi_r =
@@ -963,11 +944,11 @@ impl Lower<'_, Fixed> {
                     return Ok(());
                 }
                 let (x, y) = (self.as_num(a[0])?, self.as_num(a[1])?);
-                let (rop, tag) = match op {
-                    Op::Add => (ROp::AddD, 0u8),
-                    Op::Sub => (ROp::SubD, 1),
-                    Op::Min => (ROp::MinSD, 2),
-                    Op::Max => (ROp::MaxSD, 3),
+                let rop = match op {
+                    Op::Add => ROp::AddD,
+                    Op::Sub => ROp::SubD,
+                    Op::Min => ROp::MinSD,
+                    Op::Max => ROp::MaxSD,
                     _ => unreachable!(),
                 };
                 let commutes = matches!(op, Op::Add | Op::Min | Op::Max);
@@ -978,7 +959,7 @@ impl Lower<'_, Fixed> {
                     }
                     _ => (self.num_reg(x), self.num_src(y)),
                 };
-                let key = Key::RBin(tag, areg, bsrc.key());
+                let key = Key::RBin(rop, areg, bsrc.key());
                 let dst = self.pure(key, move |d| Inst::RBin { dst: d, op: rop, a: areg, b: bsrc });
                 Value::Num(NumVal::Reg(dst))
             }
@@ -1079,7 +1060,7 @@ impl Lower<'_, Fixed> {
             }
             op @ (Op::Lt | Op::Le | Op::Gt | Op::Ge) => {
                 if self.wide(a[0]) || self.wide(a[1]) {
-                    // Interval comparison -> tri-state ZB (zi_cmp).
+                    // Interval comparison -> a tri-state boolean (zi_cmp).
                     let kind = match op {
                         Op::Lt => 0u8,
                         Op::Le => 1,
@@ -1746,37 +1727,38 @@ impl<'a> Emitter<'a> {
             Inst::Load { off, .. } => {
                 writeln!(self.out, "    vmovdqu64 {}(%r13), %zmm{}", off, dst).unwrap();
             }
-            &Inst::BcastD { val, .. } => self.constant(val, dst),
-            &Inst::BcastQ { val, .. } => self.constant_q(val, dst),
+            &Inst::BcastD { val, .. } => self.constant(Word::D(val), dst),
+            &Inst::BcastQ { val, .. } => self.constant(Word::Q(val), dst),
             other => {
                 unreachable!("non-rematerializable def marked remat: {:?}", std::mem::discriminant(other))
             }
         }
     }
 
-    /// The constant `val` in every lane of `dst`: zero by the zeroing idiom
+    /// The constant `w` in every lane of `dst`: zero by the zeroing idiom
     /// (no memory, no dependency), anything else broadcast from the pool (a
     /// load, like the reload it replaces; `vpternlogd $0xff` for all-ones
     /// would take a logic port, the kernels' busiest, and depends on `dst`).
-    fn constant(&mut self, val: i32, dst: u8) {
-        match val {
-            0 => writeln!(self.out, "    vpxord %zmm{dst}, %zmm{dst}, %zmm{dst}").unwrap(),
+    fn constant(&mut self, w: Word, dst: u8) {
+        match w {
+            Word::D(0) | Word::Q(0) => writeln!(self.out, "    vpxord %zmm{dst}, %zmm{dst}, %zmm{dst}").unwrap(),
             _ => {
-                let l = self.pool.d(val);
-                writeln!(self.out, "    vpbroadcastd {l}(%rip), %zmm{dst}").unwrap();
+                self.broadcast(w, dst);
             }
         }
     }
 
-    /// The 64-bit constant `val` in every lane of `dst` (`constant`'s twin).
-    fn constant_q(&mut self, val: u64, dst: u8) {
-        match val {
-            0 => writeln!(self.out, "    vpxord %zmm{dst}, %zmm{dst}, %zmm{dst}").unwrap(),
-            _ => {
-                let l = self.pool.q(val);
-                writeln!(self.out, "    vpbroadcastq {l}(%rip), %zmm{dst}").unwrap();
-            }
-        }
+    /// `w` broadcast from the pool into every lane of `dst`; returns `dst`.
+    fn broadcast(&mut self, w: Word, dst: u8) -> u8 {
+        let l = self.pool.label(w);
+        writeln!(self.out, "    {} {l}(%rip), %zmm{dst}", w.bcast().0).unwrap();
+        dst
+    }
+
+    /// `w` as a broadcast memory operand (`{1toN}`).
+    fn broadcast_operand(&mut self, w: Word) -> String {
+        let l = self.pool.label(w);
+        format!("{l}(%rip){{{}}}", w.bcast().1)
     }
 
     /// Where a defined vreg is written: its home reg, or `RES` if spilled.
@@ -1804,14 +1786,8 @@ impl<'a> Emitter<'a> {
     fn src_operand(&mut self, s: Src, scratch: u8) -> String {
         match s {
             Src::Reg(v) => format!("%zmm{}", self.use_reg(v, scratch)),
-            Src::BI32(c) => {
-                let l = self.pool.d(c);
-                format!("{l}(%rip){{1to16}}")
-            }
-            Src::BQ(c) => {
-                let l = self.pool.q(c);
-                format!("{l}(%rip){{1to8}}")
-            }
+            Src::BI32(c) => self.broadcast_operand(Word::D(c)),
+            Src::BQ(c) => self.broadcast_operand(Word::Q(c)),
         }
     }
 
@@ -1840,7 +1816,7 @@ impl<'a> Emitter<'a> {
                     return;
                 }
                 let d = self.def_reg(*dst);
-                self.constant(*val, d);
+                self.constant(Word::D(*val), d);
             }
             Inst::RBin { dst, op, a, b } => {
                 let ra = self.use_reg(*a, OPA);
@@ -2029,16 +2005,9 @@ impl<'a> Emitter<'a> {
             Inst::Store { off, src } => {
                 let r = match src {
                     Src::Reg(v) => self.use_reg(*v, OPA),
-                    Src::BI32(c) => {
-                        let l = self.pool.d(*c);
-                        writeln!(self.out, "    vpbroadcastd {}(%rip), %zmm{}", l, OPA).unwrap();
-                        OPA
-                    }
-                    Src::BQ(c) => {
-                        let l = self.pool.q(*c);
-                        writeln!(self.out, "    vpbroadcastq {}(%rip), %zmm{}", l, OPA).unwrap();
-                        OPA
-                    }
+                    // Broadcast even where zero (not `constant`'s idiom).
+                    &Src::BI32(c) => self.broadcast(Word::D(c), OPA),
+                    &Src::BQ(c) => self.broadcast(Word::Q(c), OPA),
                 };
                 writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%r14)", r, off).unwrap();
             }
@@ -2053,7 +2022,7 @@ impl<'a> Emitter<'a> {
                     return;
                 }
                 let d = self.def_reg(*dst);
-                self.constant_q(*val, d);
+                self.constant(Word::Q(*val), d);
             }
             Inst::LoadMask8 { dst, off } => {
                 if self.skip_def(*dst) {
@@ -2239,10 +2208,10 @@ fn compile_with<A: GraphArith>(
         .collect();
     cells.sort_unstable();
     cells.dedup();
-    let input_reprs: Vec<Ty> = cells.iter().map(|c| g.cell_kind(*c)).collect();
+    let input_types: Vec<Ty> = cells.iter().map(|c| g.cell_kind(*c)).collect();
     let mut input_offsets: Vec<u32> = Vec::with_capacity(cells.len());
     let mut off = 0u32;
-    for r in &input_reprs {
+    for r in &input_types {
         input_offsets.push(off);
         off += input_bytes(*r);
     }
@@ -2480,7 +2449,7 @@ fn compile_with<A: GraphArith>(
         text_digest,
         input_cells: lo.input_cells,
         input_offsets,
-        input_reprs,
+        input_types,
         input_bytes,
         n_roots: roots.len(),
         root_offsets,

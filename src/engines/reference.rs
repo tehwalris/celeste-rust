@@ -46,7 +46,6 @@ pub type RefEngine = ReferenceEngine<Fixed>;
 /// The float tools' reference engine (Lua doubles).
 pub type FloatRefEngine = ReferenceEngine<Float>;
 
-
 impl<A: Arithmetic> ReferenceEngine<A> {
     /// Parse the cart, run its toplevel and `_init` for the start room of
     /// settings `s`.
@@ -92,9 +91,7 @@ impl<A: Arithmetic> ReferenceEngine<A> {
     }
 }
 
-impl<A: Arithmetic> ReferenceEngine<A>
-where
-{
+impl<A: Arithmetic> ReferenceEngine<A> {
     /// The room's start as a one-row block, without keys.
     pub fn initial(&self) -> Result<Rt2<A>> {
         to_block(&self.base, self.settings.room)
@@ -273,7 +270,7 @@ fn transfer_of<N: Rem>(leaf: &State<RefDomain<N>>) -> Result<N::Pair> {
 }
 
 /// A fly fruit's `spd.y` and `rem.y` (at a fruit level the ranges
-/// `FLY_FRUIT_SPD_Y`/`FLY_FRUIT_REM_Y`) as the point 0, inside both. Exact
+/// `FLY_FRUIT_SPD_Y` and `REM`) as the point 0, inside both. Exact
 /// for a successor projected onto the level: the two decide only whether
 /// `move` runs (`spd ~= 0`) and its `y` amount, added to `y` (the unknown
 /// number, which stays unknown under any addition: `RefDomain::arith`), and

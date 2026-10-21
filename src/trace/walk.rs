@@ -9,7 +9,6 @@ use celeste_core::arith::{Arithmetic, Fixed};
 use super::lower::Bound;
 use crate::transpile::garith::GraphArith;
 
-
 /// THE REGION KEY: a kernel is specialized on the player's whole-pixel
 /// position in one `px`-pixel grid square and speed in `[-speed, speed]`, so
 /// the range analysis folds away far-off collision tests. Each bound is an
@@ -928,7 +927,6 @@ pub struct Tracer<A: GraphArith = Fixed> {
     pub it: super::interp::Interp<'static, super::domain::Symbolic<A>>,
     pub chunks: &'static super::cart::Chunks,
 }
-
 
 /// What a lattice walk runs under: the run's settings and, for a test,
 /// `only` the player regions it traces (`None`: every region).

@@ -469,7 +469,6 @@ mod tests {
         Ok((out, map))
     }
 
-
     /// A body compiled for one pm1 key must REFUSE a state in another: a
     /// perturbed pinned cell's `Op::Pin` check declines the lane.
     #[test]
