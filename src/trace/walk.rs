@@ -54,8 +54,8 @@ impl RegionGrid {
             (field(&["spd", "x"]), (lit(-self.speed * ONE), lit(self.speed * ONE))),
             (field(&["spd", "y"]), (lit(-self.speed * ONE), lit(self.speed * ONE))),
             // `move` leaves `rem` in `[-0.5, 0.5)`; bounding it bounds the move.
-            (field(&["rem", "x"]), rem),
-            (field(&["rem", "y"]), rem),
+            (field(&[super::game::REM, "x"]), rem),
+            (field(&[super::game::REM, "y"]), rem),
         ]
     }
 }
@@ -133,7 +133,7 @@ fn successor_regions<A: GraphArith>(
     let (Some(g), Some(pl)) = (grid, shapes::player_path(st)) else { return Ok(vec![None]) };
     let window = (-(g.px as i64), 128 + g.px as i64 - 1);
     let mut hull = [(0i64, 0i64); 2];
-    for (axis, name) in ["x", "y"].into_iter().enumerate() {
+    for (axis, name) in super::game::AXES.into_iter().enumerate() {
         let mut p = pl.clone();
         p.push(iface::key(name));
         let Some(super::heap::Value::Num(n)) = iface::get(st, &p) else { anyhow::bail!("{}: not a number", iface::show(&p)) };
@@ -273,7 +273,7 @@ fn explore_no_player<A: GraphArith>(
         // The state's own unknowns (not the level's widened fields, not the
         // buttons the frame resets): no merge selects on them.
         let widened = super::widen::slots_where(&st, opts, super::widen::stores_widened);
-        let buttons = super::iface::key("__button_states");
+        let buttons = super::iface::key(super::game::BUTTONS);
         let unknown: Vec<super::iface::Path> = roots.iter().filter(|p| !consts.contains_key(*p) && !widened.contains(*p) && p.first() != Some(&buttons)).cloned().collect();
         let spec = super::frame::TraceSpec { roots: &roots, pin: &pin, merge_refused_on: &unknown, ..Default::default() };
         let f = super::frame::trace_frame(it, chunks, st, &spec).map_err(|e| e.context(format!("{what} no-player state {depth} frames after its entry did not trace")))?;
@@ -338,7 +338,7 @@ impl<A: GraphArith> NoPlayer<A> {
             }
         };
         let fruit_objs = if fruit { super::widen::objects_of_type(st, "fly_fruit") } else { Vec::new() };
-        let spawn_objs = super::widen::objects_of_type(st, "player_spawn");
+        let spawn_objs = super::widen::objects_of_type(st, super::game::PLAYER_SPAWN);
         let join = |h: &mut Hull<A>, p: super::iface::Path, r: A| {
             let e = h.entry(p).or_insert((r, r));
             *e = (if A::lt(r, e.0) { r } else { e.0 }, if A::lt(e.1, r) { r } else { e.1 });
@@ -371,7 +371,7 @@ impl<A: GraphArith> NoPlayer<A> {
     /// object's. A varying field some explored state holds unknown bounds
     /// nothing - FATAL for a field of the spawn, the phase the bounds are for.
     fn bounds(&self, shape: ShapeKey, st: &super::state::State<super::domain::Symbolic<A>>) -> Result<InputRanges<A>> {
-        let spawn_objs = super::widen::objects_of_type(st, "player_spawn");
+        let spawn_objs = super::widen::objects_of_type(st, super::game::PLAYER_SPAWN);
         let varying = |h: &Hull<A>, unknown: &std::collections::BTreeSet<super::iface::Path>, spawn: &dyn Fn(&super::iface::Path) -> bool, what: &str| -> Result<InputRanges<A>> {
             let mut b = InputRanges::<A>::new();
             for (p, &(lo, hi)) in h.iter().filter(|(_, (lo, hi))| A::lt(*lo, *hi)) {
@@ -466,7 +466,7 @@ mod tests {
             if region.is_some() || shapes::player_path(rep).is_some() {
                 continue;
             }
-            for o in widen::objects_of_type(rep, "player_spawn") {
+            for o in widen::objects_of_type(rep, super::super::game::PLAYER_SPAWN) {
                 let mut y = o.clone();
                 y.push(iface::key("y"));
                 if let Some((_, (lo, hi))) = f.bounds.iter().find(|(p, _)| *p == y) {
@@ -606,7 +606,7 @@ pub fn room_constant_lattice<A: GraphArith>(
                     (Some(_), None, None) => no_player.bounds(*k, st)?.into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect(),
                     (g, r, pl) => bail!("walk node {r:?} of a shape {} a player under grid {g:?}", if pl.is_some() { "with" } else { "without" }),
                 };
-                let spawn = !super::widen::objects_of_type(st, "player_spawn").is_empty();
+                let spawn = !super::widen::objects_of_type(st, super::game::PLAYER_SPAWN).is_empty();
                 Ok(WalkJob { node: (*k, *region), roots, pin, ival, bounds, spawn })
             })
             .collect::<Result<_>>()?;
@@ -909,7 +909,7 @@ fn walk_trace<A: GraphArith>(
             }
         }
         let regions = successor_regions(&o.st, &mut tr.it.d, grid, only)?;
-        let spawn_phase = shapes::player_path(&o.st).is_none() && !super::widen::objects_of_type(&o.st, "player_spawn").is_empty();
+        let spawn_phase = shapes::player_path(&o.st).is_none() && !super::widen::objects_of_type(&o.st, super::game::PLAYER_SPAWN).is_empty();
         let respawn = if grid.is_some() && spawn_phase && !job.spawn { Some(shapes::field_constants(&o.st, &tr.it.d, &opts)?) } else { None };
         let rep = reps.block(&o.st, &mut tr.it.d, true)?;
         outs.push(WalkOutcome { key: rep.shape_hash, constants, ival, regions, rep, respawn });

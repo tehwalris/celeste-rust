@@ -1170,7 +1170,7 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     fn room_has_flag(&mut self, st: &State<D>, flag: i16) -> Result<bool> {
-        let Some(Value::Table(rt)) = st.heap.tables[&st.globals].hash.get("room").cloned() else {
+        let Some(Value::Table(rt)) = st.heap.tables[&st.globals].hash.get(super::game::ROOM).cloned() else {
             bail!("tile_flag_at: no `room` global to check the flag against");
         };
         let coord = |k: &str| -> Result<i16> {
@@ -1383,12 +1383,15 @@ impl<'a, D: Domain> Interp<'a, D> {
             _ => None,
         };
         let parts: Vec<String> = spelled.as_deref().unwrap_or("").split('.').map(str::to_string).collect();
-        let (obj, axis) = match parts.as_slice() {
-            [obj, rem, axis] if rem == "rem" && (axis == "x" || axis == "y") => (obj.clone(), if axis == "x" { 0 } else { 1 }),
-            _ => bail!("arc capture: a split whose argument is not `<obj>.rem.<x|y>` ({spelled:?}): no way to tell whose remainder it splits"),
+        let site = match parts.as_slice() {
+            [obj, rem, axis] if rem == super::game::REM => super::game::AXES.iter().position(|a| a == axis).map(|k| (obj.clone(), k)),
+            _ => None,
+        };
+        let Some((obj, axis)) = site else {
+            bail!("arc capture: a split whose argument is not `<obj>.rem.<x|y>` ({spelled:?}): no way to tell whose remainder it splits")
         };
         let Value::Table(t) = self.read_name(&obj, st) else { bail!("arc capture: `{obj}` in a split of `{obj}.rem..` is not a table") };
-        let players = super::widen::objects_of_type(st, "player");
+        let players = super::widen::objects_of_type(st, super::game::PLAYER);
         anyhow::ensure!(players.len() <= 1, "arc capture: {} player objects", players.len());
         let is_player = players.first().is_some_and(|p| super::iface::get(st, p) == Some(Value::Table(t)));
         Ok(if is_player { SplitSite::Player(axis) } else { SplitSite::Other })
@@ -1399,7 +1402,7 @@ impl<'a, D: Domain> Interp<'a, D> {
     /// platform carrying the player) is refused: an arc edge is one rotation per
     /// axis per frame.
     fn capture_player_split(&mut self, st: &mut State<D>, axis: usize, x: &D::Num, v: &D::Num) -> Result<()> {
-        let name = if axis == 0 { "ox" } else { "oy" };
+        let name = super::game::MOVE_STEP[axis];
         let Value::Num(ox) = self.read_name(name, st) else { bail!("arc capture: the player's split on axis {axis} has no number `{name}` in scope") };
         let Some(arc) = st.arc.as_mut() else { bail!("arc capture: a player split on a path that does not capture") };
         let a = &mut arc[axis];

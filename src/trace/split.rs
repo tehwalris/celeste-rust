@@ -495,7 +495,7 @@ pub(super) fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: 
             error: o.error,
             // The transfer roots ride with the fields: same substitutions, and
             // part of what makes two outcomes one.
-            fields: o.fields.iter().map(|f| f.1).chain(o.arc.iter().copied()).collect(),
+            fields: o.fields.iter().map(|f| f.1).chain(o.arc.iter().flat_map(|a| a.nodes())).collect(),
             rests: Vec::new(),
         };
         let size = d.graph.cone(&lite.row()).len();
@@ -667,7 +667,8 @@ pub(super) fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: 
         for (f, n) in o.fields.iter_mut().zip(&lite.fields[..nf]) {
             f.1 = *n;
         }
-        o.arc = lite.fields[nf..].to_vec();
+        let mut arc = lite.fields[nf..].iter().copied();
+        o.arc = o.arc.map(|a| a.map(|_| arc.next().expect("the transfer roots ride with the fields")));
         if let (Some(p), Some(pts)) = (points.as_ref(), pts.as_ref()) {
             let g = p.position_guard(d, pts);
             o.guard = d.and(&o.guard, &g);

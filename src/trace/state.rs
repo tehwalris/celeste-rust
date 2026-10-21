@@ -67,6 +67,21 @@ impl<D: Domain> ArcAxis<D> {
     }
 }
 
+/// THE TRANSFER'S `fin`: the player's remainder on each axis at the
+/// frame's end, before any widening; `None` without a player. Two players
+/// are refused (the capture is the one player's).
+pub fn arc_fins<D: Domain>(st: &State<D>) -> Result<Option<[D::Num; 2]>> {
+    use super::game::{AXES, PLAYER, REM};
+    let players = super::widen::objects_of_type(st, PLAYER);
+    anyhow::ensure!(players.len() <= 1, "arc capture: {} player objects at the frame's end", players.len());
+    let Some(pl) = players.first() else { return Ok(None) };
+    let rem = |k: usize| match super::iface::get(st, &super::widen::field(pl, &[REM, AXES[k]])) {
+        Some(Value::Num(n)) => Ok(n),
+        other => bail!("arc capture: the player's {REM}.{} is {other:?}", AXES[k]),
+    };
+    Ok(Some([rem(0)?, rem(1)?]))
+}
+
 impl<D: Domain> PartialEq for ArcAxis<D> {
     fn eq(&self, o: &Self) -> bool {
         self.took == o.took && self.pre == o.pre && self.frag == o.frag && self.ox == o.ox
@@ -176,7 +191,7 @@ pub fn merge_canon<D: Domain>(d: &mut D, t: &State<D>, f: &State<D>, sides: Side
 /// would skip the outcome as "another room", losing its in-room arm.
 fn same_room<D: Domain>(t: &State<D>, f: &State<D>) -> bool {
     fn room<D: Domain>(s: &State<D>) -> Option<&std::collections::BTreeMap<String, Value<D>>> {
-        match s.heap.tables.get(&s.globals)?.hash.get("room")? {
+        match s.heap.tables.get(&s.globals)?.hash.get(super::game::ROOM)? {
             Value::Table(r) => s.heap.tables.get(r).map(|tab| &tab.hash),
             _ => None,
         }

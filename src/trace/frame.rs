@@ -6,7 +6,7 @@
 use anyhow::{anyhow, bail, Result};
 
 use crate::transpile::graph::NodeId;
-use crate::transpile::kernel::Roots;
+use crate::transpile::kernel::{ArcRoots, AxisRoots, Roots};
 use crate::transpile::graph::Ty;
 
 use super::domain::{Domain, Symbolic};
@@ -41,24 +41,18 @@ pub struct FrameOut<A: GraphArith = Fixed> {
     pub ubool_cells: Vec<u32>,
     /// The state itself, so a shape walk can step forward from it.
     pub st: State<Symbolic<A>>,
-    /// THE TRANSFER ROOTS (`search::arc_edges`, level-0 traces only): per axis
-    /// `ARC_AXIS_ROOTS` (`fin`: the remainder before widening, 0 without a
-    /// player). Never stored in the row.
-    pub arc: Vec<NodeId>,
-    /// Does this outcome have a player at its end (`fin` is real)?
-    pub arc_fin: bool,
+    /// THE TRANSFER ROOTS (`search::arc_edges`, level-0 traces only).
+    /// Never stored in the row.
+    pub arc: Option<ArcRoots>,
 }
 
 impl<A: GraphArith> FrameOut<A> {
     /// What the outcome computes: its stored fields, guard (`live`), error
     /// and transfer roots.
     pub fn roots(&self) -> Roots {
-        Roots { fields: self.fields.iter().map(|f| f.1).collect(), live: self.guard, error: self.error, arc: self.arc.clone() }
+        Roots { fields: self.fields.iter().map(|f| f.1).collect(), live: self.guard, error: self.error, arc: self.arc }
     }
 }
-
-/// Roots per axis in `FrameOut::arc`: took, pre, frag, ox, fin.
-pub const ARC_AXIS_ROOTS: usize = 5;
 
 impl<A: GraphArith> Clone for FrameOut<A> {
     /// For `split_undecided_selects`: `Rt2::clone_block` shares the cart.
@@ -73,8 +67,7 @@ impl<A: GraphArith> Clone for FrameOut<A> {
             cells: self.cells.clone(),
             ubool_cells: self.ubool_cells.clone(),
             st: self.st.clone(),
-            arc: self.arc.clone(),
-            arc_fin: self.arc_fin,
+            arc: self.arc,
         }
     }
 }
@@ -109,7 +102,7 @@ fn out_fields<A: GraphArith>(
     // A near level's floor `state`s are an interval column in every outcome.
     let ival_always: Vec<Path> = super::widen::near_floor_states(st, d.level);
     for p in iface::scalars(st, &[])? {
-        if p.first() == Some(&iface::key("__button_states")) {
+        if p.first() == Some(&iface::key(super::game::BUTTONS)) {
             ubool.push(p);
             continue;
         }
@@ -237,7 +230,7 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
         let r = it.d.restrict(cell, *lo, *hi);
         iface::set(&mut st, p, Value::Num(r))?;
         if let Some(pl) = &player {
-            for (k, f) in ["x", "y"].iter().enumerate() {
+            for (k, f) in super::game::AXES.iter().enumerate() {
                 if p.len() == pl.len() + 1 && p.starts_with(pl) && p[pl.len()] == iface::key(f) {
                     position[k] = Some((cell, (*lo, *hi)));
                 }
@@ -303,7 +296,7 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
         if !pinned.is_empty() {
             let mut reads: Vec<NodeId> = derived.clone();
             for o in &outs {
-                reads.extend(o.fields.iter().map(|(_, n, _)| *n).chain([o.guard]).chain(o.arc.iter().copied()));
+                reads.extend(o.fields.iter().map(|(_, n, _)| *n).chain([o.guard]).chain(o.arc.iter().flat_map(ArcRoots::nodes)));
             }
             let reach = it.d.graph.reachable(&reads);
             for x in pinned {
@@ -352,26 +345,14 @@ fn finish_outcome<A: GraphArith>(
     // Absent-as-zero fields: shape, not precision, so every level.
     super::widen::materialize_absent_fields(&mut s, &mut it.d)?;
     // The transfer roots: the remainder read BEFORE the widenings.
-    let (arc, arc_fin) = match s.arc.as_deref() {
-        None => (Vec::new(), false),
+    let arc = match s.arc.as_deref() {
+        None => None,
         Some(axes) => {
-            let players = super::widen::objects_of_type(&s, "player");
-            anyhow::ensure!(players.len() <= 1, "arc capture: {} player objects at the frame's end", players.len());
-            let mut roots = Vec::with_capacity(2 * ARC_AXIS_ROOTS);
-            for (k, a) in axes.iter().enumerate() {
-                let fin = match players.first() {
-                    Some(pl) => match iface::get(&s, &super::widen::field(pl, &["rem", ["x", "y"][k]])) {
-                        Some(Value::Num(n)) => n,
-                        other => bail!("arc capture: the player's rem.{} is {other:?}", ["x", "y"][k]),
-                    },
-                    None => {
-                        let zero = A::lit(A::from_i16(0));
-                        it.d.graph.leaf(crate::transpile::graph::Op::Const(zero, zero))
-                    }
-                };
-                roots.extend([a.took, a.pre, a.frag, a.ox, fin]);
-            }
-            (roots, !players.is_empty())
+            let fins = super::state::arc_fins(&s)?;
+            let zero = A::lit(A::from_i16(0));
+            let [fx, fy] = fins.unwrap_or_else(|| [it.d.graph.leaf(crate::transpile::graph::Op::Const(zero, zero)); 2]);
+            let axis = |a: &super::state::ArcAxis<Symbolic<A>>, fin| AxisRoots { took: a.took, pre: a.pre, frag: a.frag, ox: a.ox, fin };
+            Some(ArcRoots { axes: [axis(&axes[0], fx), axis(&axes[1], fy)], fin: fins.is_some() })
         }
     };
     // THE WIDENINGS: before `out_fields` (reads the state), after `gc`.
@@ -400,7 +381,6 @@ fn finish_outcome<A: GraphArith>(
         ubool_cells: ubool_cells.to_vec(),
         st: s,
         arc,
-        arc_fin,
     })
 }
 

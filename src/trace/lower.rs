@@ -12,7 +12,7 @@ use celeste_core::arith::Fixed;
 
 use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{Graph, NodeId};
-use crate::transpile::kernel::{Body, OutField, Roots};
+use crate::transpile::kernel::{AxisRoots, Body, OutField, Roots};
 
 use super::frame::Frame;
 use super::walk::{room_constant_lattice, Region, Walk};
@@ -30,9 +30,6 @@ pub struct Lowered<A: GraphArith = Fixed> {
 pub struct FrameOutcome<A: GraphArith = Fixed> {
     pub fields: Vec<OutField<A>>,
     pub roots: Roots,
-    /// Does the outcome have a player at its end (its `fin` transfer roots
-    /// are real: `frame::FrameOut::arc_fin`)?
-    pub arc_fin: bool,
 }
 
 /// A traced frame in the ENGINE's numbering: everything `lower_frame` needs.
@@ -49,7 +46,8 @@ pub struct Bound<A: GraphArith = Fixed> {
 fn root_legend<A: GraphArith>(f: &crate::trace::frame::Frame<A>) -> String {
     let mut out: Vec<String> = Vec::new();
     for (i, o) in f.outs.iter().enumerate() {
-        let what = o.fields.iter().map(|(p, _, _)| format!("field {}", crate::trace::iface::show(p))).chain(["error".to_string(), "live".to_string()]).chain((0..o.arc.len()).map(|k| format!("transfer root {k}")));
+        let arc = o.arc.iter().flat_map(|_| crate::trace::game::AXES.iter().flat_map(|axis| AxisRoots::NAMES.iter().map(move |r| format!("transfer {axis} {r}"))));
+        let what = o.fields.iter().map(|(p, _, _)| format!("field {}", crate::trace::iface::show(p))).chain(["error".to_string(), "live".to_string()]).chain(arc);
         for w in what {
             out.push(format!("  #{} outcome {i} {w}", out.len()));
         }
@@ -90,7 +88,7 @@ pub fn bind<A: GraphArith>(f: &crate::trace::frame::Frame<A>, g: &Graph<A>) -> R
                 f.uniform = Some(AV::UNum);
             }
         }
-        outcomes.push(FrameOutcome { fields, roots, arc_fin: o.arc_fin });
+        outcomes.push(FrameOutcome { fields, roots });
     }
     let roots: Vec<NodeId> = outcomes.iter().flat_map(|o| o.roots.flat()).collect();
     let reach = graph.reachable(&roots);

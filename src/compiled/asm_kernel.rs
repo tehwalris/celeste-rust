@@ -1136,10 +1136,8 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, si:
             })
             .collect::<Result<Vec<_>>>()?;
         // Every body computes its transfer (the rotation graph needs it).
-        let narc = b.roots.arc.len();
-        anyhow::ensure!(narc == 2 * crate::trace::frame::ARC_AXIS_ROOTS, "shape {si} outcome {}: {narc} transfer roots", b.outcome);
-        let roots = std::array::from_fn(|k| (off(b.roots.arc[k]), kind(b.roots.arc[k])));
-        let arc = ArcSlots { roots, fin: outcome.arc_fin };
+        let a = b.roots.arc.ok_or_else(|| anyhow::anyhow!("shape {si} outcome {}: no transfer roots", b.outcome))?;
+        let arc = ArcSlots { roots: a.nodes().map(|n| (off(n), kind(n))), fin: a.fin };
         asm_bodies.push(AsmBody {
             outcome: b.outcome,
             splits: b.splits.clone(),
@@ -1180,7 +1178,7 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, si:
             }
             roles[slot(b.roots.error)] |= ROLE_ERROR;
             roles[slot(b.roots.live)] |= ROLE_LIVE;
-            for &n in &b.roots.arc {
+            for n in b.roots.arc.iter().flat_map(|a| a.nodes()) {
                 roles[slot(n)] |= ROLE_ARC;
             }
         }
@@ -1245,11 +1243,7 @@ fn dup_refs(bodies: &mut [AsmBody], reads: &[emit::BodyReads]) -> DupPairs {
                     pairs.push((fa.off, fb.off, fa.kind));
                 }
             }
-            for k in 0..aa.roots.len() {
-                if !aa.fin && k % crate::trace::frame::ARC_AXIS_ROOTS == 4 {
-                    continue;
-                }
-                let ((oa, ka), (ob, kb)) = (aa.roots[k], ab.roots[k]);
+            for ((_, (oa, ka)), (_, (ob, kb))) in aa.read_roots().zip(ab.read_roots()) {
                 if ka != kb {
                     ok = false;
                     break;

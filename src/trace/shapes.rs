@@ -24,7 +24,7 @@ use super::state::State;
 pub fn frozen_tables<A: GraphArith>(st: &State<Symbolic<A>>) -> std::collections::BTreeSet<u32> {
     let mut out = std::collections::BTreeSet::new();
     let mut stack: Vec<u32> = Vec::new();
-    for name in ["types", "room"] {
+    for name in ["types", super::game::ROOM] {
         if let Some(Value::Table(t)) = iface::get(st, &[iface::key(name)]) {
             stack.push(t);
         }
@@ -98,14 +98,14 @@ pub fn blank<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>) ->
 /// `load_room` only ever writes it a constant.
 pub fn room_of<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>) -> (i16, i16) {
     let at = |k: &str| -> i16 {
-        match iface::get(st, &[iface::key("room"), iface::key(k)]) {
+        match iface::get(st, &[iface::key(super::game::ROOM), iface::key(k)]) {
             Some(Value::Num(n)) => {
                 d.as_const(&n).and_then(A::as_i16).unwrap_or(-1)
             }
             _ => -1,
         }
     };
-    (at("x"), at("y"))
+    (at(super::game::AXES[0]), at(super::game::AXES[1]))
 }
 
 /// The scalar fields of `st` that are compile-time constants (exact
@@ -119,7 +119,7 @@ pub fn field_constants<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, 
     let widened: std::collections::BTreeSet<Path> = super::widen::slots_where(st, *opts, super::widen::stores_widened).into_iter().collect();
     // The buttons are dead at the boundary (every frame resets them before
     // reading): the start state's `false` is no constant of the shape.
-    let buttons = iface::key("__button_states");
+    let buttons = iface::key(super::game::BUTTONS);
     let mut out = std::collections::BTreeMap::new();
     for p in state_paths(st)? {
         if widened.contains(&p) || p.first() == Some(&buttons) { continue; }
@@ -142,5 +142,5 @@ pub fn field_constants<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, 
 
 /// The path of the player INSTANCE in `objects`, if the state has one.
 pub fn player_path<D: Domain>(st: &State<D>) -> Option<Path> {
-    super::widen::objects_of_type(st, "player").into_iter().next()
+    super::widen::objects_of_type(st, super::game::PLAYER).into_iter().next()
 }
