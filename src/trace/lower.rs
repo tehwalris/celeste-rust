@@ -12,18 +12,16 @@ use celeste_core::arith::Fixed;
 
 use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{Graph, NodeId};
-use crate::transpile::graph::Ty;
-use crate::transpile::kernel::{Body, Emit, OutField, OutFields, Roots};
+use crate::transpile::kernel::{Body, OutField, Roots};
 
 use super::frame::Frame;
 use super::walk::{room_constant_lattice, Region, Walk};
 
+/// THE specialization of a bound frame (`lower::specialize_frame`): the
+/// fused graph and its bodies, computed once.
 pub struct Lowered<A: GraphArith = Fixed> {
-    /// One per output shape, with each field's `konst_av`.
-    pub(crate) outs: Vec<OutFields<A>>,
-    /// THE specialization (`lower::specialize_frame`): the fused graph and its
-    /// bodies, computed once.
-    pub(crate) spec: (Graph<A>, Vec<Body>),
+    pub(crate) fused: Graph<A>,
+    pub(crate) bodies: Vec<Body>,
 }
 
 /// A node's subtree, to a bounded depth, as text (for diagnostics).
@@ -39,14 +37,12 @@ pub fn show_tree<A: GraphArith>(g: &Graph<A>, root: NodeId, depth: usize) -> Str
     format!("{:?}({})", nd.op, kids.join(", "))
 }
 
-/// One output shape of a traced frame: the cell and column type of each of
-/// its fields, and what it computes (`roots`, over the engine's cells).
+/// One output shape of a traced frame: its stored fields, and what it
+/// computes (`roots`, over the engine's cells; `roots.fields` parallel to
+/// `fields`).
 pub struct FrameOutcome<A: GraphArith = Fixed> {
-    pub fields: Vec<(u32, Ty)>,
+    pub fields: Vec<OutField<A>>,
     pub roots: Roots,
-    /// Fields stored as the UNKNOWN NUMBER, with that value: off the key's
-    /// per-lane fold (`OutField::widen_uniform`).
-    pub widen: Vec<(u32, celeste_engine::runtime2::AV<A>)>,
     /// Does the outcome have a player at its end (its `fin` transfer roots
     /// are real: `frame::FrameOut::arc_fin`)?
     pub arc_fin: bool,
@@ -97,18 +93,17 @@ pub fn bind<A: GraphArith>(f: &crate::trace::frame::Frame<A>, g: &Graph<A>) -> R
     let mut outcomes = Vec::with_capacity(f.outs.len());
     for o in &f.outs {
         let mut roots = o.roots().map(|n| map[n as usize]);
-        let mut widen: Vec<(u32, AV<A>)> = Vec::new();
-        for (i, r) in roots.fields.iter_mut().enumerate() {
+        let mut fields: Vec<OutField<A>> = o.fields.iter().zip(&o.cells).map(|((_, _, ty), cell)| OutField { cell: *cell, ty: *ty, uniform: None }).collect();
+        for (r, f) in roots.fields.iter_mut().zip(&mut fields) {
             if matches!(graph.get(*r).op, crate::transpile::graph::Op::UnknownNum { .. }) {
                 *r = placeholder;
                 // Uniform, off the per-lane key fold (unknown BOOLEANS are stored
                 // uniform by `frame::out_fields`; a widening that stores a
-                // constant is the field's `konst_av`).
-                widen.push((o.cells[i], AV::UNum));
+                // constant is the lowering's `konst_fields`).
+                f.uniform = Some(AV::UNum);
             }
         }
-        let fields = o.fields.iter().zip(&o.cells).map(|((_, _, ty), cell)| (*cell, *ty)).collect();
-        outcomes.push(FrameOutcome { fields, roots, widen, arc_fin: o.arc_fin });
+        outcomes.push(FrameOutcome { fields, roots, arc_fin: o.arc_fin });
     }
     let roots: Vec<NodeId> = outcomes.iter().flat_map(|o| o.roots.flat()).collect();
     let reach = graph.reachable(&roots);
@@ -122,41 +117,15 @@ pub fn bind<A: GraphArith>(f: &crate::trace::frame::Frame<A>, g: &Graph<A>) -> R
 }
 
 /// Lower a traced frame - ALL of its output shapes together, so the part of
-/// the frame before outcomes diverge is emitted once.
-pub fn lower_frame<A: GraphArith>(
-    bound: &Bound<A>,
-    room: Option<crate::transpile::graph::Room>,
-    build_trace: bool,
-) -> Lowered<A> {
-    let (graph, outcomes, forks) = (&bound.graph, &bound.outcomes, bound.forks);
-    let mut e = Emit::bare(graph.clone());
-    e.room = room;
-    e.fork_depth = forks as usize;
-    let mut outs: Vec<crate::transpile::lower::Outcome<A>> = outcomes
-        .iter()
-        .map(|o| crate::transpile::lower::Outcome {
-            of: OutFields {
-                fields: o
-                    .fields
-                    .iter()
-                    .map(|&(cell, ty)| OutField {
-                        cell,
-                        ty,
-                        konst_av: None,
-                        // Excluded from the per-lane key fold.
-                        widen_uniform: o
-                            .widen
-                            .iter()
-                            .find(|(c, _)| *c == cell)
-                            .map(|(_, av)| *av),
-                    })
-                    .collect(),
-            },
-            roots: o.roots.clone(),
-        })
-        .collect();
-    let spec = crate::transpile::lower::lower_outcomes(&e, &mut outs, build_trace);
-    Lowered { outs: outs.into_iter().map(|o| o.of).collect(), spec }
+/// the frame before outcomes diverge is emitted once - and give each field
+/// the constant every body stores, where one does (`lower::konst_fields`).
+pub fn lower_frame<A: GraphArith>(bound: &mut Bound<A>, room: Option<&crate::transpile::graph::Room>, build_trace: bool) -> Lowered<A> {
+    let roots: Vec<Roots> = bound.outcomes.iter().map(|o| o.roots.clone()).collect();
+    let (fused, bodies) = crate::transpile::lower::specialize_frame(&bound.graph, &roots, bound.forks, room, build_trace);
+    for (oi, o) in bound.outcomes.iter_mut().enumerate() {
+        crate::transpile::lower::konst_fields(&fused, &bodies, oi, &mut o.fields);
+    }
+    Lowered { fused, bodies }
 }
 
 /// One traced frame, bound and lowered: what the kernel registry assembles.
@@ -188,8 +157,8 @@ pub(crate) fn lattice_kernel_refs<A: GraphArith>(
     let cache = lw.cache.clone();
     let slots: Vec<std::sync::Mutex<Option<(Option<Region>, super::frame::Frame<A>, Bound<A>)>>> = frames.into_iter().map(|x| std::sync::Mutex::new(Some(x))).collect();
     let refs = crate::par::Pool::per_core().stack(128 << 20).map(slots.len(), |i| {
-        let (key, f, bound) = slots[i].lock().expect("a frame's slot").take().expect("each frame is lowered once");
-        let lowered = super::lower::lower_frame(&bound, Some(room.clone()), s.diag.build_trace);
+        let (key, f, mut bound) = slots[i].lock().expect("a frame's slot").take().expect("each frame is lowered once");
+        let lowered = super::lower::lower_frame(&mut bound, Some(&room), s.diag.build_trace);
         Ok((key, LoweredFrame { frame: f, bound, lowered, cache: cache.clone() }))
     })?;
     Ok(refs)

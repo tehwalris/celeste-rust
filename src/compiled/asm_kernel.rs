@@ -1110,7 +1110,7 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, si:
     let shape = r.frame.in_rt2.shape_hash_of();
     let room = Room { cache: r.cache.clone() };
     let t_fuse = std::time::Instant::now();
-    let (fused, bodies) = (&r.lowered.spec.0, &r.lowered.spec.1);
+    let (fused, bodies) = (&r.lowered.fused, &r.lowered.bodies);
     // One output SLOT per DISTINCT root node, numbered by first appearance
     // in the bodies' roots in the kernel's order (`Roots::flat`).
     let mut flat_roots: Vec<crate::transpile::graph::NodeId> = Vec::new();
@@ -1159,19 +1159,18 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, si:
             .fields
             .iter()
             .zip(&b.roots.fields)
-            .map(|(&(cell, _), &n)| AsmField { cell: cell as usize, off: off(n), kind: kind(n), may_unknown: reads_unknown_output[n as usize] })
+            .map(|(f, &n)| AsmField { cell: f.cell as usize, off: off(n), kind: kind(n), may_unknown: reads_unknown_output[n as usize] })
             .collect();
-        let out_fields = &r.lowered.outs[b.outcome].fields;
+        // A uniform field is the key's constant prefix, not a per-lane field.
         let key_fields = outcome
             .fields
             .iter()
             .zip(&b.roots.fields)
-            .zip(out_fields)
-            .filter(|(_, f)| f.konst_av.is_none() && f.widen_uniform.is_none())
-            .map(|((&(cell, _), &n), _)| {
-                let pos = pos_cells[b.outcome].is_some_and(|(x, y)| cell == x || cell == y);
+            .filter(|(f, _)| f.uniform.is_none())
+            .map(|(f, &n)| {
+                let pos = pos_cells[b.outcome].is_some_and(|(x, y)| f.cell == x || f.cell == y);
                 // A number stored `[v, v]` keys as the number.
-                KeyField::new(cell, off(n), kind(n), pos)
+                KeyField::new(f.cell, off(n), kind(n), pos)
             })
             .collect::<Result<Vec<_>>>()?;
         // Every body computes its transfer (the rotation graph needs it).
@@ -1357,9 +1356,8 @@ fn acc_template<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, oi: us
     // Canonical: `block::skeleton` ends in `Rt2::canonicalize_ids`.
     let mut own = reshape(&r.frame.outs[oi].rt2, 0);
     let shape_hash = own.shape_hash_of();
-    for f in &r.lowered.outs[oi].fields {
-        // A widened-to-uniform cell holds its widened value (as `uniform` codes it).
-        own.cols[f.cell as usize] = match f.widen_uniform.or(f.konst_av) {
+    for f in &r.bound.outcomes[oi].fields {
+        own.cols[f.cell as usize] = match f.uniform {
             Some(av) => Col::U(av),
             None => typed(f.ty),
         };
@@ -1367,25 +1365,16 @@ fn acc_template<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, oi: us
     for &cell in &r.frame.outs[oi].ubool_cells {
         own.cols[cell as usize] = Col::U(AV::UBool);
     }
-    // The key's uniform fields, at their widened values.
-    let widen = &r.bound.outcomes[oi].widen;
+    // The key's uniform fields: every value cell uniform here, at its
+    // widened value.
     let pos = own.position_cells();
     let mut uniform = Vec::new();
     for (c, cell) in own.structure.iter().enumerate() {
-        if !matches!(cell, celeste_engine::runtime2::Cell2::Val) {
+        let (celeste_engine::runtime2::Cell2::Val, Col::U(v)) = (cell, &own.cols[c]) else {
             continue;
-        }
-        let v = match widen.iter().find(|(wc, _)| *wc as usize == c) {
-            Some((_, av)) => Some(*av),
-            None => match own.cols[c] {
-                Col::U(v) => Some(v),
-                _ => None,
-            },
         };
-        if let Some(v) = v {
-            let pos = pos.is_some_and(|(x, y)| c as u32 == x || c as u32 == y);
-            uniform.push((c as u32, if pos { Code::of_pos(v) } else { Code::of(v) }));
-        }
+        let pos = pos.is_some_and(|(x, y)| c as u32 == x || c as u32 == y);
+        uniform.push((c as u32, if pos { Code::of_pos(*v) } else { Code::of(*v) }));
     }
     let mut canon = own.clone_block();
     canon.shape_hash = shape_hash;

@@ -1,15 +1,14 @@
 //! Graph -> the fused, fork-free frame: `specialize_frame` resolves every
 //! fork configuration of the traced graph into ONE hash-consed arena, and
-//! `lower_outcomes` reads the per-outcome constants the kernel needs off the
+//! `konst_fields` reads the per-outcome constants the kernel needs off the
 //! result. The kernel registry (`compiled::asm_kernel`) assembles it.
 
 use std::collections::BTreeMap;
 
-use celeste_core::arith::Fixed;
 
 use super::garith::GraphArith;
 use super::graph::{Eval, Graph, NodeId, Op};
-use super::kernel::{Body, Emit, OutFields, Roots};
+use super::kernel::{Body, OutField, Roots};
 
 pub(crate) const BUILD_PHASES: [&str; 6] = [
     "specialize",
@@ -40,12 +39,6 @@ pub(crate) fn build_profile() -> String {
         .map(|(name, ns)| format!("{name} {:.1} s", ns.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e9))
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// One output shape: the cells it writes, and what it computes.
-pub(crate) struct Outcome<A: GraphArith = Fixed> {
-    pub(crate) of: OutFields<A>,
-    pub(crate) roots: Roots,
 }
 
 /// `want`'s images under the configuration `cfg`, specialized into `out`.
@@ -83,7 +76,6 @@ pub(crate) fn specialize_frame<A: GraphArith>(
     graph: &Graph<A>,
     outs: &[Roots],
     forks: u8,
-    decide: bool,
     room: Option<&crate::transpile::graph::Room>,
     trace: bool,
 ) -> (Graph<A>, Vec<Body>) {
@@ -172,11 +164,10 @@ pub(crate) fn specialize_frame<A: GraphArith>(
                     })
                     .collect();
                 let raw: Vec<Vec<NodeId>> = any.iter().map(|c| roots_under(graph, c, &need, &want, &mut probe)).collect();
-                raw.iter().all(|r| *r == raw[0])
-                    || (decide && {
-                        let dec = decided_roots(graph, &any, (&need, &want), room);
-                        dec.iter().all(|r| *r == dec[0])
-                    })
+                raw.iter().all(|r| *r == raw[0]) || {
+                    let dec = decided_roots(graph, &any, (&need, &want), room);
+                    dec.iter().all(|r| *r == dec[0])
+                }
             })
             .collect();
         let mut total_cfgs = 0u64;
@@ -213,14 +204,10 @@ pub(crate) fn specialize_frame<A: GraphArith>(
                     if valid[i] <= 2 {
                         return (0..valid[i]).collect();
                     }
-                    // Per fork, its values that agree, compared decided when the body is (a
+                    // Per fork, its values that agree, compared decided as the body is (a
                     // test against one platform world folds only with the ranges).
                     let plain: Vec<Vec<u8>> = (0..valid[i]).map(with).collect();
-                    let sigs = if decide {
-                        decided_roots(graph, &plain, this, room)
-                    } else {
-                        plain.iter().map(|c| roots_under(graph, c, &need, &want, &mut probe)).collect()
-                    };
+                    let sigs = decided_roots(graph, &plain, this, room);
                     (0..valid[i]).filter(|&v| !sigs[..v as usize].contains(&sigs[v as usize])).collect()
                 })
                 .collect();
@@ -253,92 +240,90 @@ pub(crate) fn specialize_frame<A: GraphArith>(
     let n_cands = cands.len();
     let t1 = std::time::Instant::now();
     // 3. Decide the boolean layer, on the RESOLVED graph.
-    if decide {
-        let all: Vec<NodeId> = cands.iter().flat_map(|c| c.roots.flat()).collect();
-        let t_phase = std::time::Instant::now();
-        let (g1, m1, _) =
-            crate::transpile::ival::fold(&sp, &all, room).expect("interval fold");
-        build_add(1, t_phase);
-        let r1: Vec<NodeId> = all.iter().map(|x| m1[*x as usize]).collect();
-        // DIAGNOSTIC (--build-trace): a body whose `error` folded to true while
-        // live somewhere declines every lane it takes: the leaves of its `error`
-        // Or-tree the interval evaluator decided true.
-        if trace {
-            let cells = crate::transpile::ival::seed_cells(&sp);
-            let vals = sp.eval(&cells, Eval::Fold, room).expect("the fold's eval");
-            let mut shown = 0;
-            for c in &cands {
-                let (error, live) = (c.roots.error, c.roots.live);
-                let error_true = matches!(g1.get(m1[error as usize]).op, Op::ConstBool(true));
-                let live_false = matches!(g1.get(m1[live as usize]).op, Op::ConstBool(false));
-                if !error_true || live_false || shown >= 3 {
-                    continue;
-                }
-                shown += 1;
-                let mut stack = vec![error];
-                let mut leaves = Vec::new();
-                while let Some(n) = stack.pop() {
-                    let nd = sp.get(n);
-                    if matches!(nd.op, Op::Or) {
-                        stack.extend(nd.args.iter().copied());
-                    } else if matches!(vals[n as usize], crate::transpile::graph::Val::Bool(Some(true))) {
-                        leaves.push(format!("{n}={:?}({})", nd.op, nd.args.iter().map(|a| format!("{a}={:?}={:?}", sp.get(*a).op, vals[*a as usize])).collect::<Vec<_>>().join(", ")));
-                        // Where an unbounded value came from: down the first full-range
-                        // operand to the node that made it.
-                        let (top_lo, top_hi) = A::bounds(A::unknown());
-                        let is_top = |v: &crate::transpile::graph::Val<A>| matches!(v, crate::transpile::graph::Val::Num(iv) if A::bounds(*iv).0 == top_lo || A::bounds(*iv).1 == top_hi);
-                        for a in nd.args.iter().copied() {
-                            let mut cur = a;
-                            let mut chain = Vec::new();
-                            for _ in 0..40 {
-                                let cn = sp.get(cur);
-                                chain.push(format!("{cur}={:?}", cn.op));
-                                match cn.args.iter().copied().find(|x| is_top(&vals[*x as usize])) {
-                                    Some(x) => cur = x,
-                                    None => {
-                                        chain.push(format!("<- args {}", cn.args.iter().map(|x| format!("{x}={:?}={:?}", sp.get(*x).op, vals[*x as usize])).collect::<Vec<_>>().join(", ")));
-                                        break;
-                                    }
+    let all: Vec<NodeId> = cands.iter().flat_map(|c| c.roots.flat()).collect();
+    let t_phase = std::time::Instant::now();
+    let (g1, m1, _) =
+        crate::transpile::ival::fold(&sp, &all, room).expect("interval fold");
+    build_add(1, t_phase);
+    let r1: Vec<NodeId> = all.iter().map(|x| m1[*x as usize]).collect();
+    // DIAGNOSTIC (--build-trace): a body whose `error` folded to true while
+    // live somewhere declines every lane it takes: the leaves of its `error`
+    // Or-tree the interval evaluator decided true.
+    if trace {
+        let cells = crate::transpile::ival::seed_cells(&sp);
+        let vals = sp.eval(&cells, Eval::Fold, room).expect("the fold's eval");
+        let mut shown = 0;
+        for c in &cands {
+            let (error, live) = (c.roots.error, c.roots.live);
+            let error_true = matches!(g1.get(m1[error as usize]).op, Op::ConstBool(true));
+            let live_false = matches!(g1.get(m1[live as usize]).op, Op::ConstBool(false));
+            if !error_true || live_false || shown >= 3 {
+                continue;
+            }
+            shown += 1;
+            let mut stack = vec![error];
+            let mut leaves = Vec::new();
+            while let Some(n) = stack.pop() {
+                let nd = sp.get(n);
+                if matches!(nd.op, Op::Or) {
+                    stack.extend(nd.args.iter().copied());
+                } else if matches!(vals[n as usize], crate::transpile::graph::Val::Bool(Some(true))) {
+                    leaves.push(format!("{n}={:?}({})", nd.op, nd.args.iter().map(|a| format!("{a}={:?}={:?}", sp.get(*a).op, vals[*a as usize])).collect::<Vec<_>>().join(", ")));
+                    // Where an unbounded value came from: down the first full-range
+                    // operand to the node that made it.
+                    let (top_lo, top_hi) = A::bounds(A::unknown());
+                    let is_top = |v: &crate::transpile::graph::Val<A>| matches!(v, crate::transpile::graph::Val::Num(iv) if A::bounds(*iv).0 == top_lo || A::bounds(*iv).1 == top_hi);
+                    for a in nd.args.iter().copied() {
+                        let mut cur = a;
+                        let mut chain = Vec::new();
+                        for _ in 0..40 {
+                            let cn = sp.get(cur);
+                            chain.push(format!("{cur}={:?}", cn.op));
+                            match cn.args.iter().copied().find(|x| is_top(&vals[*x as usize])) {
+                                Some(x) => cur = x,
+                                None => {
+                                    chain.push(format!("<- args {}", cn.args.iter().map(|x| format!("{x}={:?}={:?}", sp.get(*x).op, vals[*x as usize])).collect::<Vec<_>>().join(", ")));
+                                    break;
                                 }
                             }
-                            if chain.len() > 1 {
-                                leaves.push(format!("top source: {}", chain.join(" <- ")));
-                            }
+                        }
+                        if chain.len() > 1 {
+                            leaves.push(format!("top source: {}", chain.join(" <- ")));
                         }
                     }
                 }
-                eprintln!("[build]   outcome {} cfg {:?}: error folds TRUE while live; true disjuncts: {}", c.outcome, c.splits, leaves.join(" | "));
             }
+            eprintln!("[build]   outcome {} cfg {:?}: error folds TRUE while live; true disjuncts: {}", c.outcome, c.splits, leaves.join(" | "));
         }
-        // The boolean layer, simplified locally (`bdd::simplify_local`).
-        let t_phase = std::time::Instant::now();
-        let (g2, m2, bst) =
-            crate::transpile::bdd::simplify_local(&g1, &r1, crate::transpile::bdd::LOCAL_CAP, crate::transpile::bdd::LOCAL_EXPAND);
-        build_add(2, t_phase);
-        if trace {
-            eprintln!(
-                "[build]   boolean simplification: {:.2} s, {} -> {} nodes, {} constants, {} to atoms, {} merged ({} simple complements), {} duplicate leaves dropped, {} unanalysed (local table full)",
-                t_phase.elapsed().as_secs_f64(),
-                bst.before,
-                bst.after,
-                bst.constants,
-                bst.to_atom,
-                bst.merged,
-                bst.merged_simple,
-                bst.deduped,
-                bst.unanalysed
-            );
-        }
-        let r2: Vec<NodeId> = r1.iter().map(|x| m2[*x as usize]).collect();
-        let t_phase = std::time::Instant::now();
-        let (g3, m3, _) =
-            crate::transpile::ival::fold(&g2, &r2, room).expect("interval fold 2");
-        build_add(3, t_phase);
-        for c in cands.iter_mut() {
-            c.roots = c.roots.map(|r| m3[m2[m1[r as usize] as usize] as usize]);
-        }
-        sp = g3;
     }
+    // The boolean layer, simplified locally (`bdd::simplify_local`).
+    let t_phase = std::time::Instant::now();
+    let (g2, m2, bst) =
+        crate::transpile::bdd::simplify_local(&g1, &r1, crate::transpile::bdd::LOCAL_CAP, crate::transpile::bdd::LOCAL_EXPAND);
+    build_add(2, t_phase);
+    if trace {
+        eprintln!(
+            "[build]   boolean simplification: {:.2} s, {} -> {} nodes, {} constants, {} to atoms, {} merged ({} simple complements), {} duplicate leaves dropped, {} unanalysed (local table full)",
+            t_phase.elapsed().as_secs_f64(),
+            bst.before,
+            bst.after,
+            bst.constants,
+            bst.to_atom,
+            bst.merged,
+            bst.merged_simple,
+            bst.deduped,
+            bst.unanalysed
+        );
+    }
+    let r2: Vec<NodeId> = r1.iter().map(|x| m2[*x as usize]).collect();
+    let t_phase = std::time::Instant::now();
+    let (g3, m3, _) =
+        crate::transpile::ival::fold(&g2, &r2, room).expect("interval fold 2");
+    build_add(3, t_phase);
+    for c in cands.iter_mut() {
+        c.roots = c.roots.map(|r| m3[m2[m1[r as usize] as usize] as usize]);
+    }
+    sp = g3;
 
     let t_decide = t1.elapsed();
 
@@ -398,37 +383,29 @@ pub(crate) fn specialize_frame<A: GraphArith>(
     (sp, bodies)
 }
 
-/// The fused bodies' constant-output analysis: each outcome field's
-/// `konst_av` is the `AV` it holds in EVERY row, where every body of the
-/// outcome computes the same compile-time constant node for it. Returns the
-/// fused graph and its bodies.
-pub(crate) fn lower_outcomes<A: GraphArith>(e: &Emit<A>, outs: &mut [Outcome<A>], trace: bool) -> (Graph<A>, Vec<Body>) {
-    let roots: Vec<Roots> = outs.iter().map(|o| o.roots.clone()).collect();
-    let (sp, bodies) = specialize_frame(&e.graph, &roots, e.fork_depth as u8, e.decide, e.room.as_ref(), trace);
-    for (oi, o) in outs.iter_mut().enumerate() {
-        let mine: Vec<&Vec<NodeId>> = bodies.iter().filter(|b| b.outcome == oi).map(|b| &b.roots.fields).collect();
-        let Some(first) = mine.first() else {
+/// Outcome `oi`'s field constants: a field every body of the outcome
+/// computes as one compile-time constant node holds that `AV` in EVERY row
+/// (`OutField::uniform`; a widened field keeps its unknown number).
+pub(crate) fn konst_fields<A: GraphArith>(fused: &Graph<A>, bodies: &[Body], oi: usize, fields: &mut [OutField<A>]) {
+    use celeste_engine::runtime2::AV;
+    let mine: Vec<&Vec<NodeId>> = bodies.iter().filter(|b| b.outcome == oi).map(|b| &b.roots.fields).collect();
+    let Some(first) = mine.first() else {
+        return;
+    };
+    for (fi, f) in fields.iter_mut().enumerate() {
+        let node = first[fi];
+        // The arena is hash-consed: same node is same value.
+        if f.uniform.is_some() || !mine.iter().all(|r| r[fi] == node) {
             continue;
-        };
-        for (fi, f) in o.of.fields.iter_mut().enumerate() {
-            let node = first[fi];
-            // The arena is hash-consed: same node is same value.
-            let agreed = mine.iter().all(|r| r[fi] == node);
-            f.konst_av = if !agreed {
-                None
-            } else {
-                use celeste_engine::runtime2::AV;
-                match sp.get(node).op {
-                    // A point in an INTERVAL field is the interval `[v, v]`: an interval
-                    // column keys a point as one (`asm_kernel::emit::KeyField`).
-                    Op::Const(lo, hi) if lo == hi && f.ty == super::graph::Ty::Ival => Some(AV::Ival(A::from_lit(lo), A::from_lit(lo))),
-                    Op::Const(lo, hi) if lo == hi => Some(AV::Num(A::from_lit(lo))),
-                    Op::Const(lo, hi) => Some(AV::Ival(A::from_lit(lo), A::from_lit(hi))),
-                    Op::ConstBool(b) => Some(AV::Bool(b)),
-                    _ => None,
-                }
-            };
         }
+        f.uniform = match fused.get(node).op {
+            // A point in an INTERVAL field is the interval `[v, v]`: an interval
+            // column keys a point as one (`asm_kernel::emit::KeyField`).
+            Op::Const(lo, hi) if lo == hi && f.ty == super::graph::Ty::Ival => Some(AV::Ival(A::from_lit(lo), A::from_lit(lo))),
+            Op::Const(lo, hi) if lo == hi => Some(AV::Num(A::from_lit(lo))),
+            Op::Const(lo, hi) => Some(AV::Ival(A::from_lit(lo), A::from_lit(hi))),
+            Op::ConstBool(b) => Some(AV::Bool(b)),
+            _ => None,
+        };
     }
-    (sp, bodies)
 }
