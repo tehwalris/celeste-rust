@@ -131,19 +131,34 @@ settled here. Evidence is file:line at develop 19869c5d.
 - The runner also passed `--room` to export-ui, which refuses it, so its UI
   step failed on every improvement.
 
-## C13. HIGH: platform worlds may cover only ~64 frames under the split frame
-- `platform_worlds` steps the reference engine 128 times with `step_one`
-  (concrete.rs:121); under `--split-frame` a step is HALF a frame, while the
-  horizon guard compares GAME frames against the same 127 (wave.rs:743-745).
-  Past frame ~64 a real platform position may be missing from the table, and
-  a `p` state's successors (a union over it) would then drop real ones.
-- Affected if so: split `p` searches past f64, e.g. room (6,0) any% 70
-  ("frames 64-69 refuted") and nodiag 73 ("`--to 69` refuted"); possibly the
-  cause of C3 if that comparison ran past f64.
-- Found by reading (2026-10-21, /var/tmp/audit3/concepts.md); history:
-  the worlds date from 82d98b79, the guard moved to game frames in 8ff30b84.
-- Cheap check: count `platform_worlds(127, s)` with and without
-  `--split-frame` in room (6,0).
+## C13. HIGH, CONFIRMED: the platform-world table misses real positions
+- `platform_worlds(frames, s)` (concrete.rs:99) records the world over
+  `0..=frames` `step_one`s of a NO-INPUT reference run; its one call site
+  (walk.rs:490) passes 127. Under `--split-frame` a step is half a frame, so
+  the table covers 64 GAME frames, while the guard (wave.rs:743-745) admits
+  game frames up to 127. A `p` answer whose (world, pixel) set is empty is
+  dropped (split.rs:126 `sides()`), so real successors can be lost.
+- MEASURED (probe /var/tmp/c13-probe.diff, logs /var/tmp/c13-probe*.log):
+  room (6,0) split: table 65 worlds, uncovered from game frame 65 on (63
+  frames; 41 x values per platform missing). (1,2) split: same, but it was
+  searched unsplit (complete to 127).
+- SECOND GAP, not split-related: in room (2,1) the idle player dies (f49) and
+  the room restarts (f64), so the no-input run only ever holds platform
+  counts 0-63 (x 76-116); a living player meets x < 76 from ~f64. The
+  docstring's claim ("a no-input run visits every arrangement") is false
+  whenever the idle player dies; the guard compares a constant, not coverage.
+- Since 8ff30b84 (09-29) for the split part.
+- No witness is affected (each stays 25+ px from every platform in uncovered
+  frames), but these REFUTATIONS are unproven: room (6,0) any% 70 (horizons
+  65-69), (6,0) nodiag 73 (`--to 69`, bounds 68/73), (2,1) any% 82 and
+  nodiag 85; (6,0) 100% 75 (open) must not run until fixed. (1,2) and (6,1)
+  are unaffected.
+- C3 is NOT explained by this (proven: its comparison stayed within f34, and
+  (2,1)'s split and unsplit tables are identical).
+- Fix (not applied): count game frames (`s.clock().steps(frames)`); make the
+  generator immune to the idle player (step only the platforms, or refuse
+  loudly on a restart or freeze during generation); have `platform_worlds`
+  return the frames it covers and guard on THAT. Then re-run the four results.
 
 ## C14. Checks that can pass with nothing compared
 - `check ref` and `check arcs` pass when every sample was skipped over the
