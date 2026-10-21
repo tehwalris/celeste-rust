@@ -394,6 +394,11 @@ impl<'a, N: Arithmetic> MarkFilter<'a, N> {
     pub(crate) fn coarser(&self) -> crate::abstraction::Level {
         self.coarser
     }
+
+    /// The coarser level's arc-marked nodes.
+    pub(crate) fn marked(&self) -> &Visited<N> {
+        self.marked
+    }
 }
 
 

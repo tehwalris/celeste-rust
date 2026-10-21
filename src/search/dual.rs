@@ -25,7 +25,7 @@ use celeste_engine::exact::ExactRow;
 use celeste_engine::runtime2::Rt2;
 
 use super::driver::Arcs;
-use super::concrete::{concrete_engines, dfs_budget, exact_state, Concrete, Next, NodeKeys, Side};
+use super::concrete::{concrete_engines, dfs_budget, exact_state, Concrete, Next, Side};
 use super::rem::Rem;
 use super::replay::Replay;
 
@@ -175,12 +175,9 @@ pub(crate) fn search<X: Rem, F: Rem>(fixed: &Half<X>, float: &Half<F>, bound: u3
     let clock = fixed.settings.clock();
     ensure!(float.settings.clock() == clock, "the halves step frames differently");
     ensure!(clock.boundary(horizon), "the horizon {horizon} is not a whole number of frames ({} steps each)", clock.per_frame);
-    fn side<'a, N: Rem>(h: &Half<'a, N>) -> Result<Side<'a, N>> {
-        Ok(Side { w: &h.arcs.w, node: NodeKeys::new(&h.arcs.w, &h.arcs.shapes)?, keys: &h.arcs.space, level: h.arcs.level, s: h.settings, seeded: h.settings.concrete().1 })
-    }
     let workers = fixed.settings.threads().max(1);
     eprintln!("[dual] W {} fixed and {} float nodes; {workers} workers; the bound f{bound}", fixed.arcs.w.len(), float.arcs.w.len());
-    let Some(path) = super::concrete::search(&Pairs { sx: side(fixed)?, sf: side(float)? }, clock.frame_of(horizon), bound, clock, prefer, workers)? else { return Ok(None) };
+    let Some(path) = super::concrete::search(&Pairs { sx: fixed.arcs.side(fixed.settings)?, sf: float.arcs.side(float.settings)? }, clock.frame_of(horizon), bound, clock, prefer, workers)? else { return Ok(None) };
     // Real play leaves at the first edge that says so (one does at most).
     let fixed_exit = path.labels.iter().position(|&w| w).ok_or_else(|| anyhow!("a dual win whose fixed half never exited"))? as u32;
     Ok(Some(DualWitness { inputs: path.inputs, fixed_exit }))

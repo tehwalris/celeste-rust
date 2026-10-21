@@ -53,8 +53,8 @@ impl<N: Rem> Hulls<N> {
     }
 }
 
-/// What the arc phase holds for the check (`driver::solve`).
-pub(super) struct Pruning<'a, N: Rem = P8> {
+/// What the arc phase holds for the check (`check_level`).
+struct Pruning<'a, N: Rem = P8> {
     /// The level's W as the concrete search admits states.
     pub(crate) side: &'a Side<'a, N>,
     /// In search steps.
@@ -73,9 +73,25 @@ pub(super) struct Pruning<'a, N: Rem = P8> {
     pub(crate) hulls: Option<&'a Hulls<N>>,
 }
 
+/// THE CHECK of a level's arc phase (`driver::arc_level`): the route against
+/// its W (`side`, `arcs`), its reach marks (`reached`, if the level filters
+/// the next) and the tree in `dir`'s level -1 filter (`TreeL1::read`); with
+/// `Route::hulls` (whole frames only), against the hull forward's claim.
+pub(super) fn check_level<N: KernelLanes>(route: &Route<N>, side: &Side<N>, arcs: &super::driver::Arcs<N>, reached: Option<&Visited<N>>, dir: &std::path::Path) -> anyhow::Result<Option<u32>> {
+    let s = side.s;
+    let l1 = crate::frame::TreeL1::read(dir)?;
+    // The hull forward's claim keys every step's state: whole frames only.
+    if route.hulls && s.split_frame {
+        eprintln!("[known] the hull forward's claim is checked on whole frames only: not under --split-frame");
+    }
+    let hulls = (route.hulls && !s.split_frame).then(|| Hulls::open(dir, arcs.horizon, s)).transpose()?;
+    let p = Pruning { side, horizon: arcs.horizon, start: arcs.start, reached, l1, dir, hulls: hulls.as_ref() };
+    check(route, &p)
+}
+
 /// The route against one level's pruning. `Ok(None)`: no win by the
 /// horizon; `Ok(Some(f))`: it wins in frame `f` and survives; an error: PRUNED.
-pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Option<u32>> {
+fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Option<u32>> {
     let t0 = std::time::Instant::now();
     let clock = p.side.s.clock();
     let run = super::replay::Replay::<N>::of(route.inputs, Some(p.horizon), p.side.s)?;
