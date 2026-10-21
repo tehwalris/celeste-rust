@@ -18,10 +18,11 @@ use super::frame::Frame;
 use super::walk::{room_constant_lattice, Region, Walk};
 
 /// THE specialization of a bound frame (`lower::specialize_frame`): the
-/// fused graph and its bodies, computed once.
+/// fused graph and its bodies, computed once, and what it took.
 pub struct Lowered<A: GraphArith = Fixed> {
     pub(crate) fused: Graph<A>,
     pub(crate) bodies: Vec<Body>,
+    pub(crate) times: crate::transpile::lower::BuildTimes,
 }
 
 /// One output shape of a traced frame: its stored fields, and what it
@@ -106,11 +107,12 @@ pub fn bind<A: GraphArith>(f: &crate::trace::frame::Frame<A>, g: &Graph<A>) -> R
 /// the constant every body stores, where one does (`lower::konst_fields`).
 pub fn lower_frame<A: GraphArith>(bound: &mut Bound<A>, room: Option<&crate::transpile::graph::Room>, build_trace: bool) -> Lowered<A> {
     let roots: Vec<Roots> = bound.outcomes.iter().map(|o| o.roots.clone()).collect();
-    let (fused, bodies) = crate::transpile::lower::specialize_frame(&bound.graph, &roots, bound.forks, room, build_trace);
+    let mut times = crate::transpile::lower::BuildTimes::default();
+    let (fused, bodies) = crate::transpile::lower::specialize_frame(&bound.graph, &roots, bound.forks, room, build_trace, &mut times);
     for (oi, o) in bound.outcomes.iter_mut().enumerate() {
         crate::transpile::lower::konst_fields(&fused, &bodies, oi, &mut o.fields);
     }
-    Lowered { fused, bodies }
+    Lowered { fused, bodies, times }
 }
 
 /// One traced frame, bound and lowered: what the kernel registry assembles.

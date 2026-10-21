@@ -294,8 +294,6 @@ pub fn read_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<
     if d.level.floors_near && !mid {
         materialize_absent_fields(st, d)?;
     }
-    d.platform_cells.clear();
-    d.integral_inputs.clear();
     let mut platforms_read = false;
     for e in d.level.entries() {
         match e.hook {
@@ -585,7 +583,7 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
         let (plo, phi) = (A::from_i16(PLATFORM_PATH.0), A::from_i16(PLATFORM_PATH.1));
         let xr = d.restrict(xv, A::lit(plo), A::lit(phi));
         // An integer in every world (checked where the worlds are made).
-        d.integral_inputs.insert(xr);
+        d.frame.integral_inputs.insert(xr);
         iface::set(st, &x, Value::Num(xr))?;
         iface::set(st, &last, Value::Num(xr))?;
         // `rem.x` is replaced by the literal whole remainder: sound for a
@@ -596,7 +594,7 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
         iface::set(st, &rem, Value::Num(r))?;
         cells[j] = Some(xv);
     }
-    d.platform_cells = cells.into_iter().map(|c| c.expect("every world platform matched")).collect();
+    d.frame.platform_cells = cells.into_iter().map(|c| c.expect("every world platform matched")).collect();
     Ok(obligations)
 }
 

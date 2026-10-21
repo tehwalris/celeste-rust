@@ -31,6 +31,7 @@ use crate::transpile::garith::GraphArith;
 pub fn pins_hold<A: GraphArith>(d: &mut Symbolic<A>) -> NodeId {
     use crate::transpile::graph::Pinned;
     let pins: Vec<(NodeId, Pinned<A>)> = d
+        .frame
         .assumptions
         .iter()
         .filter_map(|a| match d.graph.get(*a).op {
@@ -73,10 +74,10 @@ pub fn of<A: GraphArith>(d: &mut Symbolic<A>, roots: &[NodeId]) -> NodeId {
 /// outcomes: each node's set of sources below it, interned (a cone walk per
 /// outcome would be outcomes x graph).
 pub fn for_outcomes<A: GraphArith>(d: &mut Symbolic<A>, outcomes: &[Vec<NodeId>]) -> Vec<NodeId> {
-    let sites: Vec<NodeId> = d.evaluated.values().copied().collect();
+    let sites: Vec<NodeId> = d.frame.evaluated.values().copied().collect();
     // Every outcome reads every restriction; the pins are charged once for the
     // frame.
-    let assumed: Vec<NodeId> = d.assumptions.iter().copied().filter(|a| matches!(d.graph.get(*a).op, Op::Restrict(..))).collect();
+    let assumed: Vec<NodeId> = d.frame.assumptions.iter().copied().filter(|a| matches!(d.graph.get(*a).op, Op::Restrict(..))).collect();
     let all: Vec<NodeId> = outcomes.iter().flatten().copied().chain(sites).chain(assumed.iter().copied()).collect();
     let reach = d.graph.reachable(&all);
     let mut sources: Vec<(NodeId, NodeId)> = Vec::new();
@@ -120,7 +121,7 @@ pub fn for_outcomes<A: GraphArith>(d: &mut Symbolic<A>, outcomes: &[Vec<NodeId>]
             (sets.len() - 1) as u32
         });
     }
-    let at: Vec<Option<NodeId>> = sources.iter().map(|(n, _)| d.evaluated.get(n).copied()).collect();
+    let at: Vec<Option<NodeId>> = sources.iter().map(|(n, _)| d.frame.evaluated.get(n).copied()).collect();
     outcomes
         .iter()
         .map(|roots| {

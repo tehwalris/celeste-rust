@@ -2041,7 +2041,7 @@ mod tests {
         assert_eq!(it.d.graph.get(r).op, Op::Const(-0x8000, 0x7fff), "the remainder is the literal [-0.5, 0.5)");
         let e = super::super::error::of(&mut it.d, &[r]);
         assert_eq!(it.d.graph.get(e).op, Op::ConstBool(false), "no lane errs");
-        assert_eq!(it.d.forks, 0, "no per-lane fork");
+        assert_eq!(it.d.frame.forks, 0, "no per-lane fork");
     }
 
     /// THE TRACER'S CONSTANT FOLDING never wraps: Lua arithmetic on

@@ -546,6 +546,33 @@ impl<A: GraphArith> Lower<'_, A> {
         self.g.ty(id) == Ty::Ival
     }
 
+    /// Store root value `v` at byte `off` of the output buffer (`halves`:
+    /// a boolean's masks are 8-bit, `Compiled::halves`).
+    fn store(&mut self, v: Value, off: u32, halves: bool) {
+        match v {
+            Value::Num(n) => {
+                let src = self.num_src(n);
+                self.insts.push(Inst::Store { off, src });
+            }
+            Value::Ival(iv) => {
+                for (half, nv) in iv.iter().enumerate() {
+                    let src = self.num_src(*nv);
+                    self.insts.push(Inst::Store { off: off + half as u32 * 64, src });
+                }
+            }
+            Value::Bool(b) => {
+                let (val, known) = (self.mask_reg(b[0]), self.mask_reg(b[1]));
+                if halves {
+                    self.insts.push(Inst::StoreMask8 { off, src: val });
+                    self.insts.push(Inst::StoreMask8 { off: off + 2, src: known });
+                } else {
+                    self.insts.push(Inst::StoreMask { off, src: val });
+                    self.insts.push(Inst::StoreMask { off: off + 2, src: known });
+                }
+            }
+        }
+    }
+
     /// The ops every arithmetic lowers alike (the boolean layer, selects,
     /// interval ends, pass-throughs); `None` for the arithmetic's own.
     fn lower_common(&mut self, id: NodeId) -> Result<Option<Value>> {
@@ -2131,6 +2158,58 @@ fn constant_key(mn: &str, ops: &str, a: &str) -> Option<String> {
     }
 }
 
+/// The input buffer's layout: the input cells `live` reads, ascending,
+/// each one's type and byte offset (by type, `input_bytes`), and the
+/// buffer's size.
+fn input_layout<A: GraphArith>(g: &Graph<A>, live: &[bool]) -> (Vec<u32>, Vec<Ty>, Vec<u32>, u32) {
+    let mut cells: Vec<u32> = (0..g.len() as NodeId)
+        .filter(|id| live[*id as usize])
+        .filter_map(|id| match g.get(id).op {
+            Op::Cell(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    cells.sort_unstable();
+    cells.dedup();
+    let types: Vec<Ty> = cells.iter().map(|c| g.cell_kind(*c)).collect();
+    let mut offsets: Vec<u32> = Vec::with_capacity(cells.len());
+    let mut off = 0u32;
+    for t in &types {
+        offsets.push(off);
+        off += input_bytes(*t);
+    }
+    (cells, types, offsets, off)
+}
+
+/// The output buffer's layout: each root's byte offset, booleans first (4
+/// B), then 64-aligned numbers (64 B) and intervals (128 B); and the
+/// buffer's size.
+fn output_layout(kinds: &[Ty]) -> (Vec<u32>, u32) {
+    let mut offsets: Vec<u32> = vec![0; kinds.len()];
+    let mut next = 0u32;
+    for (ri, k) in kinds.iter().enumerate() {
+        if *k == Ty::Bool {
+            offsets[ri] = next;
+            next += 4;
+        }
+    }
+    next = next.div_ceil(64) * 64;
+    for (ri, k) in kinds.iter().enumerate() {
+        match k {
+            Ty::Num => {
+                offsets[ri] = next;
+                next += 64;
+            }
+            Ty::Ival => {
+                offsets[ri] = next;
+                next += 128;
+            }
+            Ty::Bool | Ty::UBool => {}
+        }
+    }
+    (offsets, next.max(64))
+}
+
 /// 16.16's kernel (`GraphArith::compile_kernel`).
 pub(crate) fn compile_fixed(g: &Graph<Fixed>, roots: &[NodeId], sym: &str, opts: super::AsmOptions) -> Result<Compiled> {
     compile_with(g, roots, sym, opts, false, |lo, id| lo.lower_node(id))
@@ -2161,27 +2240,8 @@ fn compile_with<A: GraphArith>(
     mut lower: impl FnMut(&mut Lower<'_, A>, NodeId) -> Result<()>,
 ) -> Result<Compiled> {
     let live = g.reachable(roots);
-
-    let mut cells: Vec<u32> = (0..g.len() as NodeId)
-        .filter(|id| live[*id as usize])
-        .filter_map(|id| match g.get(id).op {
-            Op::Cell(c) => Some(c),
-            _ => None,
-        })
-        .collect();
-    cells.sort_unstable();
-    cells.dedup();
-    let input_types: Vec<Ty> = cells.iter().map(|c| g.cell_kind(*c)).collect();
-    let mut input_offsets: Vec<u32> = Vec::with_capacity(cells.len());
-    let mut off = 0u32;
-    for r in &input_types {
-        input_offsets.push(off);
-        off += input_bytes(*r);
-    }
-    let input_bytes = off;
-    let cell_off: HashMap<u32, u32> =
-        cells.iter().zip(&input_offsets).map(|(c, o)| (*c, *o)).collect();
-
+    let (cells, input_types, input_offsets, input_bytes) = input_layout(g, &live);
+    let cell_off: HashMap<u32, u32> = cells.iter().zip(&input_offsets).map(|(c, o)| (*c, *o)).collect();
     let mut lo = Lower {
         g,
         vals: vec![None; g.len()],
@@ -2206,74 +2266,23 @@ fn compile_with<A: GraphArith>(
     let t_lower = t_lower.elapsed();
 
     // Roots -> a PACKED output buffer, booleans first (not a line each).
-    let kind_of = |v: &Option<Value>| -> Result<Ty> {
-        Ok(match v {
-            Some(Value::Num(_)) => Ty::Num,
-            Some(Value::Ival(_)) => Ty::Ival,
-            Some(Value::Bool(_)) => Ty::Bool,
-            None => bail!("a root was never lowered"),
-        })
-    };
-    let kinds_first: Vec<Ty> = roots.iter().map(|r| kind_of(&lo.vals[*r as usize])).collect::<Result<_>>()?;
-    let mut root_offsets: Vec<u32> = vec![0; roots.len()];
-    let mut next = 0u32;
-    for (ri, k) in kinds_first.iter().enumerate() {
-        if *k == Ty::Bool {
-            root_offsets[ri] = next;
-            next += 4;
-        }
-    }
-    next = next.div_ceil(64) * 64;
-    for (ri, k) in kinds_first.iter().enumerate() {
-        match k {
-            Ty::Num => {
-                root_offsets[ri] = next;
-                next += 64;
-            }
-            Ty::Ival => {
-                root_offsets[ri] = next;
-                next += 128;
-            }
-            Ty::Bool | Ty::UBool => {}
-        }
-    }
-    let out_bytes = next.max(64);
-    let mut root_kinds: Vec<Ty> = Vec::with_capacity(roots.len());
-    for (ri, r) in roots.iter().enumerate() {
-        let base = root_offsets[ri];
-        let kind = match lo.vals[*r as usize] {
-            Some(Value::Num(n)) => {
-                let src = lo.num_src(n);
-                lo.insts.push(Inst::Store { off: base, src });
-                Ty::Num
-            }
-            Some(Value::Ival(iv)) => {
-                for (half, nv) in iv.iter().enumerate() {
-                    let src = lo.num_src(*nv);
-                    lo.insts.push(Inst::Store { off: base + half as u32 * 64, src });
-                }
-                Ty::Ival
-            }
-            Some(Value::Bool(b)) => {
-                let val = lo.mask_reg(b[0]);
-                let known = lo.mask_reg(b[1]);
-                if halves {
-                    lo.insts.push(Inst::StoreMask8 { off: base, src: val });
-                    lo.insts.push(Inst::StoreMask8 { off: base + 2, src: known });
-                } else {
-                    lo.insts.push(Inst::StoreMask { off: base, src: val });
-                    lo.insts.push(Inst::StoreMask { off: base + 2, src: known });
-                }
-                Ty::Bool
-            }
+    let root_kinds: Vec<Ty> = roots
+        .iter()
+        .map(|r| match lo.vals[*r as usize] {
+            Some(Value::Num(_)) => Ok(Ty::Num),
+            Some(Value::Ival(_)) => Ok(Ty::Ival),
+            Some(Value::Bool(_)) => Ok(Ty::Bool),
             None => bail!("root {} was never lowered", r),
-        };
-        root_kinds.push(kind);
+        })
+        .collect::<Result<_>>()?;
+    let (root_offsets, out_bytes) = output_layout(&root_kinds);
+    for (r, &off) in roots.iter().zip(&root_offsets) {
+        let v = lo.vals[*r as usize].expect("every root lowered");
+        lo.store(v, off, halves);
         if mix {
             prov_node.resize(lo.insts.len(), *r);
         }
     }
-
     let t = std::time::Instant::now();
     let (insts, order) = reschedule(std::mem::take(&mut lo.insts), lo.next_vreg);
     lo.insts = insts;
@@ -2338,75 +2347,8 @@ fn compile_with<A: GraphArith>(
     // Frame: spill slots, then (with call-outs) the zmm save area and arg buffers.
     let extra = if has_calls { SAVE_BYTES + ARGBUF_BYTES } else { 0 };
     let frame = spill_bytes + extra;
-    let mut asm = String::new();
-    writeln!(asm, ".text").unwrap();
-    writeln!(asm, ".globl {sym}").unwrap();
-    writeln!(asm, "{sym}:").unwrap();
-    // Three pushes 16-align rsp (entry is 8 mod 16); the frame is a 64-multiple.
-    // The halves' loop counter is `%r12`, pushed with `%rbx` (five pushes,
-    // aligned too); both are callee-saved, so the call-outs keep them.
-    if halves {
-        writeln!(asm, "    push %rbx").unwrap();
-        writeln!(asm, "    push %r12").unwrap();
-    }
-    writeln!(asm, "    push %r13").unwrap();
-    writeln!(asm, "    push %r14").unwrap();
-    writeln!(asm, "    push %r15").unwrap();
-    writeln!(asm, "    movq %rdi, %r13").unwrap();
-    writeln!(asm, "    movq %rsi, %r14").unwrap();
-    writeln!(asm, "    movq %rdx, %r15").unwrap();
-    if frame > 0 {
-        writeln!(asm, "    sub ${}, %rsp", frame).unwrap();
-    }
-    writeln!(asm, "    vpxorq %zmm{Z}, %zmm{Z}, %zmm{Z}", Z = ZERO).unwrap();
-    if halves {
-        // Lanes 0..8, then lanes 8..16 one input and one output buffer on.
-        writeln!(asm, "    movl $2, %r12d").unwrap();
-        writeln!(asm, ".Lhalf:").unwrap();
-    }
-    asm.push_str(&body);
-    if mix {
-        writeln!(asm, "#@end").unwrap();
-    }
-    if halves {
-        writeln!(asm, "    addq ${}, %r13", input_bytes).unwrap();
-        writeln!(asm, "    addq ${}, %r14", out_bytes).unwrap();
-        writeln!(asm, "    decl %r12d").unwrap();
-        writeln!(asm, "    jnz .Lhalf").unwrap();
-    }
-    if frame > 0 {
-        writeln!(asm, "    add ${}, %rsp", frame).unwrap();
-    }
-    writeln!(asm, "    pop %r15").unwrap();
-    writeln!(asm, "    pop %r14").unwrap();
-    writeln!(asm, "    pop %r13").unwrap();
-    if halves {
-        writeln!(asm, "    pop %r12").unwrap();
-        writeln!(asm, "    pop %rbx").unwrap();
-    }
-    writeln!(asm, "    vzeroupper").unwrap();
-    writeln!(asm, "    ret").unwrap();
-
-    writeln!(asm, ".section .rodata").unwrap();
-    writeln!(asm, ".align 64").unwrap();
-    for (i, v) in em.pool.d.iter().enumerate() {
-        writeln!(asm, ".LCd{i}: .long {}", *v as u32).unwrap();
-    }
-    if !em.pool.q.is_empty() {
-        writeln!(asm, ".align 8").unwrap();
-        for (i, v) in em.pool.q.iter().enumerate() {
-            writeln!(asm, ".LCq{i}: .quad {:#018x}", v).unwrap();
-        }
-    }
-
-    let text_digest = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        for line in asm.lines().filter(|l| !l.starts_with("#@")) {
-            line.hash(&mut h);
-        }
-        h.finish()
-    };
+    let asm = wrap(sym, &body, &em.pool, frame, halves.then_some((input_bytes, out_bytes)), mix);
+    let text_digest = text_digest(&asm);
     Ok(Compiled {
         asm,
         text_digest,
@@ -2424,6 +2366,85 @@ fn compile_with<A: GraphArith>(
         prov,
         halves,
     })
+}
+
+/// The kernel's text: `body` inside its prologue and epilogue (the
+/// callee-saved pushes, `frame` bytes of stack, the zero register; with
+/// `halves`, the doubles' loop over the two halves, each buffer's size its
+/// step), then the constant pool.
+fn wrap(sym: &str, body: &str, pool: &Pool, frame: u32, halves: Option<(u32, u32)>, mix: bool) -> String {
+    let mut asm = String::new();
+    writeln!(asm, ".text").unwrap();
+    writeln!(asm, ".globl {sym}").unwrap();
+    writeln!(asm, "{sym}:").unwrap();
+    // Three pushes 16-align rsp (entry is 8 mod 16); the frame is a 64-multiple.
+    // The halves' loop counter is `%r12`, pushed with `%rbx` (five pushes,
+    // aligned too); both are callee-saved, so the call-outs keep them.
+    if halves.is_some() {
+        writeln!(asm, "    push %rbx").unwrap();
+        writeln!(asm, "    push %r12").unwrap();
+    }
+    writeln!(asm, "    push %r13").unwrap();
+    writeln!(asm, "    push %r14").unwrap();
+    writeln!(asm, "    push %r15").unwrap();
+    writeln!(asm, "    movq %rdi, %r13").unwrap();
+    writeln!(asm, "    movq %rsi, %r14").unwrap();
+    writeln!(asm, "    movq %rdx, %r15").unwrap();
+    if frame > 0 {
+        writeln!(asm, "    sub ${}, %rsp", frame).unwrap();
+    }
+    writeln!(asm, "    vpxorq %zmm{Z}, %zmm{Z}, %zmm{Z}", Z = ZERO).unwrap();
+    if halves.is_some() {
+        // Lanes 0..8, then lanes 8..16 one input and one output buffer on.
+        writeln!(asm, "    movl $2, %r12d").unwrap();
+        writeln!(asm, ".Lhalf:").unwrap();
+    }
+    asm.push_str(body);
+    if mix {
+        writeln!(asm, "#@end").unwrap();
+    }
+    if let Some((input_bytes, out_bytes)) = halves {
+        writeln!(asm, "    addq ${}, %r13", input_bytes).unwrap();
+        writeln!(asm, "    addq ${}, %r14", out_bytes).unwrap();
+        writeln!(asm, "    decl %r12d").unwrap();
+        writeln!(asm, "    jnz .Lhalf").unwrap();
+    }
+    if frame > 0 {
+        writeln!(asm, "    add ${}, %rsp", frame).unwrap();
+    }
+    writeln!(asm, "    pop %r15").unwrap();
+    writeln!(asm, "    pop %r14").unwrap();
+    writeln!(asm, "    pop %r13").unwrap();
+    if halves.is_some() {
+        writeln!(asm, "    pop %r12").unwrap();
+        writeln!(asm, "    pop %rbx").unwrap();
+    }
+    writeln!(asm, "    vzeroupper").unwrap();
+    writeln!(asm, "    ret").unwrap();
+
+    writeln!(asm, ".section .rodata").unwrap();
+    writeln!(asm, ".align 64").unwrap();
+    for (i, v) in pool.d.iter().enumerate() {
+        writeln!(asm, ".LCd{i}: .long {}", *v as u32).unwrap();
+    }
+    if !pool.q.is_empty() {
+        writeln!(asm, ".align 8").unwrap();
+        for (i, v) in pool.q.iter().enumerate() {
+            writeln!(asm, ".LCq{i}: .quad {:#018x}", v).unwrap();
+        }
+    }
+    asm
+}
+
+/// A kernel text's digest, its `#@k` provenance comments aside
+/// (`Compiled::text_digest`).
+fn text_digest(asm: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for line in asm.lines().filter(|l| !l.starts_with("#@")) {
+        line.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// An instruction's kind for `Compiled::prov`: the variant, a binary op's

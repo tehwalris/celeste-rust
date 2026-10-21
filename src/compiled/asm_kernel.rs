@@ -919,11 +919,14 @@ impl<N: KernelLanes> Registry<N> {
         let n_workers = pool.workers(refs.len());
         let built = pool.map(refs.len(), |si| {
             let (key, r) = &refs[si];
-            build_one_shape::<N>(r, si, &format!("_{si}"), build).map(|(shape, kernel)| (shape, *key, kernel))
+            let mut times = r.lowered.times;
+            build_one_shape::<N>(r, si, &format!("_{si}"), build, &mut times).map(|(shape, kernel)| (shape, *key, kernel, times))
         })?;
         let mut kernels = HashMap::new();
         let mut first: HashMap<(u64, Option<Region>), usize> = HashMap::new();
-        for (si, (shape, key, kernel)) in built.into_iter().enumerate() {
+        let mut times = crate::transpile::lower::BuildTimes::default();
+        for (si, (shape, key, kernel, t)) in built.into_iter().enumerate() {
+            times.add(&t);
             if kernels.insert((shape, key), kernel).is_some() {
                 let slots = |i: usize| refs[i].1.frame.iface.slots.iter().map(crate::trace::iface::show).filter(|p| p.starts_with("__")).collect::<Vec<_>>();
                 anyhow::bail!(
@@ -944,7 +947,7 @@ impl<N: KernelLanes> Registry<N> {
             n_workers,
             text_digest(&kernels),
         );
-        eprintln!("[asm build]   phases, summed over workers and concurrent builds: {}", crate::transpile::lower::build_profile());
+        eprintln!("[asm build]   phases, summed over workers: {}", times.show());
         Ok(Registry { kernels, grid })
     }
 }
@@ -1068,27 +1071,28 @@ fn apply_union<N: KernelLanes>(kernel: &mut AsmKernel<N>, unions: &HashMap<u64, 
 
 /// Assemble ONE frame (gcc + dlopen) and map its bodies onto output slots;
 /// `tag` distinguishes a shape's region kernels.
-fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, si: usize, tag: &str, build: &BuildOptions) -> Result<(u64, AsmKernel<N>)> {
+fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, si: usize, tag: &str, build: &BuildOptions, times: &mut crate::transpile::lower::BuildTimes) -> Result<(u64, AsmKernel<N>)> {
+    use crate::transpile::lower::Phase;
     let shape = r.frame.in_rt2.shape_hash_of();
     let room = Room { cache: r.cache.clone() };
-    let t_fuse = std::time::Instant::now();
     let (fused, bodies) = (&r.lowered.fused, &r.lowered.bodies);
     // One output SLOT per DISTINCT root node, numbered by first appearance
     // in the bodies' roots in the kernel's order (`Roots::flat`).
-    let mut flat_roots: Vec<crate::transpile::graph::NodeId> = Vec::new();
-    let mut slot_of: HashMap<crate::transpile::graph::NodeId, usize> = HashMap::new();
-    for n in bodies.iter().flat_map(|b| b.roots.flat()) {
-        slot_of.entry(n).or_insert_with(|| {
-            flat_roots.push(n);
-            flat_roots.len() - 1
-        });
-    }
+    let (flat_roots, slot_of) = times.time(Phase::Fuse, || {
+        let mut flat_roots: Vec<crate::transpile::graph::NodeId> = Vec::new();
+        let mut slot_of: HashMap<crate::transpile::graph::NodeId, usize> = HashMap::new();
+        for n in bodies.iter().flat_map(|b| b.roots.flat()) {
+            slot_of.entry(n).or_insert_with(|| {
+                flat_roots.push(n);
+                flat_roots.len() - 1
+            });
+        }
+        (flat_roots, slot_of)
+    });
     let slot = |n: crate::transpile::graph::NodeId| slot_of[&n];
-    crate::transpile::lower::build_add(4, t_fuse);
-    let t_asm = std::time::Instant::now();
-    let (compiled, loaded) = crate::transpile::asm::compile_and_load(fused, &flat_roots, &format!("k{shape:016x}{tag}"), build.asm)
-    .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
-    crate::transpile::lower::build_add(5, t_asm);
+    let (compiled, loaded) = times
+        .time(Phase::Assemble, || crate::transpile::asm::compile_and_load(fused, &flat_roots, &format!("k{shape:016x}{tag}"), build.asm))
+        .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
 
     // Which fused nodes read the canonical output unknown (`may_unknown`).
     let reads_unknown_output: Vec<bool> = {

@@ -328,56 +328,64 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     pub graph: Graph<A>,
     /// `--build-trace`: the tracer's progress lines.
     pub build_trace: bool,
-    /// FORK choices handed out this frame (the fork ids), buttons included.
-    pub forks: u8,
     /// `split_ways` takes a static range's full width (level -1, whose speed
     /// is a range at every node).
     pub uncapped_ways: bool,
     /// The level traced (`widening::TABLE`'s entries it applies, in and out).
     pub level: celeste_engine::widening::Level,
-    /// How many `Op::UnknownBool` atoms this frame handed out.
-    pub unknown_atoms: u32,
-    /// `escaped_atom`'s memo, cleared with `unknown_atoms` (ids restart).
-    pub escaped: rustc_hash::FxHashMap<NodeId, NodeId>,
-    /// What each `both_values` fork was made for (`--build-trace`).
-    pub fork_origins: Vec<(u8, String)>,
-    /// WHERE each node with an own error was evaluated (the OR of its path
-    /// guards). Per trace.
-    pub evaluated: rustc_hash::FxHashMap<NodeId, NodeId>,
     /// Keep undecided selects as selects (level -1); off, they become forks.
     pub no_known_forks: bool,
     /// THE PLATFORM WORLDS: every arrangement of the moving platforms' `(x,
     /// last, rem.x, spd.x)`. The split pass decides comparisons per world.
     pub worlds: Option<std::sync::Arc<crate::concrete::PlatformWorlds<A>>>,
-    /// This frame's platforms' `x` input cells, in the worlds' order.
-    pub platform_cells: Vec<NodeId>,
-    /// This frame's inputs the hooks declare INTEGER-valued on every lane (a
-    /// platform's `x`), for `cancel_sub` where addition rounds.
-    pub integral_inputs: rustc_hash::FxHashSet<NodeId>,
+    /// What THIS trace accumulates (`frame::trace` starts each from a fresh
+    /// one).
+    pub frame: FrameScratch<A>,
     /// `lane_independent`'s memo (whether a lane's data reaches a node);
     /// structural, so it outlives a frame.
     lane_memo: rustc_hash::FxHashMap<NodeId, bool>,
     /// `reads_unknown_atom`'s memo: structural, like `lane_memo`.
     atom_memo: rustc_hash::FxHashMap<NodeId, bool>,
-    /// The input cells THIS trace refuses merges on, sorted
-    /// (`frame::trace_frame`'s `merge_refused_on`; set by every trace).
-    merge_refused: Vec<u32>,
-    merge_refused_memo: rustc_hash::FxHashMap<NodeId, bool>,
-    /// Fork choices handed out THIS FRAME by `(value, kind)`: a second fork
-    /// of one value reuses the first's choice instead of an empty dimension.
-    /// Cleared with `forks`.
-    fork_memo: std::collections::HashMap<(NodeId, Cut), (u8, (NodeId, NodeId))>,
     /// These three depend on the input cells' types (the graph's
     /// `cell_kind`; dropped by `forget_intervals`).
     undecidable_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
     beneath_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, bool>>,
     /// `may_answers`'s memo: `(may_true, may_false)`.
     may_memo: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, (NodeId, NodeId)>>,
+}
+
+/// What ONE trace accumulates. `frame::trace` replaces it wholesale at its
+/// start, so a trace that failed part-way leaves nothing behind.
+#[derive(Default, Clone)]
+pub struct FrameScratch<A: GraphArith = Fixed> {
+    /// FORK choices handed out this frame (the fork ids), buttons included.
+    pub forks: u8,
+    /// What each `both_values` fork was made for (`--build-trace`).
+    pub fork_origins: Vec<(u8, String)>,
+    /// Fork choices by `(value, kind)`: a second fork of one value reuses the
+    /// first's choice instead of an empty dimension.
+    fork_memo: std::collections::HashMap<(NodeId, Cut), (u8, (NodeId, NodeId))>,
+    /// How many `Op::UnknownBool` atoms this frame handed out.
+    pub unknown_atoms: u32,
+    /// `escaped_atom`'s memo (the atoms' ids restart with the frame).
+    pub escaped: rustc_hash::FxHashMap<NodeId, NodeId>,
+    /// WHERE each node with an own error was evaluated (the OR of its path
+    /// guards).
+    pub evaluated: rustc_hash::FxHashMap<NodeId, NodeId>,
     /// The frame's INPUT ASSUMPTIONS, in the order made: `Op::Restrict` (a
     /// bounded input, the only source of a static range) and `Op::Pin` (an input
     /// the body reads as a constant), each charged to every outcome.
     pub assumptions: Vec<NodeId>,
     range_memo: std::collections::HashMap<NodeId, Option<Pieces<A>>>,
+    /// The input cells this trace refuses merges on, sorted
+    /// (`frame::trace_frame`'s `merge_refused_on`, `set_merge_refused`).
+    merge_refused: Vec<u32>,
+    merge_refused_memo: rustc_hash::FxHashMap<NodeId, bool>,
+    /// The platforms' `x` input cells, in the worlds' order.
+    pub platform_cells: Vec<NodeId>,
+    /// The inputs the hooks declare INTEGER-valued on every lane (a
+    /// platform's `x`), for `cancel_sub` where addition rounds.
+    pub integral_inputs: rustc_hash::FxHashSet<NodeId>,
 }
 
 use crate::transpile::garith::Pieces;
@@ -386,14 +394,10 @@ impl<A: GraphArith> Symbolic<A> {
     pub fn set_merge_refused(&mut self, mut cells: Vec<u32>) {
         cells.sort_unstable();
         cells.dedup();
-        self.merge_refused = cells;
-        self.merge_refused_memo.clear();
+        self.frame.merge_refused = cells;
+        self.frame.merge_refused_memo.clear();
     }
 
-    pub fn clear_ranges(&mut self) {
-        self.assumptions.clear();
-        self.range_memo.clear();
-    }
 
     /// The input cells' types changed: the memos reading them no longer hold.
     pub fn forget_intervals(&mut self) {
@@ -473,7 +477,7 @@ impl<A: GraphArith> Symbolic<A> {
 
     /// The static range of `n`, from the restrictions.
     pub fn range_of(&mut self, n: NodeId) -> Option<Pieces<A>> {
-        A::pieces_of(&self.graph, &mut self.range_memo, n)
+        A::pieces_of(&self.graph, &mut self.frame.range_memo, n)
     }
 
     /// Do the static ranges put every value of `n`'s EXACT result inside the
@@ -485,15 +489,15 @@ impl<A: GraphArith> Symbolic<A> {
 
     /// Does anything give this frame a static range (a restriction)?
     fn has_ranges(&self) -> bool {
-        self.assumptions.iter().any(|a| matches!(self.graph.get(*a).op, Op::Restrict(..)))
+        self.frame.assumptions.iter().any(|a| matches!(self.graph.get(*a).op, Op::Restrict(..)))
     }
 
     /// THE RANGE ASSUMPTION: `x` restricted to `[lo, hi]` (`Op::Restrict`),
     /// its own error charged to every outcome. Read it in `x`'s place.
     pub fn restrict(&mut self, x: NodeId, lo: A::Lit, hi: A::Lit) -> NodeId {
         let r = self.graph.add(Op::Restrict(lo, hi), vec![x]);
-        if !self.assumptions.contains(&r) {
-            self.assumptions.push(r);
+        if !self.frame.assumptions.contains(&r) {
+            self.frame.assumptions.push(r);
         }
         r
     }
@@ -503,8 +507,8 @@ impl<A: GraphArith> Symbolic<A> {
     /// input read the constant.
     pub fn pin(&mut self, x: NodeId, c: crate::transpile::graph::Pinned<A>) {
         let p = self.graph.add(Op::Pin(c), vec![x]);
-        if !self.assumptions.contains(&p) {
-            self.assumptions.push(p);
+        if !self.frame.assumptions.contains(&p) {
+            self.frame.assumptions.push(p);
         }
     }
 
@@ -699,7 +703,7 @@ impl<A: GraphArith> Symbolic<A> {
                 A::num_eq(A::flr(v), v)
             }
             Op::Flr | Op::Frag(Cut::Ints, _) => true,
-            Op::Restrict(..) if self.integral_inputs.contains(&n) => true,
+            Op::Restrict(..) if self.frame.integral_inputs.contains(&n) => true,
             Op::Add | Op::Sub | Op::Neg | Op::Abs | Op::Min | Op::Max => all(&node.args),
             Op::Sel => all(&node.args[1..]),
             _ => false,
@@ -735,30 +739,27 @@ impl<A: GraphArith> Symbolic<A> {
         self.graph.fold(Op::Gt, vec![f.value, zero])
     }
 
-    pub fn clear_fork_memo(&mut self) {
-        self.fork_memo.clear();
-    }
 
     /// THE fork: partition `v`'s set, mint a choice dimension, and hand back
     /// this configuration's piece and its lanes. Every fork comes through here.
     fn fork(&mut self, v: &NodeId, p: Partition, origin: &str) -> Fork {
         // Already forked this value this frame (hash-consed)? Reuse the choice.
         if p.memo {
-            if let Some(hit) = self.fork_memo.get(&(*v, p.cut)) {
+            if let Some(hit) = self.frame.fork_memo.get(&(*v, p.cut)) {
                 let (d, out) = *hit;
                 // RAISED, not set: each site's `ForkOk` bounds its own lanes.
                 self.graph.set_fork_ways(d, p.ways);
                 return Fork { value: out.0, valid: out.1, id: d };
             }
         }
-        let d = self.forks;
-        self.forks += 1;
-        self.fork_origins.push((d, origin.to_string()));
+        let d = self.frame.forks;
+        self.frame.forks += 1;
+        self.frame.fork_origins.push((d, origin.to_string()));
         self.graph.set_fork_ways(d, p.ways);
         let value = self.graph.fold(Op::Fork(p.cut, d), vec![*v]);
         let valid = self.graph.fold(Op::ForkValid(p.cut.grid(), d), vec![*v]);
         if p.memo {
-            self.fork_memo.insert((*v, p.cut), (d, (value, valid)));
+            self.frame.fork_memo.insert((*v, p.cut), (d, (value, valid)));
         }
         Fork { value, valid, id: d }
     }
@@ -800,8 +801,8 @@ impl<A: GraphArith> Symbolic<A> {
     }
 
     pub fn unknown_bool_atom(&mut self) -> NodeId {
-        let k = self.unknown_atoms;
-        self.unknown_atoms += 1;
+        let k = self.frame.unknown_atoms;
+        self.frame.unknown_atoms += 1;
         self.graph.leaf(Op::UnknownBool(Unknown::Atom(k)))
     }
 
@@ -812,8 +813,8 @@ impl<A: GraphArith> Symbolic<A> {
     /// or an escape fork, under which every fall floor's `delay <= 0` made two
     /// successors that never merged (12 floors: 2^13 trace states).
     fn countdown_atom(&mut self) -> NodeId {
-        let k = self.unknown_atoms;
-        self.unknown_atoms += 1;
+        let k = self.frame.unknown_atoms;
+        self.frame.unknown_atoms += 1;
         self.graph.leaf(Op::UnknownBool(Unknown::Countdown(k)))
     }
 
@@ -1067,11 +1068,11 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     }
 
     fn evaluated_at(&mut self, n: &NodeId, at: &NodeId) {
-        let at = match self.evaluated.get(n) {
+        let at = match self.frame.evaluated.get(n) {
             Some(before) => self.graph.fold(Op::Or, vec![*before, *at]),
             None => *at,
         };
-        self.evaluated.insert(*n, at);
+        self.frame.evaluated.insert(*n, at);
     }
 
     fn join_num_independent(&mut self, c: &NodeId, t: &NodeId, f: &NodeId) -> Option<NodeId> {
@@ -1114,11 +1115,11 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     }
 
     fn reads_merge_refused(&mut self, c: &NodeId) -> bool {
-        if self.merge_refused.is_empty() || self.decide(c).is_some() {
+        if self.frame.merge_refused.is_empty() || self.decide(c).is_some() {
             return false;
         }
-        let refused = &self.merge_refused;
-        cone_any(&self.graph, &mut self.merge_refused_memo, *c, |op| match op {
+        let refused = &self.frame.merge_refused;
+        cone_any(&self.graph, &mut self.frame.merge_refused_memo, *c, |op| match op {
             Op::Cell(i) => Some(refused.binary_search(i).is_ok()),
             _ => None,
         })
@@ -1145,7 +1146,7 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     }
 
     fn atoms_minted(&self) -> u32 {
-        self.unknown_atoms
+        self.frame.unknown_atoms
     }
 
     fn escaped_atom(&mut self, b: &NodeId, since: u32, origin: &dyn Fn(&Self) -> String) -> Option<NodeId> {
@@ -1155,7 +1156,7 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         if !self.unknowns() {
             return None;
         }
-        if let Some(f) = self.escaped.get(b) {
+        if let Some(f) = self.frame.escaped.get(b) {
             return Some(*f);
         }
         // The atoms of this call that `b` reads. Only those make a fork; every
@@ -1194,7 +1195,7 @@ impl<A: GraphArith> Domain for Symbolic<A> {
             let either = self.graph.fold(Op::And, vec![both, g]);
             self.graph.fold(Op::Or, vec![only_t, either])
         };
-        self.escaped.insert(*b, out);
+        self.frame.escaped.insert(*b, out);
         Some(out)
     }
 
@@ -1321,7 +1322,7 @@ mod tests {
             let k = d.num(f(ox));
             let y = d.arith(Arith::Add, &x, &k).expect("add");
             let (v, valid) = d.split(Cut::Rounds, &y, ways).expect("a round fork");
-            let fork = d.forks - 1;
+            let fork = d.frame.forks - 1;
             let covered = d.graph.fold(Op::ForkOk(Cut::Rounds, ways), vec![y]);
             for (lo, hi) in [(-0.5, 0.5f64.next_down()), (-0.5, -0.5), (0.2, 0.4), (0.5f64.next_down(), 0.5), (-2.25, 1.75), (0.0, 0.0)] {
                 let iv = LuaF64Interval::new(f(lo), f(hi));
@@ -1329,7 +1330,7 @@ mod tests {
                 let yv = iv.checked_add(LuaF64Interval::point(f(ox))).expect("finite");
                 let n = yv.rounds().expect("rounds").expect("few");
                 for c in 0..ways {
-                    let mut splits = vec![OPEN; d.forks as usize];
+                    let mut splits = vec![OPEN; d.frame.forks as usize];
                     splits[fork as usize] = c;
                     let mut g = d.graph.like();
                     let map = d.graph.specialize_subset_into(&splits, None, &mut g);
@@ -1399,7 +1400,7 @@ mod tests {
         let operand = d.graph.fold(Op::Add, vec![half, moved]);
         assert_eq!(d.split_ways(Cut::Floors, &operand), 2, "a kernel lane takes one piece");
         d.uncapped_ways = true;
-        d.range_memo.clear();
+        d.frame.range_memo.clear();
         assert_eq!(d.split_ways(Cut::Floors, &operand), 5, "level -1 joins the pieces: floors -2..=2");
     }
 

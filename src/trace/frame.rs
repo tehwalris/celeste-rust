@@ -180,17 +180,12 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     let widen = !spec.concrete;
     it.trace_start_nodes = it.d.node_count();
     let mut st = st;
-    it.d.forks = 0;
+    // A fresh frame: nothing an earlier trace (one that failed part-way
+    // included) accumulated survives.
+    it.d.frame = Default::default();
     it.d.graph.reset_forks();
-    it.d.clear_ranges();
-    it.d.clear_fork_memo();
-    it.d.unknown_atoms = 0;
-    it.arc_capture = widen;
-    // Left over by a trace that failed part-way.
     it.raised.clear();
-    it.d.escaped.clear();
-    it.d.fork_origins.clear();
-    it.d.evaluated.clear();
+    it.arc_capture = widen;
     let iface = iface::symbolize(&mut it.d, &mut st, roots, pin, ival)?;
     let refused = merge_refused_on
         .iter()
@@ -292,7 +287,7 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     // guards, transfers, derived errors - may read a pinned input; only the
     // pin's own check does (`error::pins_hold`, in `global`).
     {
-        let pinned: Vec<NodeId> = it.d.assumptions.iter().filter(|a| matches!(it.d.graph.get(**a).op, crate::transpile::graph::Op::Pin(_))).map(|a| it.d.graph.get(*a).args[0]).collect();
+        let pinned: Vec<NodeId> = it.d.frame.assumptions.iter().filter(|a| matches!(it.d.graph.get(**a).op, crate::transpile::graph::Op::Pin(_))).map(|a| it.d.graph.get(*a).args[0]).collect();
         if !pinned.is_empty() {
             let mut reads: Vec<NodeId> = derived.clone();
             for o in &outs {
@@ -309,12 +304,12 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     }
     if it.d.build_trace {
         let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
-        for (_, o) in &it.d.fork_origins {
+        for (_, o) in &it.d.frame.fork_origins {
             *by.entry(o.as_str()).or_default() += 1;
         }
-        eprintln!("[build] trace_frame (widen {widen}): {} outcomes, {} pins, {} forks by origin {by:?}", outs.len(), pin.len(), it.d.forks);
+        eprintln!("[build] trace_frame (widen {widen}): {} outcomes, {} pins, {} forks by origin {by:?}", outs.len(), pin.len(), it.d.frame.forks);
     }
-    let fork_ways: Vec<u8> = (0..it.d.forks).map(|d| it.d.graph.fork_ways(d)).collect();
+    let fork_ways: Vec<u8> = (0..it.d.frame.forks).map(|d| it.d.graph.fork_ways(d)).collect();
     let raise = {
         use super::domain::Domain;
         let raised = std::mem::take(&mut it.raised);
@@ -324,7 +319,7 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
         }
         r
     };
-    Ok(Frame { iface, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, outs, raise, in_cells, in_rt2 })
+    Ok(Frame { iface, fork_origins: it.d.frame.fork_origins.clone(), forks: it.d.frame.forks, fork_ways, outs, raise, in_cells, in_rt2 })
 }
 
 /// A finished path of the frame as an outcome: its absent-as-zero fields

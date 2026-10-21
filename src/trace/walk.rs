@@ -501,46 +501,114 @@ pub fn room_constant_lattice<A: GraphArith>(
     opts: crate::abstraction::Level,
     walk: &Walk,
 ) -> Result<LatticeWalk<A>> {
-    use super::domain::Symbolic;
-    use super::shapes;
-    use anyhow::bail;
-
-    let (s, only) = (walk.settings, walk.only);
+    let s = walk.settings;
     let (Tracer { mut it, chunks }, start) = boot::<A>(s, opts)?;
-    let cache = it.cache.clone().expect("boot loads the collision cache");
-    let mut reps = Reps::new(&start, cache.clone())?;
-
-    let mut lattice: std::collections::BTreeMap<ShapeKey, std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>> = Default::default();
-    // Each representative's state in the walk's own arena (what a job's
-    // paths, pins and bounds are read off).
-    let mut states: std::collections::BTreeMap<ShapeKey, super::state::State<Symbolic<A>>> = Default::default();
-    let mut frames: std::collections::BTreeMap<WalkNode, WalkFrame<A>> = Default::default();
-    let mut refused: std::collections::BTreeMap<WalkNode, String> = Default::default();
-    // Poisoned paths by reason, summed over jobs.
-    let mut illegal: std::collections::BTreeMap<String, usize> = Default::default();
-    // The nodes whose `Frame::raise` did not fold to false.
-    let mut raising: std::collections::BTreeSet<WalkNode> = Default::default();
-    let mut ival_extra: std::collections::BTreeMap<ShapeKey, std::collections::BTreeSet<super::iface::Path>> = Default::default();
-
-    let mut no_player = match s.region_grid() {
-        Some(_) => no_player_ranges(&mut it, chunks, &reps, &start, opts)?,
-        None => NoPlayer::default(),
-    };
-    if s.diag.build_trace {
-        for l in no_player.show() {
-            eprintln!("{l}");
+    let (mut w, mut frontier) = WalkState::start(&mut it, chunks, &start, opts, walk)?;
+    // THE ROUNDS: each traces its frontier in parallel against a lattice
+    // snapshot; results apply in node order between rounds. Each frame is
+    // bound in the worker arena it was traced in.
+    let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let mut tracers: Vec<Tracer<A>> = (0..n_workers).map(|_| Tracer { it: it.clone(), chunks }).collect();
+    let (mut traces, mut round) = (0usize, 0usize);
+    let t_walk = std::time::Instant::now();
+    while !frontier.is_empty() {
+        round += 1;
+        traces += frontier.len();
+        anyhow::ensure!(traces <= 20000, "constant-lattice fixpoint did not converge");
+        let t_round = std::time::Instant::now();
+        let jobs = w.jobs(&frontier)?;
+        // Each worker clones its own copy (a `Tracer` is `Send`, not `Sync`), and
+        // per job a FRESH arena from it, so a graph depends on the job, not on
+        // scheduling.
+        let free = std::sync::Mutex::new(tracers.iter_mut().collect::<Vec<_>>());
+        let traced: Vec<WalkTraced<A>> = crate::par::Pool::new(n_workers).stack(128 << 20).map_with(
+            jobs.len(),
+            || free.lock().expect("the walk's tracers").pop().ok_or_else(|| anyhow::anyhow!("a tracer per walk worker")),
+            |tr, i| walk_trace(&mut tr.clone(), &w.reps, &jobs[i], opts, w.grid, walk.only, w.room0),
+        )?;
+        let (mut next, respawned) = w.apply(&mut it, chunks, &jobs, traced)?;
+        if respawned {
+            w.respawned()?;
         }
+        // THE DEFERRED RE-TRACE: once no new region appears, re-trace each
+        // narrowed shape in every region it reached. Sound: pins only drop,
+        // and the re-trace repeats until nothing changes.
+        if next.is_empty() {
+            for k in std::mem::take(&mut w.dirty) {
+                next.extend(w.regions.get(&k).into_iter().flatten().map(|r| (k, *r)));
+            }
+        }
+        if w.trace {
+            eprintln!("[walk] round {round}: {} traced, {} next, {:.1} s", jobs.len(), next.len(), t_round.elapsed().as_secs_f64());
+        }
+        frontier = next.into_iter().collect();
     }
-    // The START state's own intervals (an `rnd` draw in `_init`) are interval
-    // inputs at every level: no traced frame wrote them. Its representative
-    // holds 0 there.
-    let mut start_ivals: std::collections::BTreeMap<super::iface::Path, Option<(A::Lit, A::Lit)>> = Default::default();
-    let mut start_rep = start.clone();
-    {
+    w.finish(Tracer { it, chunks }, format!("{traces} traces in {round} rounds, {:.1} s ({n_workers} workers)", t_walk.elapsed().as_secs_f64()))
+}
+
+/// THE WALK between its rounds (`room_constant_lattice`).
+struct WalkState<A: GraphArith> {
+    opts: crate::abstraction::Level,
+    grid: Option<RegionGrid>,
+    /// The start's room: an outcome in another is a terminal.
+    room0: (i16, i16),
+    /// `--build-trace`: the per-trace `[lattice]` lines.
+    trace: bool,
+    reps: Reps<A>,
+    no_player: NoPlayer<A>,
+    start_key: ShapeKey,
+    start_ivals: std::collections::BTreeMap<super::iface::Path, Option<(A::Lit, A::Lit)>>,
+    /// Per shape, the constants every outcome reaching it agreed on.
+    lattice: std::collections::BTreeMap<ShapeKey, std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>>,
+    /// Each representative's state in the walk's own arena (what a job's
+    /// paths, pins and bounds are read off).
+    states: std::collections::BTreeMap<ShapeKey, super::state::State<super::domain::Symbolic<A>>>,
+    /// The regions each shape was reached in.
+    regions: std::collections::BTreeMap<ShapeKey, std::collections::BTreeSet<Option<Region>>>,
+    frames: std::collections::BTreeMap<WalkNode, WalkFrame<A>>,
+    refused: std::collections::BTreeMap<WalkNode, String>,
+    /// Poisoned paths by reason, summed over jobs.
+    illegal: std::collections::BTreeMap<String, usize>,
+    /// The nodes whose `Frame::raise` did not fold to false.
+    raising: std::collections::BTreeSet<WalkNode>,
+    ival_extra: std::collections::BTreeMap<ShapeKey, std::collections::BTreeSet<super::iface::Path>>,
+    /// Shapes waiting for the deferred re-trace.
+    dirty: std::collections::BTreeSet<ShapeKey>,
+}
+
+impl<A: GraphArith> WalkState<A> {
+    /// The walk at the start state (its no-player ranges, its own interval
+    /// inputs, its shape's representative, constants and regions), and the
+    /// first round's frontier: the start's regions.
+    fn start(
+        it: &mut super::interp::Interp<'static, super::domain::Symbolic<A>>,
+        chunks: &'static super::cart::Chunks,
+        start: &super::state::State<super::domain::Symbolic<A>>,
+        opts: crate::abstraction::Level,
+        walk: &Walk,
+    ) -> Result<(Self, Vec<WalkNode>)> {
         use super::domain::Domain as _;
-        for r in shapes::state_paths(&start)? {
-            for p in super::iface::scalars(&start, &r)? {
-                let Some(super::heap::Value::Num(n)) = super::iface::get(&start, &p) else { continue };
+        use super::shapes;
+        let s = walk.settings;
+        let cache = it.cache.clone().expect("boot loads the collision cache");
+        let mut reps = Reps::new(start, cache)?;
+        let no_player = match s.region_grid() {
+            Some(_) => no_player_ranges(it, chunks, &reps, start, opts)?,
+            None => NoPlayer::default(),
+        };
+        if s.diag.build_trace {
+            for l in no_player.show() {
+                eprintln!("{l}");
+            }
+        }
+        // The START state's own intervals (an `rnd` draw in `_init`) are interval
+        // inputs at every level: no traced frame wrote them. Its representative
+        // holds 0 there.
+        let mut start_ivals: std::collections::BTreeMap<super::iface::Path, Option<(A::Lit, A::Lit)>> = Default::default();
+        let mut start_rep = start.clone();
+        for r in shapes::state_paths(start)? {
+            for p in super::iface::scalars(start, &r)? {
+                let Some(super::heap::Value::Num(n)) = super::iface::get(start, &p) else { continue };
                 if it.d.as_const(&n).is_some() {
                     continue;
                 }
@@ -557,95 +625,109 @@ pub fn room_constant_lattice<A: GraphArith>(
                 super::iface::set(&mut start_rep, &p, super::heap::Value::Num(zero))?;
             }
         }
-    }
-    let start_rep = reps.block(&start_rep, &mut it.d, false)?;
-    let sk = start_rep.shape_hash;
-    if !start_ivals.is_empty() {
-        ival_extra.insert(sk, start_ivals.keys().cloned().collect());
-    }
-    lattice.insert(sk, shapes::field_constants(&start, &it.d, &opts)?);
-    states.insert(sk, reps.state(&start_rep, &mut it.d)?);
-    reps.blocks.insert(sk, start_rep);
-    let grid = s.region_grid();
-    let start_regions = successor_regions(&start, &mut it.d, grid, only)?;
-    let mut regions: std::collections::BTreeMap<ShapeKey, std::collections::BTreeSet<Option<Region>>> = Default::default();
-    regions.insert(sk, start_regions.iter().copied().collect());
-    let room0 = shapes::room_of(&start, &it.d);
-    let lattice_trace = s.diag.build_trace;
-
-    // THE ROUNDS: each traces its frontier in parallel against a lattice
-    // snapshot; results apply in node order between rounds. Each frame is
-    // bound in the worker arena it was traced in.
-    let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let mut tracers: Vec<Tracer<A>> = (0..n_workers).map(|_| Tracer { it: it.clone(), chunks }).collect();
-    let mut frontier: Vec<WalkNode> = start_regions.into_iter().map(|r| (sk, r)).collect();
-    // Shapes waiting for the deferred re-trace.
-    let mut dirty: std::collections::BTreeSet<ShapeKey> = Default::default();
-    let (mut traces, mut round) = (0usize, 0usize);
-    let t_walk = std::time::Instant::now();
-    while !frontier.is_empty() {
-        round += 1;
-        traces += frontier.len();
-        if traces > 20000 {
-            bail!("constant-lattice fixpoint did not converge");
+        let start_rep = reps.block(&start_rep, &mut it.d, false)?;
+        let sk = start_rep.shape_hash;
+        let mut ival_extra: std::collections::BTreeMap<ShapeKey, std::collections::BTreeSet<super::iface::Path>> = Default::default();
+        if !start_ivals.is_empty() {
+            ival_extra.insert(sk, start_ivals.keys().cloned().collect());
         }
-        let t_round = std::time::Instant::now();
-        let jobs: Vec<WalkJob<A>> = frontier
+        let lattice = std::collections::BTreeMap::from([(sk, shapes::field_constants(start, &it.d, &opts)?)]);
+        let states = std::collections::BTreeMap::from([(sk, reps.state(&start_rep, &mut it.d)?)]);
+        reps.blocks.insert(sk, start_rep);
+        let grid = s.region_grid();
+        let start_regions = successor_regions(start, &mut it.d, grid, walk.only)?;
+        let regions = std::collections::BTreeMap::from([(sk, start_regions.iter().copied().collect())]);
+        let w = WalkState {
+            opts,
+            grid,
+            room0: shapes::room_of(start, &it.d),
+            trace: s.diag.build_trace,
+            reps,
+            no_player,
+            start_key: sk,
+            start_ivals,
+            lattice,
+            states,
+            regions,
+            frames: Default::default(),
+            refused: Default::default(),
+            illegal: Default::default(),
+            raising: Default::default(),
+            ival_extra,
+            dirty: Default::default(),
+        };
+        Ok((w, start_regions.into_iter().map(|r| (sk, r)).collect()))
+    }
+
+    /// The shape number `k` has in the lattice (`--build-trace`'s lines).
+    fn shape_no(&self, k: ShapeKey) -> usize {
+        self.lattice.keys().position(|x| *x == k).unwrap_or(usize::MAX)
+    }
+
+    /// The round's jobs: each frontier node's paths, pins, interval inputs
+    /// and bounds (its region's square, or the no-player hull).
+    fn jobs(&self, frontier: &[WalkNode]) -> Result<Vec<WalkJob<A>>> {
+        use super::shapes;
+        frontier
             .iter()
             .map(|(k, region)| -> Result<WalkJob<A>> {
-                let st = &states[k];
+                let st = &self.states[k];
                 let roots = shapes::state_paths(st)?;
-                let ival = with_extra(super::widen::slots_where(st, opts, super::widen::interval_input), ival_extra.get(k));
-                let pin = pins_of(&lattice[k], &roots);
-                let bounds: InputRanges<A> = match (grid, *region, shapes::player_path(st)) {
+                let ival = with_extra(super::widen::slots_where(st, self.opts, super::widen::interval_input), self.ival_extra.get(k));
+                let pin = pins_of(&self.lattice[k], &roots);
+                let bounds: InputRanges<A> = match (self.grid, *region, shapes::player_path(st)) {
                     (Some(g), Some(r), Some(pl)) => {
                         g.bounds::<A>(&pl, r).into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect()
                     }
                     (None, None, _) => Vec::new(),
                     // The no-player phase's hull (bounds are by path).
-                    (Some(_), None, None) => no_player.bounds(*k, st)?.into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect(),
-                    (g, r, pl) => bail!("walk node {r:?} of a shape {} a player under grid {g:?}", if pl.is_some() { "with" } else { "without" }),
+                    (Some(_), None, None) => self.no_player.bounds(*k, st)?.into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect(),
+                    (g, r, pl) => anyhow::bail!("walk node {r:?} of a shape {} a player under grid {g:?}", if pl.is_some() { "with" } else { "without" }),
                 };
                 let spawn = !super::widen::objects_of_type(st, super::game::PLAYER_SPAWN).is_empty();
                 Ok(WalkJob { node: (*k, *region), roots, pin, ival, bounds, spawn })
             })
-            .collect::<Result<_>>()?;
-        // Each worker clones its own copy (a `Tracer` is `Send`, not `Sync`), and
-        // per job a FRESH arena from it, so a graph depends on the job, not on
-        // scheduling.
-        let free = std::sync::Mutex::new(tracers.iter_mut().collect::<Vec<_>>());
-        let traced: Vec<WalkTraced<A>> = crate::par::Pool::new(n_workers).stack(128 << 20).map_with(
-            jobs.len(),
-            || free.lock().expect("the walk's tracers").pop().ok_or_else(|| anyhow::anyhow!("a tracer per walk worker")),
-            |tr, i| walk_trace(&mut tr.clone(), &reps, &jobs[i], opts, grid, only, room0),
-        )?;
-        let mut next_frontier: std::collections::BTreeSet<WalkNode> = Default::default();
+            .collect()
+    }
+
+    /// The round's results, in node order: each node's frame, and each
+    /// outcome into its shape's lattice, interval inputs and regions (a
+    /// respawn explored into the no-player hulls). Returns the regions new
+    /// this round, and whether a respawn was explored.
+    fn apply(
+        &mut self,
+        it: &mut super::interp::Interp<'static, super::domain::Symbolic<A>>,
+        chunks: &'static super::cart::Chunks,
+        jobs: &[WalkJob<A>],
+        traced: Vec<WalkTraced<A>>,
+    ) -> Result<(std::collections::BTreeSet<WalkNode>, bool)> {
+        let mut next: std::collections::BTreeSet<WalkNode> = Default::default();
         let mut respawned = false;
         for (job, t) in jobs.iter().zip(traced) {
             let (k, region) = job.node;
             match t {
                 WalkTraced::Refused(e, poisoned) => {
                     for (why, n) in poisoned {
-                        *illegal.entry(why).or_default() += n;
+                        *self.illegal.entry(why).or_default() += n;
                     }
                     // A node that never traces is a MISSING KERNEL (an error
                     // after the fixpoint). Its earlier frame goes too: it
                     // was traced under pins since dropped.
-                    refused.insert(job.node, e);
-                    frames.remove(&job.node);
+                    self.refused.insert(job.node, e);
+                    self.frames.remove(&job.node);
                 }
                 WalkTraced::Traced { frame, bound, nodes_added, arena, outs, skipped, illegal: poisoned, can_raise } => {
                     for (why, n) in poisoned {
-                        *illegal.entry(why).or_default() += n;
+                        *self.illegal.entry(why).or_default() += n;
                     }
                     if can_raise {
-                        raising.insert(job.node);
+                        self.raising.insert(job.node);
                     }
-                    refused.remove(&job.node);
-                    if lattice_trace {
+                    self.refused.remove(&job.node);
+                    if self.trace {
                         eprintln!(
                             "[lattice] trace shape #{} region {:?} ({} pinned): {} outcomes, {} nodes added ({} in the worker's arena)",
-                            lattice.keys().position(|x| *x == k).unwrap_or(usize::MAX),
+                            self.shape_no(k),
                             region,
                             job.pin.len(),
                             frame.outs.len(),
@@ -657,145 +739,147 @@ pub fn room_constant_lattice<A: GraphArith>(
                         }
                     }
                     for o in outs {
-                        let tk = o.key;
-                        // A RESPAWN entry: its no-player phase explored into
-                        // the hulls (once per entry); the shapes whose bounds
-                        // grew are re-traced below.
-                        if let (true, Some(c)) = (no_player.on, &o.respawn) {
-                            if no_player.entries.insert((tk, format!("{c:?}"))) {
-                                let entry = reps.state(&o.rep, &mut it.d)?;
-                                let (n, followed, ended) = explore_no_player(&mut it, chunks, &reps, (tk, entry, c.clone()), opts, &mut no_player, "a respawn's")?;
-                                let shape_no = |x: &ShapeKey| lattice.keys().position(|y| y == x).map_or("new".to_string(), |i| format!("#{i}"));
-                                eprintln!(
-                                    "[walk] respawn entry {} (shape {}, from shape {} {:?}): {n} states explored, {followed} outcomes followed, {ended} reach the player",
-                                    no_player.entries.len(),
-                                    shape_no(&tk),
-                                    shape_no(&k),
-                                    region
-                                );
-                                respawned = true;
-                            }
-                        }
-                        // Intervals beyond the boundary's widenings: inputs next frame.
-                        let mut new_ival = false;
-                        for p in o.ival {
-                            if lattice_trace && !ival_extra.get(&tk).is_some_and(|s| s.contains(&p)) {
-                                eprintln!("[lattice]   outcome: new interval slot {} (shape #{})", super::iface::show(&p), lattice.keys().position(|x| *x == tk).unwrap_or(usize::MAX));
-                            }
-                            new_ival |= ival_extra.entry(tk).or_default().insert(p);
-                        }
-                        if lattice_trace {
-                            let known = lattice.get(&tk).map(|m| m.iter().filter(|(p, v)| o.constants.get(*p) != Some(*v)).map(|(p, _)| super::iface::show(p)).collect::<Vec<_>>());
-                            match known {
-                                None => eprintln!(
-                                    "[lattice]   outcome: NEW shape, {} constants, from shape #{}",
-                                    o.constants.len(),
-                                    lattice.keys().position(|x| *x == k).unwrap_or(usize::MAX)
-                                ),
-                                Some(gone) => eprintln!("[lattice]   outcome: shape #{}, constants removed: {:?}", lattice.keys().position(|x| *x == tk).unwrap_or(usize::MAX), gone),
-                            }
-                        }
-                        let changed = match lattice.get_mut(&tk) {
-                            None => {
-                                lattice.insert(tk, o.constants);
-                                states.insert(tk, reps.state(&o.rep, &mut it.d)?);
-                                reps.blocks.insert(tk, o.rep);
-                                true
-                            }
-                            Some(m) => {
-                                let before = m.len();
-                                m.retain(|p, v| o.constants.get(p) == Some(v));
-                                m.len() != before
-                            }
-                        };
-                        // New regions trace next round; narrowed shapes later (`dirty`).
-                        let reached = regions.entry(tk).or_default();
-                        if changed || new_ival {
-                            dirty.insert(tk);
-                        }
-                        for r in o.regions {
-                            if reached.insert(r) {
-                                next_frontier.insert((tk, r));
-                            }
-                        }
+                        respawned |= self.outcome(it, chunks, (k, region), o, &mut next)?;
                     }
                     // The frame binds the block its representative is.
                     anyhow::ensure!(frame.in_rt2.shape_hash_of() == k, "shape {k:#x} region {region:?}: the traced frame's input block has shape {:#x}", frame.in_rt2.shape_hash_of());
-                    frames.insert(job.node, WalkFrame { frame, bounds: job.bounds.clone(), bound });
+                    self.frames.insert(job.node, WalkFrame { frame, bounds: job.bounds.clone(), bound });
                 }
             }
         }
-        // A no-player node traced under bounds a respawn has since changed.
-        if respawned {
-            for ((k, region), wf) in &frames {
-                if region.is_none() && shapes::player_path(&states[k]).is_none() {
-                    let roots = shapes::state_paths(&states[k])?;
-                    let now: InputRanges<A> = no_player.bounds(*k, &states[k])?.into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect();
-                    if now != wf.bounds {
-                        dirty.insert(*k);
-                    }
+        Ok((next, respawned))
+    }
+
+    /// One live outcome of node `from` (`apply`): new regions into `next`,
+    /// a narrowed shape `dirty`. True if it was a respawn entry, explored.
+    fn outcome(
+        &mut self,
+        it: &mut super::interp::Interp<'static, super::domain::Symbolic<A>>,
+        chunks: &'static super::cart::Chunks,
+        (k, region): WalkNode,
+        o: WalkOutcome<A>,
+        next: &mut std::collections::BTreeSet<WalkNode>,
+    ) -> Result<bool> {
+        let tk = o.key;
+        let mut respawned = false;
+        // A RESPAWN entry: its no-player phase explored into the hulls (once
+        // per entry); the shapes whose bounds grew are re-traced (`respawned`).
+        if let (true, Some(c)) = (self.no_player.on, &o.respawn) {
+            if self.no_player.entries.insert((tk, format!("{c:?}"))) {
+                let entry = self.reps.state(&o.rep, &mut it.d)?;
+                let (n, followed, ended) = explore_no_player(it, chunks, &self.reps, (tk, entry, c.clone()), self.opts, &mut self.no_player, "a respawn's")?;
+                let shape_no = |x: &ShapeKey| self.lattice.keys().position(|y| y == x).map_or("new".to_string(), |i| format!("#{i}"));
+                eprintln!(
+                    "[walk] respawn entry {} (shape {}, from shape {} {:?}): {n} states explored, {followed} outcomes followed, {ended} reach the player",
+                    self.no_player.entries.len(),
+                    shape_no(&tk),
+                    shape_no(&k),
+                    region
+                );
+                respawned = true;
+            }
+        }
+        // Intervals beyond the boundary's widenings: inputs next frame.
+        let mut new_ival = false;
+        for p in o.ival {
+            if self.trace && !self.ival_extra.get(&tk).is_some_and(|s| s.contains(&p)) {
+                eprintln!("[lattice]   outcome: new interval slot {} (shape #{})", super::iface::show(&p), self.shape_no(tk));
+            }
+            new_ival |= self.ival_extra.entry(tk).or_default().insert(p);
+        }
+        if self.trace {
+            let known = self.lattice.get(&tk).map(|m| m.iter().filter(|(p, v)| o.constants.get(*p) != Some(*v)).map(|(p, _)| super::iface::show(p)).collect::<Vec<_>>());
+            match known {
+                None => eprintln!("[lattice]   outcome: NEW shape, {} constants, from shape #{}", o.constants.len(), self.shape_no(k)),
+                Some(gone) => eprintln!("[lattice]   outcome: shape #{}, constants removed: {:?}", self.shape_no(tk), gone),
+            }
+        }
+        let changed = match self.lattice.get_mut(&tk) {
+            None => {
+                self.lattice.insert(tk, o.constants);
+                self.states.insert(tk, self.reps.state(&o.rep, &mut it.d)?);
+                self.reps.blocks.insert(tk, o.rep);
+                true
+            }
+            Some(m) => {
+                let before = m.len();
+                m.retain(|p, v| o.constants.get(p) == Some(v));
+                m.len() != before
+            }
+        };
+        // New regions trace next round; narrowed shapes later (`dirty`).
+        let reached = self.regions.entry(tk).or_default();
+        if changed || new_ival {
+            self.dirty.insert(tk);
+        }
+        for r in o.regions {
+            if reached.insert(r) {
+                next.insert((tk, r));
+            }
+        }
+        Ok(respawned)
+    }
+
+    /// A respawn grew the no-player hulls: a no-player node traced under
+    /// bounds that since changed is re-traced (`dirty`).
+    fn respawned(&mut self) -> Result<()> {
+        use super::shapes;
+        for ((k, region), wf) in &self.frames {
+            if region.is_none() && shapes::player_path(&self.states[k]).is_none() {
+                let roots = shapes::state_paths(&self.states[k])?;
+                let now: InputRanges<A> = self.no_player.bounds(*k, &self.states[k])?.into_iter().filter(|(p, _)| roots.iter().any(|q| q == p)).collect();
+                if now != wf.bounds {
+                    self.dirty.insert(*k);
                 }
             }
-            if s.diag.build_trace {
-                for l in no_player.show() {
-                    eprintln!("{l}");
-                }
+        }
+        if self.trace {
+            for l in self.no_player.show() {
+                eprintln!("{l}");
             }
         }
-        // THE DEFERRED RE-TRACE: once no new region appears, re-trace each
-        // narrowed shape in every region it reached. Sound: pins only drop,
-        // and the re-trace repeats until nothing changes.
-        if next_frontier.is_empty() {
-            for k in std::mem::take(&mut dirty) {
-                for r in regions.get(&k).into_iter().flatten() {
-                    next_frontier.insert((k, *r));
-                }
+        Ok(())
+    }
+
+    /// The fixpoint reached (`rounds`: what it took, for the log): every
+    /// reachable node has its frame, or the walk fails.
+    fn finish(self, tracer: Tracer<A>, rounds: String) -> Result<LatticeWalk<A>> {
+        // Every reachable node needs a frame, or the gap shows only at runtime.
+        let nodes: Vec<WalkNode> = self.regions.iter().flat_map(|(k, rs)| rs.iter().map(move |r| (*k, *r))).collect();
+        let missing: Vec<String> = nodes
+            .iter()
+            .filter(|node| !self.frames.contains_key(*node))
+            .map(|node| format!("shape {:#x} region {:?}: {}", node.0, node.1, self.refused.get(node).map(String::as_str).unwrap_or("never traced")))
+            .collect();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "the constant-lattice fixpoint could not trace {} of {} (shape, region) nodes:\n{}",
+                missing.len(),
+                nodes.len(),
+                missing.join("\n")
+            );
+        }
+        eprintln!("[walk] reached {} shapes in {} (shape, region) nodes: {rounds}", self.lattice.len(), nodes.len());
+        // POISONED PATHS: a Lua type error not proven unreachable is a
+        // modelling gap.
+        if !self.illegal.is_empty() {
+            let total: usize = self.illegal.values().sum();
+            eprintln!("[walk] {total} POISONED paths (a Lua raise the tracer could not rule out), by reason:");
+            for (why, n) in &self.illegal {
+                eprintln!("[walk]   {n} x {why}");
             }
         }
-        if lattice_trace {
-            eprintln!("[walk] round {round}: {} traced, {} next, {:.1} s", jobs.len(), next_frontier.len(), t_round.elapsed().as_secs_f64());
+        // Poison counts raise-site hits; this is whether the condition survived.
+        if !self.raising.is_empty() {
+            eprintln!(
+                "[walk] {} of {} (shape, region) nodes have a LIVE raise row (`Frame::raise` did not fold to false)",
+                self.raising.len(),
+                nodes.len()
+            );
         }
-        frontier = next_frontier.into_iter().collect();
+        let cache = self.reps.cache.clone();
+        Ok(LatticeWalk { lattice: self.lattice, reps: self.states, frames: self.frames, cache, tracer, start_key: self.start_key, ival_extra: self.ival_extra, start_ivals: self.start_ivals })
     }
-    // Every reachable node needs a frame, or the gap shows only at runtime.
-    let nodes: Vec<WalkNode> = regions.iter().flat_map(|(k, rs)| rs.iter().map(move |r| (*k, *r))).collect();
-    let missing: Vec<String> = nodes
-        .iter()
-        .filter(|node| !frames.contains_key(*node))
-        .map(|node| format!("shape {:#x} region {:?}: {}", node.0, node.1, refused.get(node).map(String::as_str).unwrap_or("never traced")))
-        .collect();
-    if !missing.is_empty() {
-        bail!(
-            "the constant-lattice fixpoint could not trace {} of {} (shape, region) nodes:\n{}",
-            missing.len(),
-            nodes.len(),
-            missing.join("\n")
-        );
-    }
-    eprintln!(
-        "[walk] reached {} shapes in {} (shape, region) nodes: {traces} traces in {round} rounds, {:.1} s ({n_workers} workers)",
-        lattice.len(),
-        nodes.len(),
-        t_walk.elapsed().as_secs_f64()
-    );
-    // POISONED PATHS: a Lua type error not proven unreachable is a
-    // modelling gap.
-    if !illegal.is_empty() {
-        let total: usize = illegal.values().sum();
-        eprintln!("[walk] {total} POISONED paths (a Lua raise the tracer could not rule out), by reason:");
-        for (why, n) in &illegal {
-            eprintln!("[walk]   {n} x {why}");
-        }
-    }
-    // Poison counts raise-site hits; this is whether the condition survived.
-    if !raising.is_empty() {
-        eprintln!(
-            "[walk] {} of {} (shape, region) nodes have a LIVE raise row (`Frame::raise` did not fold to false)",
-            raising.len(),
-            nodes.len()
-        );
-    }
-    Ok(LatticeWalk { lattice, reps: states, frames, cache, tracer: Tracer { it, chunks }, start_key: sk, ival_extra, start_ivals })
 }
 
 /// `ival` (the level's interval inputs) plus a shape's discovered
