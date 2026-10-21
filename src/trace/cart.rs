@@ -61,7 +61,7 @@ pub const FRAME_CODE: &str = "_update()\n_draw()";
 /// minimal cart, and `--split-frame`'s `_update`.
 pub const BUILTIN_LEVEL_3: &str = include_str!("../../lua/builtin_level_3.lua");
 pub const BUILTIN_LEVEL_4: &str = include_str!("../../lua/builtin_level_4.lua");
-const MINIMAL_CART: &str = include_str!("../../lua/celeste-minimal.lua");
+pub const MINIMAL_CART: &str = include_str!("../../lua/celeste-minimal.lua");
 const SPLIT_FRAME_UPDATE: &str = include_str!("../../lua/split-frame.lua");
 
 /// The cart's Lua under settings `s` (the room, the category's patches, the

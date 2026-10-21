@@ -11,6 +11,7 @@ pub mod search;
 pub mod settings;
 pub mod starts;
 pub mod storage;
+pub mod tools;
 pub mod trace;
 pub mod transpile;
 
