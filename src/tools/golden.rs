@@ -303,7 +303,9 @@ fn play(tool: Tool, level: i16, path: &Path, one_dash: bool, trace: &Path) -> St
 /// buffered jumps re-timed.
 pub fn canonical(tool: Tool, cat: &str, level: i16, tmp: &Path, path: Option<&Path>) -> Result<std::result::Result<Canonical, Skip>> {
     let skip = |why: String| Ok(Err(Skip(why)));
-    let one_dash = cat.starts_with("gemskip");
+    // The goldens' categories include our own (`random0`, a witness's key):
+    // those are any%.
+    let one_dash = cat.parse::<crate::settings::Category>().is_ok_and(crate::settings::Category::gemskip);
     let path = match (path, cat.strip_prefix("random")) {
         (Some(p), _) => p.to_path_buf(),
         (None, Some(i)) => {
@@ -415,7 +417,7 @@ fn one(tool: Tool, job: &Job, tmp: &Path, out: &Path) -> Result<std::result::Res
         })?,
     };
     let seeds = if c.seeds.is_empty() { "-".to_string() } else { c.seeds.join(",") };
-    let gemskip = u8::from(cat.starts_with("gemskip"));
+    let gemskip = u8::from(cat.parse::<crate::settings::Category>().is_ok_and(crate::settings::Category::gemskip));
     let status = c.status.replace(' ', "_");
     Ok(Ok(match tool {
         Tool::Uct => format!("{key} {level} room={},{} seeds={seeds} gemskip={gemskip} updates={updates} uct={status} retimed={}", room.0, room.1, c.retimed),

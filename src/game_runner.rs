@@ -14,6 +14,16 @@ pub fn win_room((x, y): (i16, i16)) -> (i16, i16) {
     }
 }
 
+/// The room before `(x, y)` in the game (`win_room`'s inverse; none before
+/// the first).
+pub fn previous_room((x, y): (i16, i16)) -> Option<(i16, i16)> {
+    match (x, y) {
+        (0, 0) => None,
+        (0, y) => Some((7, y - 1)),
+        (x, y) => Some((x - 1, y)),
+    }
+}
+
 /// The cart's `level_index()` of room (x, y).
 pub fn level_index(x: i16, y: i16) -> i16 {
     x % 8 + y * 8
@@ -56,6 +66,13 @@ mod tests {
     fn win_room_of_the_default_room() {
         assert_eq!(super::win_room((1, 0)), (2, 0));
         assert_eq!(super::win_room((7, 1)), (0, 2));
+        // The room order and its inverse, over every room.
+        for y in 0..4 {
+            for x in 0..8 {
+                assert_eq!(super::previous_room(super::win_room((x, y))), Some((x, y)));
+            }
+        }
+        assert_eq!(super::previous_room((0, 0)), None);
     }
 
     #[test]

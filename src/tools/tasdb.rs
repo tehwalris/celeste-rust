@@ -132,9 +132,10 @@ impl Cat {
     pub fn fallback(self) -> &'static [&'static str] {
         CATS.iter().find(|(c, _)| *c == self.0).expect("a known category").1
     }
-    /// One dash past the orb (what PICO-8, UCT and Celia are told).
+    /// One dash past the orb (what PICO-8, UCT and Celia are told): a gemskip
+    /// category's (`Category::gemskip`).
     pub fn one_dash(self) -> bool {
-        self.0.starts_with("gemskip")
+        self.search().is_ok_and(Category::gemskip)
     }
     /// What the category means to the search (`--category`).
     pub fn search(self) -> Result<Category> {

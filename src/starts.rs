@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 
+use crate::game_runner::previous_room;
 use crate::trace::cart::{room_objects, RoomObject};
 use crate::engines::reference::RefEngine;
 
@@ -47,20 +48,11 @@ pub struct Starts {
     pub celia: Option<usize>,
 }
 
-/// The room before `(x, y)` in the game (`next_room`'s inverse).
-fn previous((x, y): (i16, i16)) -> Option<(i16, i16)> {
-    match (x, y) {
-        (0, 0) => None,
-        (0, y) => Some((7, y - 1)),
-        (x, y) => Some((x - 1, y)),
-    }
-}
-
 /// The J Celia's IL load into `room` applies (cctas.lua `load_level`, offset
 /// 0): the previous room's object count at its load, the title left out;
 /// `None` for the first room (no previous room, no jank).
 pub fn celia_jank(room: (i16, i16)) -> Result<Option<usize>> {
-    let Some(prev) = previous(room) else { return Ok(None) };
+    let Some(prev) = previous_room(room) else { return Ok(None) };
     Ok(Some(room_objects(prev).len()))
 }
 
@@ -69,7 +61,7 @@ pub fn celia_jank(room: (i16, i16)) -> Result<Option<usize>> {
 pub fn starts(s: &crate::settings::Settings) -> Result<Starts> {
     anyhow::ensure!(s.loading_jank.is_none(), "rewrite room enumerates the room's starts: no --loading-jank");
     let level = crate::game_runner::level_index(s.room.0, s.room.1) + 1;
-    let Some(prev) = previous(s.room) else {
+    let Some(prev) = previous_room(s.room) else {
         return Ok(Starts { room: s.room, level, previous: None, previous_objects: Vec::new(), spawn_frame: None, feasible: Vec::new(), classes: Vec::new(), celia: None });
     };
     let objs = room_objects(prev);
@@ -147,12 +139,5 @@ mod tests {
         };
         assert_eq!(at((3, 0)), (vec![3, 4], vec![vec![3, 4]], Some(4), Some(26)));
         assert_eq!(at((4, 1)), (vec![2, 3], vec![vec![2], vec![3]], Some(3), Some(26)));
-    }
-
-    #[test]
-    fn the_room_before_wraps_rows() {
-        assert_eq!(super::previous((0, 0)), None);
-        assert_eq!(super::previous((0, 2)), Some((7, 1)));
-        assert_eq!(super::previous((3, 1)), Some((2, 1)));
     }
 }

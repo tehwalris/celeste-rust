@@ -626,10 +626,8 @@ pub fn align(r: &Runner, room: (i16, i16), cat: Category, name: &str, prologue: 
         let spec = Spec { cart: Cart::Original(original_cart()), play: Play::Room { room, inputs: seq.to_vec(), seeds: Some(seeds.iter().map(|s| pico8::py_float(s)).collect::<Result<_>>()?) }, frames: seq.len() + 1, one_dash: cat.gemskip(), jank: jank.filter(|&j| j > 0), load_draw: false, dump: false, trace_objects: false, fenced: FENCED };
         Ok(pico8::frames(&r.run(&spec)?).into_iter().map(|fr| (fr.f, fr)).collect())
     };
-    let btn = |b: u8| {
-        let s: String = "LRUDJX".chars().enumerate().filter(|(i, _)| b >> i & 1 == 1).map(|(_, c)| c).collect();
-        if s.is_empty() { "-".to_string() } else { s }
-    };
+    // The buttons as letters, `-` for none (`LRUDJX`).
+    let btn = |b: u8| crate::concrete::format_input(b).replace('+', "");
     // The replay runs one frame past the inputs (a path file holds at most
     // that many); a run that has not left by then is not a route under these seeds.
     let ex = |rr: &std::collections::BTreeMap<u32, pico8::Frame>| -> Result<u32> {
