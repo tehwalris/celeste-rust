@@ -207,7 +207,7 @@ fn explain<N: KernelLanes>(run: &super::replay::Replay<N>, idx: &[usize], s: usi
     let kernels = crate::compiled::Kernels::<N>::new(p.side.s, p.side.level)?;
     let mut blocks = vec![tree.row(layer, sk, p.side.s.room)?];
     for k in 0..per_frame {
-        blocks = crate::storage::wave::one_frame(&kernels, blocks, layer + 1 + k as u32)?;
+        blocks = crate::storage::wave::one_frame(&kernels, blocks, layer + 1 + k as u32)?.0;
     }
     let kset: std::collections::BTreeSet<Proj> = blocks.into_iter().flat_map(|mut b| project_onto(&mut b, p.side.level)).collect();
     let want = project_onto(&mut lookup_view(&run.layers[s][idx[s]].1, seeded)?, p.side.level).remove(0);

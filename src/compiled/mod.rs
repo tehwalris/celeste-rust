@@ -11,7 +11,6 @@ use celeste_names as gen;
 
 pub(crate) mod asm_kernel;
 pub(crate) mod cache;
-pub mod dispatch;
 pub mod mix;
 
 pub use asm_kernel::{KernelLanes, Registry, Resident, Scratch};
@@ -142,18 +141,45 @@ impl<N: KernelLanes> Kernels<N> {
         lanes: &[usize],
         sink: &mut crate::storage::unit::UnitSink<N>,
     ) {
-        if !dispatch::run_chunk_kernel(self.registry(), bucket, cell_in, lanes, sink) {
+        if !self.registry().run_chunk(bucket, cell_in, lanes, sink) {
             // A COVERAGE GAP, not a degraded mode: there is no fallback.
             // The search resumes from the last completed frame's checkpoint.
             panic!(
-                "KERNEL COVERAGE GAP: a {}-row bucket of shape {:#018x} has no kernel; \
-                 reasons:\n{}\ntrace the missing shape and resume from the last checkpoint",
+                "KERNEL COVERAGE GAP: {} lanes of a {}-row bucket of shape {:#018x} have no kernel or were declined \
+                 (the reasons above); trace the missing shape and resume from the last checkpoint",
+                lanes.len(),
                 bucket.width,
                 bucket.shape_hash,
-                dispatch::miss_report(),
             );
         }
     }
+}
+
+/// The `kernel lanes:` (`missed 0` is what every log must say: a miss is
+/// FATAL in `Kernels::run_bucket`, so a run that prints this missed none),
+/// `kernel calls:` and `kernel utilization:` lines of `st`, the stats of
+/// the frames the kernels ran.
+pub fn print_kernel_stats(st: &crate::storage::stats::Stats) {
+    use crate::storage::stats::S;
+    let [calls, rows, slices, bodies, taken, takes, emitted] =
+        [S::KernelCalls, S::KernelRows, S::KernelSlices, S::KernelBodies, S::KernelBodiesTaken, S::KernelTakes, S::Emissions].map(|k| st.get(k));
+    if calls == 0 {
+        return;
+    }
+    let slice_lanes = 16 * slices;
+    eprintln!("kernel lanes: traced {rows} missed 0");
+    eprintln!(
+        "kernel calls: {calls} calls, {rows} rows ({:.1} rows/call), {slice_lanes} slice-lanes executed ({:.1}% padding)",
+        rows as f64 / calls as f64,
+        100.0 * (slice_lanes - rows) as f64 / slice_lanes as f64
+    );
+    eprintln!(
+        "kernel utilization: {bodies} (body, slice) evaluations, {taken} ({:.1}%) took a lane; \
+         {takes} lane emissions ({:.1} per input row), {emitted} past level -1 ({:.1}%)",
+        100.0 * taken as f64 / bodies.max(1) as f64,
+        takes as f64 / rows.max(1) as f64,
+        100.0 * emitted as f64 / takes.max(1) as f64
+    );
 }
 
 /// The compiled `FrameStep` (the reference's: `RefEngine`).

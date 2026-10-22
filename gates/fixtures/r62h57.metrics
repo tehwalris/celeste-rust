@@ -51,10 +51,8 @@ calls.bodies 8705261
 calls.bodies_taken 2728832
 calls.calls 259
 calls.lane_emits 36915049
-calls.lanes_missed 0
 calls.rows 704523
 calls.slice_lanes 707824
-calls.unique 18601288
 dyn.cat.a.num 12685261
 dyn.cat.b.cmp 8238706
 dyn.cat.b.logic 15248642

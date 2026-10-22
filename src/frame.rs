@@ -628,12 +628,15 @@ impl<N: Rem> ForwardState<N> {
     /// Compute and checkpoint frames `frames+1 ..= to` under the tree's
     /// level -1 filter and the coarser level's `marks`; only an empty
     /// frontier stops it (the backward seeds from wins at every frame).
+    /// Ends with the kernels' lines over the frames it computed.
     pub(crate) fn extend(&mut self, engine: &dyn FrameStep<N>, dir: &std::path::Path, to: u32, marks: Option<&MarkFilter<N>>) -> Result<()> {
         let edges_dir = dir.join("edges");
         let mut last_free = None;
+        let mut total = Stats::default();
         while self.frames < to && !self.frontier.is_empty() {
             let won_before = self.win_frame.is_some();
             let stats = self.step(engine, Some(&edges_dir), Some(dir), marks)?;
+            total.merge(&stats);
             let frame = self.frames;
             // The frame's LAST write: every file above is trusted from here.
             crate::storage::record::set_done(dir, frame, self.xfers.pairs.len())?;
@@ -644,6 +647,7 @@ impl<N: Rem> ForwardState<N> {
                 eprintln!("[fwd] first win at f{frame}");
             }
         }
+        crate::compiled::print_kernel_stats(&total);
         Ok(())
     }
 }
@@ -1113,7 +1117,7 @@ mod tests {
         let si = sink.push_source(0, (0, 0));
         sink.push_lane(si, cells[0], Hull::full());
         sink.sources_done();
-        crate::compiled::dispatch::run_chunk_kernel(registry, r, &cells, &[0], &mut sink)
+        registry.run_chunk(r, &cells, &[0], &mut sink)
     }
 
     /// The mark filter admits a marked node's rows up to its deadline only.

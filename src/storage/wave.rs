@@ -485,7 +485,6 @@ fn worker<N: Rem>(sh: &Shared<N>, sink: &mut UnitSink<N>, sc: &mut super::route:
         }
         pipe.wait(&mut idle_spins);
     }
-    crate::compiled::dispatch::fold_hits();
     stop.1 = true;
     for (k, n) in [S::RepushSegments, S::RepushRaw, S::RepushRecords, S::RepushGrown].into_iter().zip(rs.read) {
         sink.stats.add(k, n);
@@ -1386,8 +1385,9 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start
 
 /// ONE FRAME of `rows` (widened to the engine's level) against an EMPTY
 /// tree: every successor new, a row's own too (the seeds are forgotten once
-/// keyed); the whole circle as their hulls. The successors, with their keys.
-pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Rt2<N>>, frame: u32) -> Result<Vec<Rt2<N>>> {
+/// keyed); the whole circle as their hulls. The successors, with their
+/// keys, and the frame's stats.
+pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Rt2<N>>, frame: u32) -> Result<(Vec<Rt2<N>>, Stats)> {
     let mut visited = VisitedSet::<N>::new();
     let mut xfers = XferTable::<N>::default();
     let skeletons = Skeletons::<N>::default();
@@ -1396,7 +1396,8 @@ pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Rt2<N>>, frame: u3
     visited.forget_states();
     let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, filters: Filters::default(), frame, edges_dir: None, edges: None, skeletons: &skeletons };
     let wave = run_wave(engine, start, cx)?;
-    Ok(super::layer::decode_states(&wave.frontier.new, &visited.keys, visited.shapes(), usize::MAX, &|_| true)?.into_iter().map(|(_, rt2)| rt2).collect())
+    let rows = super::layer::decode_states(&wave.frontier.new, &visited.keys, visited.shapes(), usize::MAX, &|_| true)?.into_iter().map(|(_, rt2)| rt2).collect();
+    Ok((rows, wave.stats))
 }
 
 #[cfg(test)]

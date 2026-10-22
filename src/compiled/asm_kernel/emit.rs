@@ -525,15 +525,14 @@ pub(super) struct Slice<'a, N: Arithmetic = P8> {
 impl<N: KernelLanes> AsmKernel<N> {
     /// THE EMISSION of one slice (module doc): the cells, level -1, the
     /// keys and transfers, column-wise; then each body's lanes into the
-    /// sink. Returns the lanes emitted (past level -1).
-    pub(super) fn emit(&self, s: Slice<N>, sink: &mut crate::storage::unit::UnitSink<N>) -> u64 {
+    /// sink.
+    pub(super) fn emit(&self, s: Slice<N>, sink: &mut crate::storage::unit::UnitSink<N>) {
         let mut cols = COLS.with(|c| std::mem::take(&mut *c.borrow_mut()));
-        let n = self.emit_with(&mut cols, s, sink);
+        self.emit_with(&mut cols, s, sink);
         COLS.with(|c| *c.borrow_mut() = cols);
-        n
     }
 
-    fn emit_with(&self, c: &mut Cols, s: Slice<N>, sink: &mut crate::storage::unit::UnitSink<N>) -> u64 {
+    fn emit_with(&self, c: &mut Cols, s: Slice<N>, sink: &mut crate::storage::unit::UnitSink<N>) {
         let plan = &self.plan;
         let Slice { chunk, lanes, buf, half, takes, parts } = s;
         c.reset(plan);
@@ -590,7 +589,7 @@ impl<N: KernelLanes> AsmKernel<N> {
             c.arc_need[b.arc as usize] |= t;
         }
         if !any {
-            return 0;
+            return;
         }
         for (r, &(shape, f)) in plan.reads.iter().enumerate() {
             let need = c.read_need[r];
@@ -628,7 +627,6 @@ impl<N: KernelLanes> AsmKernel<N> {
         }
         // Each body's emissions: its keys assembled, into the sink.
         let generation = keys.generation();
-        let mut emitted = 0u64;
         for (bi, (b, body)) in plan.bodies.iter().zip(&self.bodies).enumerate() {
             let take = c.take[bi];
             if take == 0 {
@@ -662,7 +660,6 @@ impl<N: KernelLanes> AsmKernel<N> {
                     sink.provisional().intern(self.miss_key(bi, buf, half, i, &c.read_miss, shape, packed.get(i), &part.missing))
                 };
             }
-            emitted += take.count_ones() as u64;
             let targets = &c.targets[b.column as usize];
             let e = crate::storage::unit::BodyEmits { shape, take, keys: &out_keys, targets, xfers: &c.arc_ids[b.arc as usize] };
             let cols = &self.body_cols[bi];
@@ -670,7 +667,6 @@ impl<N: KernelLanes> AsmKernel<N> {
                 panic!("frame step: {e:#}");
             }
         }
-        emitted
     }
 
     /// Body `bi`'s lane `i`'s exact content where a code is missing: its

@@ -98,6 +98,16 @@ registry! {
     Bundles "bundles" Count Bundles;
     WaitedSegments "waited_segments" Count WaitedSegments;
     WaitedBundles "waited_bundles" Count WaitedBundles;
+    // The kernels' calls (`compiled::print_kernel_stats`): the calls, the
+    // rows they ran, their 16-lane slices, the (body, slice) evaluations
+    // and those that took a lane, the lanes the bodies took (before level
+    // -1; `lanes_raw` after it).
+    KernelCalls "kernel_calls" Count KernelCalls;
+    KernelRows "kernel_rows" Count KernelRows;
+    KernelSlices "kernel_slices" Count KernelSlices;
+    KernelBodies "kernel_bodies" Count KernelBodies;
+    KernelBodiesTaken "kernel_bodies_taken" Count KernelBodiesTaken;
+    KernelTakes "kernel_takes" Count KernelTakes;
     // The key space after the frame.
     KeyBits "key_bits" Count KeyBits;
     KeyCodes "key_codes" Count KeyCodes;
@@ -260,7 +270,7 @@ impl<R: Registry, const K: usize> Stats<R, K> {
     }
     /// `o`'s counts and times added (a worker's into the frame's; a `Max`
     /// stat the larger).
-    pub(crate) fn merge(&mut self, o: &Self) {
+    pub fn merge(&mut self, o: &Self) {
         for (k, &s) in R::ALL.iter().enumerate() {
             if s.unit() == Unit::Max {
                 self.v[k] = self.v[k].max(o.v[k]);

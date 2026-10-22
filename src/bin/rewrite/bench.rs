@@ -164,7 +164,6 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
 /// `bench frame` in the arithmetic of `N` (`--metrics`, the kernel census,
 /// is 16.16's).
 fn bench_frame<N: Rem + celeste_rust::compiled::KernelLanes>(t: &TreeDir, a: &FrameArgs) -> Result<()> {
-    use celeste_rust::compiled::dispatch::{print_stats, take_kernel_stats};
     let (cfg, level, dir) = (&t.settings, t.level, &t.dir);
     let (edges, checkpoint, reps) = (a.edges, a.checkpoint, a.reps);
     anyhow::ensure!(!checkpoint || edges, "--checkpoint needs --edges (the frame's files as the forward writes them)");
@@ -237,22 +236,18 @@ fn bench_frame<N: Rem + celeste_rust::compiled::KernelLanes>(t: &TreeDir, a: &Fr
             Some(first) => anyhow::ensure!(*first == out, "rep {rep} differs from rep 0:\n{out}against\n{first}"),
         }
         if rep == 0 {
-            let ks = take_kernel_stats();
-            print_stats(&ks);
-            anyhow::ensure!(ks.missed == 0, "KERNEL COVERAGE GAP: {} lanes missed", ks.missed);
+            celeste_rust::compiled::print_kernel_stats(&costs[0].stats);
             if let Some(path) = &a.metrics {
                 let kernels = celeste_rust::compiled::mix::kernel_metrics();
                 let slices: u64 = kernels.iter().map(|k| k.1).sum();
                 let insts: u64 = kernels.iter().map(|(_, n, c)| n * c.get("insts").copied().unwrap_or(0)).sum();
                 eprintln!("[bench] kernels: {insts} dynamic instructions over {slices} slices ({} a slice; call-outs' callees aside)", insts.checked_div(slices).unwrap_or(0));
-                pinned(path, &frame_metrics(cfg.room, level, frame, &costs[0].stats, &ks), a.pin, metrics_moves)?;
+                pinned(path, &frame_metrics(cfg.room, level, frame, &costs[0].stats), a.pin, metrics_moves)?;
             }
             celeste_rust::compiled::mix::reset_slices();
         }
         lines = Some(out);
     }
-    let ks = take_kernel_stats();
-    anyhow::ensure!(ks.missed == 0, "KERNEL COVERAGE GAP: {} lanes missed", ks.missed);
     celeste_rust::storage::bench::print_cost(frame + 1, &costs);
     if let (Some(path), Some(out)) = (&a.expect, &lines) {
         pinned(path, out, a.pin, line_moves)?;
@@ -412,7 +407,7 @@ fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize)
 /// (no timings: the same at every thread count): the frame's, the calls',
 /// every built kernel's census summed (`all.*`), the dynamic instructions
 /// (`dyn.*`: slices x static count) and per kernel that ran (`k.<sym>.*`).
-fn frame_metrics((rx, ry): (i16, i16), level: Level, frame: u32, w: &celeste_rust::storage::stats::Stats, ks: &celeste_rust::compiled::dispatch::KernelStats) -> String {
+fn frame_metrics((rx, ry): (i16, i16), level: Level, frame: u32, w: &celeste_rust::storage::stats::Stats) -> String {
     use celeste_rust::storage::stats::S;
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
@@ -430,14 +425,12 @@ fn frame_metrics((rx, ry): (i16, i16), level: Level, frame: u32, w: &celeste_rus
     // transfer ids, sorted bundles, zstd -1).
     put("frame.edge_bytes", w.get(S::EdgeBytes));
     put("frame.edge_millibytes_per_edge", (w.get(S::EdgeBytes) * 1000).checked_div(w.get(S::Edges)).unwrap_or(0));
-    put("calls.calls", ks.calls);
-    put("calls.rows", ks.rows);
-    put("calls.slice_lanes", ks.slice_lanes);
-    put("calls.bodies", ks.bodies);
-    put("calls.bodies_taken", ks.bodies_taken);
-    put("calls.lane_emits", ks.lane_emits);
-    put("calls.unique", ks.unique);
-    put("calls.lanes_missed", ks.missed);
+    put("calls.calls", w.get(S::KernelCalls));
+    put("calls.rows", w.get(S::KernelRows));
+    put("calls.slice_lanes", 16 * w.get(S::KernelSlices));
+    put("calls.bodies", w.get(S::KernelBodies));
+    put("calls.bodies_taken", w.get(S::KernelBodiesTaken));
+    put("calls.lane_emits", w.get(S::KernelTakes));
     let kernels = celeste_rust::compiled::mix::kernel_metrics();
     put("kernels.built", kernels.len() as u64);
     // Every kernel's census summed.

@@ -160,8 +160,6 @@ pub fn mem_phase(tag: &str) {
 /// to `<dir>/metrics.jsonl`: {"kind", "phases": {name: {"s", "calls"}},
 /// "extra": ...}. A write failure is reported, never fatal.
 pub fn dump(kind: &str, dir: Option<&std::path::Path>, extra: &[(&str, String)]) {
-    // Kernel coverage, when a compiled run was in play.
-    crate::compiled::dispatch::print_kernel_hits();
     let phases = PHASES.lock().unwrap();
     if phases.is_empty() {
         return;
