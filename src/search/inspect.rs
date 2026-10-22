@@ -23,7 +23,7 @@ pub(crate) fn av_show<N: Arithmetic>(v: AV<N>) -> String {
 /// then the globals'.
 pub fn cell_names<N: Arithmetic>(rt2: &Rt2<N>, ids: &BoundaryIds) -> HashMap<usize, String> {
     let mut names = HashMap::new();
-    if let Some(obj) = crate::search::pos_graph::player_object(rt2) {
+    if let Some(obj) = rt2.position_object() {
         for (nm, f) in [("player.x", ids.f_x), ("player.y", ids.f_y), ("dash_effect_time", ids.f_dash_effect_time)] {
             if let Some(c) = rt2.obj_field_cell(obj, f) {
                 names.insert(c as usize, nm.to_string());
@@ -126,9 +126,9 @@ pub fn project_all<N: Arithmetic>(rt2: &Rt2<N>) -> Vec<Proj> {
     (0..rt2.width).map(|r| project_row(rt2, &names, r as u32, &[])).collect()
 }
 
-/// Every row of `rt2` widened onto `level` (`frame::widen_rt2_to`), projected.
+/// Every row of `rt2` widened onto `level` (`Rt2::widen_to`), projected.
 pub fn project_onto<N: Arithmetic>(rt2: &mut Rt2<N>, level: crate::abstraction::Level) -> Vec<Proj> {
-    crate::frame::widen_rt2_to(rt2, level);
+    rt2.widen_to(level);
     project_all(rt2)
 }
 

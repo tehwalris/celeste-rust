@@ -8,6 +8,8 @@
 //! for both: a guard and a MONOTONE action or a constant; the pull is
 //! exact on both.
 
+use super::rem::Word;
+
 /// Points on the circle: 1 px in raw 16.16 units.
 pub(crate) const CIRCLE: u32 = 1 << 16;
 
@@ -32,7 +34,7 @@ pub struct Seg<P = u32> {
 pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + PartialOrd + Ord + std::hash::Hash + Send + Sync + 'static {
     type P: Copy + Ord + std::hash::Hash + std::fmt::Debug + Default + Send + Sync + 'static;
     /// A stored point or count (arena words, hull bounds), in point order.
-    type W: Copy + Ord + std::hash::Hash + std::fmt::Debug + Default + Send + Sync + 'static;
+    type W: Word;
     /// A transfer's monotone action: 16.16's a translation, the doubles'
     /// `r -> fl(fl(r + ox) - k)`.
     type Mono: Copy + std::fmt::Debug + PartialEq + Eq + std::hash::Hash + Send + Sync + 'static;
@@ -42,23 +44,18 @@ pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + PartialOrd
     /// `p + 1` and `p - 1`.
     fn next(p: Self::P) -> Self::P;
     fn prev(p: Self::P) -> Self::P;
-    /// A point, or a count (at most `SIZE`, or `MAX_SEGS`), as a word.
-    fn store(p: Self::P) -> Self::W;
-    fn load(w: Self::W) -> Self::P;
-    fn count(n: usize) -> Self::W;
-    fn len(w: Self::W) -> usize;
     /// A point (or `SIZE`) as a number and back (the hull's arithmetic).
     fn wide(p: Self::P) -> u64;
     fn narrow(v: u64) -> Self::P;
-    /// A word's little-endian bytes on disk, and the hash of a hull's four
-    /// words (statistics, fingerprints, the push cache's slot).
-    const W_BYTES: usize;
-    fn put_word(w: Self::W, out: &mut Vec<u8>);
-    fn get_word(b: &[u8]) -> Self::W;
-    fn hash4(w: [Self::W; 4]) -> u64;
-    /// Are a hull's four words equal (`PushCache::get`)? 16.16's in one
-    /// 8-byte compare; the doubles' word by word (a miss differs early).
-    fn same4(a: [Self::W; 4], b: [Self::W; 4]) -> bool;
+    /// A point as a word, and back.
+    #[inline]
+    fn store(p: Self::P) -> Self::W {
+        Self::W::of(Self::wide(p))
+    }
+    #[inline]
+    fn load(w: Self::W) -> Self::P {
+        Self::narrow(w.get())
+    }
     /// The image of a guard's point `p` under `m` (inside the circle: the
     /// decode checked it).
     fn apply(m: &Self::Mono, p: Self::P) -> Self::P;
@@ -174,44 +171,12 @@ impl Circle for Fixed16 {
         p - 1
     }
     #[inline]
-    fn store(p: u32) -> u16 {
-        p as u16
-    }
-    #[inline]
-    fn load(w: u16) -> u32 {
-        w as u32
-    }
-    #[inline]
-    fn count(n: usize) -> u16 {
-        n as u16
-    }
-    #[inline]
-    fn len(w: u16) -> usize {
-        w as usize
-    }
-    #[inline]
     fn wide(p: u32) -> u64 {
         p as u64
     }
     #[inline]
     fn narrow(v: u64) -> u32 {
         v as u32
-    }
-    const W_BYTES: usize = 2;
-    fn put_word(w: u16, out: &mut Vec<u8>) {
-        out.extend_from_slice(&w.to_le_bytes());
-    }
-    fn get_word(b: &[u8]) -> u16 {
-        u16::from_le_bytes([b[0], b[1]])
-    }
-    /// The four words in one, low first: exact.
-    #[inline]
-    fn hash4(w: [u16; 4]) -> u64 {
-        w[0] as u64 | (w[1] as u64) << 16 | (w[2] as u64) << 32 | (w[3] as u64) << 48
-    }
-    #[inline]
-    fn same4(a: [u16; 4], b: [u16; 4]) -> bool {
-        a == b
     }
     #[inline]
     fn apply(d: &i32, p: u32) -> u32 {
@@ -294,7 +259,7 @@ pub(super) fn clip<P: Ord + Copy>(s: Seg<P>, g: Seg<P>) -> Option<Seg<P>> {
 impl<C: Circle> Region<C> {
     pub(crate) fn full() -> Self {
         let all = Stored::of::<C>(Seg { lo: C::P::default(), hi: C::SIZE });
-        Region { slabs: vec![Slab { y: all, end: C::count(1) }], xs: vec![all] }
+        Region { slabs: vec![Slab { y: all, end: C::W::of(1) }], xs: vec![all] }
     }
     pub(crate) fn as_ref(&self) -> RegionRef<'_, C> {
         RegionRef { slabs: &self.slabs, xs: &self.xs }
@@ -304,30 +269,6 @@ impl<C: Circle> Region<C> {
     }
     pub(crate) fn n_segs(&self) -> usize {
         self.xs.len()
-    }
-    #[cfg(test)]
-    pub(crate) fn slabs(&self) -> impl Iterator<Item = (Seg<C::P>, impl Iterator<Item = Seg<C::P>> + '_)> + '_ {
-        self.as_ref().slabs()
-    }
-    #[cfg(test)]
-    pub(crate) fn contains(&self, x: C::P, y: C::P) -> bool {
-        self.as_ref().contains(x, y)
-    }
-    #[cfg(test)]
-    pub(crate) fn pieces(&self, out: &mut Vec<Piece<C::P>>) {
-        self.as_ref().pieces(out)
-    }
-    #[cfg(test)]
-    pub(crate) fn push(&self, x: Transfer<C>, y: Transfer<C>, out: &mut Vec<Piece<C::P>>) {
-        self.as_ref().push(x, y, out)
-    }
-    #[cfg(test)]
-    pub(crate) fn clip_into(&self, p: Piece<C::P>, out: &mut Vec<Piece<C::P>>) {
-        self.as_ref().clip_into(p, out)
-    }
-    #[cfg(test)]
-    pub(crate) fn pull(&self, x: Transfer<C>, y: Transfer<C>, out: &mut Vec<Piece<C::P>>) {
-        self.as_ref().pull(x, y, out)
     }
     /// The union of `pieces`, canonical (one sweep over y). `pieces` is
     /// left in an unspecified order.
@@ -368,8 +309,8 @@ impl<C: Circle> Region<C> {
                     _ => merged.push(s),
                 }
             }
-            let start = out.slabs.last().map_or(0, |s| C::len(s.end));
-            let prev_start = if out.slabs.len() >= 2 { C::len(out.slabs[out.slabs.len() - 2].end) } else { 0 };
+            let start = out.slabs.last().map_or(0, |s| s.end.get() as usize);
+            let prev_start = if out.slabs.len() >= 2 { out.slabs[out.slabs.len() - 2].end.get() as usize } else { 0 };
             if let Some(last) = out.slabs.last_mut() {
                 if C::next(C::load(last.y.last)) == lo && out.xs[prev_start..start].iter().map(|s| s.seg::<C>()).eq(merged.iter().copied()) {
                     last.y = Stored::of::<C>(Seg { lo: C::load(last.y.lo), hi });
@@ -380,7 +321,7 @@ impl<C: Circle> Region<C> {
             if out.xs.len() > max {
                 return None;
             }
-            out.slabs.push(Slab { y: Stored::of::<C>(Seg { lo, hi }), end: C::count(out.xs.len()) });
+            out.slabs.push(Slab { y: Stored::of::<C>(Seg { lo, hi }), end: C::W::of(out.xs.len() as u64) });
         }
         Some(out)
     }
@@ -412,7 +353,7 @@ impl<'a, C: Circle> RegionRef<'a, C> {
     fn stored(self) -> impl Iterator<Item = (Seg<C::P>, &'a [Stored<C::W>])> + 'a {
         let mut start = 0;
         self.slabs.iter().map(move |s| {
-            let end = C::len(s.end);
+            let end = s.end.get() as usize;
             let xs = &self.xs[start..end];
             start = end;
             (s.y.seg::<C>(), xs)
@@ -427,8 +368,8 @@ impl<'a, C: Circle> RegionRef<'a, C> {
     fn slab_at(self, y: C::P) -> Option<&'a [Stored<C::W>]> {
         let i = self.slabs.partition_point(|s| C::load(s.y.last) < y);
         let s = self.slabs.get(i).filter(|s| C::load(s.y.lo) <= y)?;
-        let start = if i == 0 { 0 } else { C::len(self.slabs[i - 1].end) };
-        Some(&self.xs[start..C::len(s.end)])
+        let start = if i == 0 { 0 } else { self.slabs[i - 1].end.get() as usize };
+        Some(&self.xs[start..s.end.get() as usize])
     }
     fn holds(xs: &[Stored<C::W>], p: C::P) -> bool {
         let i = xs.partition_point(|s| C::load(s.last) < p);
@@ -517,7 +458,7 @@ pub(crate) struct RegionArena<C: Circle = Fixed16> {
     at: Vec<u64>,
     /// A chunk's words at most (`CHUNK_WORDS`; tests seal smaller ones).
     chunk: usize,
-    sealed: Vec<Words<C::W>>,
+    sealed: Vec<crate::storage::scratch::Words<C::W>>,
     open: Vec<C::W>,
     /// Words in the sealed chunks, and in those of them mapped.
     sealed_words: u64,
@@ -525,25 +466,68 @@ pub(crate) struct RegionArena<C: Circle = Fixed16> {
     spill: Option<std::path::PathBuf>,
 }
 
-enum Words<W> {
-    Mem(Vec<W>),
-    Map(memmap2::Mmap),
+/// SETS ONCE: an arena of sets and their index by hash. A set equal to
+/// one held is found; a new one is pushed (a hash collision with a
+/// different set: pushed apart, the index keeps the first).
+#[derive(Default)]
+pub(crate) struct Interner<C: Circle = Fixed16> {
+    arena: RegionArena<C>,
+    index: rustc_hash::FxHashMap<u64, u32>,
 }
 
-impl<W> Words<W> {
-    fn words(&self) -> &[W] {
-        match self {
-            Words::Mem(v) => v,
-            // SAFETY: a map starts on a page (aligned for any word) and holds
-            // whole words (`seal` writes them); words are plain data.
-            Words::Map(m) => unsafe { std::slice::from_raw_parts(m.as_ptr().cast::<W>(), m.len() / std::mem::size_of::<W>()) },
-        }
+impl<C: Circle> Interner<C> {
+    /// Set `r` (its hash `h`, `region_hash`), if held.
+    pub(crate) fn find(&self, r: RegionRef<C>, h: u64) -> Option<u32> {
+        self.index.get(&h).copied().filter(|&s| self.arena.get(s) == r)
     }
+    /// Set `r` held once: found, or pushed.
+    pub(crate) fn intern(&mut self, r: RegionRef<C>) -> u32 {
+        let h = region_hash(r);
+        self.find(r, h).unwrap_or_else(|| self.push_hashed(r, h))
+    }
+    /// Set `r` pushed (a copy kept apart if held), its hash indexed if free.
+    pub(crate) fn push(&mut self, r: RegionRef<C>) -> u32 {
+        self.push_hashed(r, region_hash(r))
+    }
+    fn push_hashed(&mut self, r: RegionRef<C>, h: u64) -> u32 {
+        let s = self.arena.push(r);
+        self.index.entry(h).or_insert(s);
+        s
+    }
+    pub(crate) fn get(&self, i: u32) -> RegionRef<'_, C> {
+        self.arena.get(i)
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.arena.len()
+    }
+    /// The bytes its sets take (`RegionArena::bytes`).
+    pub(crate) fn bytes(&self) -> usize {
+        self.arena.bytes()
+    }
+    pub(crate) fn mapped_bytes(&self) -> usize {
+        self.arena.mapped_bytes()
+    }
+    /// Seal its full chunks into scratch files in `dir` (`RegionArena::spill_to`).
+    pub(crate) fn spill_to(&mut self, dir: &std::path::Path) {
+        self.arena.spill_to(dir)
+    }
+    /// Its arena, the index dropped.
+    pub(crate) fn into_arena(self) -> RegionArena<C> {
+        self.arena
+    }
+}
+
+/// A set's hash (`Interner`'s index).
+pub(crate) fn region_hash<C: Circle>(r: RegionRef<C>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hs = rustc_hash::FxHasher::default();
+    r.hash(&mut hs);
+    hs.finish()
 }
 
 /// The set whose record starts `w`.
 fn record<C: Circle>(w: &[C::W]) -> RegionRef<'_, C> {
-    let (ns, nx) = (C::len(w[0]), C::len(w[1]));
+    let (ns, nx) = (w[0].get() as usize, w[1].get() as usize);
     let (s, x) = (&w[2..2 + 3 * ns], &w[2 + 3 * ns..2 + 3 * ns + 2 * nx]);
     const { assert!(std::mem::size_of::<Slab<C::W>>() == 3 * std::mem::size_of::<C::W>() && std::mem::size_of::<Stored<C::W>>() == 2 * std::mem::size_of::<C::W>()) };
     // SAFETY: `Slab` and `Stored` are `repr(C)` structs of 3 and 2 words
@@ -573,7 +557,7 @@ impl<C: Circle> RegionArena<C> {
             self.seal();
         }
         self.at.push((self.sealed.len() as u64) << 32 | self.open.len() as u64);
-        self.open.extend([C::count(r.slabs.len()), C::count(r.xs.len())]);
+        self.open.extend([C::W::of(r.slabs.len() as u64), C::W::of(r.xs.len() as u64)]);
         for s in r.slabs {
             self.open.extend([s.y.lo, s.y.last, s.end]);
         }
@@ -586,18 +570,11 @@ impl<C: Circle> RegionArena<C> {
         let open = std::mem::take(&mut self.open);
         self.sealed_words += open.len() as u64;
         let w = match &self.spill {
-            None => Words::Mem(open),
+            None => crate::storage::scratch::Words::Mem(open),
             Some(dir) => {
                 let path = dir.join(format!("sets-{:05}.bin", self.sealed.len()));
-                let map = || -> anyhow::Result<memmap2::Mmap> {
-                    let f = crate::storage::scratch::Scratch::create(&path)?;
-                    // SAFETY: plain words as their bytes.
-                    f.put(unsafe { std::slice::from_raw_parts(open.as_ptr().cast::<u8>(), std::mem::size_of_val(&open[..])) })?;
-                    f.map()
-                };
-                let m = map().unwrap_or_else(|e| panic!("FATAL: the arc phase's set chunk {}: {e:#}", path.display()));
                 self.mapped_words += open.len() as u64;
-                Words::Map(m)
+                crate::storage::scratch::Words::spill(&path, open).unwrap_or_else(|e| panic!("FATAL: the arc phase's set chunk {}: {e:#}", path.display()))
             }
         };
         self.sealed.push(w);
@@ -605,7 +582,7 @@ impl<C: Circle> RegionArena<C> {
     pub(crate) fn get(&self, i: u32) -> RegionRef<'_, C> {
         let a = self.at[i as usize];
         let c = (a >> 32) as usize;
-        let w = if c == self.sealed.len() { &self.open[..] } else { self.sealed[c].words() };
+        let w = if c == self.sealed.len() { &self.open[..] } else { &self.sealed[c][..] };
         record::<C>(&w[a as u32 as usize..])
     }
     /// The bytes its sets take (their records and places).
@@ -628,12 +605,7 @@ mod tests {
         // Random regions (a few pieces each), pushed into arenas with small
         // chunks - kept in memory, and spilled to files - read back equal.
         let mut rng = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = move |n: u32| {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            (rng % n as u64) as u32
-        };
+        let mut next = move |n: u32| (crate::testutil::xorshift(&mut rng) % n as u64) as u32;
         let mut regions = Vec::new();
         let mut scratch = Vec::new();
         for _ in 0..500 {
@@ -646,7 +618,7 @@ mod tests {
             regions.push(Region::<Fixed16>::from_pieces(&mut pieces, &mut scratch));
         }
         regions.push(Region::default());
-        let dir = std::env::temp_dir().join(format!("arena-test-{}", std::process::id()));
+        let dir = crate::testutil::TestDir::new("arena-test");
         std::fs::create_dir_all(&dir).unwrap();
         for spill in [false, true] {
             let mut a = RegionArena { chunk: 64, ..RegionArena::default() };
@@ -666,8 +638,7 @@ mod tests {
     }
 
     fn lcg(s: &mut u64) -> u32 {
-        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (*s >> 33) as u32
+        (crate::testutil::lcg(s) >> 33) as u32
     }
 
     /// The canonical sweep against the plain union of pieces, and `pull`
@@ -692,7 +663,7 @@ mod tests {
             let inside = |x: u32, y: u32| orig.iter().any(|p| p.x.lo <= x && x < p.x.hi && p.y.lo <= y && y < p.y.hi);
             for &x in &probes {
                 for &y in &probes {
-                    assert_eq!(r.contains(x, y), inside(x, y), "({x}, {y})");
+                    assert_eq!(r.as_ref().contains(x, y), inside(x, y), "({x}, {y})");
                 }
             }
             // Canonical: the same set from the pieces in another order.
@@ -709,7 +680,7 @@ mod tests {
             };
             let (tx, ty) = (transfer(&mut s), transfer(&mut s));
             let mut out = Vec::new();
-            r.pull(tx, ty, &mut out);
+            r.as_ref().pull(tx, ty, &mut out);
             let pr = Region::<Fixed16>::from_pieces(&mut out, &mut Vec::new());
             let mut pp: Vec<u32> = probes.iter().flat_map(|&v| {
                 let back = |t: Transfer| match t.act {
@@ -722,42 +693,42 @@ mod tests {
             pp.dedup();
             for &x in &pp {
                 for &y in &pp {
-                    let want = tx.takes(x) && ty.takes(y) && r.contains(apply(tx, x), apply(ty, y));
-                    assert_eq!(pr.contains(x, y), want, "pull at ({x}, {y})");
+                    let want = tx.takes(x) && ty.takes(y) && r.as_ref().contains(apply(tx, x), apply(ty, y));
+                    assert_eq!(pr.as_ref().contains(x, y), want, "pull at ({x}, {y})");
                 }
             }
             // push: a point q is in the image iff some point of r inside the
             // guards maps to it - checked from both sides: every probed point
             // of r maps into the image, and the image's points pull back into r.
             let mut out = Vec::new();
-            r.push(tx, ty, &mut out);
+            r.as_ref().push(tx, ty, &mut out);
             let img = Region::<Fixed16>::from_pieces(&mut out, &mut Vec::new());
             for &x in &pp {
                 for &y in &pp {
-                    if tx.takes(x) && ty.takes(y) && r.contains(x, y) {
-                        assert!(img.contains(apply(tx, x), apply(ty, y)), "push misses the image of ({x}, {y})");
+                    if tx.takes(x) && ty.takes(y) && r.as_ref().contains(x, y) {
+                        assert!(img.as_ref().contains(apply(tx, x), apply(ty, y)), "push misses the image of ({x}, {y})");
                     }
                 }
             }
             let mut back = Vec::new();
-            img.pull(tx, ty, &mut back);
+            img.as_ref().pull(tx, ty, &mut back);
             let mut inter = Vec::new();
             for p in back {
-                r.clip_into(p, &mut inter);
+                r.as_ref().clip_into(p, &mut inter);
             }
             let back = Region::<Fixed16>::from_pieces(&mut inter, &mut Vec::new());
             let mut again = Vec::new();
-            back.push(tx, ty, &mut again);
+            back.as_ref().push(tx, ty, &mut again);
             assert_eq!(Region::<Fixed16>::from_pieces(&mut again, &mut Vec::new()), img, "the image is exactly the image of its preimage in r");
             // clip_into is the intersection.
             let q = Piece { y: seg(&mut s), x: seg(&mut s) };
             let mut cl = Vec::new();
-            r.clip_into(q, &mut cl);
+            r.as_ref().clip_into(q, &mut cl);
             let cr = Region::<Fixed16>::from_pieces(&mut cl, &mut Vec::new());
             for &x in &probes {
                 for &y in &probes {
                     let inq = q.x.lo <= x && x < q.x.hi && q.y.lo <= y && y < q.y.hi;
-                    assert_eq!(cr.contains(x, y), inq && r.contains(x, y), "clip at ({x}, {y})");
+                    assert_eq!(cr.as_ref().contains(x, y), inq && r.as_ref().contains(x, y), "clip at ({x}, {y})");
                 }
             }
         }

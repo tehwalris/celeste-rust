@@ -18,6 +18,40 @@ const ROOM_PX: i32 = 128;
 /// node, past the end of the grid so no position aliases it.
 pub(crate) const NO_CELL: u32 = (GRID * GRID) as u32;
 
+/// THE STORAGE REGIONS: `SIDE` x `SIDE` cells (an entry's cells: a `u64`
+/// mask), aligned at 0 as the kernels' `RegionGrid::of` (the grid's origin
+/// -64 is a multiple of `SIDE`), each inside one kernel region (`--region`:
+/// a multiple of `SIDE` px). A SLOT is a region's place on the grid,
+/// row-major, `NO_CELL`'s last.
+pub(crate) const SIDE: u32 = 8;
+const _: () = assert!(SIDE * SIDE == 64 && ORIGIN % SIDE as i32 == 0, "a storage region's cells are a u64 mask, on the grid's origin");
+pub(crate) const PER_ROW: u32 = GRID as u32 / SIDE;
+/// Slots per shape: the grid's regions and `NO_CELL`'s.
+pub(crate) const SLOTS: u32 = PER_ROW * PER_ROW + 1;
+pub(crate) const NO_CELL_SLOT: u32 = SLOTS - 1;
+
+/// A cell's region slot and its index in the region.
+#[inline]
+pub(crate) fn slot_local(cell: u32) -> (u32, u32) {
+    if cell == NO_CELL {
+        return (NO_CELL_SLOT, 0);
+    }
+    let (gx, gy) = (cell % GRID as u32, cell / GRID as u32);
+    ((gy / SIDE) * PER_ROW + gx / SIDE, (gy % SIDE) * SIDE + gx % SIDE)
+}
+
+/// `slot_local` inverted.
+#[inline]
+pub(crate) fn cell(slot: u32, local: u32) -> u32 {
+    if slot == NO_CELL_SLOT {
+        debug_assert_eq!(local, 0);
+        return NO_CELL;
+    }
+    let (rx, ry) = (slot % PER_ROW, slot / PER_ROW);
+    let (gx, gy) = (rx * SIDE + local % SIDE, ry * SIDE + local / SIDE);
+    gy * GRID as u32 + gx
+}
+
 /// Grid cell of a whole-pixel start-room-relative position; an error
 /// outside the grid, never a clamp.
 pub fn cell_of(x: i32, y: i32) -> Result<u32> {
@@ -78,12 +112,6 @@ pub(crate) fn whole_range_col<N: Arithmetic>(rt2: &Rt2<N>, cell: u32) -> Option<
     }
 }
 
-/// The block's player object (`player`, else `player_spawn`): one per
-/// block, its lanes share structure.
-pub(crate) fn player_object<N: Arithmetic>(rt2: &Rt2<N>) -> Option<u32> {
-    rt2.position_object()
-}
-
 /// Per-lane cell of a block (`room.x`/`room.y` must be numbers; no player or
 /// a non-numeric position: `NO_CELL`); the start room is its cache's.
 pub fn block_cells<N: Arithmetic>(rt2: &Rt2<N>) -> Result<Vec<u32>> {
@@ -97,7 +125,7 @@ pub fn block_cells<N: Arithmetic>(rt2: &Rt2<N>) -> Result<Vec<u32>> {
     let (Some(rx), Some(ry)) = (axis(room, ids.f_x), axis(room, ids.f_y)) else {
         return Err(anyhow!("block_cells: room.x/room.y are not numbers"));
     };
-    let Some(obj) = player_object(rt2) else {
+    let Some(obj) = rt2.position_object() else {
         return Ok(vec![NO_CELL; lanes]);
     };
     let (Some(px), Some(py)) = (axis(obj, ids.f_x), axis(obj, ids.f_y)) else {
@@ -141,5 +169,24 @@ mod tests {
         // No position can alias the no-position node.
         assert!(cell_of(ORIGIN + GRID - 1, ORIGIN + GRID - 1).unwrap() < NO_CELL);
         assert_eq!(cell_xy(NO_CELL), None);
+    }
+
+    /// Slots and cells round-trip through the storage regions, each inside
+    /// a 16 px kernel region.
+    #[test]
+    fn cells_round_trip_through_regions() {
+        let side = SIDE as i32;
+        for (x, y) in [(-64, -64), (-1, 0), (0, -1), (5, 7), (127, 127), (200, 40), (447, 447)] {
+            let c = cell_of(x, y).unwrap();
+            let (slot, local) = slot_local(c);
+            assert!(slot < NO_CELL_SLOT && local < SIDE * SIDE);
+            assert_eq!(cell(slot, local), c);
+            let (x0, y0) = ((slot % PER_ROW) as i32 * side - 64, (slot / PER_ROW) as i32 * side - 64);
+            assert_eq!((x0, y0), (x.div_euclid(side) * side, y.div_euclid(side) * side));
+            let k = |v: i32| v.div_euclid(16);
+            assert_eq!((k(x0), k(y0)), (k(x0 + side - 1), k(y0 + side - 1)));
+        }
+        assert_eq!(slot_local(NO_CELL), (NO_CELL_SLOT, 0));
+        assert_eq!(cell(NO_CELL_SLOT, 0), NO_CELL);
     }
 }

@@ -8,15 +8,16 @@
 //!
 //! The blocks (each `Block` in the frame file's header): the new states'
 //! hulls in runs of `NEW_BLOCK` (`HullOf::BYTES` each: 8 in 16.16), then
-//! the grown states in runs of `GROWN_BLOCK`, each its layer, region, key
-//! (deltas from the previous state where they share the fields before),
-//! cell and hull.
+//! the grown states in runs of `GROWN_BLOCK`, each its layer (a delta) and
+//! state (`codec::put_sk` after the previous state of its layer), and its
+//! hull.
 
 use crate::search::hull::HullOf;
 use anyhow::{ensure, Context, Result};
 
-use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128, wide};
+use super::codec::{get_sk, get_varint, put_sk, put_varint};
 use super::file::{self, At, Mapped};
+use super::wave::Frontier;
 use super::Sk;
 use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
@@ -28,39 +29,25 @@ pub(crate) const NEW_BLOCK: usize = 1 << 18;
 pub(crate) const GROWN_BLOCK: usize = 1 << 16;
 
 /// A frontier state: the state, its layer, its hull.
-pub(crate) type Grown<N = P8> = (Sk, u16, HullOf<N>);
-
-/// GROWN STATES in runs, sorted by layer and state across them (`write`,
-/// `check`): a frontier's old states by layer, or states as they are.
-pub(crate) trait Runs<N: Rem>: Sync {
-    fn count(&self) -> usize;
-    fn len(&self, i: usize) -> usize;
-    /// Run `i`'s states `r`, in order.
-    fn get(&self, i: usize, r: std::ops::Range<usize>) -> Vec<Grown<N>>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Grown<N: Rem = P8> {
+    pub(crate) sk: Sk,
+    pub(crate) layer: u16,
+    pub(crate) hull: HullOf<N>,
 }
 
-impl<N: Rem> Runs<N> for [&[Grown<N>]] {
-    fn count(&self) -> usize {
-        <[&[Grown<N>]]>::len(self)
-    }
-    fn len(&self, i: usize) -> usize {
-        self[i].len()
-    }
-    fn get(&self, i: usize, r: std::ops::Range<usize>) -> Vec<Grown<N>> {
-        self[i][r].to_vec()
+impl<N: Rem> Grown<N> {
+    /// The frontier's order: by layer, then state.
+    fn order(&self) -> (u16, Sk) {
+        (self.layer, self.sk)
     }
 }
 
-impl<N: Rem> Runs<N> for [super::wave::OldLayer<N>] {
-    fn count(&self) -> usize {
-        <[super::wave::OldLayer<N>]>::len(self)
-    }
-    fn len(&self, i: usize) -> usize {
-        self[i].len()
-    }
-    fn get(&self, i: usize, r: std::ops::Range<usize>) -> Vec<Grown<N>> {
-        self[i].range(r).map(|o| (o.sk, o.layer, o.hull)).collect()
-    }
+/// A frontier's states, layers and hulls: its new states (`new`, made at
+/// `frame`; `hulls` in its state order), then its grown ones.
+pub(crate) fn frontier_states<'a, N: Rem>(new: &'a super::layer::Layer<N>, hulls: &'a [HullOf<N>], frame: u32, grown: impl Iterator<Item = Grown<N>> + 'a) -> impl Iterator<Item = Grown<N>> + 'a {
+    let layer = u16::try_from(frame).expect("a frame past u16");
+    new.states_iter().zip(hulls).map(move |(sk, &hull)| Grown { sk, layer, hull }).chain(grown)
 }
 
 /// One frontier block of a frame file: of the new states (`grown` false)
@@ -75,29 +62,20 @@ pub(crate) struct Block {
 fn encode_grown<N: Rem>(states: impl Iterator<Item = Grown<N>>, n: usize) -> Vec<u8> {
     let mut raw = Vec::with_capacity(n * 14 + 8);
     put_varint(&mut raw, n as u64);
-    let mut prev: Option<(u16, u32, u128)> = None;
-    for (s, layer, h) in states {
-        let k = wide(s.key);
+    let mut prev: Option<(u16, Sk)> = None;
+    for g in states {
         match prev {
-            Some((pl, pr, pk)) if pl == layer => {
+            Some((pl, ps)) if pl == g.layer => {
                 put_varint(&mut raw, 0);
-                if pr == s.region {
-                    put_varint(&mut raw, 0);
-                    put_varint128(&mut raw, k - pk);
-                } else {
-                    put_varint(&mut raw, (s.region - pr) as u64);
-                    put_varint128(&mut raw, k);
-                }
+                put_sk(&mut raw, ps, g.sk);
             }
             _ => {
-                put_varint(&mut raw, layer as u64 - prev.map_or(0, |p| p.0 as u64) + prev.is_none() as u64);
-                put_varint(&mut raw, s.region as u64);
-                put_varint128(&mut raw, k);
+                put_varint(&mut raw, g.layer as u64 - prev.map_or(0, |p| p.0 as u64) + prev.is_none() as u64);
+                put_sk(&mut raw, Sk::default(), g.sk);
             }
         }
-        raw.push(s.local);
-        h.to_bytes(&mut raw);
-        prev = Some((layer, s.region, k));
+        g.hull.to_bytes(&mut raw);
+        prev = Some((g.layer, g.sk));
     }
     raw
 }
@@ -107,66 +85,63 @@ fn decode_grown<N: Rem>(raw: &[u8], want: usize) -> Result<Vec<Grown<N>>> {
     let n = get_varint(raw, &mut pos) as usize;
     ensure!(n == want, "{n} grown states, the index says {want}");
     let mut out: Vec<Grown<N>> = Vec::with_capacity(n);
-    let mut prev: Option<(u16, u32, u128)> = None;
+    let mut prev: Option<(u16, Sk)> = None;
     for _ in 0..n {
         ensure!(pos < raw.len(), "cut short");
         let dl = get_varint(raw, &mut pos);
-        let (layer, region, key) = match prev {
-            Some((pl, pr, pk)) if dl == 0 => {
-                let dr = get_varint(raw, &mut pos);
-                if dr == 0 {
-                    (pl, pr, pk + get_varint128(raw, &mut pos))
-                } else {
-                    (pl, pr + dr as u32, get_varint128(raw, &mut pos))
-                }
-            }
+        let (layer, sk) = match prev {
+            Some((pl, ps)) if dl == 0 => (pl, get_sk(raw, &mut pos, ps)),
             _ => {
                 let layer = prev.map_or(0, |p| p.0 as u64) + dl - prev.is_none() as u64;
                 ensure!(layer <= u16::MAX as u64, "a layer past u16");
-                (layer as u16, get_varint(raw, &mut pos) as u32, get_varint128(raw, &mut pos))
+                (layer as u16, get_sk(raw, &mut pos, Sk::default()))
             }
         };
-        ensure!(pos + 1 + HullOf::<N>::BYTES <= raw.len(), "cut short");
-        let local = raw[pos];
-        let h = HullOf::<N>::from_bytes(&raw[pos + 1..pos + 1 + HullOf::<N>::BYTES]);
-        pos += 1 + HullOf::<N>::BYTES;
-        out.push((Sk { region, key: narrow(key), local }, layer, h));
-        prev = Some((layer, region, key));
+        ensure!(pos + HullOf::<N>::BYTES <= raw.len(), "cut short");
+        let hull = HullOf::<N>::from_bytes(&raw[pos..pos + HullOf::<N>::BYTES]);
+        pos += HullOf::<N>::BYTES;
+        out.push(Grown { sk, layer, hull });
+        prev = Some((layer, sk));
     }
     ensure!(pos == raw.len(), "bytes past its states");
     Ok(out)
 }
 
-/// The frontier's blocks: per block whether it holds grown states, its run
-/// (the new hulls: run 0 of their own) and its range there.
-fn cuts<N: Rem, R: Runs<N> + ?Sized>(hulls: &[HullOf<N>], runs: &R) -> Vec<(bool, usize, std::ops::Range<usize>)> {
-    let mut cuts: Vec<(bool, usize, std::ops::Range<usize>)> = (0..hulls.len()).step_by(NEW_BLOCK).map(|a| (false, 0, a..(a + NEW_BLOCK).min(hulls.len()))).collect();
-    for i in 0..runs.count() {
-        let n = runs.len(i);
+/// The frontier's blocks: per block whether it holds grown states, its old
+/// layer (the new hulls: 0) and its range there.
+fn cuts<N: Rem>(front: &Frontier<N>) -> Vec<(bool, usize, std::ops::Range<usize>)> {
+    let n = front.hulls.len();
+    let mut cuts: Vec<(bool, usize, std::ops::Range<usize>)> = (0..n).step_by(NEW_BLOCK).map(|a| (false, 0, a..(a + NEW_BLOCK).min(n))).collect();
+    for (i, old) in front.old.iter().enumerate() {
+        let n = old.len();
         cuts.extend((0..n).step_by(GROWN_BLOCK).map(|a| (true, i, a..(a + GROWN_BLOCK).min(n))));
     }
     cuts
 }
 
-/// The frontier's blocks ENCODED: its new states' `hulls` (in the frame's
-/// state order) and its grown states in `runs` (all of them sorted by layer
-/// and state, distinct: checked); per block its kind and states, its zstd
-/// bytes and raw length (`layer::write_frame` places them).
-pub(crate) fn encode<N: Rem, R: Runs<N> + ?Sized>(hulls: &[HullOf<N>], runs: &R, threads: usize) -> Result<Vec<(Block, Vec<u8>, usize)>> {
-    let key = |g: &Grown<N>| (g.1, g.0);
-    let cuts = cuts(hulls, runs);
+/// Old layer `i`'s states `r` as frontier states.
+fn grown_of<N: Rem>(front: &Frontier<N>, i: usize, r: std::ops::Range<usize>) -> Vec<Grown<N>> {
+    front.old[i].range(r).map(Grown::from).collect()
+}
+
+/// `front`'s blocks ENCODED: its new states' hulls (in the frame's state
+/// order) and its old states by layer (all of them sorted by layer and
+/// state, distinct: checked); per block its kind and states, its zstd bytes
+/// and raw length (`layer::write_frame` places them).
+pub(crate) fn encode<N: Rem>(front: &Frontier<N>, threads: usize) -> Result<Vec<(Block, Vec<u8>, usize)>> {
+    let cuts = cuts(front);
     // Per block its bytes, and a grown block's sorted states' first and last
     // (`None`: unsorted).
     type Made = (Vec<u8>, usize, Option<Option<((u16, Sk), (u16, Sk))>>);
-    let blocks: Vec<Made> = crate::par::Pool::new(threads).map_with(cuts.len(), || Ok(zstd::bulk::Compressor::new(1)?), |z, c| {
+    let blocks: Vec<Made> = crate::par::Pool::new(threads).map_with(cuts.len(), || Ok(super::file::compressor()?), |z, c| {
         let (g, i, r) = &cuts[c];
         let (raw, ends) = if *g {
-            let v = runs.get(*i, r.clone());
-            let ends = v.windows(2).all(|w| key(&w[0]) < key(&w[1])).then(|| v.first().map(|f| (key(f), key(v.last().expect("a first")))));
+            let v = grown_of(front, *i, r.clone());
+            let ends = v.windows(2).all(|w| w[0].order() < w[1].order()).then(|| v.first().map(|f| (f.order(), v.last().expect("a first").order())));
             (encode_grown::<N>(v.into_iter(), r.len()), ends)
         } else {
             let mut raw = Vec::with_capacity(r.len() * HullOf::<N>::BYTES);
-            for h in &hulls[r.clone()] {
+            for h in &front.hulls[r.clone()] {
                 h.to_bytes(&mut raw);
             }
             (raw, Some(None))
@@ -213,7 +188,7 @@ pub(crate) fn read<N: Rem>(file: &Mapped, blocks: &[Block], threads: usize) -> R
         hulls.extend(h);
         grown.extend(g);
     }
-    ensure!(grown.windows(2).all(|w: &[Grown<N>]| (w[0].1, w[0].0) < (w[1].1, w[1].0)), "{}: its grown states are not sorted", file.path().display());
+    ensure!(grown.windows(2).all(|w: &[Grown<N>]| w[0].order() < w[1].order()), "{}: its grown states are not sorted", file.path().display());
     Ok((hulls, grown))
 }
 
@@ -222,11 +197,10 @@ pub(crate) fn read<N: Rem>(file: &Mapped, blocks: &[Block], threads: usize) -> R
 pub fn fingerprint<N: Rem>(states: impl Iterator<Item = Grown<N>>, space: &celeste_engine::exact::KeySpace<N>, shapes: &[u64]) -> Result<(u64, u64)> {
     use celeste_engine::runtime2::mix64;
     let content = space.content_hash();
-    let geo = super::GEOMETRY;
     let (mut n, mut acc) = (0u64, 0u64);
-    for (s, layer, h) in states {
-        let shape = *shapes.get(s.shape(&geo) as usize).ok_or_else(|| anyhow::anyhow!("a frontier state of no shape"))?;
-        let node = content.state(shape, s.key, s.cell(&geo));
+    for Grown { sk: s, layer, hull: h } in states {
+        let shape = *shapes.get(s.shape() as usize).ok_or_else(|| anyhow::anyhow!("a frontier state of no shape"))?;
+        let node = content.state(shape, s.key, s.cell());
         let tag = mix64(h.hash() ^ (layer as u64).rotate_left(48));
         acc = acc.wrapping_add(mix64(node ^ tag.rotate_left(17)));
         n += 1;
@@ -235,15 +209,15 @@ pub fn fingerprint<N: Rem>(states: impl Iterator<Item = Grown<N>>, space: &celes
 }
 
 /// A frame file's frontier just written, READ BACK and compared with
-/// what was written (`encode`'s arguments): FATAL otherwise (a resume
-/// would expand another frontier than the forward's).
-pub(crate) fn check<N: Rem, R: Runs<N> + ?Sized>(file: &Mapped, blocks: &[Block], hulls: &[HullOf<N>], runs: &R, threads: usize) -> Result<()> {
+/// `front`, what was written (`encode`): FATAL otherwise (a resume would
+/// expand another frontier than the forward's).
+pub(crate) fn check<N: Rem>(file: &Mapped, blocks: &[Block], front: &Frontier<N>, threads: usize) -> Result<()> {
     let path = file.path();
-    let cuts = cuts::<N, R>(hulls, runs);
+    let cuts = cuts(front);
     ensure!(blocks.len() == cuts.len(), "{}: STORED HULLS DIFFER from the forward's ({} blocks read back, {} written)", path.display(), blocks.len(), cuts.len());
     let same = super::wave::par_map(&blocks.iter().zip(&cuts).collect::<Vec<_>>(), threads, |(x, (g, i, r))| -> Result<bool> {
         let (h, gr) = decode::<N>(file, x)?;
-        Ok(x.grown == *g && if *g { gr == runs.get(*i, r.clone()) } else { h == hulls[r.clone()] })
+        Ok(x.grown == *g && if *g { gr == grown_of(front, *i, r.clone()) } else { h == front.hulls[r.clone()] })
     });
     for ok in same {
         ensure!(ok?, "{}: STORED HULLS DIFFER from the forward's", path.display());

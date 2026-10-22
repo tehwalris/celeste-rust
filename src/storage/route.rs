@@ -110,10 +110,8 @@ impl<N: Rem> Touched<N> {
         let next = mask | add;
         let at = self.slots.len();
         grow(&mut self.slots, next.count_ones() as usize);
-        let mut m = next;
-        while m != 0 {
-            let c = m.trailing_zeros() as u8;
-            m &= m - 1;
+        for c in super::layer::bits(next) {
+            let c = c as u8;
             self.slots.push(if mask >> c & 1 == 1 { self.slots[start as usize + rank(mask, c)] } else { AccOf::<N>::default() });
         }
         for &(c, ref a) in cells {
@@ -236,14 +234,13 @@ pub(crate) struct RouteState<N: Rem = P8> {
     pub(crate) segs: Vec<((u8, u32), Segment)>,
     /// The source regions its edges leave.
     pub(crate) sources: FxHashSet<u32>,
-    /// Records taken (emissions) and edge pushes merged.
-    pub(crate) recs: u64,
+    /// Edge pushes merged.
     pub(crate) pushes: u64,
 }
 
 impl<N: Rem> RouteState<N> {
     pub(crate) fn new(shape: u64, slot: u32, region: Option<u32>) -> Self {
-        RouteState { shape, slot, region, touched: Touched::default(), prov_keys: FxHashSet::default(), prov: Vec::new(), segs: Vec::new(), sources: FxHashSet::default(), recs: 0, pushes: 0 }
+        RouteState { shape, slot, region, touched: Touched::default(), prov_keys: FxHashSet::default(), prov: Vec::new(), segs: Vec::new(), sources: FxHashSet::default(), pushes: 0 }
     }
 
     /// Does the frame's end owe it anything: states pushed into, or edges?
@@ -382,10 +379,7 @@ impl UnitBundles {
             for &(t_key, mut u) in &v[..n] {
                 let mut m = u.mask;
                 if let Some(drop) = drop {
-                    let mut c = m;
-                    while c != 0 {
-                        let cell = c.trailing_zeros();
-                        c &= c - 1;
+                    for cell in super::layer::bits(m) {
                         if drop(route, t_key, cell) {
                             m &= !(1u64 << cell);
                         }
@@ -480,7 +474,7 @@ impl Default for JobScratch {
             tbs: Vec::new(),
             enc: bundle::Encoder::default(),
             raw: Vec::new(),
-            z: zstd::bulk::Compressor::new(1).expect("a zstd compressor"),
+            z: super::file::compressor().expect("a zstd compressor"),
         }
     }
 }
@@ -490,8 +484,6 @@ impl Default for JobScratch {
 /// wait: `RouteState::prov`).
 #[inline(never)]
 pub(crate) fn run_route<N: Rem>(st: &mut RouteState<N>, slice: u32, chunks: &[&Chunk<N>], cx: &RegionCtx, sc: &mut JobScratch) -> Result<()> {
-    let n: usize = chunks.iter().map(|c| c.bundles.len()).sum();
-    st.recs += n as u64;
     let record = cx.record;
     sc.tbs.clear();
     sc.s_idx.clear();
@@ -691,7 +683,7 @@ pub(crate) fn reencode(seg: &Segment, region: u32, finals: &FxHashMap<Key, Key>,
     super::file::decompress(bytes, seg.raw as usize, &mut dz, &mut raw)?;
     let mut v: Vec<Bundle> = Vec::with_capacity(seg.bundles as usize);
     let mut missing = false;
-    bundle::Block::open(&raw, &bundle::ORDER)?.bundles(|mut b| {
+    bundle::Block::open(&raw)?.bundles(|mut b| {
         if is_provisional(b.t_key) {
             match finals.get(&b.t_key) {
                 Some(&k) => b.t_key = k,

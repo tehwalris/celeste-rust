@@ -13,7 +13,7 @@ use celeste_engine::runtime2::{Col, Rt2, AV};
 use super::arcs::{Circle, Seg, Transfer};
 use super::rem::{Point, Rem, Xfer};
 use crate::abstraction::Level;
-use crate::frame::{widen_rt2_to, widened_keys};
+use crate::frame::widened_keys;
 use crate::storage::edges::EdgeStore;
 use crate::storage::layer::Tree;
 use crate::storage::Sk;
@@ -92,7 +92,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
         // As the kernels read it: projected onto the level (the start row is
         // stored exact), then the probe's remainder.
         let mut rt2 = row.clone_block();
-        widen_rt2_to(&mut rt2, level);
+        rt2.widen_to(level);
         if let Some((cx, cy)) = rem_cells(&rt2) {
             rt2.cols[cx] = Col::U(AV::Num(N::at_point(rem.0)));
             rt2.cols[cy] = Col::U(AV::Num(N::at_point(rem.1)));
@@ -140,7 +140,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
         let src_row = row_of(src)?;
         // The target by what it is (a hull tree records edges into states
         // it reaches later or never: not every target has a frame).
-        let target = (tree.shape_of(r.target.region)?, Some(r.target.key), r.target.cell(&crate::storage::GEOMETRY));
+        let target = (tree.shape_of(r.target.region)?, Some(r.target.key), r.target.cell());
         let (gx, gy) = (r.t.0.guard, r.t.1.guard);
         let pair: Vec<&Rec<N>> = recs.iter().filter(|q| q.target == r.target && q.src == src).collect();
         let in_union = |x: Point<N>, y: Point<N>| pair.iter().any(|q| image_of::<N::C>(&q.t.0, x).is_some() && image_of::<N::C>(&q.t.1, y).is_some());

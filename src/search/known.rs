@@ -2,7 +2,7 @@
 //! "Checks"; `check known`, and `search --prefer` when it wins by the
 //! horizon): a wrong pruning step drops real winners silently, so the route
 //! is stepped through the reference engine and checked at every step `s`:
-//! * level -1 (the filter the TREE recorded, `TreeFilter::of_tree`) and the
+//! * level -1 (the filter the TREE recorded, `TreeL1::read`) and the
 //!   ladder's filter (`MarkFilter::allowed`; mid-frame steps pass by
 //!   construction) keep it, at every step past the start;
 //! * at a frame boundary (mid-frame rows carry the split frame's cut
@@ -53,8 +53,8 @@ impl<N: Rem> Hulls<N> {
     }
 }
 
-/// What the arc phase holds for the check (`driver::solve`).
-pub(super) struct Pruning<'a, N: Rem = P8> {
+/// What the arc phase holds for the check (`check_level`).
+struct Pruning<'a, N: Rem = P8> {
     /// The level's W as the concrete search admits states.
     pub(crate) side: &'a Side<'a, N>,
     /// In search steps.
@@ -65,17 +65,33 @@ pub(super) struct Pruning<'a, N: Rem = P8> {
     /// This level's reached nodes (the next level's filter), if it has one.
     pub(crate) reached: Option<&'a Visited<N>>,
     /// The level -1 filter the tree was built under, with the tree's table
-    /// (`TreeFilter::of_tree`).
-    pub(crate) minus_one: Option<crate::frame::L1>,
+    /// (`TreeL1::read`).
+    pub(crate) l1: Option<crate::frame::TreeL1>,
     /// The tree's directory, for the report (read on a miss).
     pub(crate) dir: &'a std::path::Path,
     /// The hull forward's claim, checked at every step (`Route::hulls`).
     pub(crate) hulls: Option<&'a Hulls<N>>,
 }
 
+/// THE CHECK of a level's arc phase (`driver::arc_level`): the route against
+/// its W (`side`, `arcs`), its reach marks (`reached`, if the level filters
+/// the next) and the tree in `dir`'s level -1 filter (`TreeL1::read`); with
+/// `Route::hulls` (whole frames only), against the hull forward's claim.
+pub(super) fn check_level<N: KernelLanes>(route: &Route<N>, side: &Side<N>, arcs: &super::driver::Arcs<N>, reached: Option<&Visited<N>>, dir: &std::path::Path) -> anyhow::Result<Option<u32>> {
+    let s = side.s;
+    let l1 = crate::frame::TreeL1::read(dir)?;
+    // The hull forward's claim keys every step's state: whole frames only.
+    if route.hulls && s.split_frame {
+        eprintln!("[known] the hull forward's claim is checked on whole frames only: not under --split-frame");
+    }
+    let hulls = (route.hulls && !s.split_frame).then(|| Hulls::open(dir, arcs.horizon, s)).transpose()?;
+    let p = Pruning { side, horizon: arcs.horizon, start: arcs.start, reached, l1, dir, hulls: hulls.as_ref() };
+    check(route, &p)
+}
+
 /// The route against one level's pruning. `Ok(None)`: no win by the
 /// horizon; `Ok(Some(f))`: it wins in frame `f` and survives; an error: PRUNED.
-pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Option<u32>> {
+fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Option<u32>> {
     let t0 = std::time::Instant::now();
     let clock = p.side.s.clock();
     let run = super::replay::Replay::<N>::of(route.inputs, Some(p.horizon), p.side.s)?;
@@ -85,7 +101,6 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
         return Ok(None);
     };
     let frame = clock.frame_of(*exit);
-    let l1 = p.minus_one.map(|m| (m.h, m.table));
     // Per step and state: the first check it fails (`None`: it passes), and
     // where the tree holds it (with `hulls`: its state and remainder).
     let mut verdicts: Vec<Vec<Option<Miss>>> = Vec::with_capacity(run.layers.len());
@@ -94,7 +109,7 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
         let (mut v, mut h) = (Vec::with_capacity(layer.len()), Vec::with_capacity(layer.len()));
         for (parent, b) in layer {
             let from = if s == 0 { None } else { held[s - 1][*parent as usize] };
-            let (miss, at) = verdict(b, s as u32, from, seeded, l1, route, p)?;
+            let (miss, at) = verdict(b, s as u32, from, seeded, route, p)?;
             v.push(miss);
             h.push(at);
         }
@@ -118,7 +133,7 @@ pub(super) fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow:
             [
                 Some("node and W at every frame boundary"),
                 p.hulls.map(|_| "in the tree, inside its hull, by a recorded edge at every step"),
-                l1.map(|_| "level -1"),
+                p.l1.map(|_| "level -1"),
                 route.filter.map(|_| "the ladder's filter"),
                 p.reached.map(|_| "reached (the next level's filter)"),
             ]
@@ -278,25 +293,24 @@ fn hull_claim<N: Rem>(b: &Rt2<N>, s: u32, sk: Option<Sk>, from: Option<Held<N>>,
 
 /// The first check state `b` at step `s` (its parent held at `from`) fails,
 /// and where the tree holds it (with `hulls`).
-#[allow(clippy::too_many_arguments)]
-fn verdict<N: Rem>(b: &Rt2<N>, s: u32, from: Option<Held<N>>, seeded: bool, l1: Option<(u32, &crate::search::level_minus_one::CostToGo)>, route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<(Option<Miss>, Option<Held<N>>)> {
+fn verdict<N: Rem>(b: &Rt2<N>, s: u32, from: Option<Held<N>>, seeded: bool, route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<(Option<Miss>, Option<Held<N>>)> {
     let (shape, keys, cells) = lookup_keys(b, p.side.level, seeded, p.side.keys)?;
     let (key, cell) = (keys[0], cells[0]);
     let node = match key {
-        Some(k) => format!("node shape {shape:#x} key {:#x}:{:#x} cell {cell} {:?}", k.0, k.1, super::pos_graph::cell_xy(cell)),
-        None => format!("shape {shape:#x}, a code the tree never stored, cell {cell} {:?}", super::pos_graph::cell_xy(cell)),
+        Some(k) => format!("node shape {shape:#x} key {:#x}:{:#x} cell {cell} {:?}", k.0, k.1, crate::storage::cells::cell_xy(cell)),
+        None => format!("shape {shape:#x}, a code the tree never stored, cell {cell} {:?}", crate::storage::cells::cell_xy(cell)),
     };
     // The forward's filters run at every flush, so on every step but the
     // start (the initial block is never flushed).
     if s > 0 {
-        if let Some((h, table)) = l1 {
-            if table.too_late(shape, cell, s, h) {
-                return Ok((forward(format!("LEVEL -1 drops it: d {:?} from step {s} exceeds its horizon {h} ({node})", table.d_of(shape, cell))), None));
+        if let Some(l1) = p.l1 {
+            if l1.drops(shape, cell, s) {
+                return Ok((forward(format!("LEVEL -1 drops it: d {:?} from step {s} exceeds its horizon {} ({node})", l1.table.d_of(shape, cell), l1.h)), None));
             }
         }
         if let Some(f) = route.filter {
             let mut row = lookup_view(b, seeded)?;
-            crate::frame::widen_rt2_to(&mut row, p.side.level);
+            row.widen_to(p.side.level);
             if !f.allowed(&row, s)?[0] {
                 return Ok((
                     forward(format!(

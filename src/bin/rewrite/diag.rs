@@ -96,12 +96,11 @@ pub fn ckhash(run: &Settings, a: CkhashArgs) -> Result<()> {
     for line in lines {
         println!("{line}");
     }
-    let geo = celeste_rust::storage::GEOMETRY;
     if let Some(frame) = dump_edges {
         let tree = Tree::<P8>::open(dir, to)?;
         let content = tree.space.content_hash();
         let eg = celeste_rust::storage::edges::EdgeStore::<P8>::open(&dir, to)?;
-        let node = |s: Sk| content.state(tree.shapes[s.shape(&geo) as usize], s.key, s.cell(&geo));
+        let node = |s: Sk| content.state(tree.shapes[s.shape() as usize], s.key, s.cell());
         for e in eg.edges_at(frame, cfg.threads())? {
             eprintln!("edge {:016x} {:016x} {:?}", node(e.dst), node(e.src), eg.pair(e.xfer));
         }
@@ -110,12 +109,12 @@ pub fn ckhash(run: &Settings, a: CkhashArgs) -> Result<()> {
         let tree = Tree::<P8>::open(dir, to)?;
         let mut by_cell: rustc_hash::FxHashMap<u32, usize> = Default::default();
         for s in tree.layer(to, None, cfg.threads())?.0.states_iter() {
-            *by_cell.entry(s.cell(&geo)).or_default() += 1;
+            *by_cell.entry(s.cell()).or_default() += 1;
         }
         let mut v: Vec<(u32, usize)> = by_cell.into_iter().collect();
         v.sort_by_key(|&(c, n)| (std::cmp::Reverse(n), c));
         for (c, n) in v.into_iter().take(top) {
-            match celeste_rust::search::pos_graph::cell_xy(c) {
+            match celeste_rust::storage::cells::cell_xy(c) {
                 Some((x, y)) => println!("cell {c}: player ({x},{y}) x{n}"),
                 None => println!("cell {c}: no player x{n}"),
             }
@@ -133,8 +132,7 @@ pub fn census(run: &Settings, a: CensusArgs) -> Result<()> {
     let (frame, only) = a.rows.of(&t)?;
     let tree = Tree::<P8>::open(&t.dir, frame)?;
     let ids = celeste_rust::compiled::ids();
-    let geo = celeste_rust::storage::GEOMETRY;
-    let keep = |s: Sk| only.is_none_or(|c| s.cell(&geo) == c);
+    let keep = |s: Sk| only.is_none_or(|c| s.cell() == c);
     // Per shape: its rows, per column its distinct codes (capped), whether
     // it varies, the rows holding an interval or an unknown bool, the named
     // cells and the distinct (spd.x, spd.y) pairs.
@@ -246,7 +244,7 @@ pub fn census(run: &Settings, a: CensusArgs) -> Result<()> {
         let mut per: rustc_hash::FxHashMap<u32, Vec<u64>> = Default::default();
         for f in 0..=frame {
             for s in tree.layer(f, None, cfg.threads())?.0.states_iter() {
-                per.entry(s.cell(&geo)).or_insert_with(|| vec![0; n_frames])[f as usize] += 1;
+                per.entry(s.cell()).or_insert_with(|| vec![0; n_frames])[f as usize] += 1;
             }
         }
         let total = |v: &[u64]| v.iter().sum::<u64>();
@@ -318,8 +316,8 @@ pub fn trajectory(cfg: &Settings, a: TrajectoryArgs) -> Result<()> {
                 // the real-PICO-8 replay settles it.
                 for block in eng.step(st, byte)? {
                     tried += 1;
-                    let cell = celeste_rust::search::pos_graph::block_cells(&block)?[0];
-                    let pos = celeste_rust::search::pos_graph::cell_xy(cell);
+                    let cell = celeste_rust::storage::cells::block_cells(&block)?[0];
+                    let pos = celeste_rust::storage::cells::cell_xy(cell);
                     if let Some(w) = want {
                         if pos != Some(*w) {
                             *reached.entry(pos).or_default() += 1;

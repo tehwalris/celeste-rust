@@ -189,43 +189,12 @@ impl Circle for Doubles {
         p - 1
     }
     #[inline]
-    fn store(p: u64) -> u64 {
-        p
-    }
-    #[inline]
-    fn load(w: u64) -> u64 {
-        w
-    }
-    #[inline]
-    fn count(n: usize) -> u64 {
-        n as u64
-    }
-    #[inline]
-    fn len(w: u64) -> usize {
-        w as usize
-    }
-    #[inline]
     fn wide(p: u64) -> u64 {
         p
     }
     #[inline]
     fn narrow(v: u64) -> u64 {
         v
-    }
-    const W_BYTES: usize = 8;
-    fn put_word(w: u64, out: &mut Vec<u8>) {
-        out.extend_from_slice(&w.to_le_bytes());
-    }
-    fn get_word(b: &[u8]) -> u64 {
-        u64::from_le_bytes(b[..8].try_into().expect("8 bytes"))
-    }
-    #[inline]
-    fn hash4(w: [u64; 4]) -> u64 {
-        mix64(mix64(w[0] ^ w[1].rotate_left(32)) ^ w[2] ^ w[3].rotate_left(32))
-    }
-    #[inline]
-    fn same4(a: [u64; 4], b: [u64; 4]) -> bool {
-        a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3]
     }
     #[inline]
     fn apply(m: &Shift, i: u64) -> u64 {
@@ -365,8 +334,7 @@ mod tests {
     }
 
     fn lcg(s: &mut u64) -> u64 {
-        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        *s >> 1
+        crate::testutil::lcg(s) >> 1
     }
 
     #[test]
@@ -578,12 +546,12 @@ mod tests {
             let r = Region::<Doubles>::from_pieces(&mut ps, &mut Vec::new());
             let (tx, ty) = (pieces[(lcg(&mut s) % pieces.len() as u64) as usize], pieces[(lcg(&mut s) % pieces.len() as u64) as usize]);
             let mut out = Vec::new();
-            r.pull(tx.transfer(), ty.transfer(), &mut out);
+            r.as_ref().pull(tx.transfer(), ty.transfer(), &mut out);
             let pr = Region::<Doubles>::from_pieces(&mut out, &mut Vec::new());
             let around = |v: u64| [v.wrapping_sub(1), v, v + 1].into_iter().filter(|&p| p < POINTS);
             let mut px: Vec<u64> = vec![tx.lo, tx.hi - 1, near(&mut s), near(&mut s)];
             let mut py: Vec<u64> = vec![ty.lo, ty.hi - 1, near(&mut s), near(&mut s)];
-            for (y, xs) in pr.slabs() {
+            for (y, xs) in pr.as_ref().slabs() {
                 py.extend(around(y.lo).chain(around(y.hi)));
                 for x in xs {
                     px.extend(around(x.lo).chain(around(x.hi)));
@@ -592,8 +560,8 @@ mod tests {
             for &x in &px {
                 for &y in &py {
                     let takes = |a: &Axis, p: u64| a.lo <= p && p < a.hi;
-                    let want = takes(&tx, x) && takes(&ty, y) && r.contains(tx.apply(x), ty.apply(y));
-                    assert_eq!(pr.contains(x, y), want, "pull at ({x}, {y}) through {tx:?} {ty:?}");
+                    let want = takes(&tx, x) && takes(&ty, y) && r.as_ref().contains(tx.apply(x), ty.apply(y));
+                    assert_eq!(pr.as_ref().contains(x, y), want, "pull at ({x}, {y}) through {tx:?} {ty:?}");
                 }
             }
         }

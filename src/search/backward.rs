@@ -9,58 +9,47 @@
 //! winning set reaches is never touched. Exact: "intersect with the guard,
 //! then act" distributes over unions.
 
-use super::arcs::{Circle, Fixed16, Region, RegionArena, RegionRef};
+use super::arcs::{region_hash, Circle, Fixed16, Interner, Region, RegionArena, RegionRef};
 use super::rem::{Rem, Xfer};
 use celeste_core::pico8_num::Pico8Num as P8;
-use crate::storage::codec::{get_varint, get_varint128, put_varint, put_varint128, wide};
+use crate::storage::codec::{get_sk, get_varint, put_sk, put_varint};
 use crate::storage::edges::EdgeStore;
-use crate::storage::{Sk, GEOMETRY};
+use crate::storage::scratch::Words;
+use crate::storage::stats::Lap;
+use crate::storage::Sk;
 use rustc_hash::FxHashMap;
 
 const SK_MAX: Sk = Sk { region: u32::MAX, key: (u64::MAX, u64::MAX), local: u8::MAX };
 
-/// State `s` after `prev` in a sorted stream (`prev <= s`): its region's
-/// delta, its key (a delta within the region, raw past it), its cell.
-#[inline]
-fn put_sk(out: &mut Vec<u8>, prev: Sk, s: Sk) {
-    debug_assert!(prev <= s);
-    let dr = s.region - prev.region;
-    put_varint(out, dr as u64);
-    put_varint128(out, if dr == 0 { wide(s.key) - wide(prev.key) } else { wide(s.key) });
-    out.push(s.local);
-}
-
-#[inline]
-fn get_sk(b: &[u8], pos: &mut usize, prev: Sk) -> Sk {
-    let dr = get_varint(b, pos) as u32;
-    let k = get_varint128(b, pos);
-    let k = if dr == 0 { wide(prev.key) + k } else { k };
-    let local = b[*pos];
-    *pos += 1;
-    Sk { region: prev.region + dr, key: ((k >> 64) as u64, k as u64), local }
-}
-
-/// A backward's reads (`stored`, `raw`: the segments' bytes).
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ReadStats {
-    pub(crate) segments: u64,
-    pub(crate) stored: u64,
-    pub(crate) raw: u64,
-    pub(crate) bundles: u64,
-    pub(crate) edges: u64,
-    pub(crate) region_opens: u64,
-}
-
-impl ReadStats {
-    pub(crate) fn add(&mut self, o: &ReadStats) {
-        self.segments += o.segments;
-        self.stored += o.stored;
-        self.raw += o.raw;
-        self.bundles += o.bundles;
-        self.edges += o.edges;
-        self.region_opens += o.region_opens;
+crate::storage::stats::registry! {
+    /// THE ARC PHASE's statistics (`storage::stats`): a step's (its `[arc]
+    /// f` line), summed over the backward (its `[arc] backward` line).
+    A {
+        // The nodes whose set changed (whose in-edges are read), the
+        // in-edges read and emitted, in rounds (the largest's emissions).
+        Changed "changed" Count Changed;
+        InEdges "in_edges" Count InEdges;
+        Emissions "emissions" Count Emissions;
+        Rounds "rounds" Count Rounds;
+        MaxRound "max_round" Max MaxRound;
+        // The (region, frame) opens, the segments decoded: their bytes
+        // stored and raw, their bundles.
+        Opens "region_opens" Count Opens;
+        Segments "segments" Count Segments;
+        Stored "stored_gb" Bytes Stored;
+        Raw "raw_gb" Bytes Raw;
+        Bundles "bundles" Count Bundles;
+        // The nodes with a set after a step (the most).
+        Nodes "nodes" Max Nodes;
+        // Walls: the reads, the pulls, the merge.
+        Read "read_ms" Wall InEdges;
+        Pull "pull_ms" Wall Emissions;
+        Merge "merge_ms" Wall Nodes;
     }
 }
+
+/// The arc phase's statistics (`A`).
+pub(crate) type ArcStats = crate::storage::stats::Stats<A, { <A as crate::storage::stats::Registry>::ALL.len() }>;
 
 /// Nodes per block of `Winning` (a lookup decodes at most this many).
 pub(super) const BLOCK: usize = 16;
@@ -73,7 +62,7 @@ pub(super) const BLOCK: usize = 16;
 pub(crate) struct Winning<C: Circle = Fixed16> {
     n: usize,
     blocks: Vec<(Sk, u64)>,
-    data: Bytes,
+    data: Words<u8>,
     sets: Sets<C>,
     spans: usize,
 }
@@ -109,28 +98,13 @@ impl Spill {
             }
         }
     }
-    fn done(self) -> anyhow::Result<Bytes> {
+    fn done(self) -> anyhow::Result<Words<u8>> {
         match self.file {
-            None => Ok(Bytes::Mem(self.buf)),
+            None => Ok(Words::Mem(self.buf)),
             Some(f) => {
                 f.put(&self.buf)?;
-                Ok(Bytes::Map(f.map()?))
+                Ok(Words::Map(f.map()?))
             }
-        }
-    }
-}
-
-enum Bytes {
-    Mem(Vec<u8>),
-    Map(memmap2::Mmap),
-}
-
-impl std::ops::Deref for Bytes {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        match self {
-            Bytes::Mem(v) => v,
-            Bytes::Map(m) => m,
         }
     }
 }
@@ -368,25 +342,16 @@ const LOCAL_COMPACT: usize = 1 << 30;
 
 /// A step's own sets cut to those `acc` names (a round replaces its
 /// sources' sets, so the old ones are named by nothing), `acc` renumbered.
-fn compact_local<C: Circle>(acc: &mut [Acc], local: &RegionArena<C>) -> (RegionArena<C>, FxHashMap<u64, u32>) {
-    let (mut kept, mut index, mut to) = (RegionArena::default(), FxHashMap::default(), vec![u32::MAX; local.len()]);
+fn compact_local<C: Circle>(acc: &mut [Acc], local: &Interner<C>) -> Interner<C> {
+    let (mut kept, mut to) = (Interner::default(), vec![u32::MAX; local.len()]);
     for a in acc.iter_mut().filter(|a| a.set & LOCAL != 0) {
         let l = (a.set & !LOCAL) as usize;
         if to[l] == u32::MAX {
-            let r = local.get(l as u32);
-            to[l] = kept.push(r);
-            index.entry(region_hash(r)).or_insert(to[l]);
+            to[l] = kept.push(local.get(l as u32));
         }
         a.set = to[l] | LOCAL;
     }
-    (kept, index)
-}
-
-fn region_hash<C: Circle>(r: RegionRef<C>) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hs = rustc_hash::FxHasher::default();
-    r.hash(&mut hs);
-    hs.finish()
+    kept
 }
 
 /// State ranges `[bounds[k], bounds[k + 1])`: about `parts` of equal
@@ -439,10 +404,8 @@ pub struct Backward<'a, N: Rem = P8> {
     pairs: &'a [Xfer<N>],
     horizon: u32,
     threads: usize,
-    /// The ARENA of sets, equal sets once (found by hash; a collision with a
-    /// different set is stored apart). Index 0: the whole torus.
-    sets: RegionArena<N::C>,
-    interned: FxHashMap<u64, u32>,
+    /// The ARENA of sets, equal sets once. Index 0: the whole torus.
+    sets: Interner<N::C>,
     /// The nodes with a set at the frame done last, by id.
     cur: Vec<Cur>,
     /// Their indices whose set changed there (or appeared).
@@ -456,15 +419,8 @@ pub struct Backward<'a, N: Rem = P8> {
     /// `ROUND_EMITS` and `LOCAL_COMPACT` (tests shrink both: `with_rounds`).
     round_emits: usize,
     local_compact: usize,
-    read: ReadStats,
-    n_changed: u64,
-    n_emits: u64,
-    max_round: usize,
-    rounds: u64,
-    max_cur: usize,
-    d_read: std::time::Duration,
-    d_pull: std::time::Duration,
-    d_merge: std::time::Duration,
+    /// The steps' stats, summed.
+    stats: ArcStats,
     fragments: Vec<String>,
 }
 
@@ -472,15 +428,14 @@ impl<'a, N: Rem> Backward<'a, N> {
     /// `W_horizon`: the win nodes present by the horizon.
     pub fn new(store: &'a EdgeStore<N>, pairs: &'a [Xfer<N>], wins: &[(Sk, u32)], horizon: u32, threads: usize) -> Self {
         assert!(horizon < WIN as u32, "a horizon past {WIN}");
-        let mut sets = RegionArena::default();
-        let full = Region::<N::C>::full();
-        sets.push(full.as_ref());
-        let mut interned: FxHashMap<u64, u32> = FxHashMap::default();
-        interned.insert(region_hash(full.as_ref()), 0);
+        let mut sets = Interner::default();
+        assert_eq!(sets.intern(Region::<N::C>::full().as_ref()), 0, "the whole torus is set 0");
         let mut cur: Vec<Cur> = wins.iter().filter(|w| w.1 <= horizon).map(|&(id, layer)| Cur { id, set: 0, hi: horizon as u16, layer: layer as u16 | WIN }).collect();
         cur.sort_unstable_by_key(|c| c.id);
         cur.dedup_by_key(|c| c.id);
         let changed: Vec<u32> = (0..cur.len() as u32).collect();
+        let mut stats = ArcStats::default();
+        stats.set(A::Nodes, cur.len() as u64);
         Backward {
             store,
             first: store.first_frames(),
@@ -488,8 +443,6 @@ impl<'a, N: Rem> Backward<'a, N> {
             horizon,
             threads: threads.max(1),
             sets,
-            interned,
-            max_cur: cur.len(),
             cur,
             changed,
             runs: Vec::new(),
@@ -498,14 +451,7 @@ impl<'a, N: Rem> Backward<'a, N> {
             opens: FxHashMap::default(),
             round_emits: ROUND_EMITS,
             local_compact: LOCAL_COMPACT,
-            read: ReadStats::default(),
-            n_changed: 0,
-            n_emits: 0,
-            max_round: 0,
-            rounds: 0,
-            d_read: std::time::Duration::ZERO,
-            d_pull: std::time::Duration::ZERO,
-            d_merge: std::time::Duration::ZERO,
+            stats,
             fragments: Vec::new(),
         }
     }
@@ -534,7 +480,7 @@ impl<'a, N: Rem> Backward<'a, N> {
 
     /// The read, pull and merge walls so far.
     pub fn walls(&self) -> [std::time::Duration; 3] {
-        [self.d_read, self.d_pull, self.d_merge]
+        [A::Read, A::Pull, A::Merge].map(|s| self.stats.time(s))
     }
 
     /// A step's reads: the changed nodes by REGION, each read from the
@@ -561,17 +507,16 @@ impl<'a, N: Rem> Backward<'a, N> {
     /// in-edges (at step t, frames <= t + 1: sources of layer <= t). Per
     /// worker its in-edges sorted and distinct; and the item it stopped at
     /// (between items: one region bounds it by its in-edges at one frame).
-    fn read_round(&self, items: &[(usize, u32, usize, usize)], start: usize) -> anyhow::Result<(Vec<(Vec<Emit>, ReadStats)>, usize)> {
+    fn read_round(&self, items: &[(usize, u32, usize, usize)], start: usize) -> anyhow::Result<(Vec<(Vec<Emit>, ArcStats)>, usize)> {
         use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
         let (cur, changed, store, budget) = (&self.cur, &self.changed, self.store, self.round_emits);
-        let geo = GEOMETRY;
         let total = items.last().map_or(0, |x| x.0);
         let (next, held) = (AtomicUsize::new(start), AtomicUsize::new(0));
-        let parts: Vec<anyhow::Result<(Vec<Emit>, ReadStats)>> = std::thread::scope(|sc| {
+        let parts: Vec<anyhow::Result<(Vec<Emit>, ArcStats)>> = std::thread::scope(|sc| {
             let hs: Vec<_> = (0..self.threads)
                 .map(|_| {
-                    sc.spawn(|| -> anyhow::Result<(Vec<Emit>, ReadStats)> {
-                        let (mut emits, mut stats) = (Vec::new(), ReadStats::default());
+                    sc.spawn(|| -> anyhow::Result<(Vec<Emit>, ArcStats)> {
+                        let (mut emits, mut stats) = (Vec::new(), ArcStats::default());
                         let mut dec = crate::storage::edges::Decoder::default();
                         // The group's targets by (key, cell); per block
                         // target rank, its changed cells and first target.
@@ -592,12 +537,12 @@ impl<'a, N: Rem> Backward<'a, N> {
                                 targets.push((n.id.key, n.id.local, n.set));
                             }
                             let before = emits.len();
-                            let slot = region % geo.slots;
-                            stats.region_opens += 1;
+                            let slot = region % crate::storage::cells::SLOTS;
+                            stats.add(A::Opens, 1);
                             for seg in store.segments(f, region) {
-                                stats.segments += 1;
-                                stats.stored += seg.bytes.len() as u64;
-                                stats.raw += seg.raw as u64;
+                                stats.add(A::Segments, 1);
+                                stats.add(A::Stored, seg.bytes.len() as u64);
+                                stats.add(A::Raw, seg.raw as u64);
                                 let blk = dec.open(&seg)?;
                                 // The block's targets against the group's (both sorted).
                                 ranks.clear();
@@ -612,22 +557,18 @@ impl<'a, N: Rem> Backward<'a, N> {
                                     }
                                     ranks.push((m, j as u32));
                                 }
-                                stats.bundles += seg.bundles as u64;
+                                stats.add(A::Bundles, seg.bundles as u64);
                                 let sources = &blk.sources;
                                 blk.records(|r| {
                                     let (m, at) = ranks[r.t as usize];
-                                    let mut hit = m & r.mask;
-                                    while hit != 0 {
-                                        let c = hit.trailing_zeros();
-                                        hit &= hit - 1;
+                                    crate::storage::bundle::edges(m & r.mask, slot, r.o, |c, _, s_cell| {
                                         let set = targets[at as usize..].iter().find(|x| x.1 as u32 == c).expect("a changed cell").2;
                                         let (s_shape, s_key) = sources[r.s as usize];
-                                        let s_cell = crate::storage::bundle::source_cell(geo.cell(slot, c), r.o);
-                                        emits.push(Emit { p: Sk::at(&geo, s_shape, s_key, s_cell), set, xfer: r.x, layer: (f - 1) as u16 });
-                                    }
+                                        emits.push(Emit { p: Sk::at(s_shape, s_key, s_cell), set, xfer: r.x, layer: (f - 1) as u16 });
+                                    });
                                 })?;
                             }
-                            stats.edges += (emits.len() - before) as u64;
+                            stats.add(A::InEdges, (emits.len() - before) as u64);
                             held.fetch_add(emits.len() - before, Relaxed);
                         }
                         emits.sort_unstable();
@@ -643,7 +584,7 @@ impl<'a, N: Rem> Backward<'a, N> {
     }
 
     /// A set code's set (`local`: the step's own sets).
-    fn set_of<'s>(&'s self, code: u32, local: &'s RegionArena<N::C>) -> RegionRef<'s, N::C> {
+    fn set_of<'s>(&'s self, code: u32, local: &'s Interner<N::C>) -> RegionRef<'s, N::C> {
         if code & LOCAL != 0 {
             local.get(code & !LOCAL)
         } else {
@@ -651,13 +592,9 @@ impl<'a, N: Rem> Backward<'a, N> {
         }
     }
 
-    fn arena_code(&self, r: &Region<N::C>, h: u64) -> Option<u32> {
-        self.interned.get(&h).copied().filter(|&s| self.sets.get(s) == *r)
-    }
-
     /// Fold a round's in-edges into the step's sets so far (`acc`): per
     /// source its set so far (or at `t + 1`) united with the round's pulls.
-    fn fold_round(&self, acc: Vec<Acc>, parts: &[(Vec<Emit>, ReadStats)], local: &mut RegionArena<N::C>, local_interned: &mut FxHashMap<u64, u32>) -> Vec<Acc> {
+    fn fold_round(&self, acc: Vec<Acc>, parts: &[(Vec<Emit>, ArcStats)], local: &mut Interner<N::C>) -> Vec<Acc> {
         let n_emits: usize = parts.iter().map(|p| p.0.len()).sum();
         let bounds = id_ranges(parts.iter().flat_map(|p| p.0.iter().step_by(64).map(|e| e.p)).collect(), n_emits, self.threads * 4);
         let (cur, pairs, local_ro) = (&self.cur, self.pairs, &*local);
@@ -715,7 +652,7 @@ impl<'a, N: Rem> Backward<'a, N> {
                     Some(b) if self.set_of(b, local_ro) == r => b,
                     _ => {
                         let h = region_hash(r.as_ref());
-                        match self.arena_code(&r, h).or_else(|| local_interned.get(&h).copied().filter(|&s| local_ro.get(s) == r).map(|s| s | LOCAL)) {
+                        match self.sets.find(r.as_ref(), h).or_else(|| local_ro.find(r.as_ref(), h).map(|s| s | LOCAL)) {
                             Some(s) => s,
                             None => {
                                 made.push(r);
@@ -735,19 +672,9 @@ impl<'a, N: Rem> Backward<'a, N> {
             let codes: Vec<u32> = made
                 .into_iter()
                 .map(|r| {
-                    let h = region_hash(r.as_ref());
-                    match local_interned.get(&h) {
-                        Some(&s) if local.get(s) == r => s | LOCAL,
-                        found => {
-                            let s = local.len() as u32;
-                            assert!(s < MADE, "more distinct sets in a step than set codes");
-                            if found.is_none() {
-                                local_interned.insert(h, s);
-                            }
-                            local.push(r.as_ref());
-                            s | LOCAL
-                        }
-                    }
+                    let s = local.intern(r.as_ref());
+                    assert!(s < MADE, "more distinct sets in a step than set codes");
+                    s | LOCAL
                 })
                 .collect();
             acc.extend(out.into_iter().map(|mut x| {
@@ -772,39 +699,33 @@ impl<'a, N: Rem> Backward<'a, N> {
                 last_region = r;
             }
         }
-        let n_read = self.changed.len();
-        self.n_changed += n_read as u64;
-        let (mut acc, mut local, mut local_interned) = (Vec::new(), RegionArena::default(), FxHashMap::default());
+        let mut st = ArcStats::default();
+        st.set(A::Changed, self.changed.len() as u64);
+        let (mut acc, mut local) = (Vec::new(), Interner::default());
         let items = self.read_items(t);
         let total = items.last().map_or(0, |x| x.0);
-        let (mut start, mut n_emits, mut rounds) = (0usize, 0usize, 0u32);
-        let (mut d_read, mut d_pull) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let mut start = 0usize;
         while start < total {
-            let t0 = std::time::Instant::now();
+            let mut lap = Lap::start();
             let (parts, end) = self.read_round(&items, start)?;
             start = end;
             let round: usize = parts.iter().map(|p| p.0.len()).sum();
             for p in &parts {
-                self.read.add(&p.1);
+                st.merge(&p.1);
             }
-            n_emits += round;
-            rounds += 1;
-            self.max_round = self.max_round.max(round);
-            d_read += t0.elapsed();
-            let t0 = std::time::Instant::now();
-            acc = self.fold_round(acc, &parts, &mut local, &mut local_interned);
+            st.add(A::Emissions, round as u64);
+            st.add(A::Rounds, 1);
+            st.set(A::MaxRound, st.get(A::MaxRound).max(round as u64));
+            st.lap(A::Read, &mut lap);
+            acc = self.fold_round(acc, &parts, &mut local);
             if start < total && local.bytes() > self.local_compact {
-                (local, local_interned) = compact_local(&mut acc, &local);
+                local = compact_local(&mut acc, &local);
             }
-            d_pull += t0.elapsed();
+            st.lap(A::Pull, &mut lap);
         }
-        self.n_emits += n_emits as u64;
-        self.rounds += rounds as u64;
-        self.d_read += d_read;
-        self.d_pull += d_pull;
         // MERGE, the step's sets against those at t + 1: a set that grew
         // closes its span and opens one, a node of layer t + 1 closes its.
-        let t0 = std::time::Instant::now();
+        let mut lap = Lap::start();
         let close_at = t as u16 + 1;
         let bounds = id_ranges(acc.iter().step_by(64).map(|x| x.p).chain(self.cur.iter().step_by(64).map(|x| x.id)).collect(), acc.len() + self.cur.len(), self.threads * 4);
         struct RangeOut {
@@ -868,19 +789,8 @@ impl<'a, N: Rem> Backward<'a, N> {
                 if x.set & LOCAL != 0 {
                     let l = (x.set & !LOCAL) as usize;
                     if to_arena[l] == u32::MAX {
-                        let r = local.get(l as u32);
-                        let h = region_hash(r);
-                        to_arena[l] = match self.interned.get(&h) {
-                            Some(&s) if self.sets.get(s) == r => s,
-                            found => {
-                                let s = self.sets.push(r);
-                                assert!(s < MADE, "more distinct sets than set codes");
-                                if found.is_none() {
-                                    self.interned.insert(h, s);
-                                }
-                                s
-                            }
-                        };
+                        to_arena[l] = self.sets.intern(local.get(l as u32));
+                        assert!(to_arena[l] < MADE, "more distinct sets than set codes");
                     }
                     x.set = to_arena[l];
                 }
@@ -894,27 +804,22 @@ impl<'a, N: Rem> Backward<'a, N> {
         self.runs.push(run);
         self.cur = new_cur;
         self.changed = changed;
-        self.max_cur = self.max_cur.max(self.cur.len());
+        st.set(A::Nodes, self.cur.len() as u64);
         // The step's workers are gone: return their freed pages now
         // (mimalloc reclaims them lazily: ~3 GB held on a big room).
         // SAFETY: mimalloc's documented API, callable from any thread.
         unsafe { libmimalloc_sys::mi_collect(true) };
-        let d_merge = t0.elapsed();
-        self.d_merge += d_merge;
-        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        st.lap(A::Merge, &mut lap);
+        self.stats.merge(&st);
         eprintln!(
-            "[arc] f{t:03}: {n_read} changed at f{} -> {n_emits} in-edges ({rounds} rounds); {} nodes with a set, {} changed | read {:.0} pull {:.0} merge {:.0} ms | anon {:.2} GB: frame {:.2}, runs {:.2}, {} sets {:.2} ({:.2} mapped), the step's {step_sets} sets {:.2} ({step_kept} kept)",
-            t + 1,
-            self.cur.len(),
+            "[arc] f{t:03}: {}; {} changed | anon {:.2} GB: frame {:.2}, runs {:.2}, {} sets {:.2} ({:.2} mapped), the step's {step_sets} sets {:.2} ({step_kept} kept)",
+            st.line(),
             self.changed.len(),
-            ms(d_read),
-            ms(d_pull),
-            ms(d_merge),
             crate::metrics::current_rss_gb(),
             (self.cur.capacity() * std::mem::size_of::<Cur>() + self.changed.capacity() * 4) as f64 / 1e9,
             self.run_bytes.len() as f64 / 1e9,
             self.sets.len(),
-            (self.sets.bytes() + self.interned.capacity() * 16) as f64 / 1e9,
+            self.sets.bytes() as f64 / 1e9,
             self.sets.mapped_bytes() as f64 / 1e9,
             step_bytes as f64 / 1e9,
         );
@@ -950,7 +855,7 @@ impl<'a, N: Rem> Backward<'a, N> {
         drop(uses);
         // (No shrink: a Vec's unused capacity is never touched, so never
         // resident; shrinking would copy the arena.)
-        let sets = Sets { arena: std::mem::take(&mut self.sets), order };
+        let sets = Sets { arena: std::mem::take(&mut self.sets).into_arena(), order };
         crate::metrics::mem_phase("arc: backward swept");
         let spans: usize = runs.iter().map(|r| r.n).sum();
         let mut iters: Vec<_> = runs.iter().map(|r| r.iter(&all)).collect();
@@ -1014,23 +919,10 @@ impl<'a, N: Rem> Backward<'a, N> {
         let opens: Vec<u32> = self.opens.values().copied().collect();
         let (o_mean, o_max) = (opens.iter().map(|&o| o as f64).sum::<f64>() / opens.len().max(1) as f64, opens.iter().copied().max().unwrap_or(0));
         eprintln!(
-            "[arc] backward: {} sets changed, {} in-edges read ({} emissions in {} rounds, at most {} a round), {} segments decoded: {:.2} GB stored ({:.3} GB the store), {:.2} GB raw, {} bundles; {} target regions read on {o_mean:.1} steps each (at most {o_max}), {} (region, frame) opens; at most {} nodes a frame; read {:.2} s, pull {:.2} s, merge {:.2} s; {} nodes, {} spans, {} distinct sets: W {:.2} GB (nodes and spans {:.2}, sets {:.2}, {:.2} of them mapped)",
-            self.n_changed,
-            self.read.edges,
-            self.n_emits,
-            self.rounds,
-            self.max_round,
-            self.read.segments,
-            self.read.stored as f64 / 1e9,
+            "[arc] backward: {} ({:.3} GB the store); {} target regions read on {o_mean:.1} steps each (at most {o_max}); {} nodes, {} spans, {} distinct sets: W {:.2} GB (nodes and spans {:.2}, sets {:.2}, {:.2} of them mapped)",
+            self.stats.line(),
             self.store.bytes as f64 / 1e9,
-            self.read.raw as f64 / 1e9,
-            self.read.bundles,
             opens.len(),
-            self.read.region_opens,
-            self.max_cur,
-            self.d_read.as_secs_f64(),
-            self.d_pull.as_secs_f64(),
-            self.d_merge.as_secs_f64(),
             w.len(),
             w.spans,
             w.sets.len(),
@@ -1112,8 +1004,7 @@ impl<N: Rem> Seeds<N> {
 
     /// A state's `(shape, key, cell)`.
     pub fn state(&self, s: Sk) -> (u64, (u64, u64), u32) {
-        let geo = GEOMETRY;
-        (self.shapes[s.shape(&geo) as usize], s.key, s.cell(&geo))
+        (self.shapes[s.shape() as usize], s.key, s.cell())
     }
 }
 
@@ -1142,12 +1033,7 @@ pub(crate) mod tests {
     #[test]
     fn seek_finds_what_the_linear_walk_finds() {
         let mut x = 0x9e37_79b9_7f4a_7c15u64;
-        let mut rnd = |n: u64| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x % n
-        };
+        let mut rnd = |n: u64| crate::testutil::xorshift(&mut x) % n;
         for len in [0usize, 1, 2, 3, 7, 64, 1000] {
             let mut v: Vec<((u64, u64), u8, u32)> = (0..len).map(|_| ((rnd(3), rnd(200)), 0, 0)).collect();
             v.sort_unstable();
@@ -1163,10 +1049,7 @@ pub(crate) mod tests {
 
     /// A deterministic `r(m)` in `0..m` from `seed`.
     pub(crate) fn rng(mut s: u64) -> impl FnMut(u32) -> u32 {
-        move |m| {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((s >> 33) as u32) % m
-        }
+        move |m| ((crate::testutil::lcg(&mut s) >> 33) as u32) % m
     }
 
     /// A transfer's image of a point of its guard.
@@ -1196,7 +1079,7 @@ pub(crate) mod tests {
     /// `layers[src] + 1` (so `layers[dst] <= layers[src] + 1`); the wins'
     /// out-edges are dropped, as the forward never expands a win.
     pub(crate) struct TestTree {
-        dir: std::path::PathBuf,
+        dir: crate::testutil::TestDir,
         layers: Vec<u32>,
         wins: Vec<u32>,
     }
@@ -1205,8 +1088,7 @@ pub(crate) mod tests {
         pub(crate) fn new(name: &str, layers: Vec<u32>, edges: &[(u32, u32, Transfer, Transfer)], wins: Vec<u32>) -> Self {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SEQ: AtomicU32 = AtomicU32::new(0);
-            let dir = std::env::temp_dir().join(format!("celeste-arcdp-{name}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
-            let _ = std::fs::remove_dir_all(&dir);
+            let dir = crate::testutil::TestDir::new(&format!("arcdp-{name}-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
             let mut pairs: Vec<crate::search::arc_edges::Pair> = edges.iter().map(|e| (axis(e.2), axis(e.3))).collect();
             pairs.sort_unstable();
             pairs.dedup();
@@ -1236,12 +1118,6 @@ pub(crate) mod tests {
             let mut v: Vec<Sk> = self.wins.iter().map(|&k| sid(k)).collect();
             v.sort_unstable();
             v
-        }
-    }
-
-    impl Drop for TestTree {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -1301,7 +1177,7 @@ pub(crate) mod tests {
                     let mut pieces = Vec::new();
                     for e in edges.iter().filter(|e| e.0 == i) {
                         if let Some(r) = &want[t as usize + 1][e.1 as usize] {
-                            r.pull(e.2, e.3, &mut pieces);
+                            r.as_ref().pull(e.2, e.3, &mut pieces);
                         }
                     }
                     Some(Region::from_pieces(&mut pieces, &mut Vec::new())).filter(|r| !r.is_empty())

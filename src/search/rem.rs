@@ -16,6 +16,81 @@ use super::arcs::{Circle, Fixed16, Seg, Transfer};
 use super::hull::{Hull, HullOf};
 use super::rem_f64;
 
+/// A CIRCLE'S STORED WORD (`Circle::W`: arena words, hull bounds; a
+/// point or a count): 16.16's `u16`, the doubles' `u64`.
+pub trait Word: Copy + Ord + std::hash::Hash + std::fmt::Debug + Default + Send + Sync + 'static {
+    /// Its little-endian bytes on disk.
+    const BYTES: usize;
+    /// A number (a point, or a count at most `SIZE` or `MAX_SEGS`) as a
+    /// word, and back.
+    fn of(v: u64) -> Self;
+    fn get(self) -> u64;
+    fn put(self, out: &mut Vec<u8>);
+    fn read(b: &[u8]) -> Self;
+    /// The hash of a hull's four words (statistics, fingerprints, the push
+    /// cache's slot).
+    fn hash4(w: [Self; 4]) -> u64;
+    /// Are a hull's four words equal (`PushCache::get`)?
+    fn same4(a: [Self; 4], b: [Self; 4]) -> bool;
+}
+
+impl Word for u16 {
+    const BYTES: usize = 2;
+    #[inline]
+    fn of(v: u64) -> u16 {
+        v as u16
+    }
+    #[inline]
+    fn get(self) -> u64 {
+        self as u64
+    }
+    fn put(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_le_bytes());
+    }
+    fn read(b: &[u8]) -> u16 {
+        u16::from_le_bytes([b[0], b[1]])
+    }
+    /// The four words in one, low first: exact.
+    #[inline]
+    fn hash4(w: [u16; 4]) -> u64 {
+        w[0] as u64 | (w[1] as u64) << 16 | (w[2] as u64) << 32 | (w[3] as u64) << 48
+    }
+    /// In one 8-byte compare (field by field cost the push cache's lookup
+    /// 2.6% of a big room's frame).
+    #[inline]
+    fn same4(a: [u16; 4], b: [u16; 4]) -> bool {
+        a == b
+    }
+}
+
+impl Word for u64 {
+    const BYTES: usize = 8;
+    #[inline]
+    fn of(v: u64) -> u64 {
+        v
+    }
+    #[inline]
+    fn get(self) -> u64 {
+        self
+    }
+    fn put(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_le_bytes());
+    }
+    fn read(b: &[u8]) -> u64 {
+        u64::from_le_bytes(b[..8].try_into().expect("8 bytes"))
+    }
+    #[inline]
+    fn hash4(w: [u64; 4]) -> u64 {
+        use celeste_engine::runtime2::mix64;
+        mix64(mix64(w[0] ^ w[1].rotate_left(32)) ^ w[2] ^ w[3].rotate_left(32))
+    }
+    /// Word by word (a miss differs early).
+    #[inline]
+    fn same4(a: [u64; 4], b: [u64; 4]) -> bool {
+        a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3]
+    }
+}
+
 /// One axis of what a frame did to the player's remainder, captured at its
 /// split (kernels and reference engine): whether this path took it, its
 /// argument `pre` and fragment `frag` (16.16: the floor split of `rem + ox +

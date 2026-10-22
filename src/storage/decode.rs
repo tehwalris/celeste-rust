@@ -6,7 +6,7 @@
 //!   * every value cell is a key field (`exact::ShapeKeys::value_cells`);
 //!   * the position's `x`/`y` keep only their fraction in the key
 //!     (`Code::pos`); the whole pixels are the cell's, less the room offset
-//!     (`pos_graph::room_offset` of the row's own `room.x/y`);
+//!     (`cells::room_offset` of the row's own `room.x/y`);
 //!   * the code merges `Num(n)` and `Ival(n, n)` (producers disagree), so
 //!     the skeleton keeps each value column's `Repr`.
 //!
@@ -21,7 +21,7 @@ use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::exact::{Code, FieldDict, Key, KeySpace};
 use celeste_engine::runtime2::{Cell2, Col, Rt2, AV};
 
-use crate::search::pos_graph::{cell_xy, room_offset, NO_CELL};
+use crate::storage::cells::{cell_xy, room_offset, NO_CELL};
 
 /// The rows `(key, cell)` of `skel`'s shape as a block (`skel`'s values
 /// unread). A run of one key's rows differs only in position: codes are

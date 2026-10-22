@@ -13,11 +13,10 @@ use anyhow::{anyhow, ensure, Result};
 
 use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128, wide};
 use super::visited::Key;
-use super::{Sk, GEOMETRY};
+use super::Sk;
 use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
 
-const _: () = assert!(GEOMETRY.words == 1, "a set holds a u64 mask an entry: 8 x 8 storage regions");
 
 /// The bytes key `w` needs (at least 1).
 #[inline]
@@ -215,31 +214,25 @@ thread_local! {
     static ZSTD: std::cell::RefCell<Option<(zstd::bulk::Compressor<'static>, zstd::bulk::Decompressor<'static>)>> = const { std::cell::RefCell::new(None) };
 }
 
-fn zstd_pack(raw: &[u8]) -> Result<Box<[u8]>> {
+/// `f` with the thread's zstd contexts (made on first use).
+fn with_zstd<R>(f: impl FnOnce(&mut zstd::bulk::Compressor<'static>, &mut zstd::bulk::Decompressor<'static>) -> Result<R>) -> Result<R> {
     ZSTD.with(|z| {
         let mut z = z.borrow_mut();
-        let (c, _) = match &mut *z {
+        let (c, d) = match &mut *z {
             Some(x) => x,
-            None => z.insert((zstd::bulk::Compressor::new(1)?, zstd::bulk::Decompressor::new()?)),
+            None => z.insert((super::file::compressor()?, zstd::bulk::Decompressor::new()?)),
         };
-        Ok(c.compress(raw)?.into_boxed_slice())
+        f(c, d)
     })
+}
+
+fn zstd_pack(raw: &[u8]) -> Result<Box<[u8]>> {
+    with_zstd(|c, _| Ok(super::file::compress(raw, c)?.into_boxed_slice()))
 }
 
 /// `bytes` decompressed into `out` (`raw` bytes; the thread's context).
 fn zstd_unpack(bytes: &[u8], raw: usize, out: &mut Vec<u8>) -> Result<()> {
-    ZSTD.with(|z| {
-        let mut z = z.borrow_mut();
-        let (_, d) = match &mut *z {
-            Some(x) => x,
-            None => z.insert((zstd::bulk::Compressor::new(1)?, zstd::bulk::Decompressor::new()?)),
-        };
-        out.clear();
-        out.reserve(raw);
-        let n = d.decompress_to_buffer(bytes, out)?;
-        ensure!(n == raw, "a packed block decompressed to {n} bytes, not {raw}");
-        Ok(())
-    })
+    with_zstd(|_, d| super::file::decompress(bytes, raw, d, out))
 }
 
 /// One change of a packed table (`upsert`): state `(key, cell)`, its info
@@ -663,10 +656,7 @@ fn merge_rows<N: Rem>(rows: &Rows<N>, changes: &[Change<N>], w: &mut Writer<N>) 
                 infos.clear();
                 let with_old = mask & !bare;
                 let mut k = c;
-                let mut cells = mask2 & !bare2;
-                while cells != 0 {
-                    let cell = cells.trailing_zeros();
-                    cells &= cells - 1;
+                for cell in super::layer::bits(mask2 & !bare2) {
                     while k < d && (changes[k].cell as u32) < cell {
                         k += 1;
                     }
@@ -808,12 +798,7 @@ mod tests {
 
     fn rng(seed: u64) -> impl FnMut() -> u64 {
         let mut x = seed | 1;
-        move || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x
-        }
+        move || crate::testutil::xorshift(&mut x)
     }
 
     /// A plain table holds what it was made of, keys of every width (1 to

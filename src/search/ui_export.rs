@@ -49,7 +49,7 @@ use std::path::Path;
 
 use celeste_engine::exact::Key;
 
-use crate::search::pos_graph::cell_xy;
+use crate::storage::cells::cell_xy;
 use crate::storage::layer::{bits, last_frame, Tree};
 
 /// One forward frame's stats: a `forward.tsv` row under the UI's names;
@@ -394,10 +394,9 @@ struct CellRows {
 impl CellRows {
     /// The rows of `shape` at the cells `locals` of region slot `slot`.
     fn of(set: &MarkedSet, shape: u64, slot: u32, locals: u64) -> CellRows {
-        let geo = crate::storage::GEOMETRY;
         let mut out = CellRows { lo: [0; 64], hi: [0; 64], live: 0 };
         for local in bits(locals) {
-            if let Some(&(a, b)) = set.cells.get(&(shape, geo.cell(slot, local))) {
+            if let Some(&(a, b)) = set.cells.get(&(shape, crate::storage::cells::cell(slot, local))) {
                 (out.lo[local as usize], out.hi[local as usize]) = (a, b);
                 out.live |= 1 << local;
             }
@@ -424,10 +423,8 @@ fn count_marked(m: &MarksMap, rows: &CellRows, keys: &[Key], masks: &[u64]) -> [
         if live == 0 {
             break;
         }
-        let mut cells = mask & live;
-        while cells != 0 {
-            let l = cells.trailing_zeros() as usize;
-            cells &= cells - 1;
+        for l in crate::storage::layer::bits(mask & live) {
+            let l = l as usize;
             let i = gallop(lo[l], hi[l], |i| m.key(i) < *key);
             lo[l] = i;
             if i < hi[l] && m.key(i) == *key {
@@ -460,9 +457,8 @@ struct RegionBlocks {
 /// decoded, merged with the marked sets' rows at its cells, and unmapped.
 /// Does the region hold a win?
 fn count_region<N: celeste_core::arith::Arithmetic>(tree: &Tree<N>, rb: &RegionBlocks, sets: &[MarkedSet], sums: &[std::sync::Mutex<FrameSums>]) -> Result<bool> {
-    let geo = crate::storage::GEOMETRY;
-    let (shape, slot) = (tree.shape_of(rb.region)?, rb.region % geo.slots);
-    let locals = if slot == geo.no_cell_slot() { 1 } else { u64::MAX };
+    let (shape, slot) = (tree.shape_of(rb.region)?, rb.region % crate::storage::cells::SLOTS);
+    let locals = if slot == crate::storage::cells::NO_CELL_SLOT { 1 } else { u64::MAX };
     let rows: Vec<CellRows> = sets.iter().map(|m| CellRows::of(m, shape, slot, locals)).collect();
     let mut won = false;
     for &(f, bi) in &rb.blocks {
@@ -486,7 +482,7 @@ fn count_region<N: celeste_core::arith::Arithmetic>(tree: &Tree<N>, rb: &RegionB
         let marked: Vec<[u32; 64]> = sets.iter().zip(&rows).map(|(m, r)| count_marked(&m.m, r, &e.keys, &e.masks)).collect();
         let add = |to: &mut FxHashMap<u32, u64>, a: &[u32; 64]| {
             for l in bits(held).filter(|&l| a[l as usize] > 0) {
-                *to.entry(geo.cell(slot, l)).or_default() += a[l as usize] as u64;
+                *to.entry(crate::storage::cells::cell(slot, l)).or_default() += a[l as usize] as u64;
             }
         };
         let mut s = sums[f].lock().unwrap();
@@ -506,7 +502,6 @@ fn count_region<N: celeste_core::arith::Arithmetic>(tree: &Tree<N>, rb: &RegionB
 /// recorded in-edges leave from, over every frame of the tree in `dir`
 /// through `last`; sorted.
 fn sources_into<N: crate::search::rem::Rem>(dir: &Path, last: u32, regions: &[u32], threads: usize) -> Result<FxHashMap<u32, Vec<u32>>> {
-    let geo = crate::storage::GEOMETRY;
     let store = crate::storage::edges::EdgeStore::<N>::open(&dir, last)?;
     let frames: Vec<u32> = (1..=last).collect();
     let parts = crate::par::Pool::new(threads).map_with(
@@ -515,9 +510,7 @@ fn sources_into<N: crate::search::rem::Rem>(dir: &Path, last: u32, regions: &[u3
         |dec, k| {
             let mut pairs: Vec<(u32, u32)> = Vec::new();
             for &r in regions {
-                for seg in store.segments(frames[k], r) {
-                    dec.bundles(&seg, |b| crate::storage::edges::expand(&geo, r, &b, |src, dst| pairs.push((dst.cell(&geo), src.cell(&geo)))))?;
-                }
+                store.bundles_into(frames[k], r, dec, |b| crate::storage::edges::expand(r, &b, |src, dst| pairs.push((dst.cell(), src.cell()))))?;
             }
             Ok(pairs)
         },
@@ -986,8 +979,7 @@ mod tests {
     /// another), against a set on random regions; an unsorted file refused.
     #[test]
     fn marks_files_merge_with_a_regions_keys() {
-        let geo = crate::storage::GEOMETRY;
-        let dir = std::env::temp_dir().join(format!("celeste-ui-marks-{}", std::process::id()));
+        let dir = crate::testutil::TestDir::new("ui-marks");
         std::fs::create_dir_all(&dir).unwrap();
         let save = |name: &str, rows: &[((u64, u64), u32, u64, u16)]| {
             let mut v = crate::frame::Visited::new(Default::default());
@@ -999,7 +991,7 @@ mod tests {
             scan_marks(MarksMap::open(&path).unwrap(), &path, 2).unwrap()
         };
         let slot = 5u32;
-        let c = |local: u32| geo.cell(slot, local);
+        let c = |local: u32| crate::storage::cells::cell(slot, local);
         // dist = the horizon (9) minus the deadline.
         let (a, by_cell_dist) = save("a.bin", &[((1, 2), c(3), 7, 9), ((5, 6), c(3), 7, 9), ((1, 2), c(4), 7, 8), ((1, 2), c(3), 8, 9)]);
         assert_eq!(a.m.rows, 4);
@@ -1015,12 +1007,7 @@ mod tests {
 
         // Random regions of two shapes over three slots against the set.
         let mut x = 0x9e3779b97f4a7c15u64;
-        let mut rnd = move || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x
-        };
+        let mut rnd = move || crate::testutil::xorshift(&mut x);
         let mut regions = Vec::new();
         let mut rows = Vec::new();
         for shape in [3u64, 11] {
@@ -1031,12 +1018,12 @@ mod tests {
                 let masks: Vec<u64> = keys.iter().map(|_| rnd() & rnd() | 1 << (rnd() % 64)).collect();
                 for (k, &m) in keys.iter().zip(&masks) {
                     for l in bits(m).filter(|_| rnd() % 3 == 0) {
-                        rows.push((*k, geo.cell(slot, l), shape, 9));
+                        rows.push((*k, crate::storage::cells::cell(slot, l), shape, 9));
                     }
                 }
                 // Rows at cells the region does not hold, and of keys it lacks.
-                rows.push(((9, 9), geo.cell(slot, 0), shape, 9));
-                rows.push(((0, 1000), geo.cell(slot, 63), shape, 9));
+                rows.push(((9, 9), crate::storage::cells::cell(slot, 0), shape, 9));
+                rows.push(((0, 1000), crate::storage::cells::cell(slot, 63), shape, 9));
                 regions.push((shape, slot, keys, masks));
             }
         }
@@ -1045,7 +1032,7 @@ mod tests {
         for (shape, slot, keys, masks) in &regions {
             let got = marked(&m, *shape, *slot, keys, masks);
             for l in 0..64 {
-                let n = keys.iter().zip(masks).filter(|(k, &mk)| mk >> l & 1 == 1 && want.contains(&(*shape, geo.cell(*slot, l), **k))).count();
+                let n = keys.iter().zip(masks).filter(|(k, &mk)| mk >> l & 1 == 1 && want.contains(&(*shape, crate::storage::cells::cell(*slot, l), **k))).count();
                 assert_eq!(got[l as usize] as usize, n, "shape {shape} slot {slot} cell {l}");
             }
         }
@@ -1055,14 +1042,12 @@ mod tests {
         let rows: Vec<crate::frame::MarkRow> = vec![(7, 3, 5, 6, 0), (7, 3, 1, 2, 0)];
         crate::storage::file::save_value(&bad, &(rows, 9u32, celeste_engine::exact::KeySpace::<celeste_engine::runtime2::P8>::default().to_additions())).unwrap();
         assert!(scan_marks(MarksMap::open(&bad).unwrap(), &bad, 2).is_err());
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The forward's record reads back: a rerun frame's last row wins.
     #[test]
     fn a_trees_forward_record_reads_back() {
-        let dir = std::env::temp_dir().join(format!("celeste-ui-fwd-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testutil::TestDir::new("ui-fwd");
         std::fs::create_dir_all(&dir).unwrap();
         assert!(read_forward_stats(&dir).unwrap().is_empty(), "a tree from before the record");
         let ms = std::time::Duration::from_millis;
@@ -1085,14 +1070,13 @@ mod tests {
         assert_eq!(got.iter().map(|l| (l.f, l.kept)).collect::<Vec<_>>(), vec![(1, 10), (2, 21), (3, 30)]);
         let t = &got[0].times;
         assert_eq!((t.emit_ms, t.emit_idle, t.ckpt_ms, t.total_ms, got[0].visited, t.rss_gb), (7, 94, 1, 11, 4, 1.28));
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The search's `witness.txt` and a labelled path file with dashes that
     /// ends at the exit both read; a skipped frame does not.
     #[test]
     fn witness_and_reference_files_read() {
-        let dir = std::env::temp_dir().join(format!("celeste-ui-witness-{}", std::process::id()));
+        let dir = crate::testutil::TestDir::new("ui-witness");
         std::fs::create_dir_all(&dir).unwrap();
         let read = |text: &str| {
             let p = dir.join("w.txt");
@@ -1106,6 +1090,5 @@ mod tests {
         assert_eq!((r.label.as_str(), r.path.len(), r.dashes), ("TAS29 (community)", 3, vec![(2, "R".to_string())]));
         assert!(read("inputs 0,34\n0 - -\n2 8 96\n").is_err(), "frames are consecutive from 0");
         assert!(read("inputs 0,34\nprologue 1\n0 - -\n").is_err(), "an unknown line");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

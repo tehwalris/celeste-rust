@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 /// Bump whenever the meaning or layout of ANY tree content changes (older
 /// trees are refused; what each version changed: git history).
-pub(crate) const FORMAT_VERSION: u32 = 23;
+pub(crate) const FORMAT_VERSION: u32 = 24;
 
 /// The value files' magic.
 const VALUE: &[u8; 4] = b"C8TB";
@@ -54,6 +54,11 @@ impl At {
     pub(crate) fn end(&self) -> u64 {
         self.offset + self.len as u64
     }
+}
+
+/// The tree files' zstd context (level 1: "zstd -1").
+pub(crate) fn compressor() -> Result<zstd::bulk::Compressor<'static>> {
+    Ok(zstd::bulk::Compressor::new(1)?)
 }
 
 /// zstd -1 of a raw block, shrunk to its size (the compressor's buffer is

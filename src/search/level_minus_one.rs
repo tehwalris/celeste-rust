@@ -173,7 +173,7 @@ fn berry_left_behind<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, ro
     }
 }
 
-/// The player, else the player spawn (`pos_graph::player_object`'s rule).
+/// The player, else the player spawn (`Rt2::position_object`'s rule).
 fn located_object<A: GraphArith>(st: &State<Symbolic<A>>) -> Option<Path> {
     crate::trace::shapes::player_path(st).or_else(|| crate::trace::widen::objects_of_type(st, "player_spawn").into_iter().next())
 }
@@ -1000,7 +1000,7 @@ impl CostToGo {
     /// The smallest horizon at which a row at `frame` is NOT `too_late`:
     /// `frame + d`; 0 off the table (never refused), `u32::MAX` with no exit.
     pub(crate) fn admitted_from(&self, shape: u64, cell: u32, frame: u32) -> u32 {
-        let Some((x, y)) = crate::search::pos_graph::cell_xy(cell) else { return 0 };
+        let Some((x, y)) = crate::storage::cells::cell_xy(cell) else { return 0 };
         if x >= 128 {
             return 0;
         }
@@ -1018,7 +1018,7 @@ impl CostToGo {
     /// A row's d (`u32::MAX`: no exit), `None` where the table has no node
     /// (no player cell, outside the room, a shape or cell never reached).
     pub fn d_of(&self, shape: u64, cell: u32) -> Option<u32> {
-        let (x, y) = crate::search::pos_graph::cell_xy(cell)?;
+        let (x, y) = crate::storage::cells::cell_xy(cell)?;
         if x >= 128 {
             return None;
         }
@@ -1092,7 +1092,7 @@ fn cost_to_go(spd_px: i32, threads: usize, s: &crate::settings::Settings) -> Res
 /// container's: `storage::file`); bump it when what a file holds changes.
 const CACHE_FORMAT: u32 = 2;
 
-/// A tree's own table, beside its record (`TreeFilter`): the table its
+/// A tree's own table, beside its record (`TreeL1`): the table its
 /// frames were filtered by, whatever binary extends or reads the tree.
 pub(crate) const TABLE_FILE: &str = "l1-table.bin";
 
@@ -1946,7 +1946,7 @@ fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate
 /// late for the exit `horizon` (a frame) makes the table UNSOUND: an error.
 /// The report, a line per frame.
 pub fn check_route<N: crate::search::rem::Rem>(inputs: &[u8], horizon: u32, spd: i32, s: &crate::settings::Settings) -> Result<String> {
-    use crate::search::pos_graph::{block_cells, cell_xy};
+    use crate::storage::cells::{block_cells, cell_xy};
     use std::fmt::Write as _;
     let mut rep = String::new();
     let table = table(spd, s)?;
@@ -2013,7 +2013,7 @@ pub fn probe(opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
 
     // The soundness check against the recorded transitions: every edge of
     // the tree, as (source cell, target cell).
-    use crate::search::pos_graph::{cell_xy, NO_CELL};
+    use crate::storage::cells::{cell_xy, NO_CELL};
     let pairs = crate::with_arith!(s.arith, N => recorded_cell_pairs::<N>(&opts.level_dir, opts.threads)?);
     let mut pos_edges: HashSet<(i16, i16, i16, i16)> = HashSet::new();
     let mut exit_src: HashSet<(i16, i16)> = HashSet::new();
@@ -2082,7 +2082,7 @@ fn recorded_cell_pairs<N: crate::search::rem::Rem>(dir: &FsPath, threads: usize)
 /// `probe`'s comparison with a level-0 tree: per frame, what the filter
 /// would drop, and the marked states it calls too late.
 fn compare_with_tree<N: Arithmetic>(opts: &Opts, by_hash: &HashMap<u64, usize>, g1: &Graph1, sound: &[u32], rep: &mut String) -> Result<()> {
-    use crate::search::pos_graph::{cell_xy, NO_CELL};
+    use crate::storage::cells::{cell_xy, NO_CELL};
     let xy_of = |c: u32| -> (i16, i16) { if c == NO_CELL { (NONE, NONE) } else { cell_xy(c).map(|(x, y)| (x as i16, y as i16)).expect("a grid cell") } };
     let marks = match &opts.marks {
         Some(p) => {
@@ -2093,7 +2093,6 @@ fn compare_with_tree<N: Arithmetic>(opts: &Opts, by_hash: &HashMap<u64, usize>, 
         None => None,
     };
     let tree = crate::storage::layer::Tree::<N>::open(&opts.level_dir, opts.to)?;
-    let geo = crate::storage::GEOMETRY;
     say!(rep, "\nframe | states | too late (f + d > {}) | no exit path | death (kept) | left the room | other shape | not in the table | marked | MARKED TOO LATE", opts.ceiling)?;
     let mut samples: BTreeSet<String> = BTreeSet::new();
     for f in opts.from..=opts.to {
@@ -2102,7 +2101,7 @@ fn compare_with_tree<N: Arithmetic>(opts: &Opts, by_hash: &HashMap<u64, usize>, 
         let mut by_cell: std::collections::BTreeMap<(u64, u32), Vec<(u64, u64)>> = Default::default();
         let (layer, _) = tree.layer(f, None, 1)?;
         for s in layer.states_iter() {
-            by_cell.entry((tree.shape_of(s.region)?, s.cell(&geo))).or_default().push(s.key);
+            by_cell.entry((tree.shape_of(s.region)?, s.cell())).or_default().push(s.key);
         }
         let mut shapes: Vec<u64> = by_cell.keys().map(|k| k.0).collect();
         shapes.dedup();
@@ -2186,8 +2185,7 @@ mod tests {
     /// must not move it).
     #[test]
     fn a_trees_table_reads_back_under_its_fingerprint() {
-        let dir = std::env::temp_dir().join(format!("celeste-l1-tree-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testutil::TestDir::new("l1-tree");
         let d: rustc_hash::FxHashMap<(u64, i16, i16), u32> = [((7, 3, -4), 12), ((7, 3, 5), u32::MAX), ((0x9e37_79b9_7f4a_7c15, -16, 140), 0)].into_iter().collect();
         let t = CostToGo { d: d.clone(), start_d: 49 };
         assert_eq!(t.fingerprint(), 0x8475_2014_f2ed_1e20);
@@ -2197,7 +2195,6 @@ mod tests {
         assert!(tree_table(&dir, t.fingerprint() ^ 1).is_err(), "another fingerprint than the record's");
         let back = tree_table(&dir, t.fingerprint()).expect("the tree's table");
         assert_eq!((&back.d, back.start_d), (&t.d, t.start_d));
-        std::fs::remove_dir_all(&dir).expect("clean up");
     }
 
     fn num(lo: i32, hi: i32) -> Val {

@@ -9,7 +9,7 @@ use anyhow::Result;
 use rustc_hash::FxHashMap;
 
 use super::set::{Block, Change, PackedTable, PlainTable, RegionSet, Upserted};
-use super::{region_of, Geometry};
+use super::region_of;
 use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
 
@@ -26,16 +26,26 @@ const RUN_BLOCKS: usize = 64;
 /// states (by `storage::region_of`), the key space.
 #[derive(Clone)]
 pub struct VisitedSet<N: Rem = P8> {
-    pub(crate) geo: Geometry,
     pub keys: KeySpace<N>,
     shapes: Vec<u64>,
     shape_idx: FxHashMap<u64, u32>,
     set: RegionSet<PackedTable>,
 }
 
+/// One part of what `VisitedSet::absorb` takes in: a region's new entries
+/// (their hulls in the table's state order) at a layer, and its grown
+/// states (`Old`s or `Grown`s, by key and cell).
+pub(crate) struct Part<'a, N: Rem, G> {
+    pub(crate) region: u32,
+    pub(crate) new: &'a PlainTable,
+    pub(crate) hulls: &'a [HullOf<N>],
+    pub(crate) grown: &'a [G],
+    pub(crate) layer: u16,
+}
+
 impl<N: Rem> VisitedSet<N> {
-    pub(crate) fn new(geo: Geometry) -> Self {
-        VisitedSet { geo, keys: KeySpace::new(), shapes: Vec::new(), shape_idx: FxHashMap::default(), set: RegionSet::default() }
+    pub(crate) fn new() -> Self {
+        VisitedSet { keys: KeySpace::new(), shapes: Vec::new(), shape_idx: FxHashMap::default(), set: RegionSet::default() }
     }
 
     /// Forget every state, keeping the key space and the shapes
@@ -82,7 +92,7 @@ impl<N: Rem> VisitedSet<N> {
     /// The region of `(shape, slot)`, if the shape is numbered.
     #[inline]
     pub(crate) fn region(&self, shape: u64, slot: u32) -> Option<u32> {
-        self.shape_index(shape).map(|s| region_of(&self.geo, s, slot))
+        self.shape_index(shape).map(|s| region_of(s, slot))
     }
 
     /// Region `region`'s packed table, if any state is held there.
@@ -98,7 +108,9 @@ impl<N: Rem> VisitedSet<N> {
 
     /// UPSERT per region its changes (`set::Change`, sorted by key and cell,
     /// distinct; regions of numbered shapes made where absent), a big
-    /// region's runs of `RUN_BLOCKS` blocks apart, the biggest first.
+    /// region's runs of `RUN_BLOCKS` blocks apart, the biggest first:
+    /// `absorb`'s oracle.
+    #[cfg(test)]
     pub(crate) fn upsert_all(&mut self, changes: Vec<(u32, Vec<Change<N>>)>, threads: usize) -> Result<Upserted> {
         let regions: Vec<u32> = changes.iter().map(|c| c.0).collect();
         let range = |i: usize, lo: Option<Key>, hi: Option<Key>| {
@@ -123,7 +135,7 @@ impl<N: Rem> VisitedSet<N> {
         type Run = (usize, usize, (Option<Key>, Option<Key>), Vec<Block>);
         let mut runs: Vec<(usize, Run)> = Vec::new();
         for (i, region) in regions.iter().enumerate() {
-            anyhow::ensure!(((region / self.geo.slots) as usize) < self.shapes.len(), "an upserted region {region} of no numbered shape");
+            anyhow::ensure!(((region / crate::storage::cells::SLOTS) as usize) < self.shapes.len(), "an upserted region {region} of no numbered shape");
             let blocks = self.set.table_mut(*region).take_blocks();
             // Runs of blocks, each with the changes from its first key to
             // the next run's (the first from the start, the last to the end).
@@ -175,66 +187,119 @@ impl<N: Rem> VisitedSet<N> {
         self.set.tables().iter().map(|t| t.1.infos()).sum()
     }
 
-    /// A FRAME's states in: per region (each once) its NEW entries (a plain
-    /// table, of a numbered shape) with their hulls in its state order, at
-    /// layer `layer`, and its grown states (held already; sorted) with their
-    /// new hulls. Returns what it did (`held_new`: 0, the new are new).
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn absorb(&mut self, parts: &[(u32, &PlainTable, &[HullOf<N>], &[super::wave::Old<N>])], layer: u16, threads: usize) -> Result<Upserted> {
-        // Per region its new entries' first states (their hulls' places).
-        let starts: Vec<Vec<u32>> = super::wave::par_map(parts, threads, |&(region, new, hulls, _)| -> Result<Vec<u32>> {
-            let mut at = Vec::with_capacity(new.len() + 1);
+    /// FRAMES' states in (the forward's frame end; a resume's batch of frame
+    /// files): `parts`, by region, a region's in frame order - each its NEW
+    /// entries (a plain table, of a numbered shape) with their hulls in its
+    /// state order, at its `layer`, and its GROWN states (held already, or
+    /// new in an earlier part; sorted) with their new hulls. A state's last
+    /// part decides its layer and hull. Returns what it did (`held_new`: 0,
+    /// the new are new).
+    pub(crate) fn absorb<G: Copy + Into<super::hulls::Grown<N>> + Sync>(&mut self, parts: &[Part<'_, N, G>], threads: usize) -> Result<Upserted> {
+        // Per part its new entries' first states (their hulls' places).
+        let starts: Vec<Vec<u32>> = super::wave::par_map(parts, threads, |p| -> Result<Vec<u32>> {
+            let mut at = Vec::with_capacity(p.new.len() + 1);
             let mut n = 0u32;
-            for m in new.masks() {
+            for m in p.new.masks() {
                 at.push(n);
                 n += m.count_ones();
             }
             at.push(n);
-            anyhow::ensure!(n as usize == hulls.len(), "region {region}: {n} new states, {} hulls", hulls.len());
+            anyhow::ensure!(n as usize == p.hulls.len(), "region {}: {n} new states, {} hulls", p.region, p.hulls.len());
             Ok(at)
         })
         .into_iter()
         .collect::<Result<_>>()?;
-        // A run's entries and grown states: those with keys in [lo, hi).
-        let at = |i: usize, lo: Option<Key>, hi: Option<Key>| {
-            let (_, new, _, grown) = parts[i];
-            let e = |k: Option<Key>, end: usize| k.map_or(end, |k| new.lower_bound(k));
-            let g = |k: Option<Key>, end: usize| k.map_or(end, |k| grown.partition_point(|o| o.sk.key < k));
-            (e(lo, 0)..e(hi, new.len()), g(lo, 0)..g(hi, grown.len()))
+        // The regions, each its parts.
+        let mut regions: Vec<(u32, std::ops::Range<usize>)> = Vec::new();
+        for (k, p) in parts.iter().enumerate() {
+            match regions.last_mut() {
+                Some((r, ks)) if *r == p.region => ks.end = k + 1,
+                _ => regions.push((p.region, k..k + 1)),
+            }
+        }
+        anyhow::ensure!(regions.windows(2).all(|w| w[0].0 < w[1].0), "absorbed parts not by region");
+        // A part's entries and grown states in a run: keys in [lo, hi).
+        let at = |k: usize, lo: Option<Key>, hi: Option<Key>| {
+            let p = &parts[k];
+            let e = |key: Option<Key>, end: usize| key.map_or(end, |key| p.new.lower_bound(key));
+            let g = |key: Option<Key>, end: usize| key.map_or(end, |key| p.grown.partition_point(|&o| o.into().sk.key < key));
+            (e(lo, 0)..e(hi, p.new.len()), g(lo, 0)..g(hi, p.grown.len()))
         };
-        let regions: Vec<u32> = parts.iter().map(|p| p.0).collect();
-        // The new states and the grown ones, merged by key and cell (each
-        // run makes its own: all held at once they take 32 B a state).
+        // A part's new states in a run, as changes (by key and cell), into
+        // `out`; and its grown ones.
+        let fresh = |k: usize, e: std::ops::Range<usize>, out: &mut Vec<Change<N>>| {
+            let p = &parts[k];
+            let mut h = p.hulls[starts[k][e.start] as usize..starts[k][e.end] as usize].iter();
+            for x in e {
+                let (key, mask) = (p.new.key(x as u32), p.new.mask(x as u32));
+                for cell in super::layer::bits(mask) {
+                    let hull = *h.next().expect("counted above");
+                    out.push(Change { key, cell: cell as u8, info: Some(StateInfo { hull, layer: p.layer }), new: true });
+                }
+            }
+        };
+        let grown = |k: usize, g: std::ops::Range<usize>| {
+            parts[k].grown[g].iter().map(|&o| {
+                let o: super::hulls::Grown<N> = o.into();
+                Change { key: o.sk.key, cell: o.sk.local, info: Some(StateInfo { hull: o.hull, layer: o.layer }), new: false }
+            })
+        };
+        // A part's changes in a run: its new states and its grown ones,
+        // merged by key and cell.
+        let changes = |k: usize, lo: Option<Key>, hi: Option<Key>| -> Result<Vec<Change<N>>> {
+            let p = &parts[k];
+            let (e, g) = at(k, lo, hi);
+            let mut new: Vec<Change<N>> = Vec::with_capacity((starts[k][e.end] - starts[k][e.start]) as usize);
+            fresh(k, e, &mut new);
+            let mut out: Vec<Change<N>> = Vec::with_capacity(new.len() + g.len());
+            let mut g = grown(k, g).peekable();
+            for c in new {
+                while g.peek().is_some_and(|x| (x.key, x.cell) < (c.key, c.cell)) {
+                    out.push(g.next().expect("peeked"));
+                }
+                anyhow::ensure!(g.peek().is_none_or(|x| (x.key, x.cell) != (c.key, c.cell)), "region {}: a state new and grown at once", p.region);
+                out.push(c);
+            }
+            out.extend(g);
+            anyhow::ensure!(out.windows(2).all(|w| (w[0].key, w[0].cell) < (w[1].key, w[1].cell)), "region {}: grown states not by key and cell", p.region);
+            Ok(out)
+        };
+        let ids: Vec<u32> = regions.iter().map(|r| r.0).collect();
+        // Each run makes its own changes (all held at once they take 32 B a
+        // state); a region's parts' merged by state, the last part's kept
+        // (NEW where any was: new twice, the state stored twice).
         self.upsert_with(
-            &regions,
+            &ids,
             threads,
             |i, lo, hi| {
-                let (e, g) = at(i, lo, hi);
-                (starts[i][e.end] - starts[i][e.start]) as usize + g.len()
+                regions[i].1.clone().map(|k| {
+                    let (e, g) = at(k, lo, hi);
+                    (starts[k][e.end] - starts[k][e.start]) as usize + g.len()
+                }).sum()
             },
             |i, lo, hi| -> Result<std::borrow::Cow<'_, [Change<N>]>> {
-                let (region, new, hulls, grown) = parts[i];
-                let (e, g) = at(i, lo, hi);
-                let mut fresh: Vec<Change<N>> = Vec::with_capacity((starts[i][e.end] - starts[i][e.start]) as usize);
-                let mut h = hulls[starts[i][e.start] as usize..starts[i][e.end] as usize].iter();
-                for x in e {
-                    let (key, mask) = (new.key(x as u32), new.mask(x as u32));
-                    for cell in super::layer::bits(mask) {
-                        let hull = *h.next().expect("counted above");
-                        fresh.push(Change { key, cell: cell as u8, info: Some(StateInfo { hull, layer }), new: true });
+                let ks = regions[i].1.clone();
+                if ks.len() == 1 {
+                    return Ok(std::borrow::Cow::Owned(changes(ks.start, lo, hi)?));
+                }
+                // Every part's, then by state (stable: in part order).
+                let mut all: Vec<Change<N>> = Vec::new();
+                for k in ks {
+                    let (e, g) = at(k, lo, hi);
+                    fresh(k, e, &mut all);
+                    all.extend(grown(k, g));
+                }
+                all.sort_by_key(|c| (c.key, c.cell));
+                let mut out: Vec<Change<N>> = Vec::with_capacity(all.len());
+                for c in all {
+                    match out.last_mut() {
+                        Some(l) if (l.key, l.cell) == (c.key, c.cell) => {
+                            anyhow::ensure!(!(l.new && c.new), "region {}: a state stored twice", regions[i].0);
+                            *l = Change { new: l.new || c.new, ..c };
+                        }
+                        _ => out.push(c),
                     }
                 }
-                let mut out: Vec<Change<N>> = Vec::with_capacity(fresh.len() + g.len());
-                let mut g = grown[g].iter().map(|o| Change { key: o.sk.key, cell: o.sk.local, info: Some(StateInfo { hull: o.hull, layer: o.layer }), new: false }).peekable();
-                for c in fresh {
-                    while g.peek().is_some_and(|x| (x.key, x.cell) < (c.key, c.cell)) {
-                        out.push(g.next().expect("peeked"));
-                    }
-                    anyhow::ensure!(g.peek().is_none_or(|x| (x.key, x.cell) != (c.key, c.cell)), "region {region}: a state new and grown at once");
-                    out.push(c);
-                }
-                out.extend(g);
-                anyhow::ensure!(out.windows(2).all(|w| (w[0].key, w[0].cell) < (w[1].key, w[1].cell)), "region {region}: grown states not by key and cell");
                 Ok(std::borrow::Cow::Owned(out))
             },
         )
@@ -264,7 +329,7 @@ mod tests {
     /// the blocks in key order (`PackedTable::of_blocks` checks it).
     #[test]
     fn a_big_region_upserts_run_by_run() {
-        let mut v = VisitedSet::new(super::super::GEOMETRY);
+        let mut v = VisitedSet::new();
         v.add_shape(7);
         let region = 3;
         let info = |x: u64| Some(StateInfo { hull: Hull::from_bytes(&(x & 0x7fff_7fff_7fff_7fff).to_le_bytes()), layer: (x % 100) as u16 });
@@ -306,7 +371,7 @@ mod tests {
         let n = 300 * crate::storage::set::PACK_ENTRIES as u64;
         let held: Vec<Change> = (0..n).map(|k| Change { key: (0, 4 + k * 4), cell: (k % 64) as u8, info: Some(StateInfo { hull: hull(k), layer: (k % 7) as u16 }), new: true }).collect();
         let fresh = || {
-            let mut v = VisitedSet::new(super::super::GEOMETRY);
+            let mut v = VisitedSet::new();
             v.add_shape(7);
             v.upsert_all(vec![(region, held.clone())], 8).unwrap();
             v
@@ -323,7 +388,7 @@ mod tests {
             .collect();
         let layer = 40;
         let mut a = fresh();
-        let got = a.absorb(&[(region, &table, &hulls, &grown)], layer, 8).unwrap();
+        let got = a.absorb(&[Part { region, new: &table, hulls: &hulls, grown: &grown, layer }], 8).unwrap();
         // The same changes, made at once.
         let mut changes: Vec<Change> = Vec::new();
         let mut h = hulls.iter();
@@ -342,5 +407,59 @@ mod tests {
             assert_eq!(a.state(region, c.key, c.cell as u32), b.state(region, c.key, c.cell as u32), "state {:?} cell {}", c.key, c.cell);
         }
         assert!(a.table(region).unwrap().blocks().len() > 2 * RUN_BLOCKS, "several runs");
+    }
+
+    /// FRAMES AT ONCE (a resume's batch) as one after the other: a second
+    /// frame with new entries of its own, growing held states and the first
+    /// frame's new ones, in one `absorb` leaves the set as two do.
+    #[test]
+    fn absorbing_frames_at_once_is_absorbing_them_in_turn() {
+        use crate::search::hull::Hull;
+        use crate::storage::hulls::Grown;
+        let region = 5;
+        let hull = |x: u64| Hull::from_bytes(&(x.wrapping_mul(0x9e37_79b9_7f4a_7c15) & 0x7fff_7fff_7fff_7fff).to_le_bytes());
+        let n = 200 * crate::storage::set::PACK_ENTRIES as u64;
+        let held: Vec<Change> = (0..n).map(|k| Change { key: (0, 6 + k * 6), cell: (k % 64) as u8, info: Some(StateInfo { hull: hull(k), layer: (k % 5) as u16 }), new: true }).collect();
+        let fresh = || {
+            let mut v = VisitedSet::new();
+            v.add_shape(9);
+            v.upsert_all(vec![(region, held.clone())], 8).unwrap();
+            v
+        };
+        let table = |off: u64, step: usize| {
+            let keys: Vec<(u64, u64)> = (0..n).step_by(step).map(|k| (0, off + k * 6)).collect();
+            let masks: Vec<u64> = keys.iter().map(|k| 0b11u64 << (k.1 % 50)).collect();
+            PlainTable::from_sorted(&keys, &masks).unwrap()
+        };
+        let (t1, t2) = (table(1, 71), table(3, 89));
+        let (h1, h2): (Vec<Hull>, Vec<Hull>) = ((0..t1.states()).map(|i| hull(500 + i)).collect(), (0..t2.states()).map(|i| hull(900 + i)).collect());
+        // Frame 41 grows held states (every 41st) and some of frame 40's new
+        // ones (the first cell of every 3rd entry).
+        let mut g2: Vec<Grown> = (0..n).step_by(41).map(|k| Grown { sk: super::super::Sk { region, key: (0, 6 + k * 6), local: (k % 64) as u8 }, layer: (k % 5) as u16, hull: hull(k + 3) }).collect();
+        g2.extend(t1.iter().step_by(3).map(|(key, mask)| Grown { sk: super::super::Sk { region, key, local: mask.trailing_zeros() as u8 }, layer: 40, hull: hull(key.1 + 11) }));
+        g2.sort_unstable_by_key(|g| g.sk);
+        let p1 = Part { region, new: &t1, hulls: &h1, grown: &[] as &[Grown], layer: 40 };
+        let p2 = Part { region, new: &t2, hulls: &h2, grown: &g2, layer: 41 };
+        let mut a = fresh();
+        let got = a.absorb(&[p1, p2], 8).unwrap();
+        let mut b = fresh();
+        let p1 = Part { region, new: &t1, hulls: &h1, grown: &[] as &[Grown], layer: 40 };
+        let p2 = Part { region, new: &t2, hulls: &h2, grown: &g2, layer: 41 };
+        let first = b.absorb(&[p1], 8).unwrap();
+        let second = b.absorb(&[p2], 8).unwrap();
+        assert_eq!((got.added, got.held_new), (first.added + second.added, 0));
+        assert_eq!((a.len(), a.entries()), (b.len(), b.entries()));
+        for (key, mask) in t1.iter().chain(t2.iter()) {
+            for c in crate::storage::layer::bits(mask) {
+                assert_eq!(a.state(region, key, c), b.state(region, key, c), "state {key:?} cell {c}");
+            }
+        }
+        for c in held.iter().step_by(7) {
+            assert_eq!(a.state(region, c.key, c.cell as u32), b.state(region, c.key, c.cell as u32), "state {:?} cell {}", c.key, c.cell);
+        }
+        // A state new in both: stored twice.
+        let p1 = Part { region, new: &t1, hulls: &h1, grown: &[] as &[Grown], layer: 40 };
+        let again = Part { region, new: &t1, hulls: &h1, grown: &[] as &[Grown], layer: 41 };
+        assert!(fresh().absorb(&[p1, again], 8).is_err(), "a state new twice");
     }
 }

@@ -140,16 +140,10 @@ const XFER_CACHE: usize = 1 << 12;
 /// Entries of `UnitSink::src_seen` (a power of two).
 const SRC_SEEN: usize = 1 << 8;
 
-/// The lanes of a slice mask, lowest first.
+/// The lanes of a slice mask, lowest first (`layer::bits`).
 #[inline]
-pub(crate) fn lanes_of(mut m: u16) -> impl Iterator<Item = usize> {
-    std::iter::from_fn(move || {
-        (m != 0).then(|| {
-            let i = m.trailing_zeros() as usize;
-            m &= m - 1;
-            i
-        })
-    })
+pub(crate) fn lanes_of(m: u16) -> impl Iterator<Item = usize> {
+    super::layer::bits(m as u64).map(|i| i as usize)
 }
 
 /// A slice's TARGETS in one cell column of one shape (once per column, not
@@ -217,7 +211,7 @@ impl<N: Rem> Sources<N> {
 
     #[inline]
     fn push_source(&mut self, region: u32, key: Key) -> u32 {
-        let s = (region / super::GEOMETRY.slots, key);
+        let s = (region / crate::storage::cells::SLOTS, key);
         let n = self.unit_sources.len() as u32;
         let k = *self.src_idx.entry(s).or_insert(n);
         if k == n {
@@ -236,14 +230,13 @@ impl<N: Rem> Sources<N> {
 
     /// The sources and lanes are in: the lanes by source and cell.
     fn done(&mut self) {
-        let geo = super::GEOMETRY;
         self.src_first.clear();
         self.src_first.resize(self.unit_sources.len(), u32::MAX);
         self.entry_next.clear();
         self.entry_next.resize(self.srcs.len(), (u32::MAX, 0, 0, 0));
         // Lanes of an entry are consecutive, its cells ascending.
         for (lane, &(entry, cell)) in self.lanes.iter().enumerate() {
-            let (slot, local) = geo.slot_local(cell);
+            let (slot, local) = crate::storage::cells::slot_local(cell);
             let x = &mut self.entry_next[entry as usize];
             if x.2 == 0 {
                 (x.1, x.3) = (slot, lane as u32);
@@ -260,7 +253,7 @@ impl<N: Rem> Sources<N> {
     /// The lane of source `s` at `cell` (of unit `unit`).
     #[inline]
     fn lane(&self, unit: u32, s: u32, cell: u32) -> usize {
-        let (slot, local) = super::GEOMETRY.slot_local(cell);
+        let (slot, local) = crate::storage::cells::slot_local(cell);
         let mut e = self.src_first[s as usize];
         while e != u32::MAX {
             let (next, sl, mask, lane) = self.entry_next[e as usize];
@@ -278,8 +271,7 @@ impl<N: Rem> Sources<N> {
     #[inline]
     fn by_entry(&self, unit: u32, slot: u32, b: &super::route::Ub, mut f: impl FnMut(u32, u64, Option<i32>)) {
         use super::bundle::{shift_into, source_cell, TO_NONE};
-        let geo = super::GEOMETRY;
-        let none = geo.no_cell_slot();
+        let none = crate::storage::cells::NO_CELL_SLOT;
         if b.o < TO_NONE && slot != none {
             let mut left = b.mask;
             let mut e = self.src_first[b.s as usize];
@@ -297,11 +289,8 @@ impl<N: Rem> Sources<N> {
             assert!(left == 0, "unit {unit}: a bundle's source cells in no entry of the unit");
             return;
         }
-        let mut m = b.mask;
-        while m != 0 {
-            let c = m.trailing_zeros();
-            m &= m - 1;
-            let s_slot = geo.slot_local(source_cell(geo.cell(slot, c), b.o)).0;
+        for c in super::layer::bits(b.mask) {
+            let s_slot = crate::storage::cells::slot_local(source_cell(crate::storage::cells::cell(slot, c), b.o)).0;
             let mut e = self.src_first[b.s as usize];
             while e != u32::MAX && self.entry_next[e as usize].1 != s_slot {
                 e = self.entry_next[e as usize].0;
@@ -469,10 +458,10 @@ struct Guards<N: Rem> {
     last_shape: u64,
 }
 
-/// LEVEL -1 at emission: the table of `--level-minus-one` and its horizon,
-/// resolved once, and the last (shape, cell) asked.
+/// LEVEL -1 at emission: the tree's filter, and the last (shape, cell)
+/// asked.
 struct Drops {
-    l1: Option<(&'static crate::search::level_minus_one::CostToGo, u32)>,
+    l1: Option<crate::frame::TreeL1>,
     last: Option<((u64, u32), bool)>,
 }
 
@@ -480,13 +469,13 @@ impl Drops {
     /// Does it drop every row of (`shape`, `cell`) at frame `frame`?
     #[inline]
     fn drops(&mut self, shape: u64, cell: u32, frame: u32) -> bool {
-        let Some((table, h)) = self.l1 else { return false };
+        let Some(l1) = self.l1 else { return false };
         if let Some((at, r)) = self.last {
             if at == (shape, cell) {
                 return r;
             }
         }
-        let r = table.admitted_from(shape, cell, frame) > h;
+        let r = l1.drops(shape, cell, frame);
         self.last = Some(((shape, cell), r));
         r
     }
@@ -513,7 +502,6 @@ impl<N: Rem> Pusher<N> {
     /// hull)`, the cells nothing reached left out.
     #[inline(never)]
     fn pushes(&mut self, src: &Sources<N>, xfers: &Xfers<N>, unit: u32, slot: u32, targets: &[(Key, u64)], bundles: &[super::route::Ub]) -> Vec<(u32, u8, AccOf<N>)> {
-        let geo = super::GEOMETRY;
         // A slot per target cell reached (a bundle's cells are its target's).
         let (mut slots, mut offs) = (std::mem::take(&mut self.slots), std::mem::take(&mut self.offs));
         offs.clear();
@@ -541,7 +529,7 @@ impl<N: Rem> Pusher<N> {
                     }
                     None => {
                         let c = part.trailing_zeros();
-                        let s = super::bundle::source_cell(geo.cell(slot, c), b.o);
+                        let s = super::bundle::source_cell(crate::storage::cells::cell(slot, c), b.o);
                         edges.push((src.lane(unit, b.s, s) as u32, c as u8));
                     }
                 }
@@ -562,10 +550,7 @@ impl<N: Rem> Pusher<N> {
         let mut out: Vec<(u32, u8, AccOf<N>)> = Vec::with_capacity(n as usize);
         let mut at = 0usize;
         for (t, &(_, m)) in targets.iter().enumerate() {
-            let mut c = m;
-            while c != 0 {
-                let k = c.trailing_zeros();
-                c &= c - 1;
+            for k in super::layer::bits(m) {
                 if !slots[at].is_empty() {
                     out.push((t as u32, k as u8, slots[at]));
                 }
@@ -634,7 +619,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             xfers: Xfers::new(base, xfer_tab),
             routes: RouteIds::new(routes),
             pusher: Pusher::default(),
-            drops: Drops { l1: filters.minus_one.map(|m| (m.table, m.h)), last: None },
+            drops: Drops { l1: filters.l1, last: None },
             verdicts: Verdicts { marks: filters.marks, of: Default::default(), bufs: Vec::new(), at: Vec::new(), disallowed: false },
             guards: Guards { key_check: s.diag.key_check, check: Vec::new(), noted: Default::default(), registered: Default::default(), guarded: Default::default(), reference: false, last_shape: 0 },
             bundles: UnitBundles::default(),
@@ -750,7 +735,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         t.cells = *cells;
         for i in lanes_of(need) {
             let cell = cells[i];
-            let (slot, local) = super::GEOMETRY.slot_local(cell);
+            let (slot, local) = crate::storage::cells::slot_local(cell);
             t.route[i] = self.routes.id(shape, slot);
             t.local[i] = local as u8;
             let (entry, s_cell) = self.src.lanes[lanes[i]];
@@ -758,16 +743,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             t.s_region[i] = self.src.srcs[entry as usize].0;
             t.offset[i] = super::bundle::offset(s_cell, cell);
         }
-    }
-
-    /// ONE EMISSION: `emit_body` of one lane, the state `(shape, key, cell)`
-    /// reached from unit lane `lane` with transfer `xfer`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn emit(&mut self, shape: u64, cell: u32, key: Key, lane: usize, xfer: u32, init: impl Fn() -> Rt2<N>, mut push: impl FnMut(&mut RowBuf<N>)) -> Result<()> {
-        let mut targets = Targets::default();
-        self.targets(shape, &[cell; 16], 1, &[lane], &mut targets);
-        let e = BodyEmits { shape, take: 1, keys: &[key; 16], targets: &targets, xfers: &[xfer; 16] };
-        self.emit_body(&e, init, |b, _| push(b))
     }
 
     /// A BODY'S EMISSIONS into their routes' bundles. `init`: the shape's
@@ -852,22 +827,16 @@ impl<'a, N: Rem> UnitSink<'a, N> {
                 Some(p) if (p.0, p.1, p.2, p.3, p.4) == b => p.5 |= 1u64 << t.local[i],
                 _ => {
                     if let Some((r, k, s, x, o, m)) = pending {
-                        self.bundle(r, k, s, x, o, m);
+                        self.bundles.insert(r, k, s, x, o, m);
                     }
                     pending = Some((b.0, b.1, b.2, b.3, b.4, 1u64 << t.local[i]));
                 }
             }
         }
         if let Some((r, k, s, x, o, m)) = pending {
-            self.bundle(r, k, s, x, o, m);
+            self.bundles.insert(r, k, s, x, o, m);
         }
         Ok(())
-    }
-
-    /// OR `m` (target cells) into bundle `(route, t_key; s, x, o)`.
-    #[inline]
-    fn bundle(&mut self, route: u32, t_key: Key, s: u32, x: u32, o: u32, m: u64) {
-        self.bundles.insert(route, t_key, s, x, o, m);
     }
 
     /// `--key-check` of the rows in `check[i]`: each one's key is the
@@ -894,7 +863,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     pub(crate) fn row_key(&mut self, row: &Rt2<N>) -> (Rt2<N>, Key) {
         let level = crate::abstraction::Level { held: self.level.held, ..crate::abstraction::Level::EXACT };
         let mut w = row.clone_block();
-        crate::frame::widen_rt2_to(&mut w, level);
+        w.widen_to(level);
         w.canonical();
         if self.keys.shape(w.shape_hash).is_none() {
             self.note_shape(&celeste_engine::exact::ShapeRecord::of(&w));
@@ -937,9 +906,13 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             b.shape_hash = w.shape_hash;
             b
         };
+        // One lane's `emit_body`: the state reached from unit lane `lane`.
         let xfer = self.xfers.id(self.worker, pair);
+        let mut targets = Targets::default();
+        self.targets(w.shape_hash, &[cell; 16], 1, &[lane], &mut targets);
+        let e = BodyEmits { shape: w.shape_hash, take: 1, keys: &[key; 16], targets: &targets, xfers: &[xfer; 16] };
         self.guards.reference = true;
-        let r = self.emit(w.shape_hash, cell, key, lane, xfer, init, |b| b.push_row(&w, key, cell));
+        let r = self.emit_body(&e, init, |b, _| b.push_row(&w, key, cell));
         self.guards.reference = false;
         r
     }

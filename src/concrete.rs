@@ -206,7 +206,7 @@ mod tests {
         let fingerprint = |r: &Rt2| {
             let mut c = r.clone_block();
             c.canonical();
-            (r.shape_hash_of(), celeste_engine::exact::exact_rows(&c), crate::search::pos_graph::block_cells(r).expect("cells"))
+            (r.shape_hash_of(), celeste_engine::exact::exact_rows(&c), crate::storage::cells::block_cells(r).expect("cells"))
         };
         // The cart is read when an engine is built, under its settings.
         let mut whole = RefEngine::new(&Default::default()).expect("engine");

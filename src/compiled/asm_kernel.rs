@@ -1321,10 +1321,10 @@ fn dup_refs(bodies: &mut [AsmBody], reads: &[emit::BodyReads]) -> DupPairs {
 }
 
 /// Where a body's rows get player and room `x`/`y`; `None` (`NO_CELL`)
-/// without a numeric player position, as `pos_graph::block_cells`.
+/// without a numeric player position, as `cells::block_cells`.
 fn pos_sources<N: Arithmetic>(template: &Rt2<N>, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]>> {
     let ids = crate::compiled::ids();
-    let Some(obj) = crate::search::pos_graph::player_object(template) else {
+    let Some(obj) = template.position_object() else {
         return Ok(None);
     };
     let room = template

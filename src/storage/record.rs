@@ -5,7 +5,7 @@
 //!   (`Settings::write`; read back by `Settings::of_tree`, checked by
 //!   `Settings::check`);
 //! * `level_minus_one`: the level -1 filter its frames were built under,
-//!   with its table's fingerprint (`frame::TreeFilter`; the table itself is
+//!   with its table's fingerprint (`frame::TreeL1`; the table itself is
 //!   `l1-table.bin` beside the record: `level_minus_one::TABLE_FILE`);
 //! * `filtered_for`: a ladder level's, the coarser level's marks and the
 //!   horizon its forward was filtered for (`search::driver`);
@@ -150,8 +150,7 @@ mod tests {
     /// repeated key or a bare line is refused.
     #[test]
     fn a_record_reads_back_and_refuses_another_format() {
-        let dir = std::env::temp_dir().join(format!("celeste-record-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = crate::testutil::TestDir::new("record");
         assert_eq!(Record::read(&dir).expect("none"), None);
         assert_eq!(done(&dir).expect("none"), None);
         let mut rec = Record::default();
@@ -168,6 +167,5 @@ mod tests {
             std::fs::write(path(&dir), &bad).expect("write");
             assert!(Record::read(&dir).is_err(), "{bad:?} is refused");
         }
-        std::fs::remove_dir_all(&dir).expect("clean up");
     }
 }

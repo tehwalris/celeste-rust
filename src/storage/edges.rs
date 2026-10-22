@@ -4,9 +4,8 @@
 //! a header (the segments by region; per target region the SOURCE regions
 //! its edges leave), then per TARGET region its bundles (`storage::bundle`)
 //! in SEGMENTS, a wave's slices, each a zstd block. Transfers are global
-//! ids into `edges/xfer.bin`, CANONICAL (`XferTable::canonical`; a bundle
-//! holding a new one waits for it, as for a provisional target:
-//! `route::reencode`): a function of the search, not of slice order.
+//! ids into `edges/xfer.bin`, final at each slice's gather
+//! (`XferTable::merge`): a function of the search, not of the threads.
 
 use anyhow::{ensure, Context, Result};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -15,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use super::bundle::{self, Bundle};
 use super::file::{self, At, Mapped};
-use super::{Geometry, Sk, GEOMETRY};
+use super::Sk;
 use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
 
@@ -324,15 +323,8 @@ pub struct Edge {
 
 /// The edges of bundle `b` of target region `region`: `f(source, target)` each.
 #[inline]
-pub(crate) fn expand(geo: &Geometry, region: u32, b: &Bundle, mut f: impl FnMut(Sk, Sk)) {
-    let slot = region % geo.slots;
-    let mut m = b.mask;
-    while m != 0 {
-        let c = m.trailing_zeros();
-        m &= m - 1;
-        let s_cell = bundle::source_cell(geo.cell(slot, c), b.o);
-        f(Sk::at(geo, b.s_shape, b.s_key, s_cell), Sk { region, key: b.t_key, local: c as u8 });
-    }
+pub(crate) fn expand(region: u32, b: &Bundle, mut f: impl FnMut(Sk, Sk)) {
+    bundle::edges(b.mask, region % crate::storage::cells::SLOTS, b.o, |c, _, s_cell| f(Sk::at(b.s_shape, b.s_key, s_cell), Sk { region, key: b.t_key, local: c as u8 }));
 }
 
 pub(crate) struct Decoder {
@@ -350,7 +342,7 @@ impl Decoder {
     /// Segment `s`'s raw block, opened (its dictionaries read).
     pub(crate) fn open<'a>(&'a mut self, s: &SegRef) -> Result<bundle::Block<'a>> {
         file::decompress(s.bytes, s.raw, &mut self.z, &mut self.raw)?;
-        bundle::Block::open(&self.raw, &bundle::ORDER)
+        bundle::Block::open(&self.raw)
     }
 
     pub(crate) fn bundles(&mut self, s: &SegRef, f: impl FnMut(Bundle)) -> Result<()> {
@@ -485,8 +477,7 @@ impl<N: Rem> EdgeStore<N> {
     /// Every edge of frame `frame`, each segment's folded into an
     /// accumulator of its own (`init()`); the accumulators, by segment.
     pub(crate) fn par_scan<A: Send>(&self, frame: u32, threads: usize, init: impl Fn() -> A + Sync, f: impl Fn(&mut A, Edge) + Sync) -> Result<Vec<A>> {
-        let geo = GEOMETRY;
-        self.par_blocks(frame, threads, init, |acc, region, blk| blk.bundles(|b| expand(&geo, region, &b, |src, dst| f(acc, Edge { src, dst, xfer: b.x }))))
+        self.par_blocks(frame, threads, init, |acc, region, blk| blk.bundles(|b| expand(region, &b, |src, dst| f(acc, Edge { src, dst, xfer: b.x }))))
     }
 
     /// Every segment of frame `frame` opened and folded (`f(acc, target
@@ -508,10 +499,9 @@ impl<N: Rem> EdgeStore<N> {
     /// The distinct `(source cell, target cell)` pairs of frame `frame`'s
     /// edges (`Sk::cell`: the player's position cell, `NO_CELL` without one).
     pub(crate) fn cell_pairs(&self, frame: u32, threads: usize) -> Result<FxHashSet<(u32, u32)>> {
-        let geo = GEOMETRY;
         let mut all = FxHashSet::default();
         for part in self.par_scan(frame, threads, FxHashSet::default, |acc, e| {
-            acc.insert((e.src.cell(&geo), e.dst.cell(&geo)));
+            acc.insert((e.src.cell(), e.dst.cell()));
         })? {
             all.extend(part);
         }
@@ -525,19 +515,60 @@ impl<N: Rem> EdgeStore<N> {
         Ok(v)
     }
 
+    /// THE BUNDLES recorded at frame `frame` into target region `region`
+    /// (its segments decoded with `dec`): `f` each (`expand`: its edges).
+    pub(crate) fn bundles_into(&self, frame: u32, region: u32, dec: &mut Decoder, mut f: impl FnMut(Bundle)) -> Result<()> {
+        for s in self.segments(frame, region) {
+            dec.bundles(&s, &mut f)?;
+        }
+        Ok(())
+    }
+
     /// The in-edges recorded at frame `frame` of `target` (sources of layer
-    /// `frame - 1`): its region's segments decoded.
+    /// `frame - 1`).
     pub(crate) fn preds_at(&self, target: Sk, frame: u32) -> Result<Vec<(Sk, u32)>> {
-        let geo = GEOMETRY;
         let mut out = Vec::new();
-        let mut dec = Decoder::default();
-        for s in self.segments(frame, target.region) {
-            dec.bundles(&s, |b| {
-                if b.t_key == target.key && b.mask >> target.local & 1 == 1 {
-                    let s_cell = bundle::source_cell(geo.cell(target.region % geo.slots, target.local as u32), b.o);
-                    out.push((Sk::at(&geo, b.s_shape, b.s_key, s_cell), b.x));
-                }
+        self.bundles_into(frame, target.region, &mut Decoder::default(), |b| {
+            if b.t_key == target.key {
+                bundle::edges(b.mask & 1u64 << target.local, target.region % crate::storage::cells::SLOTS, b.o, |_, _, s_cell| out.push((Sk::at(b.s_shape, b.s_key, s_cell), b.x)));
+            }
+        })?;
+        Ok(out)
+    }
+
+    /// The OUT-EDGES recorded at frame `frame` of `sources` (layer `frame -
+    /// 1`): `(k, target, transfer)` for `sources[k]`, read from the target
+    /// regions the frame's source index names for the sources' regions.
+    pub(crate) fn out_of(&self, frame: u32, sources: &[Sk], threads: usize) -> Result<Vec<(usize, Sk, u32)>> {
+        let mut wanted: rustc_hash2::FxHashMap<(u32, super::visited::Key), Vec<(u32, usize)>> = Default::default();
+        let mut regions: Vec<u32> = Vec::new();
+        for (k, s) in sources.iter().enumerate() {
+            wanted.entry((s.shape(), s.key)).or_default().push((s.cell(), k));
+            regions.push(s.region);
+        }
+        regions.sort_unstable();
+        regions.dedup();
+        let mut targets: Vec<u32> = regions.iter().flat_map(|&r| self.targets_of(frame, r)).collect();
+        targets.sort_unstable();
+        targets.dedup();
+        let parts = super::wave::par_map(&targets, threads, |&region| -> Result<Vec<(usize, Sk, u32)>> {
+            let mut out = Vec::new();
+            self.bundles_into(frame, region, &mut Decoder::default(), |b| {
+                let Some(cands) = wanted.get(&(b.s_shape, b.s_key)) else { return };
+                expand(region, &b, |src, dst| {
+                    let c = src.cell();
+                    for &(wc, k) in cands {
+                        if wc == c {
+                            out.push((k, dst, b.x));
+                        }
+                    }
+                });
             })?;
+            Ok(out)
+        });
+        let mut out = Vec::new();
+        for p in parts {
+            out.extend(p?);
         }
         Ok(out)
     }
@@ -572,15 +603,14 @@ pub(crate) fn discard_after(dir: &Path, last: u32) -> Result<()> {
 /// segments of one frame and its source index.
 #[cfg(test)]
 pub(crate) fn segments_of(edges: &[(Sk, Sk, u32)]) -> Result<(Vec<Segment>, Vec<(u32, Vec<u32>)>)> {
-    let geo = GEOMETRY;
     let mut by: std::collections::BTreeMap<u32, rustc_hash2::FxHashMap<(u32, super::visited::Key, u32, u32, super::visited::Key), u64>> = Default::default();
     let mut sources: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
     for &(s, t, x) in edges {
-        let o = bundle::offset(s.cell(&geo), t.cell(&geo));
-        *by.entry(t.region).or_default().entry((s.shape(&geo), s.key, x, o, t.key)).or_default() |= 1u64 << t.local;
+        let o = bundle::offset(s.cell(), t.cell());
+        *by.entry(t.region).or_default().entry((s.shape(), s.key, x, o, t.key)).or_default() |= 1u64 << t.local;
         sources.entry(t.region).or_default().push(s.region);
     }
-    let mut z = zstd::bulk::Compressor::new(1)?;
+    let mut z = super::file::compressor()?;
     let mut raw = Vec::new();
     let mut enc = bundle::Encoder::default();
     let mut segs = Vec::new();
@@ -647,7 +677,7 @@ mod tests {
         for name in ["xfer.bin", "f.bin", "fx12.bin", "f12x.bin"] {
             assert_eq!(frame_of_name(name), None, "{name}");
         }
-        let dir = std::env::temp_dir().join(format!("celeste-edge-names-{}", std::process::id()));
+        let dir = crate::testutil::TestDir::new("edge-names");
         std::fs::create_dir_all(&dir).expect("tmp");
         for f in ["f999.bin", "f1000.bin", "f1000.tmp", "f0998.bin", "xfer.bin"] {
             std::fs::write(dir.join(f), b"").expect("write");
@@ -655,7 +685,6 @@ mod tests {
         discard_after(&dir, 999).expect("discard");
         let mut left: Vec<String> = std::fs::read_dir(&dir).expect("ls").map(|e| e.expect("e").file_name().to_string_lossy().into_owned()).collect();
         left.sort();
-        std::fs::remove_dir_all(&dir).expect("cleanup");
         assert_eq!(left, ["f0998.bin", "f999.bin", "xfer.bin"]);
     }
 
@@ -663,17 +692,15 @@ mod tests {
     /// target's in-edges by `preds_at`, the out-edge index by source region.
     #[test]
     fn a_frames_edges_come_back() {
-        let dir = std::env::temp_dir().join(format!("celeste-storage-edges-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let geo = GEOMETRY;
-        let cell = |x: i32, y: i32| crate::search::pos_graph::cell_of(x, y).unwrap();
-        let st = |shape: u32, k: u64, c: u32| Sk::at(&geo, shape, (0, k), c);
+        let dir = crate::testutil::TestDir::new("storage-edges");
+        let cell = |x: i32, y: i32| crate::storage::cells::cell_of(x, y).unwrap();
+        let st = |shape: u32, k: u64, c: u32| Sk::at(shape, (0, k), c);
         let a = st(0, 5, cell(3, 4));
         let b = st(0, 5, cell(4, 4));
         let t1 = st(1, 9, cell(5, 4));
         let t2 = st(1, 9, cell(6, 4));
         let far = st(1, 2, cell(100, 40));
-        let none = st(0, 7, crate::search::pos_graph::NO_CELL);
+        let none = st(0, 7, crate::storage::cells::NO_CELL);
         let extra = (st(0, 6, cell(2, 4)), t1, 2);
         let edges = vec![(a, t1, 3), (b, t2, 3), (a, t2, 4), (a, far, 3), (none, t1, 0), (t1, none, 1), extra];
         let pairs: Vec<Pair> = (0..5)
@@ -703,6 +730,5 @@ mod tests {
         });
         assert_eq!(store.targets_of(4, t1.region), vec![none.region]);
         assert_eq!(store.regions(4).len(), 3);
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

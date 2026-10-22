@@ -37,7 +37,7 @@ pub trait KernelLanes: crate::search::rem::Rem + GraphArith {
     /// A position's code words (`exact::Code::of_pos`): the value less its
     /// low end's whole pixels.
     fn pos_words(lo: Self::Raw, hi: Self::Raw) -> (Self::Raw, Self::Raw);
-    /// A position raw's whole pixels (`pos_graph::block_cells`' reading).
+    /// A position raw's whole pixels (`cells::block_cells`' reading).
     fn whole(r: Self::Raw) -> i16;
     /// This arithmetic's per-thread scratch pools (one static each).
     fn scratch() -> &'static LocalKey<RefCell<Vec<super::Scratch<Self>>>>;

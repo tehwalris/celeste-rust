@@ -17,7 +17,7 @@
 use super::arcs::{clip, Circle, Fixed16, Seg, Transfer};
 #[cfg(test)]
 use super::arcs::{Piece, Region};
-use super::rem::Rem;
+use super::rem::{Rem, Word};
 use celeste_core::pico8_num::Pico8Num as P8;
 
 /// The points of `C`: `0..size`.
@@ -108,7 +108,7 @@ pub struct Hull<C: Circle = Fixed16> {
 impl<C: Circle> PartialEq for Hull<C> {
     #[inline]
     fn eq(&self, o: &Self) -> bool {
-        C::same4(self.words(), o.words())
+        <C::W as Word>::same4(self.words(), o.words())
     }
 }
 
@@ -120,7 +120,7 @@ pub(crate) type AccOf<N> = HullAcc<<N as Rem>::C>;
 
 impl<C: Circle> Hull<C> {
     /// Bytes a hull takes on disk (`to_bytes`).
-    pub(crate) const BYTES: usize = 4 * C::W_BYTES;
+    pub(crate) const BYTES: usize = 4 * <C::W as Word>::BYTES;
 
     /// The point `(x, y)` (a start's exact remainder).
     pub(crate) fn point(x: C::P, y: C::P) -> Self {
@@ -201,18 +201,18 @@ impl<C: Circle> Hull<C> {
     /// Its hash (`Circle::hash4`: 16.16's is the four words in one).
     #[inline]
     pub(crate) fn hash(&self) -> u64 {
-        C::hash4(self.words())
+        <C::W as Word>::hash4(self.words())
     }
 
     /// Append its `BYTES`: its words, little-endian.
     pub(crate) fn to_bytes(&self, out: &mut Vec<u8>) {
         for w in self.words() {
-            C::put_word(w, out);
+            w.put(out);
         }
     }
 
     pub(crate) fn from_bytes(b: &[u8]) -> Self {
-        let w = |i: usize| C::get_word(&b[i * C::W_BYTES..]);
+        let w = |i: usize| <C::W as Word>::read(&b[i * <C::W as Word>::BYTES..]);
         Hull { x: Arc { start: w(0), last: w(1) }, y: Arc { start: w(2), last: w(3) } }
     }
 }
@@ -376,8 +376,7 @@ mod tests {
     use crate::search::arcs::{Act, Transfer, CIRCLE};
 
     fn lcg(s: &mut u64) -> u32 {
-        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (*s >> 33) as u32
+        (crate::testutil::lcg(s) >> 33) as u32
     }
 
     fn arc(s: &mut u64) -> Arc {
@@ -429,14 +428,14 @@ mod tests {
             let mut acc = HullAcc::default();
             let pushed = h.push(&(tx, ty), &mut acc);
             let mut img = Vec::new();
-            h.to_region().push(tx, ty, &mut img);
+            h.to_region().as_ref().push(tx, ty, &mut img);
             let img = Region::<Fixed16>::from_pieces(&mut img, &mut Vec::new());
             assert_eq!(pushed, !img.is_empty(), "{h:?} {tx:?} {ty:?}");
             assert_eq!(acc.is_empty(), !pushed);
             let Some(got) = acc.hull() else { continue };
             // Every point of the image is in the hull: probed at the image's
             // slab and segment ends.
-            for (ys, xs) in img.slabs() {
+            for (ys, xs) in img.as_ref().slabs() {
                 for x in xs {
                     for (px, py) in [(x.lo, ys.lo), (x.hi - 1, ys.hi - 1), (x.lo, ys.hi - 1), (x.hi - 1, ys.lo)] {
                         assert!(got.contains(px, py), "{h:?} {tx:?} {ty:?}: ({px}, {py}) of the image is not in {got:?}");
@@ -462,8 +461,8 @@ mod tests {
                 // Skipped: the old push's image already holds the new one.
                 assert!(was.push(&(tx, ty), &mut old), "skipped a push whose old image was empty");
                 let (mut img_new, mut img_old) = (Vec::new(), Vec::new());
-                h.to_region().push(tx, ty, &mut img_new);
-                was.to_region().push(tx, ty, &mut img_old);
+                h.to_region().as_ref().push(tx, ty, &mut img_new);
+                was.to_region().as_ref().push(tx, ty, &mut img_old);
                 assert_eq!(Region::<Fixed16>::from_pieces(&mut img_new, &mut Vec::new()), Region::<Fixed16>::from_pieces(&mut img_old, &mut Vec::new()), "{was:?} -> {h:?} {tx:?} {ty:?}: skipped a push whose image grew");
             }
         }

@@ -7,8 +7,8 @@
 //!
 //! A BLOCK holds a target region's bundles (a frame's, or a segment): its
 //! distinct target keys and source (shape, key)s sorted and delta-coded
-//! (its dictionaries; ranks, not ids), then the bundles as a sorted trie in
-//! `ORDER` (`put_record`), zstd -1 at rest. `ORDER` is mask first (equal
+//! (its dictionaries; ranks, not ids), then the bundles as a sorted trie
+//! (`put_record`), zstd -1 at rest. The trie's order is mask first (equal
 //! masks together), then offset, transfer, source, target: measured
 //! smallest of the 48 orders with absolute masks (~0.08 B an edge).
 
@@ -16,7 +16,7 @@ use anyhow::{anyhow, ensure, Result};
 
 use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128, wide};
 use super::visited::Key;
-use crate::search::pos_graph::{GRID, NO_CELL};
+use crate::storage::cells::{GRID, NO_CELL};
 
 /// One bundle; `mask` over the target region's 64 cells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -31,7 +31,6 @@ pub(crate) struct Bundle {
     pub(crate) mask: u64,
 }
 
-const _: () = assert!(super::GEOMETRY.words == 1, "bundles hold a u64 mask: 8 x 8 storage regions");
 
 /// The offset codes: target cell minus source cell, `(dx + 1024) << 11 |
 /// (dy + 1024)`, between two cells (below `TO_NONE`); into `NO_CELL`,
@@ -77,9 +76,8 @@ pub(crate) fn source_cell(t: u32, o: u32) -> u32 {
 /// target cells whose source is in the source region, and `k`; `None`: none.
 #[inline]
 pub(crate) fn shift_into(t_slot: u32, s_slot: u32, o: u32) -> Option<(u64, i32)> {
-    let geo = super::GEOMETRY;
-    debug_assert!(o < TO_NONE && t_slot != geo.no_cell_slot() && s_slot != geo.no_cell_slot());
-    let (side, pr) = (geo.side as i32, geo.per_row);
+    debug_assert!(o < TO_NONE && t_slot != crate::storage::cells::NO_CELL_SLOT && s_slot != crate::storage::cells::NO_CELL_SLOT);
+    let (side, pr) = (crate::storage::cells::SIDE as i32, crate::storage::cells::PER_ROW);
     let (dx, dy) = ((o >> 11) as i32 - 1024, (o & 2047) as i32 - 1024);
     // A source cell is its target cell plus (ddx, ddy) in the regions' grids.
     let ddx = ((t_slot % pr) as i32 - (s_slot % pr) as i32) * side - dx;
@@ -135,20 +133,6 @@ pub(crate) fn get_off(b: &[u8], pos: &mut usize) -> u32 {
     }
 }
 
-/// A field of a block's sort order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum F {
-    /// The source (its rank in the block's source dictionary).
-    S,
-    /// The target key (its rank in the target dictionary).
-    T,
-    X,
-    O,
-    M,
-}
-
-pub(crate) const ORDER: [F; 5] = [F::M, F::O, F::X, F::S, F::T];
-
 /// A bundle as a block's record holds it: source and target as ranks into
 /// the block's dictionaries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,27 +144,14 @@ pub(crate) struct Ranked {
     pub(crate) mask: u64,
 }
 
-impl Ranked {
-    #[inline]
-    fn field(&self, f: F) -> u64 {
-        match f {
-            F::S => self.s as u64,
-            F::T => self.t as u64,
-            F::X => self.x as u64,
-            F::O => self.o as u64,
-            F::M => self.mask,
-        }
-    }
-
-    #[inline]
-    fn set(&mut self, f: F, v: u64) {
-        match f {
-            F::S => self.s = v as u32,
-            F::T => self.t = v as u32,
-            F::X => self.x = v as u32,
-            F::O => self.o = v as u32,
-            F::M => self.mask = v,
-        }
+/// The EDGES of a record or bundle: of its target cells `mask` (target
+/// region slot `t_slot`) at offset `o`, `f(local, target cell, source cell)`
+/// each.
+#[inline]
+pub(crate) fn edges(mask: u64, t_slot: u32, o: u32, mut f: impl FnMut(u32, u32, u32)) {
+    for c in super::layer::bits(mask) {
+        let t = crate::storage::cells::cell(t_slot, c);
+        f(c, t, source_cell(t, o));
     }
 }
 
@@ -210,21 +181,21 @@ pub(crate) fn write_dicts(t: &[Key], s: &[(u32, Key)], out: &mut Vec<u8>) {
     }
 }
 
-/// One record of a block in `order` (`vals`, the fields in that order),
-/// after `prev`: its level byte (the first field that changed), that
-/// field's delta, the later fields raw (an offset short-coded, a mask its
-/// 8 bytes).
+/// One record of a block (`vals`: mask, offset, transfer, source,
+/// target), after `prev`: its level byte (the first field that changed),
+/// that field's delta, the later fields raw (a mask its 8 bytes, an offset
+/// short-coded, never a delta).
 #[inline]
-fn put_record(out: &mut Vec<u8>, order: &[F; 5], prev: Option<&[u64; 5]>, vals: &[u64; 5]) {
+fn put_record(out: &mut Vec<u8>, prev: Option<&[u64; 5]>, vals: &[u64; 5]) {
     let l = match prev {
         None => 0,
         Some(p) => (0..5).find(|&i| vals[i] != p[i]).expect("distinct records"),
     };
     out.push(l as u8);
     for i in l..5 {
-        match order[i] {
-            F::O => put_off(out, vals[i] as u32),
-            F::M => out.extend_from_slice(&vals[i].to_le_bytes()),
+        match i {
+            0 => out.extend_from_slice(&vals[0].to_le_bytes()),
+            1 => put_off(out, vals[1] as u32),
             _ => match prev {
                 Some(p) if i == l => put_varint(out, vals[i] - p[i]),
                 _ => put_varint(out, vals[i]),
@@ -233,10 +204,10 @@ fn put_record(out: &mut Vec<u8>, order: &[F; 5], prev: Option<&[u64; 5]>, vals: 
     }
 }
 
-/// Encode `bundles` (distinct, any order) as a raw block in `order` into
-/// `out` (cleared): the reference the grouped `Encoder` is checked against.
+/// Encode `bundles` (distinct, any order) as a raw block into `out`
+/// (cleared): the reference the grouped `Encoder` is checked against.
 #[cfg(test)]
-pub(crate) fn encode(bundles: &[Bundle], order: &[F; 5], out: &mut Vec<u8>) {
+pub(crate) fn encode(bundles: &[Bundle], out: &mut Vec<u8>) {
     out.clear();
     let mut t: Vec<Key> = bundles.iter().map(|b| b.t_key).collect();
     t.sort_unstable();
@@ -252,15 +223,14 @@ pub(crate) fn encode(bundles: &[Bundle], order: &[F; 5], out: &mut Vec<u8>) {
     let mut recs: Vec<[u64; 5]> = bundles
         .iter()
         .map(|b| {
-            let r = Ranked { s: s_rank[&(b.s_shape, b.s_key)], t: t_rank[&b.t_key], x: b.x, o: b.o, mask: b.mask };
-            order.map(|f| r.field(f))
+            [b.mask, b.o as u64, b.x as u64, s_rank[&(b.s_shape, b.s_key)] as u64, t_rank[&b.t_key] as u64]
         })
         .collect();
     recs.sort_unstable();
     debug_assert!(recs.windows(2).all(|w| w[0] != w[1]), "bundles distinct");
     put_varint(out, recs.len() as u64);
     for (k, vals) in recs.iter().enumerate() {
-        put_record(out, order, k.checked_sub(1).map(|j| &recs[j]), vals);
+        put_record(out, k.checked_sub(1).map(|j| &recs[j]), vals);
     }
 }
 
@@ -303,10 +273,8 @@ impl Encoder {
 
 }
 
-const _: () = assert!(matches!(ORDER, [F::M, F::O, F::X, F::S, F::T]), "Encoder groups ORDER's fields");
-
 impl Encoder {
-    /// `bundles` (distinct, any order) as a raw block in `ORDER` into `out`
+    /// `bundles` (distinct, any order) as a raw block into `out`
     /// (cleared), targets and sources numbered as met: the waiting bundles,
     /// in the region phase and again at the frame's end (`route::reencode`).
     pub(crate) fn encode_bundles(&mut self, bundles: &[Bundle], out: &mut Vec<u8>) {
@@ -332,7 +300,7 @@ impl Encoder {
         self.encode(&items, t_keys.len(), |l| t_keys[l as usize], &s_list, out);
     }
 
-    /// `items` (distinct) as a raw block in `ORDER` into `out` (cleared):
+    /// `items` (distinct) as a raw block into `out` (cleared):
     /// target ids below `n_ids`, their keys `t_key(id)`; source indices into
     /// `sources` (distinct; each one some item's).
     pub(crate) fn encode(&mut self, items: &[Tb], n_ids: usize, t_key: impl Fn(u32) -> Key, sources: &[(u32, Key)], out: &mut Vec<u8>) {
@@ -416,7 +384,7 @@ impl Encoder {
             // share its mask, offset and transfer: `put_record` at level 3
             // (the source's delta, the target) or 4 (the target's delta).
             let vals = |st: u64| [mask, ox >> 32, ox & 0xffff_ffff, st >> 32, st & 0xffff_ffff];
-            put_record(out, &ORDER, prev.as_ref(), &vals(run[0]));
+            put_record(out, prev.as_ref(), &vals(run[0]));
             for w in run.windows(2) {
                 let ((ps, pt), (s, t)) = ((w[0] >> 32, w[0] & 0xffff_ffff), (w[1] >> 32, w[1] & 0xffff_ffff));
                 if s == ps {
@@ -440,11 +408,10 @@ pub(crate) struct Block<'a> {
     pub(crate) sources: Vec<(u32, Key)>,
     body: &'a [u8],
     n: usize,
-    order: [F; 5],
 }
 
 impl<'a> Block<'a> {
-    pub(crate) fn open(raw: &'a [u8], order: &[F; 5]) -> Result<Self> {
+    pub(crate) fn open(raw: &'a [u8]) -> Result<Self> {
         let mut pos = 0usize;
         let nt = get_varint(raw, &mut pos) as usize;
         let mut t_keys = Vec::with_capacity(nt);
@@ -469,7 +436,7 @@ impl<'a> Block<'a> {
         }
         let n = get_varint(raw, &mut pos) as usize;
         ensure!(pos <= raw.len(), "an edge block's dictionaries past its end");
-        Ok(Block { t_keys, sources, body: &raw[pos..], n, order: *order })
+        Ok(Block { t_keys, sources, body: &raw[pos..], n })
     }
 
     #[cfg(test)]
@@ -477,7 +444,8 @@ impl<'a> Block<'a> {
         self.n == 0
     }
 
-    /// Every record, in the block's order.
+    /// Every record, in the block's order (`put_record`'s: the fields from
+    /// the level on, the level's a delta past the first record).
     pub(crate) fn records(&self, mut f: impl FnMut(&Ranked)) -> Result<()> {
         let b = self.body;
         let mut pos = 0usize;
@@ -487,20 +455,23 @@ impl<'a> Block<'a> {
             let l = b[pos] as usize;
             pos += 1;
             ensure!(l < 5 && (k > 0 || l == 0), "an edge block's record {k} at level {l}");
-            for i in l..5 {
-                let fl = self.order[i];
-                let v = match fl {
-                    F::O => get_off(b, &mut pos) as u64,
-                    F::M => {
-                        let v = u64::from_le_bytes(b[pos..pos + 8].try_into().unwrap());
-                        pos += 8;
-                        v
-                    }
-                    _ if i == l && k > 0 => r.field(fl) + get_varint(b, &mut pos),
-                    _ => get_varint(b, &mut pos),
-                };
-                r.set(fl, v);
+            // A field at the level is a delta (past the first record: the
+            // level is then 0), one after it raw.
+            let field = |at: usize, v: u32, b: &[u8], pos: &mut usize| if l == at { v.wrapping_add(get_varint(b, pos) as u32) } else { get_varint(b, pos) as u32 };
+            if l == 0 {
+                r.mask = u64::from_le_bytes(b[pos..pos + 8].try_into().unwrap());
+                pos += 8;
             }
+            if l <= 1 {
+                r.o = get_off(b, &mut pos);
+            }
+            if l <= 2 {
+                r.x = field(2, r.x, b, &mut pos);
+            }
+            if l <= 3 {
+                r.s = field(3, r.s, b, &mut pos);
+            }
+            r.t = field(4, r.t, b, &mut pos);
             f(&r);
         }
         ensure!(pos == b.len(), "an edge block did not decode to its end ({pos} of {} bytes)", b.len());
@@ -527,8 +498,7 @@ mod tests {
     use super::*;
 
     fn lcg(v: &mut u64) -> u64 {
-        *v = v.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        *v >> 11
+        crate::testutil::lcg(v) >> 11
     }
 
     /// Offsets round-trip between cells, into and out of `NO_CELL`, and in
@@ -555,32 +525,31 @@ mod tests {
     /// region (the cells `shift_into` names), refused otherwise.
     #[test]
     fn shift_into_shifts_the_grid() {
-        let geo = super::super::GEOMETRY;
         let mut v = 11u64;
         let (mut some, mut none) = (0, 0);
         for _ in 0..20000 {
-            let t_slot = (lcg(&mut v) % (geo.slots as u64 - 1)) as u32;
-            let (rx, ry) = ((t_slot % geo.per_row) as i32, (t_slot / geo.per_row) as i32);
-            let s_slot = ((ry + (lcg(&mut v) % 3) as i32 - 1).clamp(0, geo.per_row as i32 - 1) * geo.per_row as i32 + (rx + (lcg(&mut v) % 3) as i32 - 1).clamp(0, geo.per_row as i32 - 1)) as u32;
+            let t_slot = (lcg(&mut v) % (crate::storage::cells::SLOTS as u64 - 1)) as u32;
+            let (rx, ry) = ((t_slot % crate::storage::cells::PER_ROW) as i32, (t_slot / crate::storage::cells::PER_ROW) as i32);
+            let s_slot = ((ry + (lcg(&mut v) % 3) as i32 - 1).clamp(0, crate::storage::cells::PER_ROW as i32 - 1) * crate::storage::cells::PER_ROW as i32 + (rx + (lcg(&mut v) % 3) as i32 - 1).clamp(0, crate::storage::cells::PER_ROW as i32 - 1)) as u32;
             let (dx, dy) = ((lcg(&mut v) % 17) as i32 - 8, (lcg(&mut v) % 17) as i32 - 8);
             let o = ((dx + 1024) as u32) << 11 | (dy + 1024) as u32;
             let mut mask = lcg(&mut v) & lcg(&mut v) & lcg(&mut v);
             if lcg(&mut v) % 2 == 0 {
                 // Only the cells whose source is in the region.
-                mask &= (0..64u32).filter(|&c| geo.slot_local(source_cell(geo.cell(t_slot, c), o)).0 == s_slot).fold(0, |m, c| m | 1u64 << c);
+                mask &= (0..64u32).filter(|&c| crate::storage::cells::slot_local(source_cell(crate::storage::cells::cell(t_slot, c), o)).0 == s_slot).fold(0, |m, c| m | 1u64 << c);
             }
             if mask == 0 {
                 continue;
             }
             let each: Option<u64> = (0..64u32).filter(|&c| mask >> c & 1 != 0).try_fold(0u64, |m, c| {
-                let (slot, local) = geo.slot_local(source_cell(geo.cell(t_slot, c), o));
+                let (slot, local) = crate::storage::cells::slot_local(source_cell(crate::storage::cells::cell(t_slot, c), o));
                 (slot == s_slot).then_some(m | 1u64 << local)
             });
             match shift_into(t_slot, s_slot, o).filter(|&(inside, _)| mask & !inside == 0).map(|(_, k)| (shift(mask, k), k)) {
                 Some((src, k)) => {
                     assert_eq!(Some(src), each, "slots {t_slot} {s_slot} offset ({dx}, {dy}) mask {mask:x}");
                     for c in (0..64u32).filter(|&c| mask >> c & 1 != 0) {
-                        assert_eq!(geo.slot_local(source_cell(geo.cell(t_slot, c), o)).1 as i32, c as i32 + k);
+                        assert_eq!(crate::storage::cells::slot_local(source_cell(crate::storage::cells::cell(t_slot, c), o)).1 as i32, c as i32 + k);
                     }
                     some += 1;
                 }
@@ -593,10 +562,10 @@ mod tests {
         assert!(some > 1000 && none > 1000, "{some} shifted, {none} refused");
     }
 
-    /// A block decodes to its bundles in every order, wide keys and shapes
-    /// included; compression round-trips.
+    /// A block decodes to its bundles, wide keys and shapes included (records
+    /// at every level); compression round-trips.
     #[test]
-    fn blocks_round_trip_in_every_order() {
+    fn blocks_round_trip() {
         let mut v = 7u64;
         let mut bundles: Vec<Bundle> = (0..3000)
             .map(|i| {
@@ -609,21 +578,18 @@ mod tests {
             .collect();
         bundles.sort_unstable();
         bundles.dedup_by_key(|b| (b.s_shape, b.s_key, b.x, b.o, b.t_key));
-        let orders = [ORDER, [F::S, F::X, F::O, F::T, F::M], [F::T, F::S, F::X, F::O, F::M]];
-        let mut z = zstd::bulk::Compressor::new(1).unwrap();
+        let mut z = super::super::file::compressor().unwrap();
         let mut d = zstd::bulk::Decompressor::new().unwrap();
-        for order in orders {
-            let mut raw = Vec::new();
-            encode(&bundles, &order, &mut raw);
-            let stored = super::super::file::compress(&raw, &mut z).unwrap();
-            let mut back = Vec::new();
-            super::super::file::decompress(&stored, raw.len(), &mut d, &mut back).unwrap();
-            assert_eq!(back, raw);
-            let mut got = Vec::new();
-            Block::open(&back, &order).unwrap().bundles(|b| got.push(b)).unwrap();
-            got.sort_unstable();
-            assert_eq!(got, bundles, "{order:?}");
-        }
+        let mut raw = Vec::new();
+        encode(&bundles, &mut raw);
+        let stored = super::super::file::compress(&raw, &mut z).unwrap();
+        let mut back = Vec::new();
+        super::super::file::decompress(&stored, raw.len(), &mut d, &mut back).unwrap();
+        assert_eq!(back, raw);
+        let mut got = Vec::new();
+        Block::open(&back).unwrap().bundles(|b| got.push(b)).unwrap();
+        got.sort_unstable();
+        assert_eq!(got, bundles);
         // The region phase's encoder writes what `encode` does.
         let mut ids: Vec<Key> = bundles.iter().map(|b| b.t_key).collect();
         ids.sort_unstable();
@@ -637,7 +603,7 @@ mod tests {
             .map(|b| Tb { t: ids.binary_search(&b.t_key).unwrap() as u32 * 3 + 1, s: srcs.iter().position(|&x| x == (b.s_shape, b.s_key)).unwrap() as u32, x: b.x, o: b.o, mask: b.mask })
             .collect();
         let (mut a, mut b2) = (Vec::new(), Vec::new());
-        encode(&bundles, &ORDER, &mut a);
+        encode(&bundles, &mut a);
         let mut enc = Encoder::default();
         for _ in 0..2 {
             enc.encode(&items, ids.len() * 3 + 1, |t| ids[(t as usize - 1) / 3], &srcs, &mut b2);
@@ -648,8 +614,8 @@ mod tests {
             assert_eq!(a, b2, "encode_bundles and encode agree");
         }
         let mut raw = Vec::new();
-        encode(&[], &ORDER, &mut raw);
-        let b = Block::open(&raw, &ORDER).unwrap();
+        encode(&[], &mut raw);
+        let b = Block::open(&raw).unwrap();
         assert!(b.is_empty());
         b.records(|_| panic!("no records")).unwrap();
     }

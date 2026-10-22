@@ -4,7 +4,8 @@
 //! SPOOL (the compressed edge segments the wave makes
 //! long before the frame's end writes them: appended by any thread, read
 //! back by place) and the arc phase's spills (`backward`: W's varints and
-//! runs; `arcs::RegionArena`: its sealed set chunks), written, then mapped.
+//! runs; `arcs::RegionArena`: its sealed set chunks), written, then mapped
+//! (`Words`).
 
 use anyhow::{Context, Result};
 use std::os::unix::fs::FileExt;
@@ -53,6 +54,37 @@ impl Scratch {
     #[cfg(test)]
     pub(crate) fn bytes(&self) -> u64 {
         self.end.load(Ordering::Relaxed)
+    }
+}
+
+/// WORDS (plain data) held in memory, or written to a scratch file and
+/// mapped (the arc phase's spills: W's varints and runs, the set arena's
+/// sealed chunks).
+pub(crate) enum Words<W> {
+    Mem(Vec<W>),
+    Map(memmap2::Mmap),
+}
+
+impl<W: Copy> Words<W> {
+    /// `v` written to a new scratch file at `path`, mapped.
+    pub(crate) fn spill(path: &std::path::Path, v: Vec<W>) -> Result<Self> {
+        let f = Scratch::create(path)?;
+        // SAFETY: plain words as their bytes.
+        f.put(unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(&v[..])) })?;
+        Ok(Words::Map(f.map()?))
+    }
+}
+
+impl<W> std::ops::Deref for Words<W> {
+    type Target = [W];
+    fn deref(&self) -> &[W] {
+        match self {
+            Words::Mem(v) => v,
+            // SAFETY: a map starts on a page (aligned for any word) and holds
+            // whole words (`spill`, or a `Scratch` of whole words); words
+            // are plain data.
+            Words::Map(m) => unsafe { std::slice::from_raw_parts(m.as_ptr().cast::<W>(), m.len() / std::mem::size_of::<W>()) },
+        }
     }
 }
 

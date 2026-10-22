@@ -4,7 +4,7 @@ A sound LOWER BOUND `d` on the frames to the exit from every (heap shape,
 player cell), built from the same traced frames the kernels come from, used
 as a FILTER on the forward under a horizon H: a push into a cell at frame
 t is dropped when `t + d > H`. Code: `src/search/level_minus_one.rs` (its
-one builder, `table`), `frame::TreeFilter`, `UnitSink`'s level -1 drop.
+one builder, `table`), `frame::TreeL1`, `UnitSink`'s level -1 drop.
 
 ```bash
 # as a filter inside a search (H the horizon, S the speed bound in px/frame)

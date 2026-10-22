@@ -41,17 +41,17 @@ crates/celeste-names    FROZEN name tables (GLOBAL_NAMES order = canonical      
 crates/celeste-engine   Rt2 blocks, exact keys, the widening table          deps: core, names
 celeste-rust (src/)
   frame.rs              the forward (ForwardState: start, resume, extend),
-                        trees (grow_tree, TreeFilter), wins, MarkFilter
-  storage/              the visited set, the wave, the region phase, the
-                        frame/hull/edge files (one container: file;
-                        their varints and keys: codec), decode, bench
+                        trees (grow_tree, TreeL1), wins, MarkFilter
+  storage/              the player-position cells (cells), the visited set,
+                        the wave, the region phase, the frame/hull/edge
+                        files (one container: file; their varints and
+                        keys: codec), decode, bench
   search/               driver (the search's levels, each level's arc
                         phase), backward (W, the optimum), reach (inside W;
                         exact), concrete (the concrete search; dual: over
                         pairs), known, arcs, hull, rem (+ rem_f64),
                         arc_edges, arc_check, hull_replay, tree (a finished
-                        tree opened), pos_graph (the player-position
-                        cells), result, ui_export, inspect, level_minus_one
+                        tree opened), result, ui_export, inspect, level_minus_one
                         (the cost-to-go table, its one builder), robust (a
                         float witness against the libm)
   trace/                the tracer: interp, state, heap, domain (Symbolic) and
@@ -278,7 +278,7 @@ depend on its horizon throughout.
 region). No state has a number, in memory or on disk.
 
 **One state set** (`storage::set`): per storage region (8 x 8 cells,
-`storage::GEOMETRY`, nested in a kernel region; `NO_CELL` one more region
+`storage::cells::SIDE`, nested in a kernel region; `NO_CELL` one more region
 per shape) a table of ENTRIES, an exact key and a u64 cell mask, sorted by
 key. Two forms: PLAIN (arrays: the frontier, a frame read back, the next
 layer) and PACKED (zstd blocks of ~1024 entries with each state's layer and
@@ -342,8 +342,9 @@ state first reached later, or never (its push was empty or dropped).
   dictionaries and a trie of records. ~0.11 B an edge (room (6,2) 100%,
   f57).
 - **Transfers**: one table per tree, `edges/xfer.bin`.
-- **Out files** (`storage::out`, `edges/out/f{F}.bin`): the same edges by
-  SOURCE, for the re-pushes; a header indexes blocks by entry range.
+- **The source index**: per target region the source regions its edges
+  leave (the edge file's header), inverted for the out-edge lookups: the
+  re-pushes (by target, "The forward" above) and `reach`.
 - **`EdgeStore`**: segments by (frame, region), the target regions a
   source region reaches, a state's in-edges (diagnostics).
 

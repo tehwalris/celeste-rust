@@ -343,8 +343,7 @@ impl Rows {
     pub(crate) fn states<N: celeste_core::arith::Arithmetic>(&self, t: &TreeDir) -> Result<(Tree<N>, u32, Vec<Sk>)> {
         let (frame, cell) = self.of(t)?;
         let tree = Tree::<N>::open(&t.dir, frame)?;
-        let geo = celeste_rust::storage::GEOMETRY;
-        let all: Vec<Sk> = tree.layer(frame, None, t.settings.threads())?.0.states_iter().filter(|s| cell.is_none_or(|c| s.cell(&geo) == c)).collect();
+        let all: Vec<Sk> = tree.layer(frame, None, t.settings.threads())?.0.states_iter().filter(|s| cell.is_none_or(|c| s.cell() == c)).collect();
         anyhow::ensure!(!all.is_empty(), "{}: no states at step {frame}{}", t.dir.display(), self.cell.map_or(String::new(), |(x, y)| format!(" at ({x}, {y})")));
         Ok((tree, frame, all))
     }
@@ -357,12 +356,12 @@ pub(crate) fn prefixes(list: &str) -> Vec<String> {
 
 /// A player position's cell (`--cell x,y`).
 pub(crate) fn cell_at((x, y): (i32, i32)) -> Result<u32> {
-    celeste_rust::search::pos_graph::cell_of(x, y)
+    celeste_rust::storage::cells::cell_of(x, y)
 }
 
 /// A cell, for reading: the player's position.
 pub(crate) fn where_(c: u32) -> String {
-    celeste_rust::search::pos_graph::cell_xy(c).map(|(x, y)| format!("({x}, {y})")).unwrap_or_else(|| "no player".to_string())
+    celeste_rust::storage::cells::cell_xy(c).map(|(x, y)| format!("({x}, {y})")).unwrap_or_else(|| "no player".to_string())
 }
 
 /// The kernels of a level (`compiled::Kernels::new`), for the commands

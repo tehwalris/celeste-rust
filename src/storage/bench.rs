@@ -39,10 +39,9 @@ impl EdgeHashes {
     /// Frame `frame`'s `(count, sum of terms)` (`shapes`: the tree's by index).
     pub(crate) fn frame<N: crate::search::rem::Rem>(&self, store: &super::edges::EdgeStore<N>, frame: u32, content: &celeste_engine::exact::ContentHash, shapes: &[u64], threads: usize) -> Result<(u64, u64)> {
         let mix = celeste_engine::runtime2::mix64;
-        let geo = super::GEOMETRY;
         let parts = store.par_blocks(frame, threads, || (0u64, 0u64), |(n, acc), region, blk| {
-            let slot = region % geo.slots;
-            let t_shape = *shapes.get((region / geo.slots) as usize).context("a target region of no shape")?;
+            let slot = region % crate::storage::cells::SLOTS;
+            let t_shape = *shapes.get((region / crate::storage::cells::SLOTS) as usize).context("a target region of no shape")?;
             let th: Vec<u64> = blk.t_keys.iter().map(|&k| content.key(t_shape, k)).collect();
             let sh: Vec<u64> = blk.sources.iter().map(|&(s, k)| shapes.get(s as usize).map(|&h| content.key(h, k))).collect::<Option<_>>().context("a source of no shape")?;
             let mut bad = false;
@@ -51,17 +50,12 @@ impl EdgeHashes {
                     bad = true;
                     return;
                 };
-                let mut m = r.mask;
-                while m != 0 {
-                    let c = m.trailing_zeros();
-                    m &= m - 1;
-                    let tc = geo.cell(slot, c);
-                    let sc = super::bundle::source_cell(tc, r.o);
+                super::bundle::edges(r.mask, slot, r.o, |_, tc, sc| {
                     let t = mix(th[r.t as usize] ^ (tc as u64) << 1);
                     let s = mix(sh[r.s as usize] ^ (sc as u64) << 1);
                     *acc = acc.wrapping_add(mix(t ^ s.rotate_left(21) ^ p.rotate_left(42)));
                     *n += 1;
-                }
+                });
             })?;
             ensure!(!bad, "f{frame}: an edge without its transfer");
             Ok(())
@@ -190,7 +184,7 @@ pub fn load_average() -> f64 {
 /// budget (workers x wall); a wall's hardware counts where counted. Quote
 /// the min, with the load.
 pub fn print_cost(frame: u32, reps: &[Rep]) {
-    use super::stats::{Unit, ALL, S};
+    use super::stats::{Registry, Unit, ALL, S};
     let Some(r0) = reps.first() else { return };
     let col = |s: S| reps.iter().map(|r| r.stats.get(s) as f64).collect::<Vec<f64>>();
     let mm = |v: &[f64]| (v.iter().copied().fold(f64::INFINITY, f64::min), v.iter().copied().fold(f64::NEG_INFINITY, f64::max));
@@ -200,7 +194,7 @@ pub fn print_cost(frame: u32, reps: &[Rep]) {
     let budget = mm(&reps.iter().map(|r| r.stats.get(S::Wave) as f64 * r.workers as f64).collect::<Vec<_>>()).0;
     let counted = reps.iter().all(|r| r.counts.is_some());
     eprintln!("[cost] {:<28} {:>9} {:>9}  {:>6}  {:>27}  per element (the min)", "time", "s min", "s max", "share", if counted { "G ins, user cyc, kernel cyc" } else { "" });
-    for s in ALL {
+    for &s in ALL {
         let secs: Vec<f64> = match s.unit() {
             Unit::Wall | Unit::Work => col(s).iter().map(|v| v / 1e9).collect(),
             Unit::Ticks => col(s).iter().map(|v| v / super::stats::tsc_hz()).collect(),
