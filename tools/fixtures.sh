@@ -75,6 +75,7 @@ BIG="r62h57"
 # binary states them (`rewrite --version`: `settings::formats`), and the
 # sources (reported only).
 formats() {
+    [[ -x $B ]] || { echo "fixtures: no binary $B to ask for the formats (build it: cargo build --profile quick --bins)" >&2; exit 1; }
     "$B" --version | sed 's/^[^ ]* //'
 }
 # The default root: one directory per file-format set.
