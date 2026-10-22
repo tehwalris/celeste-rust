@@ -833,6 +833,12 @@ impl<N: KernelLanes> Registry<N> {
         self.kernels.len()
     }
 
+    /// Its kernels' text, fingerprinted (`text_digest`).
+    #[cfg(test)]
+    pub(crate) fn text_digest(&self) -> u64 {
+        text_digest(&self.kernels)
+    }
+
     /// Run `chunk` (rows in cell order) on the matching kernels; `false` on a
     /// miss or a decline.
     pub fn run_chunk(
@@ -899,20 +905,42 @@ impl<N: KernelLanes> Registry<N> {
     /// Retrace the start room and assemble every shape for level `opts`
     /// under settings `s`.
     pub fn build_for_start_room(opts: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Registry<N>> {
-        let grid = s.region_grid();
-        match grid {
+        match s.region_grid() {
             Some(g) => eprintln!("[region] kernels keyed on a {} px grid, player speed asserted within [-{}, {}] px", g.px, g.speed, g.speed),
             None => eprintln!("[region] no region key (--region off)"),
+        }
+        // The kernel cache, but for the diagnostics that keep or print the
+        // build (`--kernel-explain`, `--build-trace`).
+        let store = (!s.diag.kernel_explain && !s.diag.build_trace).then(super::cache::Store::default);
+        Registry::build_with(opts, s, store.as_ref())
+    }
+
+    /// `build_for_start_room` with the kernel cache `store` (none: build).
+    pub(crate) fn build_with(opts: crate::abstraction::Level, s: &crate::settings::Settings, store: Option<&super::cache::Store>) -> Result<Registry<N>> {
+        let t0 = std::time::Instant::now();
+        let key = store.map(|_| super::cache::key::<N>(opts, s)).transpose()?;
+        if let (Some(store), Some(key)) = (store, &key) {
+            if let Some(entry) = store.load::<N>(key)? {
+                let cache = crate::compiled::collision_cache(s.room);
+                let mut kernels = HashMap::new();
+                for (i, (recipe, so)) in entry.into_iter().enumerate() {
+                    let loaded = Loaded::from_bytes(&so, &format!("cached_{i}"), &recipe.compiled.sym)?;
+                    let k = (recipe.shape, recipe.region);
+                    anyhow::ensure!(kernels.insert(k, AsmKernel::of(recipe, loaded, cache.clone(), None)?).is_none(), "the kernel cache's entry {} holds kernel {k:?} twice", key.name);
+                }
+                unify(&mut kernels)?;
+                eprintln!("[asm build] {} kernels: kernel cache HIT {}, {:.2}s; kernel text {:016x}", kernels.len(), key.name, t0.elapsed().as_secs_f64(), text_digest(&kernels));
+                return Ok(Registry { kernels, grid: s.region_grid() });
+            }
         }
         let build = BuildOptions {
             asm: crate::transpile::asm::AsmOptions { trace: s.diag.build_trace, mix: s.diag.kernel_metrics },
             keep_graphs: s.diag.kernel_explain,
         };
         let build = &build;
-        let t_trace = std::time::Instant::now();
         let refs = crate::trace::lower::lattice_kernel_refs::<N>(opts, s)
             .context("retracing the start room for ASM kernels")?;
-        let trace_s = t_trace.elapsed().as_secs_f64();
+        let trace_s = t0.elapsed().as_secs_f64();
         let t_asm = std::time::Instant::now();
         // The shapes in parallel; a shape's build recurses deeply.
         let pool = crate::par::Pool::per_core().stack(128 * 1024 * 1024);
@@ -921,14 +949,17 @@ impl<N: KernelLanes> Registry<N> {
             let (region, r) = &refs[si];
             let mut times = r.lowered.times;
             let (recipe, loaded, graphs) = build_one_shape::<N>(r, (r.frame.in_rt2.shape_hash_of(), *region), si, build, &mut times)?;
+            let stored = store.is_some().then(|| Ok::<_, anyhow::Error>((recipe.clone(), loaded.bytes()?))).transpose()?;
             let key = (recipe.shape, recipe.region);
-            Ok((key, AsmKernel::of(recipe, loaded, r.cache.clone(), graphs)?, times))
+            Ok((key, AsmKernel::of(recipe, loaded, r.cache.clone(), graphs)?, times, stored))
         })?;
         let mut kernels = HashMap::new();
         let mut first: HashMap<(u64, Option<Region>), usize> = HashMap::new();
         let mut times = crate::transpile::lower::BuildTimes::default();
-        for (si, ((shape, key), kernel, t)) in built.into_iter().enumerate() {
+        let mut entry: Vec<(Recipe<N>, Vec<u8>)> = Vec::new();
+        for (si, ((shape, key), kernel, t, stored)) in built.into_iter().enumerate() {
             times.add(&t);
+            entry.extend(stored);
             if kernels.insert((shape, key), kernel).is_some() {
                 let slots = |i: usize| refs[i].1.frame.iface.slots.iter().map(crate::trace::iface::show).filter(|p| p.starts_with("__")).collect::<Vec<_>>();
                 anyhow::bail!(
@@ -941,8 +972,15 @@ impl<N: KernelLanes> Registry<N> {
             first.insert((shape, key), si);
         }
         unify(&mut kernels)?;
+        let cached = match (store, &key) {
+            (Some(store), Some(key)) => {
+                store.store::<N>(key, &entry.iter().map(|(r, so)| (r, so.as_slice())).collect::<Vec<_>>())?;
+                format!("kernel cache MISS {}, stored", key.name)
+            }
+            _ => "kernel cache off".to_string(),
+        };
         eprintln!(
-            "[asm build] {} kernels: trace {:.2}s, assemble {:.2}s ({} workers); kernel text {:016x}",
+            "[asm build] {} kernels: trace {:.2}s, assemble {:.2}s ({} workers); {cached}; kernel text {:016x}",
             kernels.len(),
             trace_s,
             t_asm.elapsed().as_secs_f64(),
@@ -950,7 +988,7 @@ impl<N: KernelLanes> Registry<N> {
             text_digest(&kernels),
         );
         eprintln!("[asm build]   phases, summed over workers: {}", times.show());
-        Ok(Registry { kernels, grid })
+        Ok(Registry { kernels, grid: s.region_grid() })
     }
 }
 
@@ -1073,7 +1111,9 @@ fn apply_union<N: KernelLanes>(kernel: &mut AsmKernel<N>, unions: &HashMap<u64, 
 
 /// A KERNEL AS ITS BUILD LEFT IT: what tracing, lowering and assembling
 /// one (shape, region) made, as plain data; `AsmKernel::of` makes the
-/// rest.
+/// rest, alike for a fresh build and a cached one (`compiled::cache`).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
 pub(crate) struct Recipe<N: Arithmetic = P8> {
     pub(crate) shape: u64,
     pub(crate) region: Option<Region>,
@@ -1094,6 +1134,7 @@ pub(crate) struct Recipe<N: Arithmetic = P8> {
 
 /// A fused body's roots as output slots (`Compiled::root_offsets`'
 /// indices).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct BodySlots {
     outcome: usize,
     splits: Vec<u8>,
@@ -1108,6 +1149,8 @@ pub(crate) struct BodySlots {
 /// An outcome's rows' skeleton: a field's column empty and typed, or
 /// uniform where every row holds one value (`OutField::uniform`, the
 /// buttons' unknown); its shape hash taken before (`Rt2::shape_hash_of`).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
 pub(crate) struct Skeleton<N: Arithmetic = P8> {
     shape_hash: u64,
     structure: Vec<celeste_engine::runtime2::Cell2<N>>,

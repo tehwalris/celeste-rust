@@ -248,7 +248,7 @@ pub enum Unknown {
 
 /// A lane's value type: what a node computes on one lane, and how a cell or
 /// a root is laid out in a kernel's buffers (`asm::codegen`).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Ty {
     Num,
     /// An interval: its two ends.

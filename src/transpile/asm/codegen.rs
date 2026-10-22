@@ -243,6 +243,7 @@ fn input_bytes(ty: Ty) -> u32 {
 }
 
 /// The assembly text plus the buffer layouts a caller packs.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Compiled {
     pub asm: String,
     /// The text's digest, its `#@k` provenance comments aside (the same with
@@ -270,6 +271,8 @@ pub struct Compiled {
     pub frame_bytes: u32,
     /// `bench-frame --metrics` only: per SSA instruction `k`, the graph node it
     /// was lowered from and its kind (the text marks its lines with `#@k`).
+    /// Read by the census at the build only.
+    #[serde(skip)]
     pub prov: Vec<(NodeId, &'static str)>,
     /// The doubles' kernels: the body computes 8 lanes and runs TWICE per call,
     /// lanes 8..16 reading and writing past lanes 0..8 (the buffers are twice

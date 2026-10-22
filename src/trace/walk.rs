@@ -14,7 +14,7 @@ use crate::transpile::garith::GraphArith;
 /// the range analysis folds away far-off collision tests. Each bound is an
 /// `Op::Restrict` on its input cell, whose own error is the per-lane check:
 /// `x`/`y` hold by the dispatch, speed and remainder only by that check.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Region {
     pub ix: i16,
     pub iy: i16,
