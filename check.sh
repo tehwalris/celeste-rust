@@ -10,7 +10,8 @@
 #                frame
 #     perf       the RELEASE binary's instruction budget (gates/perf.txt;
 #                more than 2% over FAILS)
-#     local      the local goldens (SKIPPED where the store is absent)
+#     local      the local goldens and the PICO-8 probe goldens (SKIPPED
+#                where the store or PICO-8 is absent)
 #     fixtures   every fixture rebuilt against its pinned fingerprint
 #     premerge   the pre-merge tests
 #     all        every tier above
@@ -407,13 +408,15 @@ perfcount() {
     }' | tee "$C/perf-$name.line" >&2
 }
 
-# The local goldens (trace::oracle), from the machine-local store; where it
-# is absent the test passes and says SKIPPED, repeated in the run's last line.
+# The local tier: the local goldens (trace::oracle), from the machine-local
+# store, and the PICO-8 probe goldens (trace::probe), from a real PICO-8;
+# where either is absent its test passes and says SKIPPED, repeated in the
+# run's last line.
 localgoldens() {
     step local-goldens ignoredtests local
     grep -h '\[local goldens\]' "$C/local-goldens.out" "$C/local-goldens.err" | sed 's/^/    /'
     if grep -qh 'SKIPPED' "$C/local-goldens.out" "$C/local-goldens.err"; then
-        echo "[$TIER] !!! LOCAL GOLDENS SKIPPED: the store is absent; nothing of it was checked"
+        grep -h 'SKIPPED' "$C/local-goldens.out" "$C/local-goldens.err" | sed "s/^/[$TIER] !!! /"
         echo "local-goldens" >> "$C/skipped"
     fi
 }

@@ -319,37 +319,21 @@ mod tests {
         }
     }
 
-    /// Is the checked-in golden file still what PICO-8 says? Compares bytes
-    /// either side of a regeneration (not the VCS status: a staged or
-    /// unadded file is not stale). Without PICO-8 it skips, loudly.
+    /// Is the checked-in golden file still what PICO-8 says? Regenerates
+    /// them (`tools::pico8::probe_goldens`, `rewrite pico8 probe-goldens`)
+    /// and fails on any that moved. Machine-local (it needs PICO-8, and
+    /// rewrites `lua/probe/` in the checkout): without PICO-8 it says
+    /// SKIPPED, which `./check.sh local` reports.
     #[test]
+    #[ignore = "local, ./check.sh local runs it: needs a PICO-8 at ~/pico-8/pico8, rewrites lua/probe/*.expected where PICO-8 now says something else"]
     fn the_golden_files_are_current() {
-        let p8 = std::env::var("PICO8").unwrap_or_else(|_| {
-            format!("{}/pico-8/pico8", std::env::var("HOME").unwrap_or_default())
-        });
-        if !std::path::Path::new(&p8).exists() {
-            eprintln!("[probe] no PICO-8 at {} - NOT checking the golden files", p8);
+        let p8 = crate::tools::pico8::default_pico8();
+        if !p8.exists() {
+            println!("[local goldens] the probe corpora: SKIPPED, no PICO-8 at {}", p8.display());
             return;
         }
-        let names = all_corpora().expect("read lua/probe");
-        let before: Vec<String> = names
-            .iter()
-            .map(|n| std::fs::read_to_string(format!("lua/probe/{}.expected", n)).unwrap())
-            .collect();
-        let out = std::process::Command::new("./regen-pico8-golden.sh")
-            .output()
-            .expect("run regen-pico8-golden.sh");
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-        for (i, n) in names.iter().enumerate() {
-            let after = std::fs::read_to_string(format!("lua/probe/{}.expected", n)).unwrap();
-            // The file on disk is now the NEW output, for the diff.
-            assert_eq!(
-                before[i], after,
-                "lua/probe/{}.expected is stale - real PICO-8 now says something else, \
-                 and the file has been rewritten with it so the diff is readable",
-                n
-            );
-        }
-        eprintln!("[probe] golden files match real PICO-8");
+        let changed = crate::tools::pico8::probe_goldens(&p8, std::path::Path::new(env!("CARGO_MANIFEST_DIR"))).expect("PICO-8 runs the corpora");
+        assert!(changed.is_empty(), "lua/probe/{{{}}}.expected are stale - real PICO-8 now says something else, and they have been rewritten with it so the diff is readable", changed.join(","));
+        println!("[local goldens] the probe corpora: every golden is what PICO-8 says");
     }
 }
