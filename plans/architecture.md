@@ -94,6 +94,12 @@ reference for semantics only.
 3. **The kernel set** (`compiled::asm_kernel::Registry`): one assembled
    kernel per (shape, region), built at startup with gcc + dlopen. Nothing
    is checked in; what runs is what the tracer makes of this checkout's Lua.
+   A set built once is kept in the KERNEL CACHE (`compiled::cache`,
+   `/var/tmp/celeste-kernels`), keyed on every source file, the build
+   profile, gcc and glibc, the program, the arithmetic, the level and the
+   settings: only the same build of the same sources loads it again (the
+   `[asm build]` line says HIT or MISS; `--kernel-explain` and
+   `--build-trace` always build).
 
 To the outer loop a state is opaque: `(shape, key, cell)`.
 
