@@ -480,9 +480,9 @@ fn run<A: TestArith>(c: &Compiled, l: &Loaded, rows: &[Vec<In<A>>], env: Option<
         }
     }
     A::before_call();
-    let ctx = AsmCtx::new(env.map_or(std::ptr::null(), |e| e as *const CollisionEnv as *const c_void));
+    let ctx = AsmCtx::<A>::new(env.map_or(std::ptr::null(), |e| e as *const CollisionEnv as *const c_void));
     // SAFETY: the buffers have the layout `c` states (`halves` of each).
-    unsafe { (l.func)(inbuf.as_ptr(), out.as_mut_ptr(), &ctx as *const AsmCtx as *const c_void) };
+    unsafe { (l.func)(inbuf.as_ptr(), out.as_mut_ptr(), &ctx as *const AsmCtx<A> as *const c_void) };
     (0..rows.len())
         .map(|j| {
             (0..c.n_roots)

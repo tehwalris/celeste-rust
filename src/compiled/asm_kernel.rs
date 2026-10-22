@@ -239,7 +239,7 @@ impl<N: KernelLanes> AsmKernel<N> {
         }
         let views = self.input_views(chunk);
         let env = CollisionEnv { cache: &chunk.cache };
-        let ctx = AsmCtx::new(&env as *const CollisionEnv as *const c_void);
+        let ctx = AsmCtx::<N>::new(&env as *const CollisionEnv as *const c_void);
         // Per-thread reused buffers: a fresh allocation faults every page.
         let mut sc = Scratch::take(self);
         let Scratch { inbuf, outbuf, took, takes, parts, dups, .. } = &mut sc;
@@ -265,7 +265,7 @@ impl<N: KernelLanes> AsmKernel<N> {
             (self.loaded.func)(
                 inbuf.as_ptr(),
                 outbuf.as_mut_ptr(),
-                &ctx as *const AsmCtx as *const c_void,
+                &ctx as *const AsmCtx<N> as *const c_void,
             );
         }
         let t_emit = sink.stats.tick(crate::storage::stats::S::PhKernel, t_ph);

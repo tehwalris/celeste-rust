@@ -19,7 +19,7 @@ use crate::transpile::garith::GraphArith;
 
 /// The lanes of an arithmetic the kernels compute in (one the assembler
 /// compiles).
-pub trait KernelLanes: crate::search::rem::Rem + GraphArith {
+pub trait KernelLanes: crate::search::rem::Rem + GraphArith + crate::transpile::asm::CallLanes {
     /// The 16 lanes of the value slot at byte `off` (`half`: the halves'
     /// distance in this buffer; 16.16 has none).
     fn col(buf: &[u8], half: usize, off: usize) -> [Self::Raw; 16];

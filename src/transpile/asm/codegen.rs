@@ -35,48 +35,40 @@ const CTX_MGET: u32 = 24;
 const CTX_TILE: u32 = 32;
 const CTX_TILE_LANES: u32 = 40;
 const CTX_ENV: u32 = 48;
-// The doubles' call-outs (8 `f64` lanes), after `env`.
-const CTX_FSIN: u32 = 56;
-const CTX_FMGET: u32 = 64;
-const CTX_FTILE: u32 = 72;
-const CTX_FTILE_LANES: u32 = 80;
-// The offsets ARE `AsmCtx`'s layout.
+// The offsets ARE `AsmCtx`'s layout, in both arithmetics.
 const _: () = {
     use super::callout::AsmCtx;
+    use celeste_core::{lua_f64::LuaF64, pico8_num::Pico8Num};
     use std::mem::offset_of;
-    assert!(offset_of!(AsmCtx, div) == CTX_DIV as usize);
-    assert!(offset_of!(AsmCtx, rem) == CTX_REM as usize);
-    assert!(offset_of!(AsmCtx, sin) == CTX_SIN as usize);
-    assert!(offset_of!(AsmCtx, mget) == CTX_MGET as usize);
-    assert!(offset_of!(AsmCtx, tile_flag) == CTX_TILE as usize);
-    assert!(offset_of!(AsmCtx, tile_flag_lanes) == CTX_TILE_LANES as usize);
-    assert!(offset_of!(AsmCtx, env) == CTX_ENV as usize);
-    assert!(offset_of!(AsmCtx, fsin) == CTX_FSIN as usize);
-    assert!(offset_of!(AsmCtx, fmget) == CTX_FMGET as usize);
-    assert!(offset_of!(AsmCtx, ftile_flag) == CTX_FTILE as usize);
-    assert!(offset_of!(AsmCtx, ftile_flag_lanes) == CTX_FTILE_LANES as usize);
+    macro_rules! layout {
+        ($l:ty) => {
+            assert!(offset_of!(AsmCtx<$l>, div) == CTX_DIV as usize);
+            assert!(offset_of!(AsmCtx<$l>, rem) == CTX_REM as usize);
+            assert!(offset_of!(AsmCtx<$l>, sin) == CTX_SIN as usize);
+            assert!(offset_of!(AsmCtx<$l>, mget) == CTX_MGET as usize);
+            assert!(offset_of!(AsmCtx<$l>, tile_flag) == CTX_TILE as usize);
+            assert!(offset_of!(AsmCtx<$l>, tile_flag_lanes) == CTX_TILE_LANES as usize);
+            assert!(offset_of!(AsmCtx<$l>, env) == CTX_ENV as usize);
+        };
+    }
+    layout!(Pico8Num);
+    layout!(LuaF64);
 };
 const SAVE_BYTES: u32 = 32 * 64; // the save area: a slot per zmm
 const ARGBUF_BYTES: u32 = 8 * 64; // up to 6 SIMD args + a result buffer
 
-/// A call-out op (a `call` through `AsmCtx`).
+/// A call-out op (a `call` through the arithmetic's `AsmCtx`).
 #[derive(Clone, Copy)]
 enum CallOp {
+    /// 16.16's only: the doubles divide inline.
     Div,
     Rem,
     Sin,
     Mget,
-    /// Uniform box: `scalars = [w, h, flag]`.
+    /// Uniform box: `scalars = [w, h, flag]`, whole numbers.
     TileFlag,
     /// Per-lane box: `args = [x, y, w, h]`, `scalars = [flag]`.
     TileFlagLanes,
-    /// The doubles' (8 `f64` lanes): the tools' `sin`, `LuaF64::lua_sin`.
-    FSin,
-    FMget,
-    /// Uniform box: `scalars = [w, h, flag]` as integers.
-    FTileFlag,
-    /// Per-lane box: `args = [x, y, w, h]`, `scalars = [flag]`.
-    FTileFlagLanes,
 }
 
 const FLR_MASK: i32 = 0xffff_0000u32 as i32;
@@ -84,7 +76,7 @@ const FLR_MASK: i32 = 0xffff_0000u32 as i32;
 type Vreg = u32;
 
 /// A numeric node value: a live register or a broadcast constant.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum NumVal {
     Reg(Vreg),
     ConstI32(i32),
@@ -657,6 +649,31 @@ impl<A: LaneArith> Lower<'_, A> {
             Op::ConstBool(b) => Value::Bool([MaskVal::Const(*b), MaskVal::Const(true)]),
             // Undecided in every lane: the known plane is all zeros.
             Op::UnknownBool(_) => Value::Bool([MaskVal::Const(false), MaskVal::Const(false)]),
+            // The map: call-outs on whole-number coordinates (`callout`).
+            Op::Mget => {
+                let (x, y) = (self.as_num(a[0])?, self.as_num(a[1])?);
+                let args = vec![self.num_reg(x), self.num_reg(y)];
+                let dst = self.fresh();
+                self.insts.push(Inst::Call { op: CallOp::Mget, dst, args, scalars: Vec::new() });
+                Value::Num(NumVal::Reg(dst))
+            }
+            // A box of literals is one call with the box as whole numbers;
+            // a per-lane box the scan.
+            Op::TileFlagAt => {
+                let (nx, ny) = (self.as_num(a[0])?, self.as_num(a[1])?);
+                let (x, y) = (self.num_reg(nx), self.num_reg(ny));
+                let (wv, hv, fv) = (self.as_num(a[2])?, self.as_num(a[3])?, self.as_num(a[4])?);
+                let flag = literal_i16(id, fv, "flag")?;
+                let dst = self.fresh();
+                if matches!(wv, NumVal::Reg(_)) || matches!(hv, NumVal::Reg(_)) {
+                    let (wr, hr) = (self.num_reg(wv), self.num_reg(hv));
+                    self.insts.push(Inst::Call { op: CallOp::TileFlagLanes, dst, args: vec![x, y, wr, hr], scalars: vec![flag] });
+                } else {
+                    let (w, h) = (literal_i16(id, wv, "width")?, literal_i16(id, hv, "height")?);
+                    self.insts.push(Inst::Call { op: CallOp::TileFlag, dst, args: vec![x, y], scalars: vec![w, h, flag] });
+                }
+                Value::Bool([MaskVal::Reg(dst), MaskVal::Const(true)])
+            }
             // `trace::lower::bind` keeps it out of every root's cone.
             Op::UnknownNum { .. } => bail!("node {}: an unknown number reached the kernel", id),
             Op::Not => {
@@ -731,6 +748,17 @@ impl<A: LaneArith> Lower<'_, A> {
             _ => return Ok(None),
         }))
     }
+}
+
+/// A literal lane value as a whole number (`tile_flag_at`'s box and flag:
+/// the call-out takes them so); anything else is refused.
+fn literal_i16(id: NodeId, n: NumVal, what: &str) -> Result<i32> {
+    let v = match n {
+        NumVal::ConstI32(raw) => celeste_core::pico8_num::Pico8Num::from_raw(raw).as_i16(),
+        NumVal::ConstQ(bits) => celeste_core::lua_f64::LuaF64::new(f64::from_bits(bits)).and_then(celeste_core::lua_f64::LuaF64::as_i16),
+        NumVal::Reg(_) => bail!("node {id}: tile_flag's {what} must be an exact constant"),
+    };
+    v.map(i32::from).ok_or_else(|| anyhow::anyhow!("node {id}: tile_flag's {what} {n:?} is not a whole number"))
 }
 
 impl Lower<'_, Fixed> {
@@ -1234,12 +1262,11 @@ impl Lower<'_, Fixed> {
                 let xr = self.num_reg(x);
                 Value::Num(NumVal::Reg(self.dbin_c(ROp::AndD, xr, m)))
             }
-            Op::Div | Op::Rem | Op::Sin | Op::Mget => {
+            Op::Div | Op::Rem | Op::Sin => {
                 let (op, n_args) = match &node.op {
                     Op::Div => (CallOp::Div, 2),
                     Op::Rem => (CallOp::Rem, 2),
-                    Op::Sin => (CallOp::Sin, 1),
-                    _ => (CallOp::Mget, 2),
+                    _ => (CallOp::Sin, 1),
                 };
                 let mut args = Vec::with_capacity(n_args);
                 for k in 0..n_args {
@@ -1249,39 +1276,6 @@ impl Lower<'_, Fixed> {
                 let dst = self.fresh();
                 self.insts.push(Inst::Call { op, dst, args, scalars: Vec::new() });
                 Value::Num(NumVal::Reg(dst))
-            }
-            Op::TileFlagAt => {
-                let nx = self.as_num(a[0])?;
-                let x = self.num_reg(nx);
-                let ny = self.as_num(a[1])?;
-                let y = self.num_reg(ny);
-                let (wv, hv, fv) = (self.as_num(a[2])?, self.as_num(a[3])?, self.as_num(a[4])?);
-                let flag = match fv {
-                    NumVal::ConstI32(c) => c,
-                    _ => bail!("node {}: tile_flag flag must be an exact constant", id),
-                };
-                let dst = self.fresh();
-                match (wv, hv) {
-                    (NumVal::ConstI32(w), NumVal::ConstI32(h)) => {
-                        self.insts.push(Inst::Call {
-                            op: CallOp::TileFlag,
-                            dst,
-                            args: vec![x, y],
-                            scalars: vec![w, h, flag],
-                        });
-                    }
-                    _ => {
-                        let wr = self.num_reg(wv);
-                        let hr = self.num_reg(hv);
-                        self.insts.push(Inst::Call {
-                            op: CallOp::TileFlagLanes,
-                            dst,
-                            args: vec![x, y, wr, hr],
-                            scalars: vec![flag],
-                        });
-                    }
-                }
-                Value::Bool([MaskVal::Reg(dst), MaskVal::Const(true)])
             }
             other => bail!("node {}: op {:?} is not supported by the asm slice", id, other),
         };
@@ -1710,6 +1704,8 @@ struct Emitter<'a> {
     last_neg: Option<usize>,
     /// rsp offset of the call-out argument/result buffers.
     argbuf_off: u32,
+    /// The arithmetic's mask width (a tile test's result).
+    lanes: Lanes,
     pool: Pool,
     out: String,
 }
@@ -1968,39 +1964,40 @@ impl<'a> Emitter<'a> {
                 let arg = |i: u32| argbuf + i * 64;
                 // 3. C args; `stack_arg`: tile_flag's pushed 7th scalar.
                 let (ctx_off, stack_arg): (u32, bool) = match op {
-                    CallOp::Div | CallOp::Rem | CallOp::Sin | CallOp::FSin => {
+                    CallOp::Div | CallOp::Rem | CallOp::Sin => {
+                        // The doubles divide inline: their context has no `/`, `%`.
+                        assert!(matches!(self.lanes, Lanes::L16) || matches!(op, CallOp::Sin), "a call-out of `/` or `%` in the doubles' kernel");
                         writeln!(self.out, "    leaq {}(%rsp), %rdi", resbuf).unwrap();
                         writeln!(self.out, "    leaq {}(%rsp), %rsi", arg(0)).unwrap();
-                        if !matches!(op, CallOp::Sin | CallOp::FSin) {
+                        if !matches!(op, CallOp::Sin) {
                             writeln!(self.out, "    leaq {}(%rsp), %rdx", arg(1)).unwrap();
                         }
                         let c = match op {
                             CallOp::Div => CTX_DIV,
                             CallOp::Rem => CTX_REM,
-                            CallOp::FSin => CTX_FSIN,
                             _ => CTX_SIN,
                         };
                         (c, false)
                     }
-                    CallOp::Mget | CallOp::FMget => {
+                    CallOp::Mget => {
                         self.map_call_args(resbuf);
-                        (if matches!(op, CallOp::FMget) { CTX_FMGET } else { CTX_MGET }, false)
+                        (CTX_MGET, false)
                     }
-                    CallOp::TileFlag | CallOp::FTileFlag => {
+                    CallOp::TileFlag => {
                         self.map_call_args(resbuf);
                         writeln!(self.out, "    movl ${}, %r8d", scalars[0]).unwrap();
                         writeln!(self.out, "    movl ${}, %r9d", scalars[1]).unwrap();
                         writeln!(self.out, "    subq $16, %rsp").unwrap();
                         writeln!(self.out, "    movl ${}, (%rsp)", scalars[2]).unwrap();
-                        (if matches!(op, CallOp::FTileFlag) { CTX_FTILE } else { CTX_TILE }, true)
+                        (CTX_TILE, true)
                     }
-                    CallOp::TileFlagLanes | CallOp::FTileFlagLanes => {
+                    CallOp::TileFlagLanes => {
                         self.map_call_args(resbuf);
                         writeln!(self.out, "    leaq {}(%rsp), %r8", arg(2)).unwrap();
                         writeln!(self.out, "    leaq {}(%rsp), %r9", arg(3)).unwrap();
                         writeln!(self.out, "    subq $16, %rsp").unwrap();
                         writeln!(self.out, "    movl ${}, (%rsp)", scalars[0]).unwrap();
-                        (if matches!(op, CallOp::FTileFlagLanes) { CTX_FTILE_LANES } else { CTX_TILE_LANES }, true)
+                        (CTX_TILE_LANES, true)
                     }
                 };
                 // 4. call through the ctx.
@@ -2021,8 +2018,7 @@ impl<'a> Emitter<'a> {
                 // 6. read the result into dst (a tile test's: a lane mask).
                 let at = format!("{resbuf}(%rsp)");
                 match op {
-                    CallOp::TileFlag | CallOp::TileFlagLanes => self.mask_load(Lanes::L16, *dst, &at),
-                    CallOp::FTileFlag | CallOp::FTileFlagLanes => self.mask_load(Lanes::L8, *dst, &at),
+                    CallOp::TileFlag | CallOp::TileFlagLanes => self.mask_load(self.lanes, *dst, &at),
                     _ => {
                         let d = self.def_reg(*dst);
                         writeln!(self.out, "    vmovdqu64 {at}, %zmm{d}").unwrap();
@@ -2324,6 +2320,7 @@ fn compile_with<A: LaneArith>(
         call_saves: &call_saves,
         last_neg,
         argbuf_off,
+        lanes: A::LANES,
         pool: Pool::default(),
         out: String::new(),
     };

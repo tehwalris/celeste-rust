@@ -296,21 +296,6 @@ impl Lower<'_, Float> {
         Ok(Value::Bool([MaskVal::Reg(self.fcmp(imm, xr, ys)), MaskVal::Const(true)]))
     }
 
-    /// A literal operand as an `i16` (the collision box's sizes and flag).
-    fn literal_i16(&self, id: NodeId, n: NumVal, what: &str) -> Result<i32> {
-        match n {
-            NumVal::ConstQ(bits) => {
-                let v = f64::from_bits(bits);
-                if v == v.floor() && (i16::MIN as f64..=i16::MAX as f64).contains(&v) {
-                    Ok(v as i16 as i32)
-                } else {
-                    bail!("node {}: tile_flag's {what} {v} is not an integer", id)
-                }
-            }
-            _ => bail!("node {}: tile_flag's {what} must be an exact constant", id),
-        }
-    }
-
     pub(super) fn lower_node_f64(&mut self, id: NodeId) -> Result<()> {
         if let Some(v) = self.lower_common(id)? {
             self.vals[id as usize] = Some(v);
@@ -423,7 +408,7 @@ impl Lower<'_, Float> {
                 let x = self.as_num(a[0])?;
                 let xr = self.num_reg(x);
                 let dst = self.fresh();
-                self.insts.push(Inst::Call { op: CallOp::FSin, dst, args: vec![xr], scalars: Vec::new() });
+                self.insts.push(Inst::Call { op: CallOp::Sin, dst, args: vec![xr], scalars: Vec::new() });
                 Value::Num(NumVal::Reg(dst))
             }
             op @ (Op::Lt | Op::Le | Op::Gt | Op::Ge) => self.compare(op, [a[0], a[1]])?,
@@ -549,31 +534,6 @@ impl Lower<'_, Float> {
                     _ => MaskVal::Const(true),
                 };
                 Value::Bool([ok, MaskVal::Const(true)])
-            }
-            Op::Mget => {
-                let (x, y) = (self.as_num(a[0])?, self.as_num(a[1])?);
-                let args = vec![self.num_reg(x), self.num_reg(y)];
-                let dst = self.fresh();
-                self.insts.push(Inst::Call { op: CallOp::FMget, dst, args, scalars: Vec::new() });
-                Value::Num(NumVal::Reg(dst))
-            }
-            Op::TileFlagAt => {
-                let (nx, ny) = (self.as_num(a[0])?, self.as_num(a[1])?);
-                let (x, y) = (self.num_reg(nx), self.num_reg(ny));
-                let (wv, hv, fv) = (self.as_num(a[2])?, self.as_num(a[3])?, self.as_num(a[4])?);
-                let flag = self.literal_i16(id, fv, "flag")?;
-                let dst = self.fresh();
-                match (wv, hv) {
-                    (NumVal::ConstQ(_), NumVal::ConstQ(_)) => {
-                        let (w, h) = (self.literal_i16(id, wv, "width")?, self.literal_i16(id, hv, "height")?);
-                        self.insts.push(Inst::Call { op: CallOp::FTileFlag, dst, args: vec![x, y], scalars: vec![w, h, flag] });
-                    }
-                    _ => {
-                        let (wr, hr) = (self.num_reg(wv), self.num_reg(hv));
-                        self.insts.push(Inst::Call { op: CallOp::FTileFlagLanes, dst, args: vec![x, y, wr, hr], scalars: vec![flag] });
-                    }
-                }
-                Value::Bool([MaskVal::Reg(dst), MaskVal::Const(true)])
             }
             other => bail!("node {}: op {:?} is not supported by the doubles' kernels", id, other),
         };
