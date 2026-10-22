@@ -515,17 +515,60 @@ impl<N: Rem> EdgeStore<N> {
         Ok(v)
     }
 
+    /// THE BUNDLES recorded at frame `frame` into target region `region`
+    /// (its segments decoded with `dec`): `f` each (`expand`: its edges).
+    pub(crate) fn bundles_into(&self, frame: u32, region: u32, dec: &mut Decoder, mut f: impl FnMut(Bundle)) -> Result<()> {
+        for s in self.segments(frame, region) {
+            dec.bundles(&s, &mut f)?;
+        }
+        Ok(())
+    }
+
     /// The in-edges recorded at frame `frame` of `target` (sources of layer
-    /// `frame - 1`): its region's segments decoded.
+    /// `frame - 1`).
     pub(crate) fn preds_at(&self, target: Sk, frame: u32) -> Result<Vec<(Sk, u32)>> {
         let mut out = Vec::new();
-        let mut dec = Decoder::default();
-        for s in self.segments(frame, target.region) {
-            dec.bundles(&s, |b| {
-                if b.t_key == target.key {
-                    bundle::edges(b.mask & 1u64 << target.local, target.region % crate::storage::cells::SLOTS, b.o, |_, _, s_cell| out.push((Sk::at(b.s_shape, b.s_key, s_cell), b.x)));
-                }
+        self.bundles_into(frame, target.region, &mut Decoder::default(), |b| {
+            if b.t_key == target.key {
+                bundle::edges(b.mask & 1u64 << target.local, target.region % crate::storage::cells::SLOTS, b.o, |_, _, s_cell| out.push((Sk::at(b.s_shape, b.s_key, s_cell), b.x)));
+            }
+        })?;
+        Ok(out)
+    }
+
+    /// The OUT-EDGES recorded at frame `frame` of `sources` (layer `frame -
+    /// 1`): `(k, target, transfer)` for `sources[k]`, read from the target
+    /// regions the frame's source index names for the sources' regions.
+    pub(crate) fn out_of(&self, frame: u32, sources: &[Sk], threads: usize) -> Result<Vec<(usize, Sk, u32)>> {
+        let mut wanted: rustc_hash2::FxHashMap<(u32, super::visited::Key), Vec<(u32, usize)>> = Default::default();
+        let mut regions: Vec<u32> = Vec::new();
+        for (k, s) in sources.iter().enumerate() {
+            wanted.entry((s.shape(), s.key)).or_default().push((s.cell(), k));
+            regions.push(s.region);
+        }
+        regions.sort_unstable();
+        regions.dedup();
+        let mut targets: Vec<u32> = regions.iter().flat_map(|&r| self.targets_of(frame, r)).collect();
+        targets.sort_unstable();
+        targets.dedup();
+        let parts = super::wave::par_map(&targets, threads, |&region| -> Result<Vec<(usize, Sk, u32)>> {
+            let mut out = Vec::new();
+            self.bundles_into(frame, region, &mut Decoder::default(), |b| {
+                let Some(cands) = wanted.get(&(b.s_shape, b.s_key)) else { return };
+                expand(region, &b, |src, dst| {
+                    let c = src.cell();
+                    for &(wc, k) in cands {
+                        if wc == c {
+                            out.push((k, dst, b.x));
+                        }
+                    }
+                });
             })?;
+            Ok(out)
+        });
+        let mut out = Vec::new();
+        for p in parts {
+            out.extend(p?);
         }
         Ok(out)
     }

@@ -510,9 +510,7 @@ fn sources_into<N: crate::search::rem::Rem>(dir: &Path, last: u32, regions: &[u3
         |dec, k| {
             let mut pairs: Vec<(u32, u32)> = Vec::new();
             for &r in regions {
-                for seg in store.segments(frames[k], r) {
-                    dec.bundles(&seg, |b| crate::storage::edges::expand(r, &b, |src, dst| pairs.push((dst.cell(), src.cell()))))?;
-                }
+                store.bundles_into(frames[k], r, dec, |b| crate::storage::edges::expand(r, &b, |src, dst| pairs.push((dst.cell(), src.cell()))))?;
             }
             Ok(pairs)
         },
