@@ -230,9 +230,9 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
         }
         // `samples` records evenly spaced, checked in parallel (a reference
         // engine per worker), reported in record order.
-        let stride = (recs.len() / o.samples.max(1)).max(1);
-        let picked: Vec<&Rec<N>> = recs.iter().step_by(stride).take(o.samples).collect();
-        let done: Vec<Sampled> = crate::par::Pool::new(workers).map_with(
+        let picked: Vec<&Rec<N>> = crate::differential::stride(recs.len(), o.samples).into_iter().map(|k| &recs[k]).collect();
+        let done = crate::differential::run(
+            workers,
             picked.len(),
             || {
                 let mut eng = ReferenceEngine::<N>::new(cfg)?;
@@ -241,18 +241,16 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
                 }
                 Ok(eng)
             },
-            |eng, k| {
-                let r = picked[k];
-                match check(eng, frame, r, &recs) {
-                    Err(e) if e.downcast_ref::<crate::engines::reference::TooManyPaths>().is_some() => {
-                        let msg = format!("[check arcs] f{frame} pred {} -> {}: SKIPPED ({e})", r.src.show(), r.target.show());
-                        Ok(Sampled { skipped: 1, msgs: vec![msg], ..Default::default() })
-                    }
-                    other => other,
-                }
-            },
+            |eng, k| check(eng, frame, picked[k], &recs),
         )?;
-        for o in done {
+        for (k, o) in done.into_iter().enumerate() {
+            let o = match o {
+                crate::differential::Ran::Done(o) => o,
+                crate::differential::Ran::Skipped(why) => {
+                    let r = picked[k];
+                    Sampled { skipped: 1, msgs: vec![format!("[check arcs] f{frame} pred {} -> {}: SKIPPED ({why})", r.src.show(), r.target.show())], ..Default::default() }
+                }
+            };
             for m in &o.msgs {
                 eprintln!("{m}");
             }
@@ -284,6 +282,6 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
         "agreement: {sampled} sampled records ({} from a row without a player, {} SKIPPED over the path cap); inside the guard {} probes, {} disagree, {} reach the target unpredicted; outside every guard {} probes, {} reach the target; {} reference steps",
         total.no_player, total.skipped, total.inside, total.inside_bad, total.unpredicted, total.outside, total.outside_bad, total.steps
     );
-    anyhow::ensure!(missing_total == 0 && total.inside_bad == 0 && total.unpredicted == 0 && total.outside_bad == 0, "check arcs: disagreement");
-    Ok(())
+    let bad = missing_total + total.inside_bad + total.unpredicted + total.outside_bad;
+    crate::differential::verdict((sampled - total.skipped) as usize, bad as usize, || "check arcs: disagreement".into())
 }
