@@ -50,6 +50,11 @@ impl CartData {
         &self.map_data
     }
 
+    /// The 256 tiles' flag bytes (a PICO-8 cart's `__gff__`).
+    pub fn flag_bytes(&self) -> &[u8] {
+        &self.flag_data
+    }
+
     /// PICO-8's `mget`: the tile at a whole-number map coordinate, 0 outside
     /// the 128x64 map. A branch-free kernel reads outside on loop iterations a
     /// lane does not take. A fractional coordinate is refused: the traced

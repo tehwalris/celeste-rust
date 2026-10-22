@@ -20,6 +20,7 @@ mod bench;
 mod check;
 mod diag;
 mod l1;
+mod pico8;
 mod run;
 
 /// mimalloc, not glibc: glibc retains gigabytes of freed slot chunks across
@@ -190,6 +191,11 @@ enum Command {
     /// jump fires (`canonical`), and in a 100% category the chest seed
     /// lists to try (`chest_seed_variants`).
     Witness(run::WitnessArgs),
+    /// A REAL PICO-8, headless: one room replayed, a room in real play
+    /// through the chain of rooms before it, the start real play enters a
+    /// room with, the probe goldens (`tools::pico8`, `tools::chain`).
+    #[command(subcommand)]
+    Pico8(pico8::Command),
 }
 
 impl Command {
@@ -495,6 +501,7 @@ fn main() -> Result<()> {
         }
         Command::Run(a) => run::run(&cfg, a),
         Command::Witness(a) => run::witness(&cfg, a),
+        Command::Pico8(c) => pico8::run(&cfg, c),
         Command::Ckhash(a) => diag::ckhash(&cfg, a),
         Command::Check(c) => check::run(&cfg, c),
         Command::Bench(c) => bench::run(&cfg, c),
