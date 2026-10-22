@@ -1,12 +1,12 @@
 # Room (4,0) "500 m" exit witness for celeste-minimal, derived 2026-09-16.
 #
-# Input bytes for rewrite run (-i) / pico8_diff/replay.py --room 4,0, one
+# Input bytes for rewrite run (-i) / rewrite pico8 replay --room 4,0, one
 # per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
 # bit4=jump bit5=dash.
 #
 # Derived from ~/src/github.com/CelesteClassic/tasdatabase/classic/any/TAS5.tas
 # (47 inputs): replayed on a real PICO-8 in the ORIGINAL cart
-# (celeste_ocaml/celeste.lua, `replay.py --lua ... --begin-game --room 4,0`)
+# (celeste_ocaml/celeste.lua, `rewrite pico8 replay --original --room 4,0`)
 # after 29 frames of spawn prologue, it leaves the room during frame 76
 # (= 29 + 47; 24-28 prologue frames never exit). Its per-frame player
 # positions (frames 1-75, `-` during the spawn) went through

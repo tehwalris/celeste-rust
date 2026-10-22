@@ -2,7 +2,9 @@
 //! something independent: the kernels against the reference engine row by
 //! row (`ref`), the recorded transfers against it (`arcs`), the widening
 //! table's two sides (`widen`), a known route against the search's pruning
-//! (`known`), and the tree against its own recorded graph (`replay`).
+//! (`known`), the tree against its own recorded graph (`replay`), and the
+//! kernels' tree against the reference engine's (`reference`). The
+//! sampled ones run on one harness (`differential`).
 
 use anyhow::Result;
 use celeste_engine::runtime2::Rt2;
@@ -16,7 +18,10 @@ use celeste_rust::storage::layer::Tree;
 use celeste_rust::storage::Sk;
 use std::path::PathBuf;
 
-use crate::{where_, KernelsNew, Rows};
+use celeste_rust::compiled::{KernelLanes, Kernels};
+use celeste_rust::differential;
+
+use crate::{where_, Rows};
 
 #[derive(clap::Subcommand)]
 pub enum Command {
@@ -75,13 +80,19 @@ pub enum Command {
     /// at each frame (else an error: an edge was not recorded). Prints per
     /// frame the states first reached and the edges recorded into it.
     Replay(ReplayArgs),
+    /// THE REFERENCE ENGINE'S FORWARD IS THE KERNELS': the tree's first
+    /// `--steps` grown again from the start by the reference engine (as
+    /// `forward --reference`, under the tree's settings and level) into a
+    /// scratch tree, and both fingerprinted (`ckhash --edges --hulls`): the
+    /// states, frontiers and edges with their transfers must agree at every
+    /// step. Slow; not at platform (`p`) levels.
+    Reference(ReferenceArgs),
 }
 
 #[derive(clap::Args)]
 pub struct RefArgs {
-    /// The tree (a forward's `--tree`, or a search's `levelNN`).
-    #[arg(long)]
-    tree: PathBuf,
+    #[command(flatten)]
+    tree: crate::TreeArg,
     #[command(flatten)]
     rows: Rows,
     /// Rows sampled.
@@ -106,9 +117,8 @@ pub struct RefArgs {
 
 #[derive(clap::Args)]
 pub struct ArcsArgs {
-    /// The tree (a forward's `--tree`, or a search's `levelNN`).
-    #[arg(long)]
-    tree: PathBuf,
+    #[command(flatten)]
+    tree: crate::TreeArg,
     /// The first step whose records are checked.
     #[arg(long, default_value_t = 1)]
     from_step: u32,
@@ -133,9 +143,8 @@ pub struct ArcsArgs {
 
 #[derive(clap::Args)]
 pub struct WidenArgs {
-    /// The tree (a forward's `--tree`, or a search's `levelNN`).
-    #[arg(long)]
-    tree: PathBuf,
+    #[command(flatten)]
+    tree: crate::TreeArg,
     /// The step whose stored rows are checked (default: the tree's last).
     #[arg(long)]
     step: Option<u32>,
@@ -161,10 +170,18 @@ pub struct KnownArgs {
 }
 
 #[derive(clap::Args)]
-pub struct ReplayArgs {
-    /// The tree (a forward's `--tree`, or a search's `levelNN`).
+pub struct ReferenceArgs {
+    #[command(flatten)]
+    tree: crate::TreeArg,
+    /// The last step compared (default: the tree's last).
     #[arg(long)]
-    tree: PathBuf,
+    steps: Option<u32>,
+}
+
+#[derive(clap::Args)]
+pub struct ReplayArgs {
+    #[command(flatten)]
+    tree: crate::TreeArg,
     /// The last step replayed (default: the tree's last).
     #[arg(long)]
     steps: Option<u32>,
@@ -174,26 +191,35 @@ pub struct ReplayArgs {
 pub fn run(run: &Settings, c: Command) -> Result<()> {
     match c {
         Command::Ref(a) => {
-            let t = TreeDir::open(&a.tree, run)?;
-            celeste_rust::with_arith!(t.settings.arith, N => ref_check::<celeste_rust::compiled::Kernels<N>, N>(&t, &a))
+            let t = a.tree.open(run)?;
+            celeste_rust::with_arith!(t.settings.arith, N => ref_check::<N>(&t, &a))
         }
         Command::Arcs(a) => {
-            let t = TreeDir::open(&a.tree, run)?;
+            let t = a.tree.open(run)?;
             let o = celeste_rust::search::arc_check::Opts { dir: &t.dir, from: a.from_step, to: t.frame(a.to_step)?, samples: a.samples, level: t.level, fault: a.fault.as_deref(), path_cap: a.path_cap, settings: &t.settings };
             celeste_rust::with_arith!(t.settings.arith, N => celeste_rust::search::arc_check::run::<N>(&o))
         }
         Command::Widen(a) => {
-            let t = TreeDir::open(&a.tree, run)?;
+            let t = a.tree.open(run)?;
             let frame = t.frame(a.step)?;
-            celeste_rust::with_arith!(t.settings.arith, N => widen_check::<celeste_rust::compiled::Kernels<N>, N>(&t, frame, a.emitted))
+            celeste_rust::with_arith!(t.settings.arith, N => widen_check::<N>(&t, frame, a.emitted))
         }
         Command::Known(a) => {
             let inputs = celeste_rust::concrete::read_inputs(&a.inputs)?;
             celeste_rust::search::check_known(&a.search_dir, &inputs, a.frames, run)
         }
+        Command::Reference(a) => {
+            let t = a.tree.open(run)?;
+            let to = t.frame(a.steps)?;
+            let scratch = PathBuf::from(format!("/var/tmp/celeste-check-reference-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&scratch);
+            let res = celeste_rust::with_arith!(t.settings.arith, N => reference_check::<N>(&t, to, &scratch));
+            let _ = std::fs::remove_dir_all(&scratch);
+            res
+        }
         Command::Replay(a) => {
             use celeste_rust::search::hull_replay::replay;
-            let t = TreeDir::open(&a.tree, run)?;
+            let t = a.tree.open(run)?;
             let to = t.frame(a.steps)?;
             let tm = std::time::Instant::now();
             let frames = celeste_rust::with_arith!(t.settings.arith, N => replay::<N>(&t.dir, to, t.settings.threads())?);
@@ -219,24 +245,19 @@ pub(crate) fn rerun<N: celeste_rust::search::rem::Rem>(engine: &dyn FrameStep<N>
     Ok((next, won))
 }
 
-/// `check ref` in arithmetic `A`, its kernels `K`.
-fn ref_check<K, A>(t: &TreeDir, a: &RefArgs) -> Result<()>
+/// `check ref` in arithmetic `A`.
+fn ref_check<A>(t: &TreeDir, a: &RefArgs) -> Result<()>
 where
-    K: FrameStep<A> + KernelsNew,
-    A: celeste_rust::transpile::garith::GraphArith,
-    A: Rem,
+    A: celeste_rust::transpile::garith::GraphArith + Rem + KernelLanes,
 {
     let (cfg, level) = (&t.settings, t.level);
-    let kernels = K::new(cfg, level)?;
+    let kernels = Kernels::<A>::new(cfg, level)?;
     kernels.warm();
     // Every candidate state, then `samples` evenly spaced.
     let (tree, frame, all) = a.rows.states::<A>(t)?;
     let picked: Vec<Sk> = match a.row {
         Some(r) => vec![*all.get(r).ok_or_else(|| anyhow::anyhow!("--row {r}: step {frame} has {} states", all.len()))?],
-        None => {
-            let n = a.samples.min(all.len());
-            (0..n).map(|k| all[k * all.len() / n]).collect()
-        }
+        None => differential::spread(all.len(), a.samples).into_iter().map(|k| all[k]).collect(),
     };
     let n = picked.len();
     let ids = celeste_rust::compiled::ids();
@@ -308,7 +329,8 @@ where
     };
     // The rows in parallel (the kernels' engine shared, a reference
     // engine per worker), reported in row order.
-    let done = celeste_rust::par::Pool::new(cfg.threads()).map_with(
+    let done = differential::run(
+        cfg.threads(),
         n,
         || {
             let mut reference = celeste_rust::engines::reference::ReferenceEngine::<A>::new(cfg)?.at_level(level);
@@ -320,7 +342,11 @@ where
         |reference, k| one(reference, picked[k]),
     )?;
     let (mut sound_gaps, mut precision_gaps, mut rows_bad, mut skipped, mut alike) = (0usize, 0usize, 0usize, 0usize, 0usize);
-    for (text, missing, extra, skip, lanes) in done {
+    for (text, missing, extra, skip, lanes) in done.into_iter().map(|r| match r {
+        differential::Ran::Done(r) => r,
+        // (`one` takes its own skips, its lanes counted.)
+        differential::Ran::Skipped(why) => (format!("[check ref] SKIPPED ({why})\n"), 0, 0, 1, 0),
+    }) {
         print!("{text}");
         sound_gaps += missing;
         precision_gaps += extra;
@@ -331,16 +357,11 @@ where
     println!("[check ref] {n} rows ({skipped} SKIPPED over the path cap): {rows_bad} differ; {sound_gaps} successors only in the reference, {precision_gaps} only in the kernels");
     println!("[check ref] the one converter: {alike} lanes (the rows, their kernel successors and reference leaves) convert alike on both sides");
     celeste_rust::compiled::dispatch::print_kernel_hits();
-    anyhow::ensure!(sound_gaps == 0, "check ref: {sound_gaps} reference successors the kernels miss (a SOUNDNESS gap)");
-    Ok(())
+    differential::verdict(n - skipped, sound_gaps, || format!("check ref: {sound_gaps} reference successors the kernels miss (a SOUNDNESS gap)"))
 }
 
-/// `check widen` of `frame` in the arithmetic of `N`, its kernels `K`.
-fn widen_check<K, N>(t: &TreeDir, frame: u32, emitted: usize) -> Result<()>
-where
-    K: FrameStep<N> + KernelsNew,
-    N: Rem,
-{
+/// `check widen` of `frame` in the arithmetic of `N`.
+fn widen_check<N: Rem + KernelLanes>(t: &TreeDir, frame: u32, emitted: usize) -> Result<()> {
     let (cfg, level): (&Settings, Level) = (&t.settings, t.level);
     anyhow::ensure!(
         !(level.floors_near && !cfg.clock().boundary(frame)),
@@ -363,8 +384,7 @@ where
             moved += 1;
             if shown + moved <= 8 {
                 let (pa, pb) = (project_all(&a).swap_remove(l), project_all(&b).swap_remove(l));
-                let diff: Vec<String> = pa.iter().filter(|(k, v)| pb.get(*k) != Some(v)).map(|(k, v)| format!("{k}: {v} -> {}", pb.get(k).map_or("-", |s| s.as_str()))).collect();
-                println!("[check widen] {what} row {l} of shape {:#x} MOVED: {}", a.shape_hash, diff.join(", "));
+                println!("[check widen] {what} row {l} of shape {:#x} MOVED: {}", a.shape_hash, differential::field_diff(&pa, &pb).join(", "));
             }
         }
         moved
@@ -377,12 +397,11 @@ where
         moved += check(rt2, "stored", moved);
     }
     if emitted > 0 {
-        let kernels = K::new(cfg, level)?;
+        let kernels = Kernels::<N>::new(cfg, level)?;
         kernels.warm();
         let all: Vec<(usize, u32)> = blocks.iter().enumerate().flat_map(|(bi, (_, rt2))| (0..rt2.width as u32).map(move |r| (bi, r))).collect();
-        let n = emitted.min(all.len());
-        for k in 0..n {
-            let (bi, r) = all[k * all.len() / n];
+        for k in differential::spread(all.len(), emitted) {
+            let (bi, r) = all[k];
             let mut rt2 = blocks[bi].1.clone_block();
             rt2.retain_lanes(&[r]);
             for b in rerun(&kernels, rt2, frame)?.0 {
@@ -392,6 +411,27 @@ where
         }
     }
     println!("[check widen] step {frame} at {level}: {stored} stored rows, {emitted_rows} emitted from {emitted}; {moved} moved by the block side's widening");
-    anyhow::ensure!(moved == 0, "check widen: {moved} rows the block side's widening changes (the table's two sides disagree)");
-    Ok(())
+    differential::verdict(stored + emitted_rows, moved, || format!("check widen: {moved} rows the block side's widening changes (the table's two sides disagree)"))
+}
+
+/// `check reference` of `t` to step `to` in arithmetic `N`, the reference
+/// engine's tree grown in `scratch`.
+fn reference_check<N: Rem>(t: &TreeDir, to: u32, scratch: &std::path::Path) -> Result<()> {
+    use celeste_rust::engines::reference::{RefFrameStep, ReferenceEngine};
+    let (cfg, level) = (&t.settings, t.level);
+    let tm = std::time::Instant::now();
+    let engine: Box<dyn FrameStep<N>> = Box::new(RefFrameStep::<N>::new(cfg, level)?);
+    celeste_rust::frame::grow_tree(scratch, to, cfg.minus_one(), None, level, || Ok(engine), || Ok(vec![ReferenceEngine::<N>::new(cfg)?.initial()?.canonicalized()]), cfg)?;
+    let kernels = celeste_rust::storage::fingerprint::<N>(&t.dir, to, true, true, cfg.threads())?;
+    let reference = celeste_rust::storage::fingerprint::<N>(scratch, to, true, true, cfg.threads())?;
+    let mut bad = 0;
+    for (k, r) in kernels.iter().zip(&reference) {
+        if k != r {
+            bad += 1;
+            println!("[check reference] the kernels' {k}\n[check reference] the reference's {r}");
+        }
+    }
+    bad += kernels.len().abs_diff(reference.len());
+    println!("[check reference] {}: steps 0-{to} at {level}, {} fingerprint lines, {bad} differ ({:.1} s)", t.dir.display(), kernels.len(), tm.elapsed().as_secs_f64());
+    differential::verdict(kernels.len(), bad, || format!("check reference: {bad} of the kernels' fingerprint lines are not the reference engine's"))
 }

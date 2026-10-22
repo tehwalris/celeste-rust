@@ -1,7 +1,7 @@
-# The local goldens' test (trace::oracle; #[ignore]d, `./check.sh local` runs
-# it) prints what it replayed, or that it SKIPPED them (the store holds our
-# unsubmitted routes and is never committed): shown on success too, so a
-# skip is never silent.
+# The local tier's tests (#[ignore = "local, ..."], `./check.sh local` runs
+# them) print what they compared, or that they SKIPPED (the local goldens'
+# store holds our unsubmitted routes and is never committed; the probe
+# corpora need a PICO-8): shown on success too, so a skip is never silent.
 [[profile.default.overrides]]
-filter = "test(the_local_goldens)"
+filter = "test(the_local_goldens) | test(the_golden_files_are_current)"
 success-output = "immediate"

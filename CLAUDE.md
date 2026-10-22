@@ -99,9 +99,11 @@ latter.
   only READS a finished tree takes its settings from the record and refuses
   them as flags. A new tree setting is a field of `Settings` (its flag) and
   a row of `Settings::rows` (its record line), and bumps
-  `settings::VERSION`. Add a
-  knob only when necessary; prefer Rust to Python (Python only drives
-  external tools: PICO-8, UCT, Celia, the tasdatabase).
+  `settings::VERSION`. Add a knob only when necessary.
+- **No Python.** Every tool is a `rewrite` subcommand, the external ones
+  included (PICO-8, UCT, Celia, the tasdatabase: `src/tools/`). The only
+  other code is the Lua that runs inside PICO-8 or LOVE, and the thin
+  shell wrappers (safe-run.sh, one-cargo.sh, check.sh, tools/fixtures.sh).
 - **Never commit generated JSON** (a 28 MB `cfg_analysis.json` once
   dominated the history), nor `ui/dist`, `ui/node_modules` or exported UI
   data. **Never commit an unsubmitted or teased route** (witness, golden
@@ -196,12 +198,15 @@ this; Celia models it. Searches run with `--loading-jank J` (the category
 runner sets it and searches the other feasible J's too).
 
 ```bash
-tools/uct/check_uploads.py [--cat CAT] FILE.tas...   # IL, UCT, Celia, chain, BOOT chain -> VALID/INVALID
-tools/celia/validate.sh [--dashes 1] [--fixp] LEVEL FILE.tas   # Celia headless (gemskip: one dash; 16.16)
-pico8_diff/chain.py CAT LEVEL FILE --boot            # real PICO-8 from 100m with the database's files
-pico8_diff/chain.py CAT LEVEL FILE --modes           # IL / jank / chain entry states diffed field by field
-pico8_diff/chain.py CAT LEVEL x --check-start target/quick/rewrite   # the search's start vs the boot chain
-target/quick/rewrite room --room X,Y [--category C] --balloon-seeds 0   # every J and its start class
+# Under ./safe-run.sh --memory 8G -- (PICO-8 and LOVE run inside the cap):
+rewrite validate uploads [--cat CAT] FILE.tas...    # IL, UCT, Celia, chain, BOOT chain -> VALID/INVALID
+rewrite validate celia [--dashes 1] [--fixp] LEVEL FILE.tas   # Celia headless (gemskip: one dash; 16.16); `uct` likewise
+rewrite pico8 chain FILE --room X,Y --category C --boot     # real PICO-8 from 100m with the database's files
+rewrite pico8 chain FILE --room X,Y --category C --modes    # IL / jank / chain entry states diffed field by field
+rewrite pico8 check-start --room X,Y --category C           # the search's start vs the boot chain
+rewrite room --room X,Y [--category C] --balloon-seeds 0    # every J and its start class
+rewrite category JOBS.json OUTDIR                           # the category runner (`tools::category`)
+rewrite golden uct|celia CAT all                            # the float oracle's goldens
 ```
 
 The boot chain is the verdict; a passing UCT run is not. Our result is the
@@ -260,8 +265,8 @@ frame under `--split-frame`: `settings::Clock`). The most common:
 ./safe-run.sh -- ./target/quick/rewrite ckhash --tree DIR --steps 44
 # A float witness against a nudged libm `sin`.
 ./safe-run.sh -- ./target/quick/rewrite robust --arith float --room X,Y [category] --inputs FILE
-# On a real PICO-8, headless (--lua .../celeste_ocaml/celeste.lua --begin-game: the original cart).
-pico8_diff/replay.py --room 1,0 tas/room_1_0_exit_frame_99.txt
+# On a real PICO-8, headless (--original: the game as released, celeste_ocaml's celeste.lua).
+./safe-run.sh -- ./target/quick/rewrite pico8 replay --room 1,0 --inputs tas/room_1_0_exit_frame_99.txt
 ```
 
 ### The UI (`ui/`)

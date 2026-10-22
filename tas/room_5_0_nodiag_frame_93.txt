@@ -8,5 +8,5 @@
 # f70 U. Replayed on a real PICO-8, room changes to (6,0) during frame 93 in
 # celeste-minimal AND the original cart for balloon seeds 0, 0.25, 0.5,
 # 0.636 and 0.75:
-#   pico8_diff/replay.py --room 5,0 --balloon-seeds 0 tas/room_5_0_nodiag_frame_93.txt
+#   rewrite pico8 replay --room 5,0 --balloon-seeds 0 --inputs tas/room_5_0_nodiag_frame_93.txt
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,34,0,0,0,0,0,0,0,0,0,0,0,0,0,34,0,0,0,0,0,0,16,0,0,0,0,0,36,0,0,0,0,0,0,2,2,2,0,2,2,36,0,0,0,0,0,0,2,2,2,2,2,16,0,16,0,16,0,16,0,16,0,16,0

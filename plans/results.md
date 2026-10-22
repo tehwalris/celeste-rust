@@ -10,8 +10,8 @@ trajectory` (`tas/room_X_Y_reference_frame_N.txt`). The database counts
 `frames = exit frame - prologue - 1` (UCT's clean save: inputs - 1); "f"
 marks a count in its terms.
 
-Every witness here exits at its frame on a real PICO-8 (`pico8_diff/
-replay.py`), balloon rooms under the seeds named. Every result before
+Every witness here exits at its frame on a real PICO-8 (`rewrite pico8
+replay`), balloon rooms under the seeds named. Every result before
 2026-10-08 was searched from an IL LOAD (the room loaded alone); real play
 enters through a transition ("Real play" below).
 
@@ -115,7 +115,7 @@ level; witnesses `tas/room_X_Y_nodiag_frame_N.txt`, uploads
 Our improvements differ from the community runs in the route, not the
 counting: both replayed in the original cart in one harness, the player
 first exists on the same frame. Every upload went through UCT's clean save
-(`tools/uct/validate.sh`). UCT computes in doubles: in (1,2) its player is
+(`rewrite validate uct`). UCT computes in doubles: in (1,2) its player is
 a pixel off PICO-8's while riding a platform, so the 113 finishes in UCT
 only a frame later (86f), and that 86 dies in real play; the upload is
 the PICO-8 alignment, 85f, valid in IL, Celia, the chain and the boot
@@ -161,8 +161,8 @@ ahead). Withdrawn (`tas/invalid`); 67f is the real-play optimum.
 ## Gemskip (2026-10-08 .. 10-16)
 
 `--category gemskipany`: the orb room (5,2) is won by its bare exit and
-every later room starts with ONE dash (the replay's `--one-dash`, the
-tools' `validate.sh --dashes 1`). `gemskipnodiag` adds nodiag's rule,
+every later room starts with ONE dash (the PICO-8 replay's and the
+tools' `--dashes 1` follow the category). `gemskipnodiag` adds nodiag's rule,
 `gemskip100` 100%'s. Levels `r0sxhn,r0sxh` unless said; "OPTIMAL" = the last level's arc bound equals
 the witness's frame. Witnesses `tas/room_X_Y_gemskip*_frame_N.txt`,
 uploads `tas/tasdatabase/gemskip*/upload/`.
@@ -189,7 +189,7 @@ for a same-length variant valid in both, never a longer run; a room whose
 community run is valid only in UCT is parked. Gemskip 100% 2800m: the
 first optimal witness died in UCT and Celia (a remainder of 0x0.7fff in
 16.16 is exactly 0.5 in doubles); a second one is VALID everywhere, and
-`pico8_diff/chain.py` plays it (`OVERRIDES`) so the boot chain runs
+`rewrite pico8 chain` plays it (`tasdb::OVERRIDES`) so the boot chain runs
 unbroken from 100m to 3000m.
 
 ## Real play: the loading jank (2026-10-08)
@@ -257,16 +257,15 @@ room alone and misses it; Celia models it.
   Count up from the bound on the kept level-0 tree.
 - `--frames C --ceiling`: C is a known solution's, so a refutation or no
   witness is an error. Without one, `--frames H` with H generous.
-- `tools/category_runner.py` runs a category end to end: the real-play
+- `rewrite category` runs a category end to end: the real-play
   start classes, the search with `--prefer` the community file, the
   original-cart replay, UCT and Celia, one upload file.
 - Balloon rooms: replay the witness with the file's seeds and with 0 / 0.5
-  / PICO-8's rnd (`pico8_diff/replay.py --balloon-seeds a,b`).
+  / PICO-8's rnd (`rewrite pico8 replay --balloon-seeds a,b`).
 - When a level grows, look at the states before reasoning about counts
   (`census --cells`, `census --cell`, `census --erase`, the since-cut
   `spurious`, `check ref --row`, `check known`): that chain found the floor-collision
   join bug and room (1,3)'s keying bug.
 - Finding the reference: scan prologue offsets (23-37), replay in the
-  original cart (`replay.py --lua ~/src/github.com/tehwalris/celeste_ocaml/
-  celeste.lua --begin-game`), then `rewrite trajectory` (the minimal cart
+  original cart (`rewrite pico8 replay --original`), then `rewrite trajectory` (the minimal cart
   has no jump buffer, so raw inputs often do not transfer).

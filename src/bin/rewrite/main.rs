@@ -22,6 +22,7 @@ mod diag;
 mod l1;
 mod pico8;
 mod run;
+mod validate;
 
 /// mimalloc, not glibc: glibc retains gigabytes of freed slot chunks across
 /// its arenas (plans/lessons.md). Counted (`metrics::Counting`): the `[mem]`
@@ -117,7 +118,7 @@ enum Command {
     /// ONE CONCRETE RUN: the reference engine plays inputs from the room's entry.
     ///
     /// Prints the player each frame (whole frames under `--split-frame`), in
-    /// `pico8_diff/replay.py`'s frame convention: the basis for checking a
+    /// `rewrite pico8 replay`'s frame convention: the basis for checking a
     /// witness against a real PICO-8. A frame that forks (`rnd`) is an
     /// error: give the balloons' seeds.
     Run(run::Args),
@@ -147,8 +148,8 @@ enum Command {
     ///
     /// One "x,y" per line from frame 1 (`-` accepts any), followed
     /// breadth-first over the reference engine's concrete step, deduplicated
-    /// exactly. Prints the input bytes for `rewrite run -i` /
-    /// `pico8_diff/replay.py`, or the first frame it could not follow.
+    /// exactly, to its first win. Prints the input bytes for `rewrite run -i`
+    /// / `rewrite pico8 replay`, or the first frame it could not follow.
     Trajectory(diag::TrajectoryArgs),
     /// A float witness's ROBUSTNESS to the host libm (plans/float.md, `search::robust`).
     ///
@@ -196,6 +197,22 @@ enum Command {
     /// room with, the probe goldens (`tools::pico8`, `tools::chain`).
     #[command(subcommand)]
     Pico8(pico8::Command),
+    /// The community's TAS tools: UniversalClassicTas and Celia headless,
+    /// and tasdatabase files in every tool and start mode (`tools::love`,
+    /// `tools::uploads`).
+    #[command(subcommand)]
+    Validate(validate::Command),
+    /// THE FLOAT ORACLE'S GOLDENS (`tools::golden`): the tool's exact traces
+    /// of the tasdatabase's files, random files and our witnesses, to
+    /// gates/TOOL (`local`: /var/tmp/float-goldens/TOOL) and its manifest.
+    /// READ THE DIFF: a golden that moved means the tool's run did.
+    Golden(validate::GoldenArgs),
+    /// THE CATEGORY RUNNER (`tools::category`): a queue of (category, room)
+    /// searches against the community tasdatabase, each result verified end
+    /// to end (the reference, the search, the witness in the original cart,
+    /// the upload valid in real play), one JSON line per job in
+    /// OUTDIR/results.jsonl. OUTDIR/STOP stops it before the next job.
+    Category(validate::CategoryArgs),
 }
 
 impl Command {
@@ -205,14 +222,16 @@ impl Command {
     }
 }
 
+/// A search's horizon, levels, directory and outputs (`search`, `dual`).
 #[derive(clap::Args)]
 pub struct SearchArgs {
     /// The horizon in game frames (two steps each under --split-frame):
     /// every frame up to it is searched.
     #[arg(long)]
     frames: u32,
-    /// The horizon is a KNOWN solution's frame (a replayed TAS): a
-    /// refutation, or no concrete witness by it, is an error.
+    /// The horizon is a KNOWN solution's frame (a replayed TAS; `dual`: a
+    /// known dual run's): a refutation, or no concrete witness by it, is an
+    /// error.
     #[arg(long)]
     ceiling: bool,
     /// The levels (`Level::parse`), comma-separated, coarsest first:
@@ -223,55 +242,37 @@ pub struct SearchArgs {
     /// The search's directory: level i's tree goes to `level{i:02}/` under it.
     #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
     search_dir: String,
-    /// Stop at the arc bound (no concrete search).
+    /// Stop at the arc bound (`dual`: the dual bound), no concrete search.
     #[arg(long)]
     no_witness: bool,
     /// Write the web UI's arc pass into this directory (`export-ui --arc
     /// DIR`): the winning sets' support (`level0.marks.bin`) and the
     /// ARC-MARKED nodes (`arc.marks.bin`) as `(shape, cell, key, dist)` rows,
     /// `dist` the horizon less the last frame the node still wins from; and
-    /// `witness.txt` (inputs and player position per frame).
+    /// `witness.txt` (inputs and player position per frame). `dual`: the
+    /// FLOAT half's arc pass (the count) and the dual witness.
     #[arg(long)]
     save_marks: Option<String>,
     /// A known solution (a `tas/` file or a comma list of input bytes, the
     /// spawn prologue included): the concrete search tries its input first
     /// at every frame, so the witness is the optimum closest to it (every
     /// input is still tried). When it exits by the horizon it is also
-    /// CHECKED against every pruning step at every level (as `check known`):
-    /// the search fails if one drops it.
+    /// CHECKED against every pruning step at every level (as `check known`;
+    /// `dual`: each half's): the search fails if one drops it.
     #[arg(long)]
     prefer: Option<String>,
 }
 
 #[derive(clap::Args)]
 pub struct DualArgs {
-    /// The horizon in game frames (as `search --frames`).
-    #[arg(long)]
-    frames: u32,
-    /// The horizon is a KNOWN dual run's frame: a refutation, or no dual
-    /// witness by it, is an error.
-    #[arg(long)]
-    ceiling: bool,
-    #[arg(long, default_value = "r0sx")]
-    level: String,
-    #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
-    search_dir: String,
-    /// Stop at the dual bound (no concrete search).
-    #[arg(long)]
-    no_witness: bool,
-    /// A known run, tried first and checked against each half's pruning (as `search --prefer`).
-    #[arg(long)]
-    prefer: Option<String>,
-    /// The float half's tool: `celia` (default) or `uct`.
-    #[arg(long, default_value = "celia")]
-    float_half: String,
+    #[command(flatten)]
+    search: SearchArgs,
+    /// The float half's tool.
+    #[arg(long, value_enum, default_value = "celia")]
+    float_half: celeste_rust::settings::FloatTool,
     /// The float half's loading jank J (Celia only; default: its IL load's).
     #[arg(long)]
     float_loading_jank: Option<usize>,
-    /// The FLOAT half's arc pass (the count) and the dual witness, as
-    /// `search --save-marks`.
-    #[arg(long)]
-    save_marks: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -306,7 +307,7 @@ pub struct ExportUiArgs {
     arc: Option<String>,
     /// A concrete run to draw instead of the arc directory's witness:
     /// `[label TEXT]`, `inputs a,b,..`, `[dashes F:DIR ..]`, then `f x y`
-    /// per frame from 0 (`tools/align_tas.py ... OUTDIR` writes one).
+    /// per frame from 0 (`rewrite pico8 align --out DIR` writes one).
     #[arg(long)]
     witness: Option<String>,
     /// Another concrete run to draw next to it (same format): e.g. the
@@ -317,6 +318,20 @@ pub struct ExportUiArgs {
     /// byte (the tasdatabase upload the category runner verified).
     #[arg(long)]
     download: Option<String>,
+}
+
+/// THE TREE a command reads, its settings its records' (`TreeDir`).
+#[derive(clap::Args)]
+pub(crate) struct TreeArg {
+    /// The tree (a forward's `--tree`, or a search's `levelNN`).
+    #[arg(long)]
+    tree: std::path::PathBuf,
+}
+
+impl TreeArg {
+    pub(crate) fn open(&self, run: &Settings) -> Result<TreeDir> {
+        TreeDir::open(&self.tree, run)
+    }
 }
 
 /// THE ROW SELECTOR of the commands that read a frame's states: the frame
@@ -364,23 +379,12 @@ pub(crate) fn where_(c: u32) -> String {
     celeste_rust::storage::cells::cell_xy(c).map(|(x, y)| format!("({x}, {y})")).unwrap_or_else(|| "no player".to_string())
 }
 
-/// The kernels of a level (`compiled::Kernels::new`), for the commands
-/// generic over the arithmetic.
-pub(crate) trait KernelsNew: Sized {
-    fn new(cfg: &celeste_rust::settings::Settings, level: Level) -> Result<Self>;
-}
-impl<N: celeste_rust::compiled::KernelLanes> KernelsNew for celeste_rust::compiled::Kernels<N> {
-    fn new(cfg: &celeste_rust::settings::Settings, level: Level) -> Result<Self> {
-        celeste_rust::compiled::Kernels::<N>::new(cfg, level)
-    }
-}
 /// `search` and `dual` (`float`: the float half's settings): `search::run`,
 /// its verdict reported.
-#[allow(clippy::too_many_arguments)]
-fn search(cfg: &Settings, float: Option<&Settings>, horizon: u32, ceiling: bool, level: &str, dir: &str, bound_only: bool, save_marks: Option<&str>, prefer: Option<&str>) -> Result<()> {
-    let prefer = prefer.map(celeste_rust::concrete::read_inputs).transpose()?;
-    let dir = std::path::Path::new(dir);
-    let spec = celeste_rust::search::SearchSpec { settings: cfg, level, horizon, ceiling, dir, bound_only, save_marks: save_marks.map(std::path::Path::new), prefer: prefer.as_deref(), dual: float };
+fn search(cfg: &Settings, float: Option<&Settings>, a: &SearchArgs) -> Result<()> {
+    let prefer = a.prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
+    let dir = std::path::Path::new(&a.search_dir);
+    let spec = celeste_rust::search::SearchSpec { settings: cfg, level: &a.level, horizon: a.frames, ceiling: a.ceiling, dir, bound_only: a.no_witness, save_marks: a.save_marks.as_deref().map(std::path::Path::new), prefer: prefer.as_deref(), dual: float };
     report(&celeste_rust::search::run(&spec)?, dir)
 }
 /// A search's verdict (`search::run`'s record), printed; an error where it
@@ -460,7 +464,8 @@ fn tree_flags_given(m: &clap::ArgMatches) -> Vec<String> {
 }
 
 fn main() -> Result<()> {
-    let matches = Cli::command().get_matches();
+    // `--version`: the file formats a tree is written in (tools/fixtures.sh).
+    let matches = Cli::command().version(&*Box::leak(celeste_rust::settings::formats().into_boxed_str())).get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     if cli.command.reads_trees() {
         let given = tree_flags_given(&matches);
@@ -477,15 +482,10 @@ fn main() -> Result<()> {
         }
     })?;
     match cli.command {
-        Command::Search(a) => search(&cfg, None, a.frames, a.ceiling, &a.level, &a.search_dir, a.no_witness, a.save_marks.as_deref(), a.prefer.as_deref()),
+        Command::Search(a) => search(&cfg, None, &a),
         Command::Dual(a) => {
-            let tool = match a.float_half.as_str() {
-                "celia" => celeste_rust::settings::FloatTool::Celia,
-                "uct" => celeste_rust::settings::FloatTool::Uct,
-                t => anyhow::bail!("--float-half: `celia` or `uct`, not {t:?}"),
-            };
-            let float = cfg.float_half(tool, a.float_loading_jank)?;
-            search(&cfg, Some(&float), a.frames, a.ceiling, &a.level, &a.search_dir, a.no_witness, a.save_marks.as_deref(), a.prefer.as_deref())
+            let float = cfg.float_half(a.float_half, a.float_loading_jank)?;
+            search(&cfg, Some(&float), &a.search)
         }
         Command::Forward(a) => {
             let t = std::time::Instant::now();
@@ -501,6 +501,9 @@ fn main() -> Result<()> {
         Command::Run(a) => run::run(&cfg, a),
         Command::Witness(a) => run::witness(&cfg, a),
         Command::Pico8(c) => pico8::run(&cfg, c),
+        Command::Validate(c) => validate::run(c),
+        Command::Golden(a) => validate::golden(a),
+        Command::Category(a) => validate::category(a),
         Command::Ckhash(a) => diag::ckhash(&cfg, a),
         Command::Check(c) => check::run(&cfg, c),
         Command::Bench(c) => bench::run(&cfg, c),

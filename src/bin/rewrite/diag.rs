@@ -7,27 +7,20 @@ use anyhow::Result;
 use celeste_engine::runtime2::{Rt2, P8};
 use celeste_rust::frame::wins_of;
 use celeste_rust::search::inspect::cell_names;
-use celeste_rust::search::tree::TreeDir;
 use celeste_rust::settings::{Arith, Settings};
 use celeste_rust::storage::layer::Tree;
 use celeste_rust::storage::Sk;
 use celeste_rust::engines::reference::RefEngine;
-use std::path::PathBuf;
 
 use crate::{prefixes, where_, Rows};
 
 #[derive(clap::Args)]
 pub struct CkhashArgs {
-    /// The tree (a forward's `--tree`, or a search's `levelNN`).
-    #[arg(long)]
-    tree: PathBuf,
+    #[command(flatten)]
+    tree: crate::TreeArg,
     /// The last step fingerprinted (default: the tree's last).
     #[arg(long)]
     steps: Option<u32>,
-    /// Also list the N most populated player positions at step `steps`
-    /// (to pick a synthetic `--win-at` target with real fan-out).
-    #[arg(long)]
-    cells: Option<usize>,
     /// Also fingerprint each frame's recorded edges (`e{frame} count
     /// hash`) by the states they join and their transfers: two trees
     /// with the same lines have the same graph, whatever ids they gave
@@ -47,9 +40,8 @@ pub struct CkhashArgs {
 
 #[derive(clap::Args)]
 pub struct CensusArgs {
-    /// The tree (a forward's `--tree`, or a search's `levelNN`).
-    #[arg(long)]
-    tree: PathBuf,
+    #[command(flatten)]
+    tree: crate::TreeArg,
     #[command(flatten)]
     rows: Rows,
     /// Stop counting a column's distinct values past this many.
@@ -72,9 +64,6 @@ pub struct TrajectoryArgs {
     /// One line per frame: `x,y`, or `-` (any).
     #[arg(long)]
     trajectory: String,
-    /// Stop once a win is reached (default), else follow to the end.
-    #[arg(long, default_value_t = true)]
-    stop_at_win: bool,
 }
 
 #[derive(clap::Args)]
@@ -86,11 +75,11 @@ pub struct RobustArgs {
 }
 
 pub fn ckhash(run: &Settings, a: CkhashArgs) -> Result<()> {
-    let t = TreeDir::open(&a.tree, run)?;
+    let t = a.tree.open(run)?;
     let (dir, to, cfg) = (&t.dir, t.frame(a.steps)?, &t.settings);
-    let (top_cells, edges, hulls, dump_edges) = (a.cells, a.edges, a.hulls, a.dump_edges);
+    let (edges, hulls, dump_edges) = (a.edges, a.hulls, a.dump_edges);
     if cfg.arith != Arith::Fixed {
-        anyhow::ensure!(dump_edges.is_none() && top_cells.is_none(), "--dump-edges, --cells: fixed trees only so far");
+        anyhow::ensure!(dump_edges.is_none(), "--dump-edges: fixed trees only so far");
     }
     let lines = celeste_rust::with_arith!(cfg.arith, N => celeste_rust::storage::fingerprint::<N>(dir, to, edges, hulls, cfg.threads())?);
     for line in lines {
@@ -105,28 +94,13 @@ pub fn ckhash(run: &Settings, a: CkhashArgs) -> Result<()> {
             eprintln!("edge {:016x} {:016x} {:?}", node(e.dst), node(e.src), eg.pair(e.xfer));
         }
     }
-    if let Some(top) = top_cells {
-        let tree = Tree::<P8>::open(dir, to)?;
-        let mut by_cell: rustc_hash::FxHashMap<u32, usize> = Default::default();
-        for s in tree.layer(to, None, cfg.threads())?.0.states_iter() {
-            *by_cell.entry(s.cell()).or_default() += 1;
-        }
-        let mut v: Vec<(u32, usize)> = by_cell.into_iter().collect();
-        v.sort_by_key(|&(c, n)| (std::cmp::Reverse(n), c));
-        for (c, n) in v.into_iter().take(top) {
-            match celeste_rust::storage::cells::cell_xy(c) {
-                Some((x, y)) => println!("cell {c}: player ({x},{y}) x{n}"),
-                None => println!("cell {c}: no player x{n}"),
-            }
-        }
-    }
     Ok(())
 }
 
 pub fn census(run: &Settings, a: CensusArgs) -> Result<()> {
     use celeste_engine::exact::Code;
     use celeste_engine::runtime2::{Cell2, Col, AV};
-    let t = TreeDir::open(&a.tree, run)?;
+    let t = a.tree.open(run)?;
     anyhow::ensure!(!t.float(), "census: a 16.16 tree only so far");
     let cfg = &t.settings;
     let (frame, only) = a.rows.of(&t)?;
@@ -284,7 +258,7 @@ pub fn census(run: &Settings, a: CensusArgs) -> Result<()> {
 
 /// `trajectory`, under the run's settings `cfg`.
 pub fn trajectory(cfg: &Settings, a: TrajectoryArgs) -> Result<()> {
-    let TrajectoryArgs { trajectory, stop_at_win } = a;
+    let TrajectoryArgs { trajectory } = a;
     let traj: Vec<Option<(i32, i32)>> = std::fs::read_to_string(&trajectory)?
         .lines()
         .map(|l| l.trim())
@@ -293,8 +267,7 @@ pub fn trajectory(cfg: &Settings, a: TrajectoryArgs) -> Result<()> {
             if l == "-" {
                 return Ok(None);
             }
-            let (x, y) = l.split_once(',').ok_or_else(|| anyhow::anyhow!("{trajectory}: {l:?} is not \"x,y\" or \"-\""))?;
-            Ok(Some((x.trim().parse()?, y.trim().parse()?)))
+            Ok(Some(celeste_rust::settings::pair::<i32>(l, &trajectory).map_err(anyhow::Error::msg)?))
         })
         .collect::<Result<_>>()?;
     let mut eng = RefEngine::new(&cfg)?;
@@ -332,7 +305,7 @@ pub fn trajectory(cfg: &Settings, a: TrajectoryArgs) -> Result<()> {
                     }
                     let mut p = path.clone();
                     p.push(byte);
-                    if stop_at_win && wins_of(&block, &cfg)?.iter().any(|&w| w) {
+                    if wins_of(&block, &cfg)?.iter().any(|&w| w) {
                         println!("[trajectory] WIN at f{f} after {} frames; inputs:", p.len());
                         println!("{}", p.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(","));
                         return Ok(());

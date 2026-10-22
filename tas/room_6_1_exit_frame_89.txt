@@ -2,7 +2,7 @@
 # search (2026-10-02). Exits on a real PICO-8 with balloon seeds 0, 0.5 and
 # PICO-8's rnd.
 #
-# Input bytes for rewrite run (-i) / pico8_diff/replay.py --room 6,1, one
+# Input bytes for rewrite run (-i) / rewrite pico8 replay --room 6,1, one
 # per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
 # bit4=jump bit5=dash.
 #

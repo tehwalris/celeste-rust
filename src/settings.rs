@@ -24,6 +24,20 @@ use std::path::{Path, PathBuf};
 /// (tools/fixtures.sh rebuilds its fixtures on a change).
 pub const VERSION: u32 = 3;
 
+/// The order of a tree's transfer table (`storage::edges::XferTable`):
+/// a frame's new transfers are numbered at each slice's GATHER (the pairs
+/// first met in the slice, by content: `XferTable::merge`). A frame check
+/// encodes a fixture's transfers by their ids, so its edge bytes follow it.
+const XFER_ORDER: &str = "gather";
+
+/// THE FILE FORMATS a tree is written in: what a stored tree, a fixture
+/// among them, is a function of besides its settings and the code
+/// (`rewrite --version` prints it; tools/fixtures.sh keys its store and
+/// rebuilds its fixtures by it).
+pub fn formats() -> String {
+    format!("checkpoint {} edges {} settings {VERSION} xfers {XFER_ORDER}", crate::storage::file::FORMAT_VERSION, crate::storage::edges::VERSION)
+}
+
 /// The game's arithmetic (`--arith`): 16.16, or the float tools' doubles
 /// with the tool (which decides the room's start and the seeds' meaning).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,7 +66,7 @@ macro_rules! with_arith {
 }
 
 /// The float tool a float run models (`--arith float-celia|float-uct`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum FloatTool {
     /// UniversalClassicTas: the room loaded alone (the IL load), the file's
     /// seeds set on its balloons and chests (`set_seeds`). A secondary
@@ -166,7 +180,7 @@ pub struct Settings {
     #[arg(long, global = true, default_value = "any")]
     pub category: Category,
     /// The room as real play enters it: its loading frame from object J
-    /// (pico8_diff/chain.py), or `none` (the IL load).
+    /// (`rewrite pico8 entry-jank`), or `none` (the IL load).
     #[arg(long, global = true, default_value = "none", value_parser = parse_jank)]
     pub loading_jank: std::option::Option<usize>,
     /// The start room's balloons' phases fixed, "s1,s2,..", or `none`.
@@ -515,7 +529,8 @@ pub fn recorded_arith(dir: &Path) -> Result<Arith> {
     }
 }
 
-fn pair<T: std::str::FromStr>(s: &str, what: &str) -> std::result::Result<(T, T), String> {
+/// `"a,b"` (`what` names it in a refusal).
+pub fn pair<T: std::str::FromStr>(s: &str, what: &str) -> std::result::Result<(T, T), String> {
     let (a, b) = s.split_once(',').ok_or_else(|| format!("{what}: \"a,b\", not {s:?}"))?;
     let p = |t: &str| t.trim().parse::<T>().map_err(|_| format!("{what}: {t:?} is not a number"));
     Ok((p(a)?, p(b)?))

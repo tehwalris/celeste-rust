@@ -11,7 +11,7 @@
 -- `t={} t[3]="c"` and `{"a",nil,"c"}` hold the same values and have
 -- different lengths. So the model has to be checked, not reasoned about.
 --
--- Regenerate the golden file with ./regen-pico8-golden.sh (needs PICO-8).
+-- Regenerate the golden file with `rewrite pico8 probe-goldens` (needs PICO-8).
 
 -- Elements only. `#` is a separate function because this model answers
 -- it exactly or raises (see `Table::len`), and the tables with holes in

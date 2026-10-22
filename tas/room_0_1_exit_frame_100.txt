@@ -1,9 +1,9 @@
 # Room (0,1) "900 m": exit at frame 100 for celeste-minimal, found by the
 # search (2026-10-01). Balloon seeds [0, 0.8905] (TAS9's), [0, 0] and PICO-8's
 # own rnd all exit; [0.5, 0.5] does not:
-#   pico8_diff/replay.py --room 0,1 --balloon-seeds 0,0.8905 tas/room_0_1_exit_frame_100.txt
+#   rewrite pico8 replay --room 0,1 --balloon-seeds 0,0.8905 --inputs tas/room_0_1_exit_frame_100.txt
 #
-# Input bytes for rewrite run (-i) / pico8_diff/replay.py --room 0,1, one
+# Input bytes for rewrite run (-i) / rewrite pico8 replay --room 0,1, one
 # per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
 # bit4=jump bit5=dash.
 #

@@ -48,7 +48,7 @@ counts as the evidence.
 | `t2` | end to end and the slow tests, in 4 lanes | 55 s |
 | `big` | the reference frame (6,2) f56 -> f57, the platform frame | 38 s |
 | `perf` | the instruction budget: the RELEASE build, measured; milestones and `all`, not every change | ~4 min after an edit (the release build ~3.5 min, the frames 33 s) |
-| `local` | the local goldens | 2 s |
+| `local` | the local goldens, the PICO-8 probe goldens | ~2 min (the probe build) |
 | `fixtures` | every fixture rebuilt from scratch against its pin | 3-4 min |
 | `all` | the pre-merge run: every tier above and the pre-merge tests (53 s) | ~11 min (the release build in it) |
 
@@ -73,7 +73,7 @@ Unit tests are kept only for the basics:
   definitions (`arcs`, `arc_edges`, `backward`, `reach`, `hull`, `rem_f64`);
 - what no pin reaches. These cover the tracer's and the codegen's edge
   cases (overflow declines, error ownership, folding exactness), the
-  console's corpora (`probe`), the CLI and the scripts.
+  console's corpora (`probe`), the CLI and the tools (`src/tools/`).
 
 A test that builds a room's kernels or runs a forward does not belong in
 t0. 2026-10-16: tests the pins cover were deleted. Each deletion's evidence
@@ -114,8 +114,9 @@ The steps run in four lanes:
   `gate10d-dual` (the dual search, its bound and witness), `search42-objects`
   (the objects ladder at a synthetic win, every `[gate]` line), and
   `export-ui` (the UI export of four of these searches, by digest);
-- **properties**: `reference10` and `reference10f` (`forward --reference`
-  against the kernels' forward, `ckhash --edges --hulls` f0-f27), and
+- **properties**: `reference10` and `reference10f` (`check reference`: the
+  reference engine's forward against the kernels', `ckhash --edges --hulls`
+  f0-f27), and
   `hull10[f]` (`check replay` over the kernels' tree to f36: its recorded
   edges reproduce its states at every frame);
 - **platforms**: `forward60-platforms` (room (6,0) `r0sxhfp` split frame to
@@ -154,11 +155,14 @@ The steps run in four lanes:
     (+11.9%); r62h57 passed at +1.5%.
   - Re-pin (`./check.sh perf --pin`) only for an intended speedup, or a
     change that has to cost, and say which in the commit.
-- **local**: `trace::oracle::tests::the_local_goldens`. It replays the local
-  store `/var/tmp/float-goldens`: our unsubmitted witnesses' goldens. The
-  store is the machine's, not the checkout's, so t0 does not run it. Where
-  the store is absent the step passes, prints `LOCAL GOLDENS SKIPPED`, and
-  says so in the run's last line.
+- **local**: what needs the machine, not the checkout, so t0 does not run
+  it. `trace::oracle::tests::the_local_goldens` replays the local store
+  `/var/tmp/float-goldens`: our unsubmitted witnesses' goldens.
+  `trace::probe::tests::the_golden_files_are_current` runs every probe
+  corpus on a real PICO-8 (`rewrite pico8 probe-goldens`) and fails where
+  its golden moved (rewritten in `lua/probe/`: read the diff). Where the
+  store or PICO-8 is absent, its test passes and prints SKIPPED, and the
+  run's last line says so.
 - **fixtures**: `tools/fixtures.sh verify all big` rebuilds every fixture
   beside the installed one and checks its fingerprint. This is the only
   check of a fixture's early frames under the current code. The other tiers
@@ -212,7 +216,8 @@ For a profile, `perf record -g -m 8 -- rewrite bench frame ...`:
 ## The fixtures
 
 `tools/fixtures.sh ensure|build|pin|verify|list NAME...` (`all`, `big`).
-The trees live under `/var/tmp/celeste-fixtures/FORMATS` (one directory per
+The trees live under `/var/tmp/celeste-fixtures/FORMATS` (FORMATS as the
+binary states them, `rewrite --version`; one directory per
 file-format set, `tools/fixtures.sh root`; `CELESTE_FIXTURES` overrides), so
 checkouts on different formats never rebuild each other's fixtures; they are
 never committed.
@@ -259,7 +264,11 @@ Say which in the commit.
 
 - `tools/fixtures.sh pin NAME...`: a fixture's own frames;
 - `./check.sh t1 --pin`, `t2 --pin`, `big --pin`: frame lines, metrics, gate
-  lines, the UI digests;
+  lines (the room (1,0) oracles and their float and dual twins too), the UI
+  digests: every comparison of a tier goes through check.sh's `same`, so
+  `--pin` re-pins exactly what the tier compares. The one exception is t2's
+  `forward60`, which compares with the r60s fixture's pin (`fixtures.sh
+  pin r60s` writes it);
 - `./check.sh perf --pin`: the instruction budget.
 
 `git diff gates/` shows what moved. A file-format change rebuilds every

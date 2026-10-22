@@ -2,10 +2,10 @@
 # proven optimum (h89 confirmed at all 18 levels, h88 refuted at level 6,
 # 2026-09-19), equal to the community TAS (TAS4: 62 inputs + 27 spawn frames).
 # From `rewrite witness --horizon 89 --level 17 --room 3,0`; replayed on a
-# real PICO-8 (`pico8_diff/replay.py --room 3,0`): the room changes to (4,0)
+# real PICO-8 (`rewrite pico8 replay --room 3,0`): the room changes to (4,0)
 # at f89.
 #
-# Input bytes for rewrite run (-i) / pico8_diff/replay.py, one per frame
+# Input bytes for rewrite run (-i) / rewrite pico8 replay, one per frame
 # starting at frame 1. bit0=left bit1=right bit2=up bit3=down bit4=jump
 # bit5=dash
 0

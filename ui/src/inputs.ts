@@ -3,7 +3,7 @@
 // held at the frame shown - and a strip of the frames around it, one column
 // per frame and one lane per button, so presses and releases read as bars.
 //
-// Frame convention (pico8_diff/replay.py, concrete_run): frame f is the
+// Frame convention (rewrite pico8 replay, rewrite run): frame f is the
 // f-th `_update()`, which reads `inputs[f - 1]`; the path's position at f is
 // the state AFTER it. So the byte shown at f is the one that produced the
 // box drawn at f, and a dash marked at f (the cart's own dash branch ran on

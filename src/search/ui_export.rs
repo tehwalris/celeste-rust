@@ -703,7 +703,7 @@ fn room_tiles(room: (i16, i16)) -> Result<Tiles> {
 
 /// `witness.txt` (`search --save-marks`): `inputs a,b,..`, then `f x y`
 /// per frame from 0 (`f - -` without a player). A `--witness` /
-/// `--reference` file (`tools/align_tas.py`) may also carry `label TEXT` and
+/// `--reference` file (`rewrite pico8 align`) may also carry `label TEXT` and
 /// `dashes F:DIR ...` before the frames, and end early (at the exit).
 fn read_witness(path: &Path) -> Result<Witness> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;

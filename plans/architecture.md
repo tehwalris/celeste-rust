@@ -230,7 +230,7 @@ the new room's objects from index J on get one update on the loading frame
 J depends on how the previous room was played: `rewrite room` computes
 the feasible J's grouped by the exact start state they give, and the
 category runner searches each class. The boot chain on a real PICO-8 is the
-ground truth (`pico8_diff/chain.py --boot`, `--check-start`).
+ground truth (`rewrite pico8 chain --boot`, `rewrite pico8 check-start`).
 
 **Frame 0 is the start as the engine made it**, keyed by its own codes
 (not its boundary view), and nothing looks it up by projection.
@@ -503,9 +503,9 @@ verification surface behind it:
 plans/refactor.md: `git show c4dd3241:plans/refactor.md`).
 
 - Open candidates:
-  - The cart patches are written twice, in Rust (`trace::cart`) and in
-    `pico8_diff/replay.py` with different semantics; `pico8_diff/` belongs
-    under `tools/`.
+  - The cart patches are written twice, for the tracer (`trace::cart`) and
+    for PICO-8 (`tools::pico8`); their two semantic differences are named
+    (`tools::pico8::FENCED`: C4, C11) until plans/correctness.md decides them.
   - The engine crate knows the game (`runtime2::BoundaryIds`,
     `Rt2::player_objects`).
   - The tracer beyond its audit: one trace for every level (today each

@@ -1,7 +1,7 @@
 # Room (2,2) "1900 m": exit at frame 74 for celeste-minimal, found by the
 # search (2026-10-02). No balloons.
 #
-# Input bytes for rewrite run (-i) / pico8_diff/replay.py --room 2,2, one
+# Input bytes for rewrite run (-i) / rewrite pico8 replay --room 2,2, one
 # per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
 # bit4=jump bit5=dash.
 #

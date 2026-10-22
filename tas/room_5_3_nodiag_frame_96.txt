@@ -7,6 +7,6 @@
 # (reference engine, every input and rnd leaf, pruned only by W) found NO win
 # within 92, 93, 94, 95 frames and this one at 96. No diagonal dash press.
 # Replayed on a real PICO-8:
-#   pico8_diff/replay.py --room 5,3 --balloon-seeds 0,0,0,0,0,0 tas/room_5_3_nodiag_frame_96.txt
+#   rewrite pico8 replay --room 5,3 --balloon-seeds 0,0,0,0,0,0 --inputs tas/room_5_3_nodiag_frame_96.txt
 # -> the room changes to (6,3) during frame 96.
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,34,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,36,0,0,0,0,0,0,0,2,0,2,16,0,0,0,0,0,0,36,0,0,0,0,0,0,33,0,0,0,0,0,0,36,0,0,0,0,0,0,0,0,2,2,0,16,0,0,0,0

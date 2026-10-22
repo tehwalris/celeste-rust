@@ -1,23 +1,7 @@
-//! The repository's own conventions, checked: the Python tools' doctests
-//! pass, and check.sh finds its tiers' ignored tests (every `#[ignore]`
-//! names its tier). (That every run is under a memory cap is checked at run
-//! time: `settings::refuse_uncapped`, one-cargo.sh.)
-
-/// The Python tools' doctests pass: the category runner's (`ui_label`: an
-/// unverified result is labelled so in the web UI; a crashed replay fails
-/// the job), the PICO-8 replay's and the tools' (a crash or a missing
-/// result raises, never reads as a run).
-#[test]
-fn the_python_doctests_pass() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let check = "import doctest, sys, celeste.pico8, celeste.love\n\
-                 sys.path.insert(0, '../pico8_diff')\n\
-                 import category_runner, replay\n\
-                 bad = sum(doctest.testmod(m).failed for m in (celeste.pico8, celeste.love, category_runner, replay))\n\
-                 sys.exit(1 if bad else 0)";
-    let out = std::process::Command::new("python3").args(["-c", check]).current_dir(root.join("tools")).output().expect("python3");
-    assert!(out.status.success(), "the Python doctests:\n{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-}
+//! The repository's own conventions, checked: check.sh finds its tiers'
+//! ignored tests (every `#[ignore]` names its tier). (That every run is
+//! under a memory cap is checked at run time: `settings::refuse_uncapped`,
+//! one-cargo.sh.)
 
 /// The `.rs` files under `dir` (`target/` aside).
 fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {

@@ -233,7 +233,7 @@ input, never a stored value); the concrete search's seeded-balloon view
 - **`rnd`** is an interval at every level (decided with Philippe
   2026-09-20); the concrete search takes every leaf. A refutation holds for
   every draw; a confirmation means "some draw wins". Each witness is
-  replayed on PICO-8 per seed (`pico8_diff/replay.py --balloon-seeds`);
+  replayed on PICO-8 per seed (`rewrite pico8 replay --balloon-seeds`);
   several exit only for some. A comparison that straddles an `rnd`
   interval forks without narrowing it, so two comparisons of one draw fork
   independently: combinations no single draw gives are admitted (the same

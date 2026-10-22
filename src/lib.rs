@@ -4,6 +4,7 @@ pub mod compiled;
 pub mod frame;
 pub mod game_runner;
 pub mod concrete;
+pub mod differential;
 pub mod engines;
 pub mod metrics;
 pub mod par;
@@ -22,7 +23,7 @@ mod testutil;
 
 // The leaf types live in `celeste-core` (so the engine crates can use them);
 // re-exported here so `celeste_rust::pico8_num` etc. resolve.
-pub use celeste_core::{arith, cart_data, collision_cache, pico8_num};
+pub use celeste_core::{arith, pico8_num};
 
 pub use celeste_core::builtins;
 

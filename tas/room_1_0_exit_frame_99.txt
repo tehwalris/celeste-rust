@@ -4,7 +4,7 @@
 # inputs. tas/room_1_0_exit_frame_100.txt is the same route counted with a
 # 24-frame prologue (an idle player update on frame 24).
 #
-# Input bytes for rewrite run (-i) / pico8_diff/replay.py, one per frame
+# Input bytes for rewrite run (-i) / rewrite pico8 replay, one per frame
 # starting at frame 1. bit0=left bit1=right bit2=up bit3=down bit4=jump
 # bit5=dash. The room transition to (2,0) fires DURING FRAME 99.
 #
@@ -12,7 +12,7 @@
 # Exact level's marks of the full ladder run (`rewrite search --room 1,0`,
 # commit cff5913: every level Bits(0..15) and Exact wins by 99, 98 refuted
 # at Bits(6)), and VERIFIED ON A REAL PICO-8 (0.2.6) with
-# `pico8_diff/replay.py`: the console transitions during frame 99.
+# `rewrite pico8 replay`: the console transitions during frame 99.
 #
 # The player's first update is frame 24, the frame the player object is
 # created: `foreach(objects, ...)` is `for o in all(objects)`, and `all`

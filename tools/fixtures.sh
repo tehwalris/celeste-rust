@@ -33,37 +33,37 @@ PINS=gates/fixtures
 MEM=20G
 
 L1_62="--category 100 --loading-jank 2 --level-minus-one 94,5"
-# NAME -> FLAGS (the settings) | ROOM | COMMAND | TREE (the level dir under
-# the fixture) | LAST (the tree's last step).
+# NAME -> FLAGS (the settings) | COMMAND | TREE (the level dir under the
+# fixture) | LAST (the tree's last step).
 spec() {
     TREE=.; FLAGS=""
     case $1 in
         # Room (1,0) 200m r0sxh, the mid frame f55 -> f56 (85k new states
         # and 125k grown in: 2.2M emissions, 2.5M edges re-pushed).
-        r10) ROOM=1,0; CMD="forward --room 1,0 --level r0sxh --steps 56"; LAST=56 ;;
+        r10) CMD="forward --room 1,0 --level r0sxh --steps 56"; LAST=56 ;;
         # Room (6,2) 100% 2300m r0sxhf under level -1 (94,5), f50 -> f51
         # (305k new states and 579k grown in: 6.6M emissions, 8.3M edges
         # re-pushed); the reference frame is r62h57.
-        r62h) FLAGS=$L1_62; ROOM=6,2; CMD="forward --room 6,2 --level r0sxhf --steps 51"; LAST=51 ;;
+        r62h) FLAGS=$L1_62; CMD="forward --room 6,2 --level r0sxhf --steps 51"; LAST=51 ;;
         # Room (4,2) 2100m at the object level r0sxhn under level -1 (71,5), f60 -> f61.
-        r42n) FLAGS="--level-minus-one 71,5"; ROOM=4,2; CMD="forward --room 4,2 --level r0sxhn --steps 61"; LAST=61 ;;
+        r42n) FLAGS="--level-minus-one 71,5"; CMD="forward --room 4,2 --level r0sxhn --steps 61"; LAST=61 ;;
         # The same room with its objects exact (r0sxh): the reference
         # checks' object room (the reference forks r0sxhn's widened objects
         # into thousands of paths a row: plans/devloop.md).
-        r42x) FLAGS="--level-minus-one 71,5"; ROOM=4,2; CMD="forward --room 4,2 --level r0sxh --steps 56"; LAST=56 ;;
+        r42x) FLAGS="--level-minus-one 71,5"; CMD="forward --room 4,2 --level r0sxh --steps 56"; LAST=56 ;;
         # Room (6,0) 700m, platforms unknown, split frame: steps 70 -> 71.
-        r60s) FLAGS="--split-frame"; ROOM=6,0; CMD="forward --room 6,0 --level r0sxhfp --steps 71"; LAST=71 ;;
+        r60s) FLAGS="--split-frame"; CMD="forward --room 6,0 --level r0sxhfp --steps 71"; LAST=71 ;;
         # A finished search for the backward: room (1,0) r0sxh, synthetic
         # win at (40,64) (first win f47, optimum 49), horizon 56.
-        r10arc) ROOM=1,0; CMD="search --room 1,0 --level r0sxh --frames 56 --win-at 40,64"; TREE=level00; LAST=56 ;;
+        r10arc) CMD="search --room 1,0 --level r0sxh --frames 56 --win-at 40,64"; TREE=level00; LAST=56 ;;
         # FLOAT twins (`--arith float`, Celia's start: plans/float.md):
         # r10's, r42n's and r42x's frames in the doubles' kernels.
-        f10) FLAGS="--arith float"; ROOM=1,0; CMD="forward --room 1,0 --level r0sxh --steps 56"; LAST=56 ;;
-        f42n) FLAGS="--arith float --level-minus-one 71,5"; ROOM=4,2; CMD="forward --room 4,2 --level r0sxhn --steps 61"; LAST=61 ;;
-        f42x) FLAGS="--arith float --level-minus-one 71,5"; ROOM=4,2; CMD="forward --room 4,2 --level r0sxh --steps 56"; LAST=56 ;;
-        f10arc) FLAGS="--arith float"; ROOM=1,0; CMD="search --room 1,0 --level r0sxh --frames 56 --win-at 40,64"; TREE=level00; LAST=56 ;;
+        f10) FLAGS="--arith float"; CMD="forward --room 1,0 --level r0sxh --steps 56"; LAST=56 ;;
+        f42n) FLAGS="--arith float --level-minus-one 71,5"; CMD="forward --room 4,2 --level r0sxhn --steps 61"; LAST=61 ;;
+        f42x) FLAGS="--arith float --level-minus-one 71,5"; CMD="forward --room 4,2 --level r0sxh --steps 56"; LAST=56 ;;
+        f10arc) FLAGS="--arith float"; CMD="search --room 1,0 --level r0sxh --frames 56 --win-at 40,64"; TREE=level00; LAST=56 ;;
         # BIG (a minute, ~10 GB): the reference frame (6,2) 100% f56 -> f57.
-        r62h57) FLAGS=$L1_62; ROOM=6,2; CMD="forward --room 6,2 --level r0sxhf --steps 57"; LAST=57 ;;
+        r62h57) FLAGS=$L1_62; CMD="forward --room 6,2 --level r0sxhf --steps 57"; LAST=57 ;;
         *) echo "fixtures: no fixture $1 (tools/fixtures.sh list)" >&2; exit 2 ;;
     esac
 }
@@ -71,13 +71,12 @@ ALL="r10 r62h r42n r42x r60s r10arc f10 f42n f42x f10arc"
 BIG="r62h57"
 
 # What the fixture's frames are a function of, besides its spec: the file
-# formats and the order of its transfer table (a mismatch is STALE), and
-# the sources (reported only). A frame check encodes the fixture's
-# transfers by their ids in `xfer.bin`, so its edge bytes follow the
-# table's order: a frame's new transfers are numbered at each slice's
-# GATHER (the pairs first met in the slice, by content: `XferTable::merge`).
+# formats and the order of its transfer table (a mismatch is STALE), as the
+# binary states them (`rewrite --version`: `settings::formats`), and the
+# sources (reported only).
 formats() {
-    echo "checkpoint $(grep -o 'FORMAT_VERSION: u32 = [0-9]*' src/storage/file.rs | grep -o '[0-9]*$') edges $(grep -o '^const VERSION: u32 = [0-9]*' src/storage/edges.rs | grep -o '[0-9]*$') settings $(grep -o '^pub const VERSION: u32 = [0-9]*' src/settings.rs | grep -o '[0-9]*$') xfers gather"
+    [[ -x $B ]] || { echo "fixtures: no binary $B to ask for the formats (build it: cargo build --profile quick --bins)" >&2; exit 1; }
+    "$B" --version | sed 's/^[^ ]* //'
 }
 # The default root: one directory per file-format set.
 fmt_tag() { formats | awk '{printf "c%s-e%s-s%s", $2, $4, $6}'; }

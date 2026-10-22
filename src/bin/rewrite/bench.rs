@@ -10,7 +10,6 @@ use celeste_rust::search::tree::TreeDir;
 use celeste_rust::settings::{Arith, Settings};
 use std::path::PathBuf;
 
-use crate::KernelsNew;
 
 #[derive(clap::Subcommand)]
 pub enum Command {
@@ -40,13 +39,62 @@ pub enum Command {
     /// (shape, key, cell) and its set), the same every rep; per rep the
     /// read, pull and merge walls.
     Backward(BackwardArgs),
+    /// PER-LINE CYCLES THROUGH INLINED FRAMES, from a `perf record` of the
+    /// release binary (`perf report` lumps every inlined callee into its
+    /// outer function; the binary has line tables, not frame pointers).
+    ///
+    /// Each sampled address's inline chain is resolved with `addr2line -i`;
+    /// the samples are attributed by outermost function, or with `--within
+    /// FUNC` by line inside the outermost frame whose function contains FUNC
+    /// (`--at FILE:LINE`: only samples at that line of it, split `--depth`
+    /// frames further in):
+    ///
+    ///   perf script -i perf.data -F tid,time,ip,sym,dso -G > samples.txt
+    ///   perf script -i perf.data --show-mmap-events | grep MMAP | grep release/rewrite
+    ///     # -> [0xBASE(...) @ 0xPGOFF ...]: the binary's text mapping
+    ///   rewrite bench inline --samples samples.txt --binary BIN --base BASE --delta DELTA
+    ///
+    /// DELTA = PGOFF + (the R E segment's vaddr - its file offset), e.g.
+    /// 0x11b000 + 0x1000 (`readelf -lW BIN | grep LOAD`).
+    Inline(InlineArgs),
+}
+
+#[derive(clap::Args)]
+pub struct InlineArgs {
+    /// `perf script -F tid,time,ip,sym,dso -G` output.
+    #[arg(long)]
+    samples: PathBuf,
+    /// The profiled binary.
+    #[arg(long)]
+    binary: PathBuf,
+    /// Its text mapping's start (hex).
+    #[arg(long, value_parser = hex)]
+    base: u64,
+    /// Its file offset plus the segment's vaddr less offset (hex).
+    #[arg(long, value_parser = hex)]
+    delta: u64,
+    /// Only these threads' samples (default: all).
+    #[arg(long, value_delimiter = ',')]
+    tids: Vec<u64>,
+    /// By line inside the outermost frame whose function contains this.
+    #[arg(long)]
+    within: Option<String>,
+    /// With `--within`: only samples at this `file:line` of it.
+    #[arg(long, requires = "within")]
+    at: Option<String>,
+    /// With `--within`: the frames further in that split a line.
+    #[arg(long, default_value_t = 1)]
+    depth: usize,
+}
+
+fn hex(s: &str) -> std::result::Result<u64, String> {
+    u64::from_str_radix(s.trim_start_matches("0x"), 16).map_err(|e| format!("{s:?}: {e}"))
 }
 
 #[derive(clap::Args)]
 pub struct FrameArgs {
-    /// The tree (a forward's `--tree`, or a search's `levelNN`).
-    #[arg(long)]
-    tree: PathBuf,
+    #[command(flatten)]
+    tree: crate::TreeArg,
     /// The step F to run F -> F+1 from (default: the tree's last).
     #[arg(long)]
     step: Option<u32>,
@@ -80,9 +128,8 @@ pub struct FrameArgs {
 
 #[derive(clap::Args)]
 pub struct BackwardArgs {
-    /// A search's tree (its `levelNN`: `frames/`, `edges/` under it).
-    #[arg(long)]
-    tree: PathBuf,
+    #[command(flatten)]
+    tree: crate::TreeArg,
     /// The search's horizon, in steps (default: the tree's last); the graph
     /// and the winning sets are built for it.
     #[arg(long)]
@@ -99,27 +146,24 @@ pub struct BackwardArgs {
 pub fn run(run: &Settings, c: Command) -> Result<()> {
     match c {
         Command::Frame(a) => {
-            let t = TreeDir::open(&a.tree, run)?;
+            let t = a.tree.open(run)?;
             if t.settings.arith != Arith::Fixed {
                 anyhow::ensure!(a.metrics.is_none(), "a float tree: bench frame --metrics (the kernel census) is 16.16's");
             }
-            celeste_rust::with_arith!(t.settings.arith, N => bench_frame::<celeste_rust::compiled::Kernels<N>, N>(&t, &a))
+            celeste_rust::with_arith!(t.settings.arith, N => bench_frame::<N>(&t, &a))
         }
         Command::Backward(a) => {
-            let t = TreeDir::open(&a.tree, run)?;
+            let t = a.tree.open(run)?;
             let horizon = t.frame(a.steps)?;
             celeste_rust::with_arith!(t.settings.arith, N => bench_backward::<N>(&t, horizon, a.step, a.reps))
         }
+        Command::Inline(a) => inline(&a),
     }
 }
 
-/// `bench frame` in the arithmetic of `N`, its kernels `K` (`--metrics`,
-/// the kernel census, is 16.16's).
-fn bench_frame<K, N>(t: &TreeDir, a: &FrameArgs) -> Result<()>
-where
-    K: FrameStep<N> + KernelsNew,
-    N: Rem,
-{
+/// `bench frame` in the arithmetic of `N` (`--metrics`, the kernel census,
+/// is 16.16's).
+fn bench_frame<N: Rem + celeste_rust::compiled::KernelLanes>(t: &TreeDir, a: &FrameArgs) -> Result<()> {
     use celeste_rust::compiled::dispatch::{print_stats, take_kernel_stats};
     let (cfg, level, dir) = (&t.settings, t.level, &t.dir);
     let (edges, checkpoint, reps) = (a.edges, a.checkpoint, a.reps);
@@ -127,7 +171,7 @@ where
     anyhow::ensure!(!a.pin || (a.expect.is_some() || a.metrics.is_some()), "--pin writes --expect and --metrics: give one");
     anyhow::ensure!(!a.pin || a.expect.is_none() || checkpoint, "--pin --expect: a pin holds every line (--edges --checkpoint)");
     let frame = t.frame(a.step)?;
-    let engine = K::new(cfg, level)?;
+    let engine = celeste_rust::compiled::Kernels::<N>::new(cfg, level)?;
     let t = std::time::Instant::now();
     engine.warm();
     let t_kernels = t.elapsed().as_secs_f64();
@@ -422,4 +466,89 @@ fn frame_metrics((rx, ry): (i16, i16), level: Level, frame: u32, w: &celeste_rus
         writeln!(out, "{k} {v}").unwrap();
     }
     out
+}
+
+/// `bench inline`.
+fn inline(a: &InlineArgs) -> Result<()> {
+    use std::collections::HashMap;
+    let bin = a.binary.to_string_lossy();
+    let (mut ips, mut other, mut total): (HashMap<u64, usize>, HashMap<String, usize>, usize) = Default::default();
+    for line in std::fs::read_to_string(&a.samples).with_context(|| a.samples.display().to_string())?.lines() {
+        // Three whitespace-separated words, then the rest.
+        let mut p: Vec<&str> = Vec::with_capacity(4);
+        let mut rest = line.trim_start();
+        while p.len() < 3 && !rest.is_empty() {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            p.push(&rest[..end]);
+            rest = rest[end..].trim_start();
+        }
+        if !rest.is_empty() {
+            p.push(rest);
+        }
+        let Some(tid) = p.first().and_then(|t| t.parse::<u64>().ok()).filter(|_| p.len() == 4) else { continue };
+        if !a.tids.is_empty() && !a.tids.contains(&tid) {
+            continue;
+        }
+        total += 1;
+        if p[3].contains(&format!("({bin})")) {
+            *ips.entry(hex(p[2]).map_err(anyhow::Error::msg)? - a.base + a.delta).or_default() += 1;
+        } else {
+            let rest = p[3].trim();
+            let (sym, dso) = rest.rsplit_once(" (").map_or(("?", "?"), |(s, d)| (s, d.trim_end_matches(')')));
+            *other.entry(if dso.contains("asm-scratch") { "KERNEL .so".into() } else if dso.contains("kallsyms") { "[k]".into() } else { sym.to_string() }).or_default() += 1;
+        }
+    }
+    let mut addrs: Vec<u64> = ips.keys().copied().collect();
+    addrs.sort();
+    let input: String = addrs.iter().map(|a| format!("{a:#x}\n")).collect();
+    let mut child = std::process::Command::new("addr2line").args(["-i", "-f", "-C", "-a", "-e"]).arg(&a.binary).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().context("addr2line")?;
+    let mut stdin = child.stdin.take().expect("piped");
+    let writer = std::thread::spawn(move || std::io::Write::write_all(&mut stdin, input.as_bytes()));
+    let out = child.wait_with_output()?;
+    writer.join().expect("the writer")?;
+    // Per address its inline chain, innermost first: (function, file:line).
+    let mut chains: HashMap<u64, Vec<(String, String)>> = HashMap::new();
+    let (mut cur, lines) = (None, String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect::<Vec<_>>());
+    let mut i = 0;
+    while i < lines.len() {
+        if let Some(h) = lines[i].strip_prefix("0x") {
+            cur = Some(u64::from_str_radix(h, 16)?);
+            i += 1;
+        } else if let (Some(c), Some(loc)) = (cur, lines.get(i + 1)) {
+            chains.entry(c).or_default().push((lines[i].clone(), loc.clone()));
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    println!("{total} samples, {} addresses", addrs.len());
+    let short = |loc: &str| loc.rsplit('/').next().unwrap_or(loc).split(" (").next().unwrap_or(loc).to_string();
+    let pct = |c: usize| 100.0 * c as f64 / total.max(1) as f64;
+    let mut by: HashMap<String, usize> = HashMap::new();
+    let mut within = 0;
+    for (addr, &c) in &ips {
+        let ch = chains.get(addr).map_or(&[][..], |v| &v[..]);
+        match &a.within {
+            None => *by.entry(ch.last().map_or("??".into(), |f| f.0.chars().take(120).collect())).or_default() += c,
+            Some(func) => {
+                let Some(j) = ch.iter().rposition(|(f, l)| f.contains(func.as_str()) && a.at.as_ref().is_none_or(|at| l.contains(at.as_str()))) else { continue };
+                within += c;
+                let inner: Vec<String> = (j.saturating_sub(a.depth)..j).rev().map(|k| format!("{}@{}", ch[k].0.rsplit("::").next().unwrap_or("").chars().take(30).collect::<String>(), short(&ch[k].1))).collect();
+                *by.entry(format!("{}  {}", short(&ch[j].1), if inner.is_empty() { "(own)".to_string() } else { inner.join(" > ") })).or_default() += c;
+            }
+        }
+    }
+    if a.within.is_none() {
+        for (k, c) in other {
+            *by.entry(k).or_default() += c;
+        }
+    } else {
+        println!("{}{}: {:.2}% of {total} samples", a.within.as_deref().unwrap_or(""), a.at.as_ref().map_or(String::new(), |l| format!(" at {l}")), pct(within));
+    }
+    let mut rows: Vec<(String, usize)> = by.into_iter().collect();
+    rows.sort_by(|x, y| y.1.cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+    for (k, c) in rows.into_iter().take(if a.within.is_some() { 40 } else { 30 }) {
+        println!("{:6.2}%  {k}", pct(c));
+    }
+    Ok(())
 }

@@ -1,7 +1,7 @@
 # Room (3,2) reference for celeste-minimal, derived 2026-10-01.
-#   pico8_diff/replay.py --room 3,2 --balloon-seeds 0,0,0,0.37515 tas/room_3_2_reference_frame_128.txt
+#   rewrite pico8 replay --room 3,2 --balloon-seeds 0,0,0,0.37515 --inputs tas/room_3_2_reference_frame_128.txt
 #
-# Input bytes for rewrite run (-i) / pico8_diff/replay.py --room 3,2, one
+# Input bytes for rewrite run (-i) / rewrite pico8 replay --room 3,2, one
 # per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
 # bit4=jump bit5=dash.
 #
