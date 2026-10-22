@@ -30,11 +30,6 @@ pub type Ref = u32;
 pub const FALSE: Ref = 0;
 pub const TRUE: Ref = 1;
 
-/// The image of a node `simplify_local` did not rebuild. Deliberately not 0:
-/// an out-of-range id panics in `Graph::get`, where node 0 would quietly
-/// be some unrelated constant.
-pub const UNREACHABLE: NodeId = NodeId::MAX;
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct Triple {
     /// Index into the variable order; terminals compare as `u32::MAX`.
@@ -221,18 +216,6 @@ fn flatten<A: GraphArith>(g: &Graph<A>, root: NodeId, want_and: bool, cap: usize
     Some(leaves)
 }
 
-/// `x` and `y` are complements by their spelling: one is `Not` of the
-/// other, or they are complementary comparisons over the same operands.
-fn syntactic_complements<A: GraphArith>(g: &Graph<A>, x: NodeId, y: NodeId) -> bool {
-    let (nx, ny) = (g.get(x), g.get(y));
-    match (&nx.op, &ny.op) {
-        (Op::Not, _) if nx.args[0] == y => true,
-        (_, Op::Not) if ny.args[0] == x => true,
-        (Op::Lt, Op::Ge) | (Op::Ge, Op::Lt) | (Op::Le, Op::Gt) | (Op::Gt, Op::Le) => nx.args == ny.args,
-        _ => false,
-    }
-}
-
 // THE LOCAL PASS: each rewrite is proved on a small BDD of the node's OWN
 // bounded cone: past the expansion budget a compound node is an opaque
 // variable, which proves less and never anything false. It runs once, in
@@ -405,7 +388,7 @@ fn factor_local<A: GraphArith>(g: &Graph<A>, local: &mut Local, id: NodeId, expa
     let residual = |p: &[NodeId]| -> Vec<NodeId> { p.iter().copied().filter(|l| !common.contains(l)).collect() };
     let simple = parts.len() == 2 && {
         let (x, y) = (residual(&parts[0]), residual(&parts[1]));
-        x.len() == 1 && y.len() == 1 && syntactic_complements(g, x[0], y[0])
+        x.len() == 1 && y.len() == 1 && g.complements(x[0], y[0])
     };
     Some((if dual { Op::Or } else { Op::And }, common.into_iter().collect(), simple))
 }
@@ -415,7 +398,7 @@ fn factor_local<A: GraphArith>(g: &Graph<A>, local: &mut Local, id: NodeId, expa
 /// graph, its function on a BDD of at most `cap` nodes over its cone
 /// expanded to `expand` compound nodes, then a constant, a genuine atom, or
 /// the common-factor collapse where proved. Returns the new graph, the old
-/// -> new map (`UNREACHABLE` outside the reachable set) and `Stats`. The
+/// -> new map (`graph::UNBUILT` outside the reachable set) and `Stats`. The
 /// numeric layer is copied through `fold`, so a select whose condition
 /// became constant folds to one arm.
 ///
@@ -483,29 +466,22 @@ fn factor_local<A: GraphArith>(g: &Graph<A>, local: &mut Local, id: NodeId, expa
 pub fn simplify_local<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], cap: usize, expand: usize) -> (Graph<A>, Vec<NodeId>, Stats) {
     let need = g.reachable(roots);
     let mut out = g.like();
-    let mut map: Vec<NodeId> = vec![UNREACHABLE; g.len()];
     let mut st = Stats { before: need.iter().filter(|x| **x).count(), ..Default::default() };
     let mut local = Local::new(cap);
     // Per node of `out`, what it settled to (hash-consing hands back nodes
     // already analysed).
     let mut settled: FxHashMap<NodeId, NodeId> = FxHashMap::default();
-    for id in 0..g.len() {
-        if !need[id] {
-            continue;
-        }
-        let node = g.get(id as NodeId);
-        let args: Vec<NodeId> = node.args.iter().map(|x| map[*x as usize]).collect();
-        let built = out.fold(node.op.clone(), args);
+    let map = g.rebuild_into(Some(&need), &mut out, |_, node, args, out| {
+        let built = out.fold(node.op.clone(), args.to_vec());
         if let Some(s) = settled.get(&built) {
-            map[id] = *s;
-            continue;
+            return Some(*s);
         }
         // A leaf repeated in an `And`/`Or` tree goes: idempotence, with
         // associativity and commutativity, is exact in Kleene.
         let new = match out.get(built).op {
             Op::And | Op::Or => {
                 let op = out.get(built).op.clone();
-                match flatten(&out, built, matches!(op, Op::And), 64) {
+                match flatten(out, built, matches!(op, Op::And), 64) {
                     Some(leaves) => {
                         let mut seen: rustc_hash::FxHashSet<NodeId> = Default::default();
                         let uniq: Vec<NodeId> = leaves.iter().copied().filter(|l| seen.insert(*l)).collect();
@@ -525,15 +501,14 @@ pub fn simplify_local<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], cap: usize,
         };
         if let Some(s) = settled.get(&new).copied() {
             settled.insert(built, s);
-            map[id] = s;
-            continue;
+            return Some(s);
         }
-        let structural = matches!(out.get(new).op, Op::And | Op::Or | Op::Not) || is_bool_sel(&out, new);
+        let structural = matches!(out.get(new).op, Op::And | Op::Or | Op::Not) || is_bool_sel(out, new);
         let result = if !structural {
             new
         } else {
             local.reset(expand);
-            match local.func(&out, new) {
+            match local.func(out, new) {
                 None => {
                     st.unanalysed += 1;
                     new
@@ -547,7 +522,7 @@ pub fn simplify_local<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], cap: usize,
                         st.to_atom += 1;
                         at
                     }
-                    None => match factor_local(&out, &mut local, new, expand) {
+                    None => match factor_local(out, &mut local, new, expand) {
                         Some((op, common, simple)) => {
                             st.merged += 1;
                             st.merged_simple += simple as usize;
@@ -563,8 +538,8 @@ pub fn simplify_local<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], cap: usize,
         st.bdd_nodes = st.bdd_nodes.max(local.b.len());
         settled.insert(new, result);
         settled.insert(built, result);
-        map[id] = result;
-    }
+        Some(result)
+    });
     let mapped: Vec<NodeId> = roots.iter().map(|r| map[*r as usize]).collect();
     st.after = out.reachable(&mapped).iter().filter(|x| **x).count();
     (out, map, st)

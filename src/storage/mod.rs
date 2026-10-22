@@ -5,7 +5,7 @@
 //! files; and its one text record (`record`).
 //!
 //! A state is `(shape, key, cell)` (`Sk`; the key holds no position:
-//! `exact::Code::pos`) everywhere: the edges, the frame files, the
+//! `exact::Code::of_pos`) everywhere: the edges, the frame files, the
 //! backward. No state has a number.
 #![warn(unreachable_pub)]
 

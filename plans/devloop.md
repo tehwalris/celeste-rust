@@ -141,15 +141,17 @@ The steps run in four lanes:
   (45.42 G) and float f42n f60 (6.00 G), pinned from develop
   `fa251711`.
   - The count is `perf stat -e instructions:u` of a `bench frame --reps 3`
-    run, less a `--reps 1` run, over 2. The kernel build, the tree's load
-    and the start cancel out. Always 16 threads.
+    run, less a `--reps 1` run, over 2, after a `--reps 0` run that fills
+    the kernel cache: both counted runs load the kernels, so the kernels,
+    the tree's load and the start cancel out. Always 16 threads.
   - Not the quick binary: its 16 codegen units re-partition on unrelated
     edits (the wave's generics are instantiated in the binary crate), and
     a diagnostic's edit in `rewrite.rs` moved all three frames by +2.2-3.1%
     (2026-10-16). Release, and quick at one codegen unit, are stable
     across such edits.
   - A frame more than 2% over its pin FAILS. One more than 2% under says to
-    re-pin.
+    re-pin. One more than 20% off either way FAILS as implausible (a run
+    that built its kernels against one that loaded them), never a re-pin.
   - Run to run the counts stay within 0.2% at load 30-190. A loop injected
     into the wave, adding 0.73 G a rep, failed r62h (+3.7%) and f42n
     (+11.9%); r62h57 passed at +1.5%.
@@ -281,9 +283,10 @@ then the tiers' `--pin`.
   `r0sxhn` fork the widened objects into thousands of paths a row. t1
   checks the object room at `r0sxh`, and the n kernels end to end
   (search42) and by key-check.
-- **Every process builds its kernels** (room (1,0) ~1 s, (6,2) ~4 s, (6,0)
-  split ~20-40 s). That is most of t1's and t2's time. A kernel cache keyed
-  on the binary would cut both.
+- **Every build of the sources builds its kernels once** (the kernel
+  cache, `compiled::cache`: a set is keyed on the sources, so a commit's
+  first check builds every set; a hit loads in 0.1-2 s against room
+  (1,0)'s ~5 s, (6,2)'s ~20-30 s and (6,0) split's ~70 s).
 - **A frame check meets no new transfer** (`ForwardState::at` loads the
   whole table). The numbering of a frame's new transfers is checked by
   the full forwards (t2, `fixtures`).

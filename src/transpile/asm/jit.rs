@@ -136,6 +136,19 @@ unsafe impl Send for Loaded {}
 unsafe impl Sync for Loaded {}
 
 impl Loaded {
+    /// The shared object's bytes (a kernel cache entry's).
+    pub fn bytes(&self) -> Result<Vec<u8>> {
+        Ok(std::fs::read(&self.path)?)
+    }
+
+    /// A shared object's `bytes` (a kernel cache entry's), written to this
+    /// process's scratch and loaded (`open`).
+    pub fn from_bytes(bytes: &[u8], tag: &str, sym: &str) -> Result<Loaded> {
+        let path = scratch_dir().join(format!("{}.so", unique_stem(tag)));
+        std::fs::write(&path, bytes)?;
+        Loaded::open(&path, sym)
+    }
+
     /// `dlopen` `path` and resolve `sym` to a `KernelFn`.
     pub fn open(path: &Path, sym: &str) -> Result<Loaded> {
         let cpath = CString::new(path.to_str().unwrap())?;

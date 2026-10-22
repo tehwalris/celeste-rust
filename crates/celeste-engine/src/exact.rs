@@ -22,7 +22,7 @@ use celeste_core::arith::Arithmetic;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::runtime2::{mix64, Cell2, Rt2, AV, P8, POS_WHOLE};
+use crate::runtime2::{mix64, Cell2, Rt2, AV, P8};
 
 /// A packed key: (bits 64..127, bits 0..63). Bit 127 tags a PROVISIONAL key.
 pub type Key = (u64, u64);
@@ -37,14 +37,6 @@ pub const NONE: u32 = u32::MAX;
 #[inline]
 pub fn is_provisional(k: Key) -> bool {
     k.0 & PROVISIONAL != 0
-}
-
-/// A key's slot in a hash table (the key itself is compared exactly). A
-/// packed key is mostly zero in its high word: no table may use a word as
-/// its hash.
-#[inline]
-pub fn slot_hash(k: Key) -> u64 {
-    mix64(k.1 ^ mix64(k.0 ^ 0x9e37_79b9_7f4a_7c15))
 }
 
 #[inline]
@@ -163,15 +155,6 @@ impl<N: Arithmetic> Code<N> {
             K_PTR => AV::Ptr(small::<N>(self.a)),
             _ => AV::NilPtr,
         }
-    }
-}
-
-impl Code {
-    /// `of_pos` of the raw 16.16 bounds `lo`, `hi` (the kernels' emission).
-    #[inline]
-    pub fn pos(lo: u32, hi: u32) -> Code {
-        let whole = lo & POS_WHOLE;
-        Code::num(lo.wrapping_sub(whole), hi.wrapping_sub(whole))
     }
 }
 

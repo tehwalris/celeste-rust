@@ -10,6 +10,7 @@ use celeste_engine::runtime2;
 use celeste_names as gen;
 
 pub(crate) mod asm_kernel;
+pub(crate) mod cache;
 pub mod dispatch;
 pub mod mix;
 

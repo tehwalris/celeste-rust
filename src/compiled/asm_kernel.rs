@@ -40,7 +40,8 @@ struct AsmField {
 /// `live` roots; a lane is emitted iff `live & !error`.
 struct AsmBody {
     outcome: usize,
-    /// The fork configuration (two bits per fork), for diagnostics.
+    /// The fork configuration (a fragment a fork, `graph::ANY_VALID` for a
+    /// dead one): the build report's, and `dup_refs`' "one fork away".
     splits: Vec<u8>,
     fields: Vec<AsmField>,
     /// `error`'s slot (`--kernel-explain`).
@@ -139,45 +140,22 @@ impl DupRef {
     }
 }
 
-/// An accumulator column: a uniform constant or an empty typed vector.
-enum ColInit<N: Arithmetic = P8> {
-    Uniform(AV<N>),
-    EmptyNum,
-    EmptyBool,
-    EmptyIval,
-}
-
-/// A per-outcome accumulator recipe (skeleton, column inits, the boundary's
-/// constants), so the append emits rows already at the boundary.
+/// A per-outcome accumulator recipe: its rows' skeleton and the boundary's
+/// constants, so the append emits rows already at the boundary.
 struct AccTemplate<N: Arithmetic = P8> {
-    skeleton: Rt2<N>,
-    inits: Vec<(usize, ColInit<N>)>,
     shape_hash: u64,
     /// The key's uniform fields: every value cell uniform at the boundary,
     /// at its WIDENED value, as `(cell, code)` by cell.
     uniform: Vec<(u32, Code<N>)>,
     /// The shape as a key space records it (checked against its record).
     record: ShapeRecord,
-    /// This outcome's own skeleton, for cells the union makes typed.
+    /// This outcome's own skeleton: a field's column empty and typed, or
+    /// uniform where every row holds one value (`OutField::konst_av`, a
+    /// widened field's `widen_uniform`, the buttons' unknown).
     own: Rt2<N>,
     /// The SHAPE's skeleton, typed wherever any outcome varies a cell: every
     /// queue and piece of the shape has these columns. Set by `unify`.
     union: std::sync::Arc<Rt2<N>>,
-}
-
-impl<N: Arithmetic> AccTemplate<N> {
-    fn build(&self) -> Rt2<N> {
-        let mut b = reshape(&self.skeleton, 0);
-        for (c, init) in &self.inits {
-            b.cols[*c] = match init {
-                ColInit::Uniform(av) => Col::U(*av),
-                ColInit::EmptyNum => Col::N(Vec::new()),
-                ColInit::EmptyBool => Col::V(Vec::new()),
-                ColInit::EmptyIval => Col::I(Vec::new()),
-            };
-        }
-        b
-    }
 }
 
 /// Rust's default spawned-thread stack, assumed without `set_thread_stack`.
@@ -261,7 +239,7 @@ impl<N: KernelLanes> AsmKernel<N> {
         }
         let views = self.input_views(chunk);
         let env = CollisionEnv { cache: &chunk.cache };
-        let ctx = AsmCtx::new(&env as *const CollisionEnv as *const c_void);
+        let ctx = AsmCtx::<N>::new(&env as *const CollisionEnv as *const c_void);
         // Per-thread reused buffers: a fresh allocation faults every page.
         let mut sc = Scratch::take(self);
         let Scratch { inbuf, outbuf, took, takes, parts, dups, .. } = &mut sc;
@@ -287,7 +265,7 @@ impl<N: KernelLanes> AsmKernel<N> {
             (self.loaded.func)(
                 inbuf.as_ptr(),
                 outbuf.as_mut_ptr(),
-                &ctx as *const AsmCtx as *const c_void,
+                &ctx as *const AsmCtx<N> as *const c_void,
             );
         }
         let t_emit = sink.stats.tick(crate::storage::stats::S::PhKernel, t_ph);
@@ -299,40 +277,8 @@ impl<N: KernelLanes> AsmKernel<N> {
             // Only expanded lanes reach a slice: an unexpanded row's (an
             // exit, a lost berry) error would be no decline.
             if live & error & valid != 0 {
-                // Declined (fatal in the caller): report the lanes.
-                let declined = live & error & valid;
-                let ids = crate::compiled::ids();
-                let mut rows = String::new();
-                let mut m = declined;
-                while m != 0 {
-                    let i = m.trailing_zeros() as usize;
-                    m &= m - 1;
-                    let lane = lanes[i];
-                    let mut desc = format!("lane {lane}:");
-                    for obj in chunk.player_objects() {
-                        for (name, f) in [("rem", ids.f_rem), ("spd", ids.f_spd)] {
-                            if let Some(pc) = chunk.obj_field_cell(obj, f) {
-                                if let Col::U(AV::Ptr(sub)) = chunk.cols[pc as usize] {
-                                    for (axis, g) in [("x", ids.f_x), ("y", ids.f_y)] {
-                                        if let Some(c) = chunk.obj_field_cell(sub, g) {
-                                            desc.push_str(&format!(" {name}.{axis}={:?}", chunk.cols[c as usize].at(lane)));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    rows.push_str(&desc);
-                    rows.push('\n');
-                }
-                eprintln!(
-                    "[kernel] shape {:#x} body of outcome {} declined lanes {:#06x} (live {:#06x} error {:#06x}):\n{rows}",
-                    chunk.shape_hash, body.outcome, declined, live, error
-                );
-                match self.flat_roots.get(body.error_root) {
-                    Some(&error_node) => self.explain_error(chunk, lanes[declined.trailing_zeros() as usize], error_node),
-                    None => eprintln!("[kernel] rerun with --kernel-explain for the error the lane holds"),
-                }
+                // Declined: fatal in the caller.
+                self.report_decline(chunk, lanes, body, live, error, live & error & valid);
                 sc.put_back();
                 return false;
             }
@@ -367,7 +313,41 @@ impl<N: KernelLanes> AsmKernel<N> {
         true
     }
 
-    /// On a decline: print the `error` disjuncts not false for `lane`.
+    /// A decline (`declined`: the lanes `live & error`): the lanes, their
+    /// player's `rem` and `spd`, and (`--kernel-explain`) why the first
+    /// one's `error` holds.
+    #[cold]
+    fn report_decline(&self, chunk: &Rt2<N>, lanes: &[usize], body: &AsmBody, live: u16, error: u16, declined: u16) {
+        let ids = crate::compiled::ids();
+        let mut rows = String::new();
+        for i in crate::storage::unit::lanes_of(declined) {
+            let lane = lanes[i];
+            rows.push_str(&format!("lane {lane}:"));
+            for obj in chunk.player_objects() {
+                for (name, f) in [("rem", ids.f_rem), ("spd", ids.f_spd)] {
+                    let Some(Col::U(AV::Ptr(sub))) = chunk.obj_field_cell(obj, f).map(|pc| &chunk.cols[pc as usize]) else { continue };
+                    for (axis, g) in [("x", ids.f_x), ("y", ids.f_y)] {
+                        if let Some(c) = chunk.obj_field_cell(*sub, g) {
+                            rows.push_str(&format!(" {name}.{axis}={:?}", chunk.cols[c as usize].at(lane)));
+                        }
+                    }
+                }
+            }
+            rows.push('\n');
+        }
+        eprintln!(
+            "[kernel] shape {:#x} body of outcome {} declined lanes {:#06x} (live {:#06x} error {:#06x}):\n{rows}",
+            chunk.shape_hash, body.outcome, declined, live, error
+        );
+        match self.flat_roots.get(body.error_root) {
+            Some(&error_node) => self.explain_error(chunk, lanes[declined.trailing_zeros() as usize], error_node),
+            None => eprintln!("[kernel] rerun with --kernel-explain for the error the lane holds"),
+        }
+    }
+
+    /// Why `error_node` holds on `lane`: its disjuncts not false, each
+    /// followed down to its first undecided condition, and its failing
+    /// premises.
     fn explain_error(&self, chunk: &Rt2<N>, lane: usize, error_node: crate::transpile::graph::NodeId) {
         use crate::transpile::graph::{Op, Val};
         let mut cells: std::collections::HashMap<u32, Val<N>> = Default::default();
@@ -382,108 +362,68 @@ impl<N: KernelLanes> AsmKernel<N> {
                 return;
             }
         };
-        let mut stack = vec![error_node];
-        let mut seen = std::collections::HashSet::new();
-        let mut shown = 0;
-        while let Some(n) = stack.pop() {
-            if !seen.insert(n) {
-                continue;
-            }
-            let node = self.fused.get(n);
-            if matches!(node.op, Op::Or) {
-                stack.extend(node.args.iter().copied());
-                continue;
-            }
-            if vals[n as usize] != Val::Bool(Some(false)) && shown < 6 {
-                shown += 1;
-                let args: Vec<String> = node
-                    .args
-                    .iter()
-                    .map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize]))
-                    .collect();
-                eprintln!("[kernel]   error disjunct {} {:?} = {:?}; args {}", n, node.op, vals[n as usize], args.join(", "));
-                // Follow Sels (and undecided booleans) to the first undecided condition.
-                let mut cur = n;
-                for _ in 0..12 {
-                    let nd = self.fused.get(cur);
-                    let next = match nd.op {
-                        Op::Sel => match vals[nd.args[0] as usize] {
-                            Val::Bool(Some(true)) => Some(nd.args[1]),
-                            Val::Bool(Some(false)) => Some(nd.args[2]),
-                            _ => {
-                                let c = nd.args[0];
-                                let cn = self.fused.get(c);
-                                let cargs: Vec<String> = cn
-                                    .args
-                                    .iter()
-                                    .map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize]))
-                                    .collect();
-                                eprintln!("[kernel]     undecided condition {} {:?} = {:?}; args {}", c, cn.op, vals[c as usize], cargs.join(", "));
-                                // and one level into the comparison's operands
-                                for &a in &cn.args {
-                                    let an = self.fused.get(a);
-                                    if matches!(an.op, Op::Sel) {
-                                        let aargs: Vec<String> = an.args.iter().map(|&b| format!("{}={:?}<{:?}>", b, self.fused.get(b).op, vals[b as usize])).collect();
-                                        eprintln!("[kernel]       operand {} Sel; args {}", a, aargs.join(", "));
-                                    }
-                                }
-                                None
-                            }
-                        },
-                        Op::Le | Op::Ge | Op::Lt | Op::Gt | Op::Eq | Op::Same | Op::ForkOk(..) => {
-                            nd.args.iter().copied().find(|&a| matches!(self.fused.get(a).op, Op::Sel))
-                        }
-                        // An undecided boolean: down its first undecided operand.
-                        Op::And | Op::Or | Op::Not => nd.args.iter().copied().find(|&a| vals[a as usize] == Val::Bool(None)),
+        let g = &self.fused;
+        let why = crate::transpile::why::Explain { g, vals: Some(&vals) };
+        let val = |n: crate::transpile::graph::NodeId| vals[n as usize];
+        for n in why.disjuncts(error_node).into_iter().filter(|&n| val(n) != Val::Bool(Some(false))).take(6) {
+            eprintln!("[kernel]   error disjunct {}", why.with_args(n));
+            // Down Sels (and undecided booleans) to the first undecided condition.
+            let chain = why.chain(n, 12, |cur| {
+                let nd = g.get(cur);
+                match nd.op {
+                    Op::Sel => match val(nd.args[0]) {
+                        Val::Bool(Some(b)) => Some(nd.args[if b { 1 } else { 2 }]),
                         _ => None,
-                    };
-                    match next {
-                        Some(x) => cur = x,
-                        None => {
-                            // Where the walk stops: the undecided node itself.
-                            if !matches!(nd.op, Op::Sel) {
-                                let args: Vec<String> = nd.args.iter().map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize])).collect();
-                                eprintln!("[kernel]     undecided at {} {:?} = {:?}; args {}", cur, nd.op, vals[cur as usize], args.join(", "));
-                                eprintln!("[kernel]       = {}", crate::trace::lower::show_tree(&self.fused, cur, 6));
-                            }
-                            break;
-                        }
-                    }
+                    },
+                    Op::Le | Op::Ge | Op::Lt | Op::Gt | Op::Eq | Op::Same | Op::ForkOk(..) => nd.args.iter().copied().find(|&a| g.get(a).op == Op::Sel),
+                    Op::And | Op::Or | Op::Not => nd.args.iter().copied().find(|&a| val(a) == Val::Bool(None)),
+                    _ => None,
                 }
-                // The FAILING premise: false conjuncts through the strict
-                // merges down to the leaves decided false.
-                let mut stack = vec![n];
-                let mut walked = std::collections::HashSet::new();
-                let mut leaves = 0;
-                while let Some(x) = stack.pop() {
-                    if !walked.insert(x) || leaves >= 8 {
-                        continue;
+            });
+            let end = chain[chain.len() - 1];
+            if chain.len() <= 12 {
+                let nd = g.get(end);
+                if nd.op == Op::Sel {
+                    // Its condition is undecided, and one level into the comparison's operands.
+                    let c = nd.args[0];
+                    eprintln!("[kernel]     undecided condition {}", why.with_args(c));
+                    for &a in g.get(c).args.iter().filter(|&&a| g.get(a).op == Op::Sel) {
+                        eprintln!("[kernel]       operand {}", why.with_args(a));
                     }
-                    let nd = self.fused.get(x);
-                    match nd.op {
-                        Op::And | Op::Or => stack.extend(nd.args.iter().copied().filter(|&a| vals[a as usize] == Val::Bool(Some(false)))),
-                        Op::Sel => match vals[nd.args[0] as usize] {
-                            Val::Bool(Some(true)) => stack.push(nd.args[1]),
-                            Val::Bool(Some(false)) => stack.push(nd.args[2]),
-                            _ => {}
-                        },
-                        _ => {
-                            leaves += 1;
-                            let args: Vec<String> = nd.args.iter().map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize])).collect();
-                            eprintln!("[kernel]     failing premise {} {:?} = {:?}; args {}", x, nd.op, vals[x as usize], args.join(", "));
-                            // A `Known` premise: its undecided operands.
-                            if matches!(nd.op, Op::Known) {
-                                let mut todo = vec![(nd.args[0], 0usize)];
-                                let mut shown = std::collections::HashSet::new();
-                                while let Some((y, depth)) = todo.pop() {
-                                    if depth > 6 || !shown.insert(y) || vals[y as usize] != Val::Bool(None) {
-                                        continue;
-                                    }
-                                    let yn = self.fused.get(y);
-                                    let yargs: Vec<String> = yn.args.iter().map(|&a| format!("{}={:?}<{:?}>", a, self.fused.get(a).op, vals[a as usize])).collect();
-                                    eprintln!("[kernel]       undecided {}{} {:?}; args {}", "  ".repeat(depth), y, yn.op, yargs.join(", "));
-                                    todo.extend(yn.args.iter().map(|&a| (a, depth + 1)));
+                } else {
+                    eprintln!("[kernel]     undecided at {}", why.with_args(end));
+                    eprintln!("[kernel]       = {}", why.tree(end, 6));
+                }
+            }
+            // The FAILING premise: false conjuncts through the strict
+            // merges down to the leaves decided false.
+            let mut stack = vec![n];
+            let mut walked = std::collections::HashSet::new();
+            let mut leaves = 0;
+            while let Some(x) = stack.pop() {
+                if !walked.insert(x) || leaves >= 8 {
+                    continue;
+                }
+                let nd = g.get(x);
+                match nd.op {
+                    Op::And | Op::Or => stack.extend(nd.args.iter().copied().filter(|&a| val(a) == Val::Bool(Some(false)))),
+                    Op::Sel => match val(nd.args[0]) {
+                        Val::Bool(Some(b)) => stack.push(nd.args[if b { 1 } else { 2 }]),
+                        _ => {}
+                    },
+                    _ => {
+                        leaves += 1;
+                        eprintln!("[kernel]     failing premise {}", why.with_args(x));
+                        // A `Known` premise: its undecided operands.
+                        if nd.op == Op::Known {
+                            let mut todo = vec![(nd.args[0], 0usize)];
+                            let mut shown = std::collections::HashSet::new();
+                            while let Some((y, depth)) = todo.pop() {
+                                if depth > 6 || !shown.insert(y) || val(y) != Val::Bool(None) {
+                                    continue;
                                 }
+                                eprintln!("[kernel]       undecided {}{}", "  ".repeat(depth), why.with_args(y));
+                                todo.extend(g.get(y).args.iter().map(|&a| (a, depth + 1)));
                             }
                         }
                     }
@@ -497,10 +437,10 @@ impl<N: KernelLanes> AsmKernel<N> {
         self.compiled
             .input_cells
             .iter()
-            .zip(&self.compiled.input_reprs)
+            .zip(&self.compiled.input_types)
             .zip(&self.input_names)
-            .map(|((&cell, repr), name)| {
-                InputView::of(&chunk.cols[cell as usize], *repr)
+            .map(|((&cell, ty), name)| {
+                InputView::of(&chunk.cols[cell as usize], *ty)
                     .unwrap_or_else(|e| panic!("{e}: input cell {cell} = {name} of shape {:#x}", chunk.shape_hash))
             })
             .collect()
@@ -573,11 +513,11 @@ impl<N: KernelLanes> AsmKernel<N> {
                     N::put_masks(buf, half, off, val, Some(known));
                 }
                 InputView::UBoolU(val, known) => N::put_masks(buf, half, off, *val, Some(*known)),
-                InputView::Any(col, repr) => {
+                InputView::Any(col, ty) => {
                     // The general case: a materialized `AV` column, per value.
                     for l in 0..16 {
                         let v = col.at(lane(l));
-                        match repr {
+                        match ty {
                             Ty::Num => N::put(buf, half, off, l, num_raw(v)),
                             Ty::Ival => {
                                 let (a, b) = ival_raw(v);
@@ -758,8 +698,8 @@ enum InputView<'c, N: Arithmetic = P8> {
 }
 
 impl<'c, N: Arithmetic> InputView<'c, N> {
-    fn of(col: &'c Col<N>, repr: Ty) -> Result<Self, String> {
-        Ok(match (repr, col) {
+    fn of(col: &'c Col<N>, ty: Ty) -> Result<Self, String> {
+        Ok(match (ty, col) {
             (Ty::Num, Col::N(v)) => InputView::Num(v),
             (Ty::Num, Col::U(AV::Num(n))) => InputView::NumU(n.raw()),
             (Ty::Ival, Col::I(v)) => InputView::Ival(v),
@@ -777,7 +717,7 @@ impl<'c, N: Arithmetic> InputView<'c, N> {
             (Ty::UBool, Col::U(AV::Bool(b))) => InputView::UBoolU(if *b { 0xffff } else { 0 }, 0xffff),
             (Ty::UBool, Col::U(AV::UBool)) => InputView::UBoolU(0, 0),
             (Ty::UBool, other) => return Err(format!("ASM maybe-unknown bool input column is {other:?}")),
-            (repr, other) => InputView::Any(other, repr),
+            (ty, other) => InputView::Any(other, ty),
         })
     }
 }
@@ -826,9 +766,9 @@ pub(crate) fn key_check<N: crate::search::rem::Rem>(slot: &crate::storage::unit:
     );
 }
 
-/// `--key-check` on a block the forward STORES (a layer's piece,
-/// `storage::wave::gather_layer`): the boundary over a copy keeps its shape
-/// and structure, and the key space keys its rows as stored.
+/// `--key-check` on a block the forward STORES (a layer's rows, decoded at
+/// the frame's end): the boundary over a copy keeps its shape and
+/// structure, and the key space keys its rows as stored.
 pub(crate) fn key_check_block<N: celeste_core::arith::Arithmetic>(blk: &Rt2<N>, keys: &KeySpace<N>) {
     let mut b = blk.clone_block();
     b.boundary_canonicalize();
@@ -891,6 +831,12 @@ use crate::trace::walk::Region;
 impl<N: KernelLanes> Registry<N> {
     pub fn len(&self) -> usize {
         self.kernels.len()
+    }
+
+    /// Its kernels' text, fingerprinted (`text_digest`).
+    #[cfg(test)]
+    pub(crate) fn text_digest(&self) -> u64 {
+        text_digest(&self.kernels)
     }
 
     /// Run `chunk` (rows in cell order) on the matching kernels; `false` on a
@@ -959,31 +905,61 @@ impl<N: KernelLanes> Registry<N> {
     /// Retrace the start room and assemble every shape for level `opts`
     /// under settings `s`.
     pub fn build_for_start_room(opts: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Registry<N>> {
-        let grid = s.region_grid();
-        match grid {
+        match s.region_grid() {
             Some(g) => eprintln!("[region] kernels keyed on a {} px grid, player speed asserted within [-{}, {}] px", g.px, g.speed, g.speed),
             None => eprintln!("[region] no region key (--region off)"),
+        }
+        // The kernel cache, but for the diagnostics that keep or print the
+        // build (`--kernel-explain`, `--build-trace`).
+        let store = (!s.diag.kernel_explain && !s.diag.build_trace).then(super::cache::Store::default);
+        Registry::build_with(opts, s, store.as_ref())
+    }
+
+    /// `build_for_start_room` with the kernel cache `store` (none: build).
+    pub(crate) fn build_with(opts: crate::abstraction::Level, s: &crate::settings::Settings, store: Option<&super::cache::Store>) -> Result<Registry<N>> {
+        let t0 = std::time::Instant::now();
+        let key = store.map(|_| super::cache::key::<N>(opts, s)).transpose()?;
+        if let (Some(store), Some(key)) = (store, &key) {
+            if let Some(entry) = store.load::<N>(key)? {
+                let cache = crate::compiled::collision_cache(s.room);
+                let mut kernels = HashMap::new();
+                for (i, (recipe, so)) in entry.into_iter().enumerate() {
+                    let loaded = Loaded::from_bytes(&so, &format!("cached_{i}"), &recipe.compiled.sym)?;
+                    let k = (recipe.shape, recipe.region);
+                    anyhow::ensure!(kernels.insert(k, AsmKernel::of(recipe, loaded, cache.clone(), None)?).is_none(), "the kernel cache's entry {} holds kernel {k:?} twice", key.name);
+                }
+                unify(&mut kernels)?;
+                eprintln!("[asm build] {} kernels: kernel cache HIT {}, {:.2}s; kernel text {:016x}", kernels.len(), key.name, t0.elapsed().as_secs_f64(), text_digest(&kernels));
+                return Ok(Registry { kernels, grid: s.region_grid() });
+            }
         }
         let build = BuildOptions {
             asm: crate::transpile::asm::AsmOptions { trace: s.diag.build_trace, mix: s.diag.kernel_metrics },
             keep_graphs: s.diag.kernel_explain,
         };
         let build = &build;
-        let t_trace = std::time::Instant::now();
         let refs = crate::trace::lower::lattice_kernel_refs::<N>(opts, s)
             .context("retracing the start room for ASM kernels")?;
-        let trace_s = t_trace.elapsed().as_secs_f64();
+        let trace_s = t0.elapsed().as_secs_f64();
         let t_asm = std::time::Instant::now();
         // The shapes in parallel; a shape's build recurses deeply.
         let pool = crate::par::Pool::per_core().stack(128 * 1024 * 1024);
         let n_workers = pool.workers(refs.len());
         let built = pool.map(refs.len(), |si| {
-            let (key, r) = &refs[si];
-            build_one_shape::<N>(r, si, &format!("_{si}"), build).map(|(shape, kernel)| (shape, *key, kernel))
+            let (region, r) = &refs[si];
+            let mut times = r.lowered.times;
+            let (recipe, loaded, graphs) = build_one_shape::<N>(r, (r.frame.in_rt2.shape_hash_of(), *region), si, build, &mut times)?;
+            let stored = store.is_some().then(|| Ok::<_, anyhow::Error>((recipe.clone(), loaded.bytes()?))).transpose()?;
+            let key = (recipe.shape, recipe.region);
+            Ok((key, AsmKernel::of(recipe, loaded, r.cache.clone(), graphs)?, times, stored))
         })?;
         let mut kernels = HashMap::new();
         let mut first: HashMap<(u64, Option<Region>), usize> = HashMap::new();
-        for (si, (shape, key, kernel)) in built.into_iter().enumerate() {
+        let mut times = crate::transpile::lower::BuildTimes::default();
+        let mut entry: Vec<(Recipe<N>, Vec<u8>)> = Vec::new();
+        for (si, ((shape, key), kernel, t, stored)) in built.into_iter().enumerate() {
+            times.add(&t);
+            entry.extend(stored);
             if kernels.insert((shape, key), kernel).is_some() {
                 let slots = |i: usize| refs[i].1.frame.iface.slots.iter().map(crate::trace::iface::show).filter(|p| p.starts_with("__")).collect::<Vec<_>>();
                 anyhow::bail!(
@@ -996,16 +972,35 @@ impl<N: KernelLanes> Registry<N> {
             first.insert((shape, key), si);
         }
         unify(&mut kernels)?;
+        let cached = match (store, &key) {
+            (Some(store), Some(key)) => {
+                store.store::<N>(key, &entry.iter().map(|(r, so)| (r, so.as_slice())).collect::<Vec<_>>())?;
+                format!("kernel cache MISS {}, stored", key.name)
+            }
+            _ => "kernel cache off".to_string(),
+        };
         eprintln!(
-            "[asm build] {} kernels: trace {:.2}s, assemble {:.2}s ({} workers)",
+            "[asm build] {} kernels: trace {:.2}s, assemble {:.2}s ({} workers); {cached}; kernel text {:016x}",
             kernels.len(),
             trace_s,
             t_asm.elapsed().as_secs_f64(),
             n_workers,
+            text_digest(&kernels),
         );
-        eprintln!("[asm build]   phases, summed over workers and concurrent builds: {}", crate::transpile::lower::build_profile());
-        Ok(Registry { kernels, grid })
+        eprintln!("[asm build]   phases, summed over workers: {}", times.show());
+        Ok(Registry { kernels, grid: s.region_grid() })
     }
+}
+
+/// A kernel set's text, fingerprinted: each kernel's (shape, region) and
+/// text digest (`Compiled::text_digest`), in key order.
+fn text_digest<N: KernelLanes>(kernels: &HashMap<(u64, Option<Region>), AsmKernel<N>>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut all: Vec<((u64, Option<Region>), u64)> = kernels.iter().map(|(k, v)| (*k, v.compiled.text_digest)).collect();
+    all.sort_unstable();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    all.hash(&mut h);
+    h.finish()
 }
 
 /// The type of a typed column (or of a uniform value one could hold).
@@ -1114,50 +1109,148 @@ fn apply_union<N: KernelLanes>(kernel: &mut AsmKernel<N>, unions: &HashMap<u64, 
     Ok(())
 }
 
-/// Assemble ONE frame (gcc + dlopen) and map its bodies onto output slots;
-/// `tag` distinguishes a shape's region kernels.
-fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, si: usize, tag: &str, build: &BuildOptions) -> Result<(u64, AsmKernel<N>)> {
-    let shape = r.frame.in_rt2.shape_hash_of();
-    let room = Room { cache: r.cache.clone() };
-    let t_fuse = std::time::Instant::now();
-    let (fused, bodies) = (&r.lowered.spec.0, &r.lowered.spec.1);
+/// A KERNEL AS ITS BUILD LEFT IT: what tracing, lowering and assembling
+/// one (shape, region) made, as plain data; `AsmKernel::of` makes the
+/// rest, alike for a fresh build and a cached one (`compiled::cache`).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+pub(crate) struct Recipe<N: Arithmetic = P8> {
+    pub(crate) shape: u64,
+    pub(crate) region: Option<Region>,
+    pub(crate) compiled: Compiled,
+    pub(crate) forks: u8,
+    pub(crate) fused_nodes: usize,
+    /// Per root slot: does it read the canonical output unknown
+    /// (`AsmField::may_unknown`)?
+    pub(crate) may_unknown: Vec<bool>,
+    pub(crate) bodies: Vec<BodySlots>,
+    /// Per outcome, its rows' skeleton (`AccTemplate::own`).
+    pub(crate) outcomes: Vec<Skeleton<N>>,
+    /// Per input cell, its traced path (named by packing failures).
+    pub(crate) input_names: Vec<String>,
+    /// `--metrics`: the kernel census.
+    pub(crate) census: Option<crate::compiled::mix::Census>,
+}
+
+/// A fused body's roots as output slots (`Compiled::root_offsets`'
+/// indices).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BodySlots {
+    outcome: usize,
+    splits: Vec<u8>,
+    /// Per stored field, its cell and slot.
+    fields: Vec<(u32, u32)>,
+    error: u32,
+    live: u32,
+    /// The transfer roots' slots (`ArcRoots::nodes`' order), and `fin`.
+    arc: ([u32; 2 * crate::transpile::kernel::AxisRoots::N], bool),
+}
+
+/// An outcome's rows' skeleton: a field's column empty and typed, or
+/// uniform where every row holds one value (`OutField::uniform`, the
+/// buttons' unknown); its shape hash taken before (`Rt2::shape_hash_of`).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "")]
+pub(crate) struct Skeleton<N: Arithmetic = P8> {
+    shape_hash: u64,
+    structure: Vec<celeste_engine::runtime2::Cell2<N>>,
+    cols: Vec<Col<N>>,
+    globals: Vec<u32>,
+}
+
+impl<N: Arithmetic> Skeleton<N> {
+    /// Outcome `oi` of a lowered frame's.
+    fn of<A: KernelLanes>(r: &crate::trace::lower::LoweredFrame<A>, oi: usize) -> Skeleton<A> {
+        // Canonical: `block::skeleton` ends in `Rt2::canonicalize_ids`.
+        let mut own = reshape(&r.frame.outs[oi].rt2, 0);
+        let shape_hash = own.shape_hash_of();
+        for f in &r.bound.outcomes[oi].fields {
+            own.cols[f.cell as usize] = match f.uniform {
+                Some(av) => Col::U(av),
+                None => typed(f.ty),
+            };
+        }
+        for &cell in &r.frame.outs[oi].ubool_cells {
+            own.cols[cell as usize] = Col::U(AV::UBool);
+        }
+        Skeleton { shape_hash, structure: own.structure, cols: own.cols, globals: own.globals }
+    }
+
+    /// As a block of no rows in `cache`'s room.
+    fn rt2(&self, cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>) -> Rt2<N> {
+        let mut b = Rt2::empty(0, self.globals.len(), celeste_names::STRINGS, cache);
+        b.globals = self.globals.clone();
+        b.structure = self.structure.clone();
+        b.cols = self.cols.clone();
+        b
+    }
+}
+
+impl<N: Arithmetic> AccTemplate<N> {
+    /// The template of skeleton `own` (`shape_hash` its shape's): the key's
+    /// uniform fields (every value cell uniform here, at its widened value)
+    /// and the shape's record.
+    fn of(own: Rt2<N>, shape_hash: u64) -> AccTemplate<N> {
+        let pos = own.position_cells();
+        let mut uniform = Vec::new();
+        for (c, cell) in own.structure.iter().enumerate() {
+            let (celeste_engine::runtime2::Cell2::Val, Col::U(v)) = (cell, &own.cols[c]) else {
+                continue;
+            };
+            let pos = pos.is_some_and(|(x, y)| c as u32 == x || c as u32 == y);
+            uniform.push((c as u32, if pos { Code::of_pos(*v) } else { Code::of(*v) }));
+        }
+        let mut canon = own.clone_block();
+        canon.shape_hash = shape_hash;
+        AccTemplate { shape_hash, uniform, record: ShapeRecord::of(&canon), union: std::sync::Arc::new(own.clone_block()), own }
+    }
+}
+
+/// `--kernel-explain`'s fused graph and roots of a kernel.
+type Graphs<N> = Option<(crate::transpile::graph::Graph<N>, Vec<crate::transpile::graph::NodeId>)>;
+
+/// Assemble ONE lowered frame (gcc + dlopen) as kernel `key`'s recipe and
+/// its loaded code; `tag` distinguishes a shape's region kernels. With
+/// `keep_graphs` (`--kernel-explain`), also its fused graph and roots.
+fn build_one_shape<N: KernelLanes>(
+    r: &crate::trace::lower::LoweredFrame<N>,
+    key: (u64, Option<Region>),
+    si: usize,
+    build: &BuildOptions,
+    times: &mut crate::transpile::lower::BuildTimes,
+) -> Result<(Recipe<N>, Loaded, Graphs<N>)> {
+    use crate::transpile::graph::NodeId;
+    use crate::transpile::lower::Phase;
+    let shape = key.0;
+    let (fused, bodies) = (&r.lowered.fused, &r.lowered.bodies);
     // One output SLOT per DISTINCT root node, numbered by first appearance
     // in the bodies' roots in the kernel's order (`Roots::flat`).
-    let mut flat_roots: Vec<crate::transpile::graph::NodeId> = Vec::new();
-    let mut slot_of: HashMap<crate::transpile::graph::NodeId, usize> = HashMap::new();
-    for n in bodies.iter().flat_map(|b| b.roots.flat()) {
-        slot_of.entry(n).or_insert_with(|| {
-            flat_roots.push(n);
-            flat_roots.len() - 1
-        });
-    }
-    let slot = |n: crate::transpile::graph::NodeId| slot_of[&n];
-    crate::transpile::lower::build_add(7, t_fuse);
-    let t_asm = std::time::Instant::now();
-    let (compiled, loaded) = crate::transpile::asm::compile_and_load(fused, &flat_roots, &format!("k{shape:016x}{tag}"), build.asm)
-    .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
-    crate::transpile::lower::build_add(8, t_asm);
-
+    let (flat_roots, slot_of) = times.time(Phase::Fuse, || {
+        let mut flat_roots: Vec<NodeId> = Vec::new();
+        let mut slot_of: HashMap<NodeId, u32> = HashMap::new();
+        for n in bodies.iter().flat_map(|b| b.roots.flat()) {
+            slot_of.entry(n).or_insert_with(|| {
+                flat_roots.push(n);
+                flat_roots.len() as u32 - 1
+            });
+        }
+        (flat_roots, slot_of)
+    });
+    let slot = |n: NodeId| slot_of[&n];
+    let tag = format!("_{si}");
+    let (mut compiled, loaded) = times
+        .time(Phase::Assemble, || crate::transpile::asm::compile_and_load(fused, &flat_roots, &format!("k{shape:016x}{tag}"), build.asm))
+        .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
     // Which fused nodes read the canonical output unknown (`may_unknown`).
     let reads_unknown_output: Vec<bool> = {
         let mut out = vec![false; fused.len()];
         for n in 0..fused.len() {
-            let node = fused.get(n as crate::transpile::graph::NodeId);
+            let node = fused.get(n as NodeId);
             out[n] = node.op == crate::transpile::graph::Op::UnknownBool(crate::transpile::graph::Unknown::Output) || node.args.iter().any(|a| out[*a as usize]);
         }
         out
     };
-    let acc_templates = (0..r.bound.outcomes.len())
-        .map(|oi| acc_template(r, oi))
-        .collect::<Result<Vec<_>>>()?;
-    // Per outcome, its position coordinates' cells (keyed without their whole pixels).
-    let pos_cells: Vec<Option<(u32, u32)>> = acc_templates.iter().map(|t| t.build().position_cells()).collect();
-    // Each body's roots onto their slots.
-    let off = |n: crate::transpile::graph::NodeId| compiled.root_offsets[slot(n)] as usize;
-    let kind = |n: crate::transpile::graph::NodeId| compiled.root_kinds[slot(n)];
-    let mut asm_bodies = Vec::with_capacity(bodies.len());
-    // What each body reads at emission (`emit::Plan`).
-    let mut reads = Vec::with_capacity(bodies.len());
+    let mut slots = Vec::with_capacity(bodies.len());
     for b in bodies {
         let outcome = &r.bound.outcomes[b.outcome];
         anyhow::ensure!(
@@ -1167,48 +1260,17 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, si:
             outcome.fields.len(),
             b.roots.fields.len()
         );
-        let fields = outcome
-            .fields
-            .iter()
-            .zip(&b.roots.fields)
-            .map(|(&(cell, _), &n)| AsmField { cell: cell as usize, off: off(n), kind: kind(n), may_unknown: reads_unknown_output[n as usize] })
-            .collect();
-        let out_fields = &r.lowered.outs[b.outcome].fields;
-        let key_fields = outcome
-            .fields
-            .iter()
-            .zip(&b.roots.fields)
-            .zip(out_fields)
-            .filter(|(_, f)| f.konst_av.is_none() && f.widen_uniform.is_none())
-            .map(|((&(cell, _), &n), _)| {
-                let pos = pos_cells[b.outcome].is_some_and(|(x, y)| cell == x || cell == y);
-                // A number stored `[v, v]` keys as the number.
-                KeyField::new(cell, off(n), kind(n), pos)
-            })
-            .collect::<Result<Vec<_>>>()?;
         // Every body computes its transfer (the rotation graph needs it).
-        let narc = b.roots.arc.len();
-        anyhow::ensure!(narc == 2 * crate::trace::frame::ARC_AXIS_ROOTS, "shape {si} outcome {}: {narc} transfer roots", b.outcome);
-        let roots = std::array::from_fn(|k| (off(b.roots.arc[k]), kind(b.roots.arc[k])));
-        let arc = ArcSlots { roots, fin: outcome.arc_fin };
-        asm_bodies.push(AsmBody {
+        let a = b.roots.arc.ok_or_else(|| anyhow::anyhow!("shape {si} outcome {}: no transfer roots", b.outcome))?;
+        slots.push(BodySlots {
             outcome: b.outcome,
             splits: b.splits.clone(),
-            fields,
-            error_root: slot(b.roots.error),
-            error_off: off(b.roots.error),
-            live_off: off(b.roots.live),
-            dup_refs: Vec::new(),
+            fields: outcome.fields.iter().zip(&b.roots.fields).map(|(f, &n)| (f.cell, slot(n))).collect(),
+            error: slot(b.roots.error),
+            live: slot(b.roots.live),
+            arc: (a.nodes().map(slot), a.fin),
         });
-        reads.push(emit::BodyReads { outcome: b.outcome, shape: acc_templates[b.outcome].shape_hash, key_fields, arc, pos: None });
     }
-
-    for (b, rd) in asm_bodies.iter().zip(reads.iter_mut()) {
-        rd.pos = pos_sources(&acc_templates[b.outcome].build(), &b.fields)?;
-    }
-    let dup_pairs = dup_refs(&mut asm_bodies, &reads);
-    let plan = emit::Plan::of(&reads);
-
     let input_names: Vec<String> = compiled
         .input_cells
         .iter()
@@ -1221,47 +1283,105 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, si:
                 .unwrap_or_else(|| format!("cell {c}, not an input slot"))
         })
         .collect();
-    let mut compiled = compiled;
-    let mix_slices = if build.asm.mix {
+    let census = if build.asm.mix {
         use crate::compiled::mix::{ROLE_ARC, ROLE_ERROR, ROLE_FIELD, ROLE_LIVE};
         let mut roles = vec![0u8; flat_roots.len()];
         for b in bodies {
             for &n in &b.roots.fields {
-                roles[slot(n)] |= ROLE_FIELD;
+                roles[slot(n) as usize] |= ROLE_FIELD;
             }
-            roles[slot(b.roots.error)] |= ROLE_ERROR;
-            roles[slot(b.roots.live)] |= ROLE_LIVE;
-            for &n in &b.roots.arc {
-                roles[slot(n)] |= ROLE_ARC;
+            roles[slot(b.roots.error) as usize] |= ROLE_ERROR;
+            roles[slot(b.roots.live) as usize] |= ROLE_LIVE;
+            for n in b.roots.arc.iter().flat_map(|a| a.nodes()) {
+                roles[slot(n) as usize] |= ROLE_ARC;
             }
         }
         let guards: Vec<_> = bodies.iter().map(|b| (b.roots.error, b.roots.live)).collect();
         let census = N::mix_report(&crate::compiled::mix::Input { traced: &r.bound.graph, fused, roots: &flat_roots, roles: &roles, bodies: &guards, compiled: &compiled })
             .with_context(|| format!("the census of {}", compiled.sym))?;
         compiled.asm = String::new();
-        Some(crate::compiled::mix::counter(&compiled.sym, census))
+        Some(census)
     } else {
         None
     };
-    Ok((
+    let recipe = Recipe {
         shape,
-        AsmKernel {
+        region: key.1,
+        compiled,
+        forks: r.bound.forks,
+        fused_nodes: fused.len(),
+        may_unknown: flat_roots.iter().map(|n| reads_unknown_output[*n as usize]).collect(),
+        bodies: slots,
+        outcomes: (0..r.bound.outcomes.len()).map(|oi| Skeleton::<N>::of(r, oi)).collect(),
+        input_names,
+        census,
+    };
+    let graphs = build.keep_graphs.then(|| (fused.clone(), flat_roots));
+    Ok((recipe, loaded, graphs))
+}
+
+impl<N: KernelLanes> AsmKernel<N> {
+    /// The kernel of `recipe`, its code `loaded`, in `cache`'s room (`graphs`:
+    /// `--kernel-explain`'s fused graph and roots): its accumulator
+    /// templates, its bodies on their slots with what each reads at
+    /// emission (`emit::Plan`), the earlier bodies each repeats.
+    fn of(
+        recipe: Recipe<N>,
+        loaded: Loaded,
+        cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
+        graphs: Graphs<N>,
+    ) -> Result<AsmKernel<N>> {
+        let Recipe { compiled, forks, fused_nodes, may_unknown, bodies, outcomes, input_names, census, .. } = recipe;
+        let acc_templates: Vec<AccTemplate<N>> = outcomes.iter().map(|sk| AccTemplate::of(sk.rt2(cache.clone()), sk.shape_hash)).collect();
+        // Per outcome, its position coordinates' cells (keyed without their whole pixels).
+        let pos_cells: Vec<Option<(u32, u32)>> = acc_templates.iter().map(|t| t.own.position_cells()).collect();
+        let off = |s: u32| compiled.root_offsets[s as usize] as usize;
+        let kind = |s: u32| compiled.root_kinds[s as usize];
+        let mut asm_bodies = Vec::with_capacity(bodies.len());
+        // What each body reads at emission (`emit::Plan`).
+        let mut reads = Vec::with_capacity(bodies.len());
+        for b in bodies {
+            let own = &acc_templates[b.outcome].own;
+            let fields = b.fields.iter().map(|&(cell, s)| AsmField { cell: cell as usize, off: off(s), kind: kind(s), may_unknown: may_unknown[s as usize] }).collect();
+            // A uniform field is the key's constant prefix, not a per-lane field.
+            let key_fields = b
+                .fields
+                .iter()
+                .filter(|(cell, _)| !matches!(own.cols[*cell as usize], Col::U(_)))
+                .map(|&(cell, s)| {
+                    let pos = pos_cells[b.outcome].is_some_and(|(x, y)| cell == x || cell == y);
+                    // A number stored `[v, v]` keys as the number.
+                    KeyField::new(cell, off(s), kind(s), pos)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let arc = ArcSlots { roots: b.arc.0.map(|s| (off(s), kind(s))), fin: b.arc.1 };
+            asm_bodies.push(AsmBody { outcome: b.outcome, splits: b.splits, fields, error_root: b.error as usize, error_off: off(b.error), live_off: off(b.live), dup_refs: Vec::new() });
+            reads.push(emit::BodyReads { outcome: b.outcome, shape: acc_templates[b.outcome].shape_hash, key_fields, arc, pos: None });
+        }
+        for (b, rd) in asm_bodies.iter().zip(reads.iter_mut()) {
+            rd.pos = pos_sources(&acc_templates[b.outcome].own, &b.fields)?;
+        }
+        let dup_pairs = dup_refs(&mut asm_bodies, &reads);
+        let plan = emit::Plan::of(&reads);
+        let mix_slices = census.map(|c| crate::compiled::mix::counter(&compiled.sym, c));
+        let (fused, flat_roots) = graphs.unwrap_or_default();
+        Ok(AsmKernel {
             loaded,
             compiled,
             bodies: asm_bodies,
             dup_pairs,
             plan,
             acc_templates,
-            forks: r.bound.forks,
+            forks,
             body_cols: Vec::new(),
-            fused_nodes: fused.len(),
+            fused_nodes,
             mix_slices,
-            fused: if build.keep_graphs { fused.clone() } else { crate::transpile::graph::Graph::default() },
-            flat_roots: if build.keep_graphs { flat_roots } else { Vec::new() },
-            room,
+            fused,
+            flat_roots,
+            room: Room { cache },
             input_names,
-        },
-    ))
+        })
+    }
 }
 
 /// Every body's `dup_refs`: the earlier bodies of its outcome one fork away.
@@ -1296,11 +1416,7 @@ fn dup_refs(bodies: &mut [AsmBody], reads: &[emit::BodyReads]) -> DupPairs {
                     pairs.push((fa.off, fb.off, fa.kind));
                 }
             }
-            for k in 0..aa.roots.len() {
-                if !aa.fin && k % crate::trace::frame::ARC_AXIS_ROOTS == 4 {
-                    continue;
-                }
-                let ((oa, ka), (ob, kb)) = (aa.roots[k], ab.roots[k]);
+            for ((_, (oa, ka)), (_, (ob, kb))) in aa.read_roots().zip(ab.read_roots()) {
                 if ka != kb {
                     ok = false;
                     break;
@@ -1361,70 +1477,6 @@ fn pos_sources<N: Arithmetic>(template: &Rt2<N>, fields: &[AsmField]) -> Result<
         return Ok(None);
     };
     Ok(Some([px, py, rx, ry]))
-}
-
-/// The accumulator recipe for one outcome, with `shape_hash` and its key's
-/// uniform fields.
-fn acc_template<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, oi: usize) -> Result<AccTemplate<N>> {
-    // Canonical: `block::skeleton` ends in `Rt2::canonicalize_ids`.
-    let skeleton = reshape(&r.frame.outs[oi].rt2, 0);
-    let shape_hash = skeleton.shape_hash_of();
-    let mut inits: Vec<(usize, ColInit<N>)> = Vec::new();
-    for f in &r.lowered.outs[oi].fields {
-        let cell = f.cell as usize;
-        // A widened-to-uniform cell holds its widened value (as `uniform` codes it).
-        if let Some(av) = f.widen_uniform.or(f.konst_av) {
-            inits.push((cell, ColInit::Uniform(av)));
-        } else {
-            inits.push((
-                cell,
-                match f.ty {
-                    Ty::Num => ColInit::EmptyNum,
-                    Ty::Bool | Ty::UBool => ColInit::EmptyBool,
-                    Ty::Ival => ColInit::EmptyIval,
-                },
-            ));
-        }
-    }
-    for &cell in &r.frame.outs[oi].ubool_cells {
-        inits.push((cell as usize, ColInit::Uniform(AV::UBool)));
-    }
-    let empty0 = reshape(&skeleton, 0);
-    let mut t = AccTemplate {
-        skeleton,
-        inits,
-        shape_hash,
-        uniform: Vec::new(),
-        record: ShapeRecord { hash: 0, sig: Vec::new(), pos: None },
-        own: empty0.clone_block(),
-        union: std::sync::Arc::new(empty0),
-    };
-    t.own = t.build();
-    t.union = std::sync::Arc::new(t.build());
-    // The key's uniform fields, at their widened values.
-    let widen = &r.bound.outcomes[oi].widen;
-    let empty = t.build();
-    let pos = empty.position_cells();
-    for (c, cell) in empty.structure.iter().enumerate() {
-        if !matches!(cell, celeste_engine::runtime2::Cell2::Val) {
-            continue;
-        }
-        let uniform = match widen.iter().find(|(wc, _)| *wc as usize == c) {
-            Some((_, av)) => Some(*av),
-            None => match empty.cols[c] {
-                Col::U(v) => Some(v),
-                _ => None,
-            },
-        };
-        if let Some(v) = uniform {
-            let pos = pos.is_some_and(|(x, y)| c as u32 == x || c as u32 == y);
-            t.uniform.push((c as u32, if pos { Code::of_pos(v) } else { Code::of(v) }));
-        }
-    }
-    let mut canon = empty.clone_block();
-    canon.shape_hash = shape_hash;
-    t.record = ShapeRecord::of(&canon);
-    Ok(t)
 }
 
 /// Kernel call counters: [0] calls, [1] rows offered, [2] slice-lanes

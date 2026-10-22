@@ -455,7 +455,7 @@ fn run<A: TestArith>(c: &Compiled, l: &Loaded, rows: &[Vec<In<A>>], env: Option<
         let (mut val, mut known) = (0u16, 0u16);
         for j in 0..16 {
             let put = |buf: &mut Vec<u8>, at: usize, v: A| A::put(buf, ib, at, j, v.raw());
-            match (c.input_reprs[ci], row(j)[*cell as usize]) {
+            match (c.input_types[ci], row(j)[*cell as usize]) {
                 (Ty::Num, In::N(x)) => put(&mut inbuf, off, x),
                 (Ty::Ival, In::I(lo, hi)) => {
                     put(&mut inbuf, off, lo);
@@ -473,16 +473,16 @@ fn run<A: TestArith>(c: &Compiled, l: &Loaded, rows: &[Vec<In<A>>], env: Option<
                 (r, v) => panic!("cell {cell}: {v:?} into a {r:?} input"),
             }
         }
-        match c.input_reprs[ci] {
+        match c.input_types[ci] {
             Ty::Bool => A::put_masks(&mut inbuf, ib, off, val, None),
             Ty::UBool => A::put_masks(&mut inbuf, ib, off, val, Some(known)),
             Ty::Num | Ty::Ival => {}
         }
     }
     A::before_call();
-    let ctx = AsmCtx::new(env.map_or(std::ptr::null(), |e| e as *const CollisionEnv as *const c_void));
+    let ctx = AsmCtx::<A>::new(env.map_or(std::ptr::null(), |e| e as *const CollisionEnv as *const c_void));
     // SAFETY: the buffers have the layout `c` states (`halves` of each).
-    unsafe { (l.func)(inbuf.as_ptr(), out.as_mut_ptr(), &ctx as *const AsmCtx as *const c_void) };
+    unsafe { (l.func)(inbuf.as_ptr(), out.as_mut_ptr(), &ctx as *const AsmCtx<A> as *const c_void) };
     (0..rows.len())
         .map(|j| {
             (0..c.n_roots)
@@ -859,7 +859,7 @@ fn the_ice_map_is_the_tile_scan<A: TestArith>() {
 }
 both!(the_ice_map_is_the_tile_scan, the_ice_map_is_the_tile_scan_fixed, the_ice_map_is_the_tile_scan_float);
 
-/// The input layouts (`CellRepr`): a boolean through `Not`/`Sel`, a
+/// The input layouts (by `Ty`): a boolean through `Not`/`Sel`, a
 /// maybe-unknown boolean's own known mask, an interval through `+`/`flr`;
 /// the slots' order and offsets.
 fn input_representations<A: TestArith>() {

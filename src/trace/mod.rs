@@ -31,4 +31,5 @@ pub mod shapes;
 mod probe;
 pub mod state;
 pub mod frame;
+pub mod game;
 pub mod widen;

@@ -11,7 +11,7 @@ use std::fmt::Write;
 
 use anyhow::{bail, Result};
 
-use celeste_core::arith::{Fixed, Float};
+use celeste_core::arith::{Arithmetic, Fixed, Float};
 
 use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{self, Cut, Graph, NodeId, Op, Ty};
@@ -35,56 +35,48 @@ const CTX_MGET: u32 = 24;
 const CTX_TILE: u32 = 32;
 const CTX_TILE_LANES: u32 = 40;
 const CTX_ENV: u32 = 48;
-// The doubles' call-outs (8 `f64` lanes), after `env`.
-const CTX_FSIN: u32 = 56;
-const CTX_FMGET: u32 = 64;
-const CTX_FTILE: u32 = 72;
-const CTX_FTILE_LANES: u32 = 80;
-// The offsets ARE `AsmCtx`'s layout.
+// The offsets ARE `AsmCtx`'s layout, in both arithmetics.
 const _: () = {
     use super::callout::AsmCtx;
+    use celeste_core::{lua_f64::LuaF64, pico8_num::Pico8Num};
     use std::mem::offset_of;
-    assert!(offset_of!(AsmCtx, div) == CTX_DIV as usize);
-    assert!(offset_of!(AsmCtx, rem) == CTX_REM as usize);
-    assert!(offset_of!(AsmCtx, sin) == CTX_SIN as usize);
-    assert!(offset_of!(AsmCtx, mget) == CTX_MGET as usize);
-    assert!(offset_of!(AsmCtx, tile_flag) == CTX_TILE as usize);
-    assert!(offset_of!(AsmCtx, tile_flag_lanes) == CTX_TILE_LANES as usize);
-    assert!(offset_of!(AsmCtx, env) == CTX_ENV as usize);
-    assert!(offset_of!(AsmCtx, fsin) == CTX_FSIN as usize);
-    assert!(offset_of!(AsmCtx, fmget) == CTX_FMGET as usize);
-    assert!(offset_of!(AsmCtx, ftile_flag) == CTX_FTILE as usize);
-    assert!(offset_of!(AsmCtx, ftile_flag_lanes) == CTX_FTILE_LANES as usize);
+    macro_rules! layout {
+        ($l:ty) => {
+            assert!(offset_of!(AsmCtx<$l>, div) == CTX_DIV as usize);
+            assert!(offset_of!(AsmCtx<$l>, rem) == CTX_REM as usize);
+            assert!(offset_of!(AsmCtx<$l>, sin) == CTX_SIN as usize);
+            assert!(offset_of!(AsmCtx<$l>, mget) == CTX_MGET as usize);
+            assert!(offset_of!(AsmCtx<$l>, tile_flag) == CTX_TILE as usize);
+            assert!(offset_of!(AsmCtx<$l>, tile_flag_lanes) == CTX_TILE_LANES as usize);
+            assert!(offset_of!(AsmCtx<$l>, env) == CTX_ENV as usize);
+        };
+    }
+    layout!(Pico8Num);
+    layout!(LuaF64);
 };
 const SAVE_BYTES: u32 = 32 * 64; // the save area: a slot per zmm
 const ARGBUF_BYTES: u32 = 8 * 64; // up to 6 SIMD args + a result buffer
 
-/// A call-out op (a `call` through `AsmCtx`).
+/// A call-out op (a `call` through the arithmetic's `AsmCtx`).
 #[derive(Clone, Copy)]
 enum CallOp {
+    /// 16.16's only: the doubles divide inline.
     Div,
     Rem,
     Sin,
     Mget,
-    /// Uniform box: `scalars = [w, h, flag]`.
+    /// Uniform box: `scalars = [w, h, flag]`, whole numbers.
     TileFlag,
     /// Per-lane box: `args = [x, y, w, h]`, `scalars = [flag]`.
     TileFlagLanes,
-    /// The doubles' (8 `f64` lanes): the tools' `sin`, `LuaF64::lua_sin`.
-    FSin,
-    FMget,
-    /// Uniform box: `scalars = [w, h, flag]` as integers.
-    FTileFlag,
-    /// Per-lane box: `args = [x, y, w, h]`, `scalars = [flag]`.
-    FTileFlagLanes,
 }
 
 const FLR_MASK: i32 = 0xffff_0000u32 as i32;
 
 type Vreg = u32;
 
-/// A numeric (ZN) node value: a live register or a broadcast constant.
-#[derive(Clone, Copy, PartialEq)]
+/// A numeric node value: a live register or a broadcast constant.
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum NumVal {
     Reg(Vreg),
     ConstI32(i32),
@@ -117,7 +109,7 @@ enum Src {
     BQ(u64),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ROp {
     AddD,
     SubD,
@@ -172,7 +164,7 @@ enum Key {
     Load(u32),
     LoadMask(u32),
     BcastD(i32),
-    RBin(u8, Vreg, SrcKey),
+    RBin(ROp, Vreg, SrcKey),
     Neg(Vreg),
     Abs(Vreg),
     Muldq(Vreg, Vreg),
@@ -251,14 +243,19 @@ fn input_bytes(ty: Ty) -> u32 {
 }
 
 /// The assembly text plus the buffer layouts a caller packs.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Compiled {
     pub asm: String,
+    /// The text's digest, its `#@k` provenance comments aside (the same with
+    /// `--metrics` or without), kept once the text is dropped: what the
+    /// `[asm build]` line fingerprints a kernel set by.
+    pub text_digest: u64,
     /// Input cells, in ascending order (layout: by type, `input_bytes`).
     pub input_cells: Vec<u32>,
     /// Byte offset of each input cell (parallel to `input_cells`).
     pub input_offsets: Vec<u32>,
     /// Each input cell's type (the graph's `cell_kind`).
-    pub input_reprs: Vec<Ty>,
+    pub input_types: Vec<Ty>,
     pub input_bytes: u32,
     pub n_roots: usize,
     /// Root byte offsets: bools first (4 B: `val` u16, `known` at +2), then
@@ -274,6 +271,8 @@ pub struct Compiled {
     pub frame_bytes: u32,
     /// `bench-frame --metrics` only: per SSA instruction `k`, the graph node it
     /// was lowered from and its kind (the text marks its lines with `#@k`).
+    /// Read by the census at the build only.
+    #[serde(skip)]
     pub prov: Vec<(NodeId, &'static str)>,
     /// The doubles' kernels: the body computes 8 lanes and runs TWICE per call,
     /// lanes 8..16 reading and writing past lanes 0..8 (the buffers are twice
@@ -281,25 +280,81 @@ pub struct Compiled {
     pub halves: bool,
 }
 
+/// What the shared lowering (`Lower::lower_common`) asks of an
+/// arithmetic's lanes: a literal's value and the masks' width.
+trait LaneArith: GraphArith {
+    const LANES: Lanes;
+    fn konst(lit: Self::Lit) -> NumVal;
+}
+
+impl LaneArith for Fixed {
+    const LANES: Lanes = Lanes::L16;
+    fn konst(lit: i32) -> NumVal {
+        NumVal::ConstI32(lit)
+    }
+}
+
+impl LaneArith for Float {
+    const LANES: Lanes = Lanes::L8;
+    fn konst(lit: u64) -> NumVal {
+        NumVal::ConstQ(lit)
+    }
+}
+
+/// A mask's lanes: 16 of 32 bits (16.16) or 8 of 64 (the doubles' half).
+#[derive(Clone, Copy)]
+enum Lanes {
+    L16,
+    L8,
+}
+
+impl Lanes {
+    /// `k1` to a vector mask of these lanes.
+    fn expand(self) -> &'static str {
+        match self {
+            Lanes::L16 => "vpmovm2d",
+            Lanes::L8 => "vpmovm2q",
+        }
+    }
+}
+
+/// A broadcast constant's lane word: 32 bits (16.16, a vector mask) or 64
+/// (a double's bits).
+#[derive(Clone, Copy)]
+enum Word {
+    D(i32),
+    Q(u64),
+}
+
+impl Word {
+    /// Its broadcast mnemonic, and the `{1toN}` of a memory operand.
+    fn bcast(self) -> (&'static str, &'static str) {
+        match self {
+            Word::D(_) => ("vpbroadcastd", "1to16"),
+            Word::Q(_) => ("vpbroadcastq", "1to8"),
+        }
+    }
+}
+
+/// The text's constants, a `.rodata` pool per word size.
 #[derive(Default)]
 struct Pool {
     d: Vec<i32>,
     q: Vec<u64>,
 }
 impl Pool {
-    fn d(&mut self, v: i32) -> String {
-        let i = self.d.iter().position(|x| *x == v).unwrap_or_else(|| {
-            self.d.push(v);
-            self.d.len() - 1
-        });
-        format!(".LCd{i}")
-    }
-    fn q(&mut self, v: u64) -> String {
-        let i = self.q.iter().position(|x| *x == v).unwrap_or_else(|| {
-            self.q.push(v);
-            self.q.len() - 1
-        });
-        format!(".LCq{i}")
+    /// `w`'s label, pooled on first use.
+    fn label(&mut self, w: Word) -> String {
+        fn at<T: PartialEq>(pool: &mut Vec<T>, v: T) -> usize {
+            pool.iter().position(|x| *x == v).unwrap_or_else(|| {
+                pool.push(v);
+                pool.len() - 1
+            })
+        }
+        match w {
+            Word::D(v) => format!(".LCd{}", at(&mut self.d, v)),
+            Word::Q(v) => format!(".LCq{}", at(&mut self.q, v)),
+        }
     }
 }
 
@@ -315,7 +370,7 @@ struct Lower<'a, A: GraphArith> {
     memo: HashMap<Key, Vreg>,
 }
 
-impl<A: GraphArith> Lower<'_, A> {
+impl<A: LaneArith> Lower<'_, A> {
     fn fresh(&mut self) -> Vreg {
         let v = self.next_vreg;
         self.next_vreg += 1;
@@ -362,28 +417,22 @@ impl<A: GraphArith> Lower<'_, A> {
 
     /// A memoized 32-bit-lane binary op (`And/Or/Xor` operands canonical).
     fn dbin(&mut self, op: ROp, a: Vreg, b: Vreg) -> Vreg {
-        let tag = match op {
-            ROp::AddD => 0u8,
-            ROp::SubD => 1,
-            ROp::MinSD => 2,
-            ROp::MaxSD => 3,
-            ROp::AndD => 4,
-            ROp::OrD => 5,
-            ROp::XorD => 6,
-            ROp::AndnD => 7,
-        };
         let (a, b) = if matches!(op, ROp::AndD | ROp::OrD | ROp::XorD) && b < a {
             (b, a)
         } else {
             (a, b)
         };
-        let key = Key::RBin(tag, a, SrcKey::Reg(b));
+        let key = Key::RBin(op, a, SrcKey::Reg(b));
         self.pure(key, move |d| Inst::RBin { dst: d, op, a, b: Src::Reg(b) })
     }
 
+    /// A 32-bit-lane binary op with a broadcast CONSTANT second operand.
+    fn dbin_c(&mut self, op: ROp, a: Vreg, c: i32) -> Vreg {
+        self.pure(Key::RBin(op, a, SrcKey::I32(c)), move |d| Inst::RBin { dst: d, op, a, b: Src::BI32(c) })
+    }
+
     fn not_mask(&mut self, a: Vreg) -> Vreg {
-        let key = Key::RBin(6, a, SrcKey::I32(-1));
-        self.pure(key, move |d| Inst::RBin { dst: d, op: ROp::XorD, a, b: Src::BI32(-1) })
+        self.dbin_c(ROp::XorD, a, -1)
     }
 
     fn ternlog(&mut self, a: Vreg, b: Vreg, c: Vreg, imm: u8) -> Vreg {
@@ -486,64 +535,27 @@ impl<A: GraphArith> Lower<'_, A> {
         match self.vals[id as usize] {
             Some(Value::Num(n)) => Ok(n),
             _ => bail!(
-                "node {} (op {:?}, {:?}; args {}) is not a numeric value where one was needed; interval source: {}",
-                id,
-                self.g.get(id).op,
-                self.g.ty(id),
-                self.g
-                    .get(id)
-                    .args
-                    .iter()
-                    .map(|&a| format!("{a}={:?}/{:?}", self.g.get(a).op, self.g.ty(a)))
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                "node {} is not a numeric value where one was needed; interval source: {}",
+                crate::transpile::why::Explain::of(self.g).with_args(id),
                 self.interval_source(id)
             ),
         }
     }
 
-    /// `id`'s subtree to `depth`, with domains (for errors).
-    fn describe(&self, id: NodeId, depth: usize) -> String {
-        let node = self.g.get(id);
-        let known = match self.vals[id as usize] {
-            Some(Value::Bool([_, MaskVal::Const(true)])) => "K",
-            Some(Value::Bool(_)) => "?",
-            _ => "",
-        };
-        if depth == 0 || node.args.is_empty() {
-            return format!("{id}={:?}/{:?}{known}", node.op, self.g.ty(id));
-        }
-        format!(
-            "{id}={:?}/{:?}{known}({})",
-            node.op,
-            self.g.ty(id),
-            node.args.iter().map(|&a| self.describe(a, depth - 1)).collect::<Vec<_>>().join(", ")
-        )
-    }
-
-    /// The chain of interval operands that made `id` an interval.
+    /// The chain of interval operands that made `id` an interval (a select's
+    /// arm; where no arm is, its condition).
     fn interval_source(&self, id: NodeId) -> String {
-        let mut out = Vec::new();
-        let mut cur = id;
-        for _ in 0..64 {
-            let node = self.g.get(cur);
-            out.push(format!("{cur}={:?}", node.op));
-            let next = match node.op {
-                Op::Sel => {
-                    let arm = node.args[1..].iter().copied().find(|&x| self.wide(x));
-                    if arm.is_none() {
-                        out.push(format!("<- condition {}", self.describe(node.args[0], 5)));
-                    }
-                    arm
-                }
-                _ => node.args.iter().copied().find(|&x| self.wide(x)),
-            };
-            match next {
-                Some(x) => cur = x,
-                None => break,
-            }
+        let why = crate::transpile::why::Explain::of(self.g);
+        let chain = why.chain(id, 64, |n| {
+            let node = self.g.get(n);
+            let from = if node.op == Op::Sel { 1 } else { 0 };
+            node.args[from..].iter().copied().find(|&x| self.wide(x))
+        });
+        let last = self.g.get(chain[chain.len() - 1]);
+        match last.op {
+            Op::Sel if chain.len() <= 64 => format!("{} <- condition {}", why.show_chain(&chain), why.tree(last.args[0], 5)),
+            _ => why.show_chain(&chain),
         }
-        out.join(" <- ")
     }
 
     fn as_bool(&self, id: NodeId) -> Result<[MaskVal; 2]> {
@@ -556,7 +568,7 @@ impl<A: GraphArith> Lower<'_, A> {
     fn as_ival(&self, id: NodeId) -> Result<[NumVal; 2]> {
         match self.vals[id as usize] {
             Some(Value::Ival(i)) => Ok(i),
-            // A number is the degenerate interval [x, x] (zi_of_zn).
+            // A number is the degenerate interval [x, x].
             Some(Value::Num(n)) => Ok([n, n]),
             _ => bail!("node {} is not an interval where one was needed", id),
         }
@@ -567,15 +579,104 @@ impl<A: GraphArith> Lower<'_, A> {
         self.g.ty(id) == Ty::Ival
     }
 
+    /// Store root value `v` at byte `off` of the output buffer (`halves`:
+    /// a boolean's masks are 8-bit, `Compiled::halves`).
+    fn store(&mut self, v: Value, off: u32, halves: bool) {
+        match v {
+            Value::Num(n) => {
+                let src = self.num_src(n);
+                self.insts.push(Inst::Store { off, src });
+            }
+            Value::Ival(iv) => {
+                for (half, nv) in iv.iter().enumerate() {
+                    let src = self.num_src(*nv);
+                    self.insts.push(Inst::Store { off: off + half as u32 * 64, src });
+                }
+            }
+            Value::Bool(b) => {
+                let (val, known) = (self.mask_reg(b[0]), self.mask_reg(b[1]));
+                if halves {
+                    self.insts.push(Inst::StoreMask8 { off, src: val });
+                    self.insts.push(Inst::StoreMask8 { off: off + 2, src: known });
+                } else {
+                    self.insts.push(Inst::StoreMask { off, src: val });
+                    self.insts.push(Inst::StoreMask { off: off + 2, src: known });
+                }
+            }
+        }
+    }
+
+    /// The lane mask at input byte `off` as a vector mask (`A::LANES` wide).
+    fn load_mask(&mut self, off: u32) -> Vreg {
+        match A::LANES {
+            Lanes::L16 => self.pure(Key::LoadMask(off), move |d| Inst::LoadMask { dst: d, off }),
+            Lanes::L8 => self.pure(Key::LoadMask8(off), move |d| Inst::LoadMask8 { dst: d, off }),
+        }
+    }
+
     /// The ops every arithmetic lowers alike (the boolean layer, selects,
     /// interval ends, pass-throughs); `None` for the arithmetic's own.
     fn lower_common(&mut self, id: NodeId) -> Result<Option<Value>> {
         let node = self.g.get(id);
         let a = node.args.clone();
         Ok(Some(match &node.op {
+            Op::Const(lo, hi) if lo == hi => Value::Num(A::konst(*lo)),
+            Op::Const(lo, hi) => Value::Ival([A::konst(*lo), A::konst(*hi)]),
+            Op::Cell(c) => {
+                let off = *self.cell_off.get(c).expect("input cell offset assigned before lowering");
+                let load = |l: &mut Self, off: u32| l.pure(Key::Load(off), move |d| Inst::Load { dst: d, off });
+                match self.g.cell_kind(*c) {
+                    Ty::Num => Value::Num(NumVal::Reg(load(self, off))),
+                    Ty::Bool => Value::Bool([MaskVal::Reg(self.load_mask(off)), MaskVal::Const(true)]),
+                    Ty::UBool => {
+                        let val = self.load_mask(off);
+                        Value::Bool([MaskVal::Reg(val), MaskVal::Reg(self.load_mask(off + 2))])
+                    }
+                    // Two number planes: lo at +0, hi at +64.
+                    Ty::Ival => {
+                        let lo = load(self, off);
+                        Value::Ival([NumVal::Reg(lo), NumVal::Reg(load(self, off + 64))])
+                    }
+                }
+            }
+            // Equality of two booleans: `val = ~(pv ^ qv)`, `known = pk & qk`.
+            Op::Eq if self.g.ty(a[0]).is_bool() => {
+                let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
+                let x = self.m_xor(p[0], q[0]);
+                let val = self.m_not(x);
+                let known = self.m_and(p[1], q[1]);
+                Value::Bool([val, known])
+            }
+            // A boolean is decided where its known plane is.
+            Op::Known if self.g.ty(a[0]).is_bool() => Value::Bool([self.as_bool(a[0])?[1], MaskVal::Const(true)]),
             Op::ConstBool(b) => Value::Bool([MaskVal::Const(*b), MaskVal::Const(true)]),
             // Undecided in every lane: the known plane is all zeros.
             Op::UnknownBool(_) => Value::Bool([MaskVal::Const(false), MaskVal::Const(false)]),
+            // The map: call-outs on whole-number coordinates (`callout`).
+            Op::Mget => {
+                let (x, y) = (self.as_num(a[0])?, self.as_num(a[1])?);
+                let args = vec![self.num_reg(x), self.num_reg(y)];
+                let dst = self.fresh();
+                self.insts.push(Inst::Call { op: CallOp::Mget, dst, args, scalars: Vec::new() });
+                Value::Num(NumVal::Reg(dst))
+            }
+            // A box of literals is one call with the box as whole numbers;
+            // a per-lane box the scan.
+            Op::TileFlagAt => {
+                let (nx, ny) = (self.as_num(a[0])?, self.as_num(a[1])?);
+                let (x, y) = (self.num_reg(nx), self.num_reg(ny));
+                let (wv, hv, fv) = (self.as_num(a[2])?, self.as_num(a[3])?, self.as_num(a[4])?);
+                let flag = literal_i16(id, fv, "flag")?;
+                let dst = self.fresh();
+                if matches!(wv, NumVal::Reg(_)) || matches!(hv, NumVal::Reg(_)) {
+                    let (wr, hr) = (self.num_reg(wv), self.num_reg(hv));
+                    self.insts.push(Inst::Call { op: CallOp::TileFlagLanes, dst, args: vec![x, y, wr, hr], scalars: vec![flag] });
+                } else {
+                    let (w, h) = (literal_i16(id, wv, "width")?, literal_i16(id, hv, "height")?);
+                    self.insts.push(Inst::Call { op: CallOp::TileFlag, dst, args: vec![x, y], scalars: vec![w, h, flag] });
+                }
+                Value::Bool([MaskVal::Reg(dst), MaskVal::Const(true)])
+            }
             // `trace::lower::bind` keeps it out of every root's cone.
             Op::UnknownNum { .. } => bail!("node {}: an unknown number reached the kernel", id),
             Op::Not => {
@@ -652,6 +753,17 @@ impl<A: GraphArith> Lower<'_, A> {
     }
 }
 
+/// A literal lane value as a whole number (`tile_flag_at`'s box and flag:
+/// the call-out takes them so); anything else is refused.
+fn literal_i16(id: NodeId, n: NumVal, what: &str) -> Result<i32> {
+    let v = match n {
+        NumVal::ConstI32(raw) => celeste_core::pico8_num::Pico8Num::from_raw(raw).as_i16(),
+        NumVal::ConstQ(bits) => celeste_core::lua_f64::LuaF64::new(f64::from_bits(bits)).and_then(celeste_core::lua_f64::LuaF64::as_i16),
+        NumVal::Reg(_) => bail!("node {id}: tile_flag's {what} must be an exact constant"),
+    };
+    v.map(i32::from).ok_or_else(|| anyhow::anyhow!("node {id}: tile_flag's {what} {n:?} is not a whole number"))
+}
+
 impl Lower<'_, Fixed> {
     fn muldq(&mut self, a: Vreg, b: Vreg) -> Vreg {
         // vpmuldq is commutative in its two source lanes.
@@ -685,8 +797,8 @@ impl Lower<'_, Fixed> {
 
     /// `s` if `id` is the literal `2^(16+s)`, `0 <= s <= 14` (`div_pow2`'s).
     fn pow2_divisor(&self, id: NodeId) -> Option<u8> {
-        match self.g.get(id).op {
-            Op::Const(lo, hi) if lo == hi && lo > 0 && (lo as u32).is_power_of_two() => {
+        match self.g.point(id).map(Fixed::lit) {
+            Some(lo) if lo > 0 && (lo as u32).is_power_of_two() => {
                 let m = (lo as u32).trailing_zeros();
                 (16..=30).contains(&m).then(|| (m - 16) as u8)
             }
@@ -698,10 +810,7 @@ impl Lower<'_, Fixed> {
     /// PICO-8's `%` is `rem_euclid` on the raw bits, which for a positive power
     /// of two is the low bits, negatives included.
     fn pow2_modulus_mask(&self, id: NodeId) -> Option<i32> {
-        match self.g.get(id).op {
-            Op::Const(lo, hi) if lo == hi && lo > 0 && (lo as u32).is_power_of_two() => Some(lo - 1),
-            _ => None,
-        }
+        self.g.point(id).map(Fixed::lit).filter(|&lo| lo > 0 && (lo as u32).is_power_of_two()).map(|lo| lo - 1)
     }
 
     fn blend_imm(&mut self, mask: u16, a: Vreg, b: Vreg) -> Vreg {
@@ -724,34 +833,13 @@ impl Lower<'_, Fixed> {
         self.pure(Key::Cmp(imm, a, b.key()), move |d| Inst::Cmp { dst: d, imm, a, b })
     }
 
-    // The interval layer: a ZI is two i32 planes.
-
-    /// A 32-bit-lane binary op with a broadcast CONSTANT second operand.
-    fn dbin_c(&mut self, op: ROp, a: Vreg, c: i32) -> Vreg {
-        let tag = match op {
-            ROp::AddD => 0u8,
-            ROp::SubD => 1,
-            ROp::MinSD => 2,
-            ROp::MaxSD => 3,
-            ROp::AndD => 4,
-            ROp::OrD => 5,
-            ROp::XorD => 6,
-            ROp::AndnD => 7,
-        };
-        self.pure(Key::RBin(tag, a, SrcKey::I32(c)), move |d| Inst::RBin {
-            dst: d,
-            op,
-            a,
-            b: Src::BI32(c),
-        })
-    }
     fn neg(&mut self, a: Vreg) -> Vreg {
         self.pure(Key::Neg(a), move |d| Inst::Neg { dst: d, a })
     }
     fn absd(&mut self, a: Vreg) -> Vreg {
         self.pure(Key::Abs(a), move |d| Inst::Abs { dst: d, a })
     }
-    /// `zn_flr`: `x & 0xffff_0000`.
+    /// `flr`: `x & 0xffff_0000`.
     fn flr(&mut self, a: Vreg) -> Vreg {
         self.dbin_c(ROp::AndD, a, FLR_MASK)
     }
@@ -760,6 +848,8 @@ impl Lower<'_, Fixed> {
     fn mask_eq(&mut self, a: Vreg, b: Vreg) -> Vreg {
         self.cmp(0, a, Src::Reg(b))
     }
+
+    // The interval layer: an interval is two i32 planes.
 
     /// Interval `+`. An overflowing endpoint WRAPS to garbage: the op's own
     /// error (`Op::NoWrap`).
@@ -886,17 +976,8 @@ impl Lower<'_, Fixed> {
 
     /// `id`'s raw value if a positive constant (the only monotone scale/divisor).
     fn pos_const_scalar(&self, id: NodeId) -> Option<i32> {
-        match self.g.get(id).op {
-            Op::Const(lo, hi) if lo == hi && lo > 0 => Some(lo),
-            _ => None,
-        }
+        self.g.point(id).map(Fixed::lit).filter(|&lo| lo > 0)
     }
-
-
-
-
-
-
 
     fn lower_node(&mut self, id: NodeId) -> Result<()> {
         if let Some(v) = self.lower_common(id)? {
@@ -906,45 +987,6 @@ impl Lower<'_, Fixed> {
         let node = self.g.get(id);
         let a = node.args.clone();
         let val = match &node.op {
-            Op::Const(lo, hi) => {
-                if lo == hi {
-                    Value::Num(NumVal::ConstI32(*lo))
-                } else {
-                    Value::Ival([NumVal::ConstI32(*lo), NumVal::ConstI32(*hi)])
-                }
-            }
-            Op::Cell(c) => {
-                let off = *self
-                    .cell_off
-                    .get(c)
-                    .expect("input cell offset assigned before lowering");
-                match self.g.cell_kind(*c) {
-                    Ty::Num => {
-                        let dst =
-                            self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off });
-                        Value::Num(NumVal::Reg(dst))
-                    }
-                    Ty::Bool => {
-                        let dst =
-                            self.pure(Key::LoadMask(off), move |d| Inst::LoadMask { dst: d, off });
-                        Value::Bool([MaskVal::Reg(dst), MaskVal::Const(true)])
-                    }
-                    Ty::UBool => {
-                        let known_off = off + 2;
-                        let val = self.pure(Key::LoadMask(off), move |d| Inst::LoadMask { dst: d, off });
-                        let known = self.pure(Key::LoadMask(known_off), move |d| Inst::LoadMask { dst: d, off: known_off });
-                        Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
-                    }
-                    Ty::Ival => {
-                        // Two ZN planes: lo at +0, hi at +64.
-                        let hi_off = off + 64;
-                        let lo_r = self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off });
-                        let hi_r =
-                            self.pure(Key::Load(hi_off), move |d| Inst::Load { dst: d, off: hi_off });
-                        Value::Ival([NumVal::Reg(lo_r), NumVal::Reg(hi_r)])
-                    }
-                }
-            }
             op @ (Op::Add | Op::Sub | Op::Min | Op::Max) => {
                 if self.wide(a[0]) || self.wide(a[1]) {
                     let (ia, ib) = (self.as_ival(a[0])?, self.as_ival(a[1])?);
@@ -959,11 +1001,11 @@ impl Lower<'_, Fixed> {
                     return Ok(());
                 }
                 let (x, y) = (self.as_num(a[0])?, self.as_num(a[1])?);
-                let (rop, tag) = match op {
-                    Op::Add => (ROp::AddD, 0u8),
-                    Op::Sub => (ROp::SubD, 1),
-                    Op::Min => (ROp::MinSD, 2),
-                    Op::Max => (ROp::MaxSD, 3),
+                let rop = match op {
+                    Op::Add => ROp::AddD,
+                    Op::Sub => ROp::SubD,
+                    Op::Min => ROp::MinSD,
+                    Op::Max => ROp::MaxSD,
                     _ => unreachable!(),
                 };
                 let commutes = matches!(op, Op::Add | Op::Min | Op::Max);
@@ -974,7 +1016,7 @@ impl Lower<'_, Fixed> {
                     }
                     _ => (self.num_reg(x), self.num_src(y)),
                 };
-                let key = Key::RBin(tag, areg, bsrc.key());
+                let key = Key::RBin(rop, areg, bsrc.key());
                 let dst = self.pure(key, move |d| Inst::RBin { dst: d, op: rop, a: areg, b: bsrc });
                 Value::Num(NumVal::Reg(dst))
             }
@@ -1075,7 +1117,7 @@ impl Lower<'_, Fixed> {
             }
             op @ (Op::Lt | Op::Le | Op::Gt | Op::Ge) => {
                 if self.wide(a[0]) || self.wide(a[1]) {
-                    // Interval comparison -> tri-state ZB (zi_cmp).
+                    // Interval comparison -> a tri-state boolean (zi_cmp).
                     let kind = match op {
                         Op::Lt => 0u8,
                         Op::Le => 1,
@@ -1119,14 +1161,6 @@ impl Lower<'_, Fixed> {
                         let known = self.dbin(ROp::OrD, both, disjoint);
                         Value::Bool([MaskVal::Reg(val), MaskVal::Reg(known)])
                     }
-                    Ty::Bool | Ty::UBool => {
-                        let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
-                        // val = ~(pv ^ qv), known = pk & qk
-                        let x = self.m_xor(p[0], q[0]);
-                        let val = self.m_not(x);
-                        let known = self.m_and(p[1], q[1]);
-                        Value::Bool([val, known])
-                    }
                     _ => {
                         let x = self.as_num(a[0])?;
                         let y = self.as_num(a[1])?;
@@ -1154,10 +1188,7 @@ impl Lower<'_, Fixed> {
                     }
                 }
                 match self.g.ty(inner) {
-                    Ty::Bool | Ty::UBool => {
-                        let b = self.as_bool(inner)?;
-                        Value::Bool([b[1], MaskVal::Const(true)])
-                    }
+                    Ty::Bool | Ty::UBool => unreachable!("a boolean's `Known` is `lower_common`'s"),
                     Ty::Ival => {
                         // A number is decided iff lo == hi.
                         let iv = self.as_ival(inner)?;
@@ -1217,7 +1248,7 @@ impl Lower<'_, Fixed> {
                         "node {}: NoWrap of {:?} with no literal operand (`{}`) is not modelled: no kernel computes whether it overflows",
                         id,
                         op,
-                        self.describe(x, 2)
+                        crate::transpile::why::Explain::of(self.g).tree(x, 2)
                     ),
                 };
                 Value::Bool([ok, MaskVal::Const(true)])
@@ -1234,12 +1265,11 @@ impl Lower<'_, Fixed> {
                 let xr = self.num_reg(x);
                 Value::Num(NumVal::Reg(self.dbin_c(ROp::AndD, xr, m)))
             }
-            Op::Div | Op::Rem | Op::Sin | Op::Mget => {
+            Op::Div | Op::Rem | Op::Sin => {
                 let (op, n_args) = match &node.op {
                     Op::Div => (CallOp::Div, 2),
                     Op::Rem => (CallOp::Rem, 2),
-                    Op::Sin => (CallOp::Sin, 1),
-                    _ => (CallOp::Mget, 2),
+                    _ => (CallOp::Sin, 1),
                 };
                 let mut args = Vec::with_capacity(n_args);
                 for k in 0..n_args {
@@ -1249,39 +1279,6 @@ impl Lower<'_, Fixed> {
                 let dst = self.fresh();
                 self.insts.push(Inst::Call { op, dst, args, scalars: Vec::new() });
                 Value::Num(NumVal::Reg(dst))
-            }
-            Op::TileFlagAt => {
-                let nx = self.as_num(a[0])?;
-                let x = self.num_reg(nx);
-                let ny = self.as_num(a[1])?;
-                let y = self.num_reg(ny);
-                let (wv, hv, fv) = (self.as_num(a[2])?, self.as_num(a[3])?, self.as_num(a[4])?);
-                let flag = match fv {
-                    NumVal::ConstI32(c) => c,
-                    _ => bail!("node {}: tile_flag flag must be an exact constant", id),
-                };
-                let dst = self.fresh();
-                match (wv, hv) {
-                    (NumVal::ConstI32(w), NumVal::ConstI32(h)) => {
-                        self.insts.push(Inst::Call {
-                            op: CallOp::TileFlag,
-                            dst,
-                            args: vec![x, y],
-                            scalars: vec![w, h, flag],
-                        });
-                    }
-                    _ => {
-                        let wr = self.num_reg(wv);
-                        let hr = self.num_reg(hv);
-                        self.insts.push(Inst::Call {
-                            op: CallOp::TileFlagLanes,
-                            dst,
-                            args: vec![x, y, wr, hr],
-                            scalars: vec![flag],
-                        });
-                    }
-                }
-                Value::Bool([MaskVal::Reg(dst), MaskVal::Const(true)])
             }
             other => bail!("node {}: op {:?} is not supported by the asm slice", id, other),
         };
@@ -1710,6 +1707,8 @@ struct Emitter<'a> {
     last_neg: Option<usize>,
     /// rsp offset of the call-out argument/result buffers.
     argbuf_off: u32,
+    /// The arithmetic's mask width (a tile test's result).
+    lanes: Lanes,
     pool: Pool,
     out: String,
 }
@@ -1742,37 +1741,38 @@ impl<'a> Emitter<'a> {
             Inst::Load { off, .. } => {
                 writeln!(self.out, "    vmovdqu64 {}(%r13), %zmm{}", off, dst).unwrap();
             }
-            &Inst::BcastD { val, .. } => self.constant(val, dst),
-            &Inst::BcastQ { val, .. } => self.constant_q(val, dst),
+            &Inst::BcastD { val, .. } => self.constant(Word::D(val), dst),
+            &Inst::BcastQ { val, .. } => self.constant(Word::Q(val), dst),
             other => {
                 unreachable!("non-rematerializable def marked remat: {:?}", std::mem::discriminant(other))
             }
         }
     }
 
-    /// The constant `val` in every lane of `dst`: zero by the zeroing idiom
+    /// The constant `w` in every lane of `dst`: zero by the zeroing idiom
     /// (no memory, no dependency), anything else broadcast from the pool (a
     /// load, like the reload it replaces; `vpternlogd $0xff` for all-ones
     /// would take a logic port, the kernels' busiest, and depends on `dst`).
-    fn constant(&mut self, val: i32, dst: u8) {
-        match val {
-            0 => writeln!(self.out, "    vpxord %zmm{dst}, %zmm{dst}, %zmm{dst}").unwrap(),
+    fn constant(&mut self, w: Word, dst: u8) {
+        match w {
+            Word::D(0) | Word::Q(0) => writeln!(self.out, "    vpxord %zmm{dst}, %zmm{dst}, %zmm{dst}").unwrap(),
             _ => {
-                let l = self.pool.d(val);
-                writeln!(self.out, "    vpbroadcastd {l}(%rip), %zmm{dst}").unwrap();
+                self.broadcast(w, dst);
             }
         }
     }
 
-    /// The 64-bit constant `val` in every lane of `dst` (`constant`'s twin).
-    fn constant_q(&mut self, val: u64, dst: u8) {
-        match val {
-            0 => writeln!(self.out, "    vpxord %zmm{dst}, %zmm{dst}, %zmm{dst}").unwrap(),
-            _ => {
-                let l = self.pool.q(val);
-                writeln!(self.out, "    vpbroadcastq {l}(%rip), %zmm{dst}").unwrap();
-            }
-        }
+    /// `w` broadcast from the pool into every lane of `dst`; returns `dst`.
+    fn broadcast(&mut self, w: Word, dst: u8) -> u8 {
+        let l = self.pool.label(w);
+        writeln!(self.out, "    {} {l}(%rip), %zmm{dst}", w.bcast().0).unwrap();
+        dst
+    }
+
+    /// `w` as a broadcast memory operand (`{1toN}`).
+    fn broadcast_operand(&mut self, w: Word) -> String {
+        let l = self.pool.label(w);
+        format!("{l}(%rip){{{}}}", w.bcast().1)
     }
 
     /// Where a defined vreg is written: its home reg, or `RES` if spilled.
@@ -1800,15 +1800,80 @@ impl<'a> Emitter<'a> {
     fn src_operand(&mut self, s: Src, scratch: u8) -> String {
         match s {
             Src::Reg(v) => format!("%zmm{}", self.use_reg(v, scratch)),
-            Src::BI32(c) => {
-                let l = self.pool.d(c);
-                format!("{l}(%rip){{1to16}}")
-            }
-            Src::BQ(c) => {
-                let l = self.pool.q(c);
-                format!("{l}(%rip){{1to8}}")
-            }
+            Src::BI32(c) => self.broadcast_operand(Word::D(c)),
+            Src::BQ(c) => self.broadcast_operand(Word::Q(c)),
         }
+    }
+
+    /// `dst = a OP b` (AT&T: `mn b, a, dst`; `b` a register or a broadcast
+    /// constant).
+    fn binop(&mut self, mn: &str, dst: Vreg, a: Vreg, b: Src) {
+        let ra = self.use_reg(a, OPA);
+        let bop = self.src_operand(b, OPB);
+        let d = self.def_reg(dst);
+        writeln!(self.out, "    {mn} {bop}, %zmm{ra}, %zmm{d}").unwrap();
+        self.store_def(dst, d);
+    }
+
+    /// `dst = OP a`, with an immediate (`mn $imm, a, dst`) or without.
+    fn unop(&mut self, mn: &str, imm: Option<u8>, dst: Vreg, a: Vreg) {
+        let ra = self.use_reg(a, OPA);
+        let d = self.def_reg(dst);
+        match imm {
+            Some(imm) => writeln!(self.out, "    {mn} ${imm}, %zmm{ra}, %zmm{d}").unwrap(),
+            None => writeln!(self.out, "    {mn} %zmm{ra}, %zmm{d}").unwrap(),
+        }
+        self.store_def(dst, d);
+    }
+
+    /// `dst = a PRED b` as a vector mask (AT&T: `mn $imm, b, a, %k1`, then
+    /// `k1` expanded to the lanes).
+    fn compare(&mut self, mn: &str, lanes: Lanes, imm: u8, dst: Vreg, a: Vreg, b: Src) {
+        let ra = self.use_reg(a, OPA);
+        let bop = self.src_operand(b, OPB);
+        let d = self.def_reg(dst);
+        writeln!(self.out, "    {mn} ${imm}, {bop}, %zmm{ra}, %k1").unwrap();
+        writeln!(self.out, "    {} %k1, %zmm{d}", lanes.expand()).unwrap();
+        self.store_def(dst, d);
+    }
+
+    /// The lane mask at `at` (a memory operand) into `dst` as a vector mask.
+    fn mask_load(&mut self, lanes: Lanes, dst: Vreg, at: &str) {
+        if self.skip_def(dst) {
+            return;
+        }
+        let d = self.def_reg(dst);
+        let (zx, kmov) = match lanes {
+            Lanes::L16 => ("movzwl", "kmovw"),
+            Lanes::L8 => ("movzbl", "kmovb"),
+        };
+        writeln!(self.out, "    {zx} {at}, %eax").unwrap();
+        writeln!(self.out, "    {kmov} %eax, %k1").unwrap();
+        writeln!(self.out, "    {} %k1, %zmm{d}", lanes.expand()).unwrap();
+        self.store_def(dst, d);
+    }
+
+    /// Vector mask `src` as a lane mask at byte `off` of the output buffer.
+    fn mask_store(&mut self, lanes: Lanes, src: Vreg, off: u32) {
+        let rs = self.use_reg(src, OPA);
+        let (to_k, kmov, mov) = match lanes {
+            Lanes::L16 => ("vpmovd2m", "kmovw", "movw %ax"),
+            Lanes::L8 => ("vpmovq2m", "kmovb", "movb %al"),
+        };
+        writeln!(self.out, "    {to_k} %zmm{rs}, %k1").unwrap();
+        writeln!(self.out, "    {kmov} %k1, %eax").unwrap();
+        writeln!(self.out, "    {mov}, {off}(%r14)").unwrap();
+    }
+
+    /// A map call-out's first four C arguments: the collision env, the
+    /// result buffer `resbuf`, the coordinates' argument buffers.
+    fn map_call_args(&mut self, resbuf: u32) {
+        let arg = |i: u32| self.argbuf_off + i * 64;
+        let (x, y) = (arg(0), arg(1));
+        writeln!(self.out, "    movq {}(%r15), %rdi", CTX_ENV).unwrap();
+        writeln!(self.out, "    leaq {}(%rsp), %rsi", resbuf).unwrap();
+        writeln!(self.out, "    leaq {}(%rsp), %rdx", x).unwrap();
+        writeln!(self.out, "    leaq {}(%rsp), %rcx", y).unwrap();
     }
 
     fn emit_inst(&mut self, k: usize, inst: &Inst) {
@@ -1821,27 +1886,15 @@ impl<'a> Emitter<'a> {
                 writeln!(self.out, "    vmovdqu64 {}(%r13), %zmm{}", off, d).unwrap();
                 self.store_def(*dst, d);
             }
-            Inst::LoadMask { dst, off } => {
-                if self.skip_def(*dst) {
-                    return;
-                }
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    movzwl {}(%r13), %eax", off).unwrap();
-                writeln!(self.out, "    kmovw %eax, %k1").unwrap();
-                writeln!(self.out, "    vpmovm2d %k1, %zmm{}", d).unwrap();
-                self.store_def(*dst, d);
-            }
+            Inst::LoadMask { dst, off } => self.mask_load(Lanes::L16, *dst, &format!("{off}(%r13)")),
             Inst::BcastD { dst, val } => {
                 if self.skip_def(*dst) {
                     return;
                 }
                 let d = self.def_reg(*dst);
-                self.constant(*val, d);
+                self.constant(Word::D(*val), d);
             }
             Inst::RBin { dst, op, a, b } => {
-                let ra = self.use_reg(*a, OPA);
-                let bop = self.src_operand(*b, OPB);
-                let d = self.def_reg(*dst);
                 let mn = match op {
                     ROp::AddD => "vpaddd",
                     ROp::SubD => "vpsubd",
@@ -1852,8 +1905,7 @@ impl<'a> Emitter<'a> {
                     ROp::XorD => "vpxord",
                     ROp::AndnD => "vpandnd",
                 };
-                writeln!(self.out, "    {} {}, %zmm{}, %zmm{}", mn, bop, ra, d).unwrap();
-                self.store_def(*dst, d);
+                self.binop(mn, *dst, *a, *b);
             }
             Inst::Neg { dst, a } => {
                 let ra = self.use_reg(*a, OPA);
@@ -1862,12 +1914,7 @@ impl<'a> Emitter<'a> {
                 writeln!(self.out, "    vpsubd %zmm{}, %zmm{}, %zmm{}", ra, ZERO, d).unwrap();
                 self.store_def(*dst, d);
             }
-            Inst::Abs { dst, a } => {
-                let ra = self.use_reg(*a, OPA);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vpabsd %zmm{}, %zmm{}", ra, d).unwrap();
-                self.store_def(*dst, d);
-            }
+            Inst::Abs { dst, a } => self.unop("vpabsd", None, *dst, *a),
             Inst::Muldq { dst, a, b } => {
                 let ra = self.use_reg(*a, OPA);
                 let rb = self.use_reg(*b, OPB);
@@ -1875,24 +1922,9 @@ impl<'a> Emitter<'a> {
                 writeln!(self.out, "    vpmuldq %zmm{}, %zmm{}, %zmm{}", rb, ra, d).unwrap();
                 self.store_def(*dst, d);
             }
-            Inst::Sraq { dst, a, imm } => {
-                let ra = self.use_reg(*a, OPA);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vpsraq ${}, %zmm{}, %zmm{}", imm, ra, d).unwrap();
-                self.store_def(*dst, d);
-            }
-            Inst::Sllq { dst, a, imm } => {
-                let ra = self.use_reg(*a, OPA);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vpsllq ${}, %zmm{}, %zmm{}", imm, ra, d).unwrap();
-                self.store_def(*dst, d);
-            }
-            Inst::ShrD { dst, a, imm, arith } => {
-                let ra = self.use_reg(*a, OPA);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    {} ${}, %zmm{}, %zmm{}", if *arith { "vpsrad" } else { "vpsrld" }, imm, ra, d).unwrap();
-                self.store_def(*dst, d);
-            }
+            Inst::Sraq { dst, a, imm } => self.unop("vpsraq", Some(*imm), *dst, *a),
+            Inst::Sllq { dst, a, imm } => self.unop("vpsllq", Some(*imm), *dst, *a),
+            Inst::ShrD { dst, a, imm, arith } => self.unop(if *arith { "vpsrad" } else { "vpsrld" }, Some(*imm), *dst, *a),
             Inst::BlendImm { dst, mask, a, b } => {
                 let ra = self.use_reg(*a, OPA);
                 let rb = self.use_reg(*b, OPB);
@@ -1903,14 +1935,7 @@ impl<'a> Emitter<'a> {
                 writeln!(self.out, "    vpblendmd %zmm{}, %zmm{}, %zmm{}{{%k1}}", rb, ra, d).unwrap();
                 self.store_def(*dst, d);
             }
-            Inst::Cmp { dst, imm, a, b } => {
-                let ra = self.use_reg(*a, OPA);
-                let bop = self.src_operand(*b, OPB);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vpcmpd ${}, {}, %zmm{}, %k1", imm, bop, ra).unwrap();
-                writeln!(self.out, "    vpmovm2d %k1, %zmm{}", d).unwrap();
-                self.store_def(*dst, d);
-            }
+            Inst::Cmp { dst, imm, a, b } => self.compare("vpcmpd", Lanes::L16, *imm, *dst, *a, *b),
             Inst::Ternlog { dst, a, b, c, imm } => {
                 let ra = self.use_reg(*a, OPA);
                 let rb = self.use_reg(*b, OPB);
@@ -1938,51 +1963,44 @@ impl<'a> Emitter<'a> {
                     writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%rsp)", r, self.save_off + r * 64)
                         .unwrap();
                 }
-                let arg = |i: u32| self.argbuf_off + i * 64;
+                let argbuf = self.argbuf_off;
+                let arg = |i: u32| argbuf + i * 64;
                 // 3. C args; `stack_arg`: tile_flag's pushed 7th scalar.
                 let (ctx_off, stack_arg): (u32, bool) = match op {
-                    CallOp::Div | CallOp::Rem | CallOp::Sin | CallOp::FSin => {
+                    CallOp::Div | CallOp::Rem | CallOp::Sin => {
+                        // The doubles divide inline: their context has no `/`, `%`.
+                        assert!(matches!(self.lanes, Lanes::L16) || matches!(op, CallOp::Sin), "a call-out of `/` or `%` in the doubles' kernel");
                         writeln!(self.out, "    leaq {}(%rsp), %rdi", resbuf).unwrap();
                         writeln!(self.out, "    leaq {}(%rsp), %rsi", arg(0)).unwrap();
-                        if !matches!(op, CallOp::Sin | CallOp::FSin) {
+                        if !matches!(op, CallOp::Sin) {
                             writeln!(self.out, "    leaq {}(%rsp), %rdx", arg(1)).unwrap();
                         }
                         let c = match op {
                             CallOp::Div => CTX_DIV,
                             CallOp::Rem => CTX_REM,
-                            CallOp::FSin => CTX_FSIN,
                             _ => CTX_SIN,
                         };
                         (c, false)
                     }
-                    CallOp::Mget | CallOp::FMget => {
-                        writeln!(self.out, "    movq {}(%r15), %rdi", CTX_ENV).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rsi", resbuf).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rdx", arg(0)).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rcx", arg(1)).unwrap();
-                        (if matches!(op, CallOp::FMget) { CTX_FMGET } else { CTX_MGET }, false)
+                    CallOp::Mget => {
+                        self.map_call_args(resbuf);
+                        (CTX_MGET, false)
                     }
-                    CallOp::TileFlag | CallOp::FTileFlag => {
-                        writeln!(self.out, "    movq {}(%r15), %rdi", CTX_ENV).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rsi", resbuf).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rdx", arg(0)).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rcx", arg(1)).unwrap();
+                    CallOp::TileFlag => {
+                        self.map_call_args(resbuf);
                         writeln!(self.out, "    movl ${}, %r8d", scalars[0]).unwrap();
                         writeln!(self.out, "    movl ${}, %r9d", scalars[1]).unwrap();
                         writeln!(self.out, "    subq $16, %rsp").unwrap();
                         writeln!(self.out, "    movl ${}, (%rsp)", scalars[2]).unwrap();
-                        (if matches!(op, CallOp::FTileFlag) { CTX_FTILE } else { CTX_TILE }, true)
+                        (CTX_TILE, true)
                     }
-                    CallOp::TileFlagLanes | CallOp::FTileFlagLanes => {
-                        writeln!(self.out, "    movq {}(%r15), %rdi", CTX_ENV).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rsi", resbuf).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rdx", arg(0)).unwrap();
-                        writeln!(self.out, "    leaq {}(%rsp), %rcx", arg(1)).unwrap();
+                    CallOp::TileFlagLanes => {
+                        self.map_call_args(resbuf);
                         writeln!(self.out, "    leaq {}(%rsp), %r8", arg(2)).unwrap();
                         writeln!(self.out, "    leaq {}(%rsp), %r9", arg(3)).unwrap();
                         writeln!(self.out, "    subq $16, %rsp").unwrap();
                         writeln!(self.out, "    movl ${}, (%rsp)", scalars[0]).unwrap();
-                        (if matches!(op, CallOp::FTileFlagLanes) { CTX_FTILE_LANES } else { CTX_TILE_LANES }, true)
+                        (CTX_TILE_LANES, true)
                     }
                 };
                 // 4. call through the ctx.
@@ -2000,100 +2018,48 @@ impl<'a> Emitter<'a> {
                 if self.last_neg.is_some_and(|n| n > k) {
                     writeln!(self.out, "    vpxorq %zmm{Z}, %zmm{Z}, %zmm{Z}", Z = ZERO).unwrap();
                 }
-                // 6. read the result into dst.
-                let d = self.def_reg(*dst);
-                if matches!(op, CallOp::TileFlag | CallOp::TileFlagLanes) {
-                    writeln!(self.out, "    movzwl {}(%rsp), %eax", resbuf).unwrap();
-                    writeln!(self.out, "    kmovw %eax, %k1").unwrap();
-                    writeln!(self.out, "    vpmovm2d %k1, %zmm{}", d).unwrap();
-                } else if matches!(op, CallOp::FTileFlag | CallOp::FTileFlagLanes) {
-                    // An 8-lane mask, as 64-bit lanes.
-                    writeln!(self.out, "    movzbl {}(%rsp), %eax", resbuf).unwrap();
-                    writeln!(self.out, "    kmovb %eax, %k1").unwrap();
-                    writeln!(self.out, "    vpmovm2q %k1, %zmm{}", d).unwrap();
-                } else {
-                    writeln!(self.out, "    vmovdqu64 {}(%rsp), %zmm{}", resbuf, d).unwrap();
+                // 6. read the result into dst (a tile test's: a lane mask).
+                let at = format!("{resbuf}(%rsp)");
+                match op {
+                    CallOp::TileFlag | CallOp::TileFlagLanes => self.mask_load(self.lanes, *dst, &at),
+                    _ => {
+                        let d = self.def_reg(*dst);
+                        writeln!(self.out, "    vmovdqu64 {at}, %zmm{d}").unwrap();
+                        self.store_def(*dst, d);
+                    }
                 }
-                self.store_def(*dst, d);
             }
-            Inst::StoreMask { off, src } => {
-                let rs = self.use_reg(*src, OPA);
-                writeln!(self.out, "    vpmovd2m %zmm{}, %k1", rs).unwrap();
-                writeln!(self.out, "    kmovw %k1, %eax").unwrap();
-                writeln!(self.out, "    movw %ax, {}(%r14)", off).unwrap();
-            }
+            Inst::StoreMask { off, src } => self.mask_store(Lanes::L16, *src, *off),
             Inst::Store { off, src } => {
                 let r = match src {
                     Src::Reg(v) => self.use_reg(*v, OPA),
-                    Src::BI32(c) => {
-                        let l = self.pool.d(*c);
-                        writeln!(self.out, "    vpbroadcastd {}(%rip), %zmm{}", l, OPA).unwrap();
-                        OPA
-                    }
-                    Src::BQ(c) => {
-                        let l = self.pool.q(*c);
-                        writeln!(self.out, "    vpbroadcastq {}(%rip), %zmm{}", l, OPA).unwrap();
-                        OPA
-                    }
+                    // Broadcast even where zero (not `constant`'s idiom).
+                    &Src::BI32(c) => self.broadcast(Word::D(c), OPA),
+                    &Src::BQ(c) => self.broadcast(Word::Q(c), OPA),
                 };
                 writeln!(self.out, "    vmovdqu64 %zmm{}, {}(%r14)", r, off).unwrap();
             }
-            Inst::StoreMask8 { off, src } => {
-                let rs = self.use_reg(*src, OPA);
-                writeln!(self.out, "    vpmovq2m %zmm{}, %k1", rs).unwrap();
-                writeln!(self.out, "    kmovb %k1, %eax").unwrap();
-                writeln!(self.out, "    movb %al, {}(%r14)", off).unwrap();
-            }
+            Inst::StoreMask8 { off, src } => self.mask_store(Lanes::L8, *src, *off),
             Inst::BcastQ { dst, val } => {
                 if self.skip_def(*dst) {
                     return;
                 }
                 let d = self.def_reg(*dst);
-                self.constant_q(*val, d);
+                self.constant(Word::Q(*val), d);
             }
-            Inst::LoadMask8 { dst, off } => {
-                if self.skip_def(*dst) {
-                    return;
-                }
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    movzbl {}(%r13), %eax", off).unwrap();
-                writeln!(self.out, "    kmovb %eax, %k1").unwrap();
-                writeln!(self.out, "    vpmovm2q %k1, %zmm{}", d).unwrap();
-                self.store_def(*dst, d);
-            }
+            Inst::LoadMask8 { dst, off } => self.mask_load(Lanes::L8, *dst, &format!("{off}(%r13)")),
             Inst::FBin { dst, op, a, b } => {
-                let ra = self.use_reg(*a, OPA);
-                let bop = self.src_operand(*b, OPB);
-                let d = self.def_reg(*dst);
                 let mn = match op {
                     FOp::Add => "vaddpd",
                     FOp::Sub => "vsubpd",
                     FOp::Mul => "vmulpd",
                     FOp::Div => "vdivpd",
                 };
-                // AT&T: `dst = a op b`.
-                writeln!(self.out, "    {} {}, %zmm{}, %zmm{}", mn, bop, ra, d).unwrap();
-                self.store_def(*dst, d);
+                self.binop(mn, *dst, *a, *b);
             }
-            Inst::FRnd { dst, a, imm } => {
-                let ra = self.use_reg(*a, OPA);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vrndscalepd ${}, %zmm{}, %zmm{}", imm, ra, d).unwrap();
-                self.store_def(*dst, d);
-            }
-            Inst::FCmp { dst, imm, a, b } => {
-                let ra = self.use_reg(*a, OPA);
-                let bop = self.src_operand(*b, OPB);
-                let d = self.def_reg(*dst);
-                // AT&T: `k1 = a pred b`.
-                writeln!(self.out, "    vcmppd ${}, {}, %zmm{}, %k1", imm, bop, ra).unwrap();
-                writeln!(self.out, "    vpmovm2q %k1, %zmm{}", d).unwrap();
-                self.store_def(*dst, d);
-            }
+            Inst::FRnd { dst, a, imm } => self.unop("vrndscalepd", Some(*imm), *dst, *a),
+            Inst::FCmp { dst, imm, a, b } => self.compare("vcmppd", Lanes::L8, *imm, *dst, *a, *b),
             Inst::QBin { dst, op, a, b } => {
-                let ra = self.use_reg(*a, OPA);
-                let bop = self.src_operand(*b, OPB);
-                let d = self.def_reg(*dst);
                 let mn = match op {
                     QOp::Add => "vpaddq",
                     QOp::Sub => "vpsubq",
@@ -2101,17 +2067,9 @@ impl<'a> Emitter<'a> {
                     QOp::Or => "vporq",
                     QOp::Xor => "vpxorq",
                 };
-                writeln!(self.out, "    {} {}, %zmm{}, %zmm{}", mn, bop, ra, d).unwrap();
-                self.store_def(*dst, d);
+                self.binop(mn, *dst, *a, *b);
             }
-            Inst::QCmp { dst, imm, a, b } => {
-                let ra = self.use_reg(*a, OPA);
-                let bop = self.src_operand(*b, OPB);
-                let d = self.def_reg(*dst);
-                writeln!(self.out, "    vpcmpq ${}, {}, %zmm{}, %k1", imm, bop, ra).unwrap();
-                writeln!(self.out, "    vpmovm2q %k1, %zmm{}", d).unwrap();
-                self.store_def(*dst, d);
-            }
+            Inst::QCmp { dst, imm, a, b } => self.compare("vpcmpq", Lanes::L8, *imm, *dst, *a, *b),
         }
     }
 }
@@ -2195,6 +2153,58 @@ fn constant_key(mn: &str, ops: &str, a: &str) -> Option<String> {
     }
 }
 
+/// The input buffer's layout: the input cells `live` reads, ascending,
+/// each one's type and byte offset (by type, `input_bytes`), and the
+/// buffer's size.
+fn input_layout<A: GraphArith>(g: &Graph<A>, live: &[bool]) -> (Vec<u32>, Vec<Ty>, Vec<u32>, u32) {
+    let mut cells: Vec<u32> = (0..g.len() as NodeId)
+        .filter(|id| live[*id as usize])
+        .filter_map(|id| match g.get(id).op {
+            Op::Cell(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    cells.sort_unstable();
+    cells.dedup();
+    let types: Vec<Ty> = cells.iter().map(|c| g.cell_kind(*c)).collect();
+    let mut offsets: Vec<u32> = Vec::with_capacity(cells.len());
+    let mut off = 0u32;
+    for t in &types {
+        offsets.push(off);
+        off += input_bytes(*t);
+    }
+    (cells, types, offsets, off)
+}
+
+/// The output buffer's layout: each root's byte offset, booleans first (4
+/// B), then 64-aligned numbers (64 B) and intervals (128 B); and the
+/// buffer's size.
+fn output_layout(kinds: &[Ty]) -> (Vec<u32>, u32) {
+    let mut offsets: Vec<u32> = vec![0; kinds.len()];
+    let mut next = 0u32;
+    for (ri, k) in kinds.iter().enumerate() {
+        if *k == Ty::Bool {
+            offsets[ri] = next;
+            next += 4;
+        }
+    }
+    next = next.div_ceil(64) * 64;
+    for (ri, k) in kinds.iter().enumerate() {
+        match k {
+            Ty::Num => {
+                offsets[ri] = next;
+                next += 64;
+            }
+            Ty::Ival => {
+                offsets[ri] = next;
+                next += 128;
+            }
+            Ty::Bool | Ty::UBool => {}
+        }
+    }
+    (offsets, next.max(64))
+}
+
 /// 16.16's kernel (`GraphArith::compile_kernel`).
 pub(crate) fn compile_fixed(g: &Graph<Fixed>, roots: &[NodeId], sym: &str, opts: super::AsmOptions) -> Result<Compiled> {
     compile_with(g, roots, sym, opts, false, |lo, id| lo.lower_node(id))
@@ -2216,7 +2226,7 @@ pub fn compile<A: GraphArith>(
 
 /// `compile` with the arithmetic's lowering (`lower`, one node) and lane
 /// layout (`halves`).
-fn compile_with<A: GraphArith>(
+fn compile_with<A: LaneArith>(
     g: &Graph<A>,
     roots: &[NodeId],
     sym: &str,
@@ -2225,27 +2235,8 @@ fn compile_with<A: GraphArith>(
     mut lower: impl FnMut(&mut Lower<'_, A>, NodeId) -> Result<()>,
 ) -> Result<Compiled> {
     let live = g.reachable(roots);
-
-    let mut cells: Vec<u32> = (0..g.len() as NodeId)
-        .filter(|id| live[*id as usize])
-        .filter_map(|id| match g.get(id).op {
-            Op::Cell(c) => Some(c),
-            _ => None,
-        })
-        .collect();
-    cells.sort_unstable();
-    cells.dedup();
-    let input_reprs: Vec<Ty> = cells.iter().map(|c| g.cell_kind(*c)).collect();
-    let mut input_offsets: Vec<u32> = Vec::with_capacity(cells.len());
-    let mut off = 0u32;
-    for r in &input_reprs {
-        input_offsets.push(off);
-        off += input_bytes(*r);
-    }
-    let input_bytes = off;
-    let cell_off: HashMap<u32, u32> =
-        cells.iter().zip(&input_offsets).map(|(c, o)| (*c, *o)).collect();
-
+    let (cells, input_types, input_offsets, input_bytes) = input_layout(g, &live);
+    let cell_off: HashMap<u32, u32> = cells.iter().zip(&input_offsets).map(|(c, o)| (*c, *o)).collect();
     let mut lo = Lower {
         g,
         vals: vec![None; g.len()],
@@ -2270,74 +2261,23 @@ fn compile_with<A: GraphArith>(
     let t_lower = t_lower.elapsed();
 
     // Roots -> a PACKED output buffer, booleans first (not a line each).
-    let kind_of = |v: &Option<Value>| -> Result<Ty> {
-        Ok(match v {
-            Some(Value::Num(_)) => Ty::Num,
-            Some(Value::Ival(_)) => Ty::Ival,
-            Some(Value::Bool(_)) => Ty::Bool,
-            None => bail!("a root was never lowered"),
-        })
-    };
-    let kinds_first: Vec<Ty> = roots.iter().map(|r| kind_of(&lo.vals[*r as usize])).collect::<Result<_>>()?;
-    let mut root_offsets: Vec<u32> = vec![0; roots.len()];
-    let mut next = 0u32;
-    for (ri, k) in kinds_first.iter().enumerate() {
-        if *k == Ty::Bool {
-            root_offsets[ri] = next;
-            next += 4;
-        }
-    }
-    next = next.div_ceil(64) * 64;
-    for (ri, k) in kinds_first.iter().enumerate() {
-        match k {
-            Ty::Num => {
-                root_offsets[ri] = next;
-                next += 64;
-            }
-            Ty::Ival => {
-                root_offsets[ri] = next;
-                next += 128;
-            }
-            Ty::Bool | Ty::UBool => {}
-        }
-    }
-    let out_bytes = next.max(64);
-    let mut root_kinds: Vec<Ty> = Vec::with_capacity(roots.len());
-    for (ri, r) in roots.iter().enumerate() {
-        let base = root_offsets[ri];
-        let kind = match lo.vals[*r as usize] {
-            Some(Value::Num(n)) => {
-                let src = lo.num_src(n);
-                lo.insts.push(Inst::Store { off: base, src });
-                Ty::Num
-            }
-            Some(Value::Ival(iv)) => {
-                for (half, nv) in iv.iter().enumerate() {
-                    let src = lo.num_src(*nv);
-                    lo.insts.push(Inst::Store { off: base + half as u32 * 64, src });
-                }
-                Ty::Ival
-            }
-            Some(Value::Bool(b)) => {
-                let val = lo.mask_reg(b[0]);
-                let known = lo.mask_reg(b[1]);
-                if halves {
-                    lo.insts.push(Inst::StoreMask8 { off: base, src: val });
-                    lo.insts.push(Inst::StoreMask8 { off: base + 2, src: known });
-                } else {
-                    lo.insts.push(Inst::StoreMask { off: base, src: val });
-                    lo.insts.push(Inst::StoreMask { off: base + 2, src: known });
-                }
-                Ty::Bool
-            }
+    let root_kinds: Vec<Ty> = roots
+        .iter()
+        .map(|r| match lo.vals[*r as usize] {
+            Some(Value::Num(_)) => Ok(Ty::Num),
+            Some(Value::Ival(_)) => Ok(Ty::Ival),
+            Some(Value::Bool(_)) => Ok(Ty::Bool),
             None => bail!("root {} was never lowered", r),
-        };
-        root_kinds.push(kind);
+        })
+        .collect::<Result<_>>()?;
+    let (root_offsets, out_bytes) = output_layout(&root_kinds);
+    for (r, &off) in roots.iter().zip(&root_offsets) {
+        let v = lo.vals[*r as usize].expect("every root lowered");
+        lo.store(v, off, halves);
         if mix {
             prov_node.resize(lo.insts.len(), *r);
         }
     }
-
     let t = std::time::Instant::now();
     let (insts, order) = reschedule(std::mem::take(&mut lo.insts), lo.next_vreg);
     lo.insts = insts;
@@ -2383,6 +2323,7 @@ fn compile_with<A: GraphArith>(
         call_saves: &call_saves,
         last_neg,
         argbuf_off,
+        lanes: A::LANES,
         pool: Pool::default(),
         out: String::new(),
     };
@@ -2402,6 +2343,32 @@ fn compile_with<A: GraphArith>(
     // Frame: spill slots, then (with call-outs) the zmm save area and arg buffers.
     let extra = if has_calls { SAVE_BYTES + ARGBUF_BYTES } else { 0 };
     let frame = spill_bytes + extra;
+    let asm = wrap(sym, &body, &em.pool, frame, halves.then_some((input_bytes, out_bytes)), mix);
+    let text_digest = text_digest(&asm);
+    Ok(Compiled {
+        asm,
+        text_digest,
+        input_cells: lo.input_cells,
+        input_offsets,
+        input_types,
+        input_bytes,
+        n_roots: roots.len(),
+        root_offsets,
+        out_bytes,
+        root_kinds,
+        sym: sym.to_string(),
+        spill_slots,
+        frame_bytes: frame,
+        prov,
+        halves,
+    })
+}
+
+/// The kernel's text: `body` inside its prologue and epilogue (the
+/// callee-saved pushes, `frame` bytes of stack, the zero register; with
+/// `halves`, the doubles' loop over the two halves, each buffer's size its
+/// step), then the constant pool.
+fn wrap(sym: &str, body: &str, pool: &Pool, frame: u32, halves: Option<(u32, u32)>, mix: bool) -> String {
     let mut asm = String::new();
     writeln!(asm, ".text").unwrap();
     writeln!(asm, ".globl {sym}").unwrap();
@@ -2409,7 +2376,7 @@ fn compile_with<A: GraphArith>(
     // Three pushes 16-align rsp (entry is 8 mod 16); the frame is a 64-multiple.
     // The halves' loop counter is `%r12`, pushed with `%rbx` (five pushes,
     // aligned too); both are callee-saved, so the call-outs keep them.
-    if halves {
+    if halves.is_some() {
         writeln!(asm, "    push %rbx").unwrap();
         writeln!(asm, "    push %r12").unwrap();
     }
@@ -2423,16 +2390,16 @@ fn compile_with<A: GraphArith>(
         writeln!(asm, "    sub ${}, %rsp", frame).unwrap();
     }
     writeln!(asm, "    vpxorq %zmm{Z}, %zmm{Z}, %zmm{Z}", Z = ZERO).unwrap();
-    if halves {
+    if halves.is_some() {
         // Lanes 0..8, then lanes 8..16 one input and one output buffer on.
         writeln!(asm, "    movl $2, %r12d").unwrap();
         writeln!(asm, ".Lhalf:").unwrap();
     }
-    asm.push_str(&body);
+    asm.push_str(body);
     if mix {
         writeln!(asm, "#@end").unwrap();
     }
-    if halves {
+    if let Some((input_bytes, out_bytes)) = halves {
         writeln!(asm, "    addq ${}, %r13", input_bytes).unwrap();
         writeln!(asm, "    addq ${}, %r14", out_bytes).unwrap();
         writeln!(asm, "    decl %r12d").unwrap();
@@ -2444,7 +2411,7 @@ fn compile_with<A: GraphArith>(
     writeln!(asm, "    pop %r15").unwrap();
     writeln!(asm, "    pop %r14").unwrap();
     writeln!(asm, "    pop %r13").unwrap();
-    if halves {
+    if halves.is_some() {
         writeln!(asm, "    pop %r12").unwrap();
         writeln!(asm, "    pop %rbx").unwrap();
     }
@@ -2453,32 +2420,27 @@ fn compile_with<A: GraphArith>(
 
     writeln!(asm, ".section .rodata").unwrap();
     writeln!(asm, ".align 64").unwrap();
-    for (i, v) in em.pool.d.iter().enumerate() {
+    for (i, v) in pool.d.iter().enumerate() {
         writeln!(asm, ".LCd{i}: .long {}", *v as u32).unwrap();
     }
-    if !em.pool.q.is_empty() {
+    if !pool.q.is_empty() {
         writeln!(asm, ".align 8").unwrap();
-        for (i, v) in em.pool.q.iter().enumerate() {
+        for (i, v) in pool.q.iter().enumerate() {
             writeln!(asm, ".LCq{i}: .quad {:#018x}", v).unwrap();
         }
     }
+    asm
+}
 
-    Ok(Compiled {
-        asm,
-        input_cells: lo.input_cells,
-        input_offsets,
-        input_reprs,
-        input_bytes,
-        n_roots: roots.len(),
-        root_offsets,
-        out_bytes,
-        root_kinds,
-        sym: sym.to_string(),
-        spill_slots,
-        frame_bytes: frame,
-        prov,
-        halves,
-    })
+/// A kernel text's digest, its `#@k` provenance comments aside
+/// (`Compiled::text_digest`).
+fn text_digest(asm: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for line in asm.lines().filter(|l| !l.starts_with("#@")) {
+        line.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// An instruction's kind for `Compiled::prov`: the variant, a binary op's

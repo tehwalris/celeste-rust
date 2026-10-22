@@ -294,8 +294,6 @@ pub fn read_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<
     if d.level.floors_near && !mid {
         materialize_absent_fields(st, d)?;
     }
-    d.platform_cells.clear();
-    d.integral_inputs.clear();
     let mut platforms_read = false;
     for e in d.level.entries() {
         match e.hook {
@@ -427,7 +425,7 @@ fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symboli
         Ok(())
     };
     let mut players = Vec::new();
-    for obj in objects_of_type(st, "player") {
+    for obj in objects_of_type(st, super::game::PLAYER) {
         hitbox(st, d, &obj, PLAYER_HITBOX)?;
         let coord = |f: &str| -> Result<NodeId> {
             let p = field(&obj, &[f]);
@@ -527,9 +525,9 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
     anyhow::ensure!(first.len() == platforms.len(), "a platform world has {} platforms, the state {}", first.len(), platforms.len());
     fn konst<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, p: &Path) -> Result<A> {
         match iface::get(st, p) {
-            Some(Value::Num(n)) => match d.graph.get(n).op {
-                Op::Const(a, b) if a == b => Ok(A::from_lit(a)),
-                ref o => bail!("{}: a platform's {} is not a known constant ({o:?})", iface::show(p), iface::show(p)),
+            Some(Value::Num(n)) => match d.graph.point(n) {
+                Some(v) => Ok(v),
+                None => bail!("{}: a platform's {} is not a known constant ({:?})", iface::show(p), iface::show(p), d.graph.get(n).op),
             },
             _ => bail!("{}: not a number", iface::show(p)),
         }
@@ -579,13 +577,13 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
                 iface::set(st, &spd, Value::Num(r))?;
             }
         }
-        let (x, last, rem) = (field(obj, &["x"]), field(obj, &["last"]), field(obj, &["rem", "x"]));
+        let (x, last, rem) = (field(obj, &["x"]), field(obj, &["last"]), field(obj, &[super::game::REM, "x"]));
         let Some(Value::Num(xv)) = iface::get(st, &x) else { bail!("{}: not a number", iface::show(&x)) };
         anyhow::ensure!(matches!(d.graph.get(xv).op, Op::Cell(_)), "a platform's `x` must be an input cell");
         let (plo, phi) = (A::from_i16(PLATFORM_PATH.0), A::from_i16(PLATFORM_PATH.1));
         let xr = d.restrict(xv, A::lit(plo), A::lit(phi));
         // An integer in every world (checked where the worlds are made).
-        d.integral_inputs.insert(xr);
+        d.frame.integral_inputs.insert(xr);
         iface::set(st, &x, Value::Num(xr))?;
         iface::set(st, &last, Value::Num(xr))?;
         // `rem.x` is replaced by the literal whole remainder: sound for a
@@ -596,7 +594,7 @@ pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbo
         iface::set(st, &rem, Value::Num(r))?;
         cells[j] = Some(xv);
     }
-    d.platform_cells = cells.into_iter().map(|c| c.expect("every world platform matched")).collect();
+    d.frame.platform_cells = cells.into_iter().map(|c| c.expect("every world platform matched")).collect();
     Ok(obligations)
 }
 
@@ -647,7 +645,7 @@ mod tests {
         for &byte in &route {
             let roots = slots_where(&st, Level::EXACT, dead);
             with_key += roots.iter().any(|p| p.last() == Some(&iface::key("spr"))) as usize;
-            with_player += !objects_of_type(&st, "player").is_empty() as usize;
+            with_player += !objects_of_type(&st, crate::trace::game::PLAYER).is_empty() as usize;
             let f = trace_frame(&mut it, &chunks, st.clone(), &crate::trace::frame::TraceSpec { roots: &roots, concrete: true, ..Default::default() }).expect("trace");
             // Everything a successor depends on, its booleans decided as far as a
             // BDD over independent atoms can (a guard re-merged after a branch on
@@ -699,7 +697,7 @@ mod tests {
             traced += 1;
             for b in 0..6 {
                 let v = it.d.boolean(byte >> b & 1 == 1);
-                iface::set(&mut st, &[iface::key("__button_states"), Step::Idx(b)], Value::Bool(v)).expect("a button");
+                iface::set(&mut st, &[iface::key(crate::trace::game::BUTTONS), Step::Idx(b)], Value::Bool(v)).expect("a button");
             }
             // Until the chest's `rnd` makes the concrete frame two (the key
             // is taken and the chest opened by then).

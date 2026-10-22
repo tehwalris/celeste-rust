@@ -24,12 +24,13 @@ use celeste_engine::runtime2::{Rt2, P8};
 
 use super::{AsmKernel, KernelLanes};
 use crate::transpile::graph::Ty;
+use crate::transpile::kernel::AxisRoots;
 use crate::search::rem::Capture;
 use crate::storage::unit::lanes_of;
 
 /// One per-row field of a key: its cell (the shape's dictionary), output
 /// slot, its type and whether it is a position coordinate (its code
-/// `exact::Code::pos`).
+/// `exact::Code::of_pos`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct KeyField {
     pub cell: u32,
@@ -213,23 +214,23 @@ impl KeyField {
 /// flag. The words alone do not decode (zero fin words are no `fin` without
 /// a fin root, `fin = Some((0, 0))` with one), and `UnitSink::xfer_id_raw`'s
 /// cache is keyed on them.
-pub(crate) const RAW_WORDS: usize = 4 * crate::trace::frame::ARC_AXIS_ROOTS + 1;
+pub(crate) const RAW_WORDS: usize = 4 * AxisRoots::N + 1;
 pub(crate) type RawWords<N = P8> = [<N as Arithmetic>::Raw; RAW_WORDS];
 
-/// A body's transfer roots (`FrameOut::arc`): per axis took, pre, frag, ox,
-/// fin as (offset, kind); `fin`: the outcome ends with a player.
+/// A body's transfer roots (`kernel::ArcRoots`) as (offset, kind), in
+/// `ArcRoots::nodes`' order; `fin`: the outcome ends with a player.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct ArcSlots {
-    pub roots: [(usize, Ty); 2 * crate::trace::frame::ARC_AXIS_ROOTS],
+    pub roots: [(usize, Ty); 2 * AxisRoots::N],
     pub fin: bool,
 }
 
 impl ArcSlots {
     /// The roots the transfer reads (without a `fin`, not the fin roots).
     #[inline]
-    fn read_roots(&self) -> impl Iterator<Item = (usize, (usize, Ty))> + '_ {
+    pub(super) fn read_roots(&self) -> impl Iterator<Item = (usize, (usize, Ty))> + '_ {
         let fin = self.fin;
-        self.roots.iter().copied().enumerate().filter(move |(k, _)| fin || k % crate::trace::frame::ARC_AXIS_ROOTS != 4)
+        self.roots.iter().copied().enumerate().filter(move |(k, _)| fin || k % AxisRoots::N != AxisRoots::FIN)
     }
 
     /// Lane `i`'s transfer as plain words off the output slots: per root
@@ -289,14 +290,14 @@ impl ArcSlots {
         let one = N::Raw::from(1u32);
         let num = |r: N::Raw| N::from_raw(r).unwrap_or_else(|| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: a transfer root {r:?} is no number", chunk.shape_hash));
         let axis = |a: usize| -> Capture<N> {
-            let base = a * crate::trace::frame::ARC_AXIS_ROOTS;
+            let base = a * AxisRoots::N;
             let pair = |k: usize| (num(words[2 * (base + k)]), num(words[2 * (base + k) + 1]));
             assert!(
                 self.roots[base].1 == Ty::Bool && words[2 * base + 1] == one,
                 "arc edges: shape {:#x} outcome {outcome} lane {lane}: axis {a}'s `took` is not a decided boolean",
                 chunk.shape_hash
             );
-            Capture { took: words[2 * base] == one, pre: pair(1), frag: pair(2), ox: pair(3), fin: self.fin.then(|| pair(4)) }
+            Capture { took: words[2 * base] == one, pre: pair(1), frag: pair(2), ox: pair(3), fin: self.fin.then(|| pair(AxisRoots::FIN)) }
         };
         N::transfer(&axis(0), &axis(1)).unwrap_or_else(|e| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: {e}", chunk.shape_hash))
     }

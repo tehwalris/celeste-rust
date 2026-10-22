@@ -8,7 +8,7 @@ mod callout;
 mod codegen;
 mod jit;
 
-pub use callout::{AsmCtx, CollisionEnv};
+pub use callout::{AsmCtx, CallLanes, CollisionEnv};
 pub use codegen::{compile, Compiled};
 pub(crate) use codegen::{compile_fixed, compile_float};
 pub use jit::{assemble, check_mxcsr, KernelFn, Loaded};

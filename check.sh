@@ -392,6 +392,10 @@ perfcount() {
     local name=$1 f=$2
     local n i1 i3 rep pin
     rm -f "$C/perf-$name.line"
+    # The kernel cache warmed first (`compiled::cache`): both counted runs
+    # load the kernels, so their build cancels; one that built them and one
+    # that loaded them would not.
+    ./safe-run.sh --memory "$MEM" -- "$RB" bench frame --tree "$F/$name" --step "$f" --threads 16 --reps 0 > /dev/null 2> "$C/perf-$name-warm.err" || return 1
     for n in 1 3; do
         ./safe-run.sh --memory "$MEM" -- perf stat -x, -e instructions:u -o "$C/perf-$name-$n.stat" -- "$RB" bench frame --tree "$F/$name" --step "$f" --edges --threads 16 --expect "$G/$name.frame" --reps "$n" > "$C/perf-$name-$n.frame" || return 1
     done
@@ -399,6 +403,7 @@ perfcount() {
     i3=$(awk -F, '$3 ~ /^instructions/ {print $1}' "$C/perf-$name-3.stat")
     [[ $i1 =~ ^[0-9]+$ && $i3 =~ ^[0-9]+$ ]] || { echo "perf stat counted no instructions ($C/perf-$name-1.stat): perf missing, or perf_event_paranoid > 2?" >&2; return 1; }
     rep=$(( (i3 - i1) / 2 ))
+    (( rep > 0 )) || { echo "$name: $rep instructions a rep: implausible: a run built kernels the other did not?" | tee "$C/perf-$name.line" >&2; return 1; }
     if [[ $PIN == --pin ]]; then
         if grep -q "^$name " "$PERF_PINS"; then sed -i "s/^$name .*/$name $rep/" "$PERF_PINS"; else echo "$name $rep" >> "$PERF_PINS"; fi
         echo "re-pinned $name: $rep instructions a rep" | tee "$C/perf-$name.line" >&2
@@ -406,11 +411,13 @@ perfcount() {
     fi
     pin=$(awk -v n="$name" '$1 == n {print $2}' "$PERF_PINS")
     [[ -n $pin ]] || { echo "$name: no pin in $PERF_PINS (./check.sh perf --pin)" >&2; return 1; }
+    # More than 20% either way is no change of the code's: FAIL, no re-pin.
     awk -v r="$rep" -v p="$pin" -v n="$name" 'BEGIN {
         d = 100 * (r - p) / p
-        note = d > 2 ? ": OVER BUDGET" : (d < -2 ? ": faster, re-pin (./check.sh perf --pin) to keep the gain" : "")
+        implausible = d > 20 || d < -20
+        note = implausible ? ": IMPLAUSIBLE: a run built kernels the other did not?" : (d > 2 ? ": OVER BUDGET" : (d < -2 ? ": faster, re-pin (./check.sh perf --pin) to keep the gain" : ""))
         printf "%s: %.3f G instructions a rep, pinned %.3f G (%+.2f%%)%s\n", n, r / 1e9, p / 1e9, d, note
-        exit d > 2
+        exit d > 2 || implausible
     }' | tee "$C/perf-$name.line" >&2
 }
 

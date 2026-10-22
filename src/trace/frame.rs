@@ -6,7 +6,7 @@
 use anyhow::{anyhow, bail, Result};
 
 use crate::transpile::graph::NodeId;
-use crate::transpile::kernel::Roots;
+use crate::transpile::kernel::{ArcRoots, AxisRoots, Roots};
 use crate::transpile::graph::Ty;
 
 use super::domain::{Domain, Symbolic};
@@ -41,24 +41,18 @@ pub struct FrameOut<A: GraphArith = Fixed> {
     pub ubool_cells: Vec<u32>,
     /// The state itself, so a shape walk can step forward from it.
     pub st: State<Symbolic<A>>,
-    /// THE TRANSFER ROOTS (`search::arc_edges`, level-0 traces only): per axis
-    /// `ARC_AXIS_ROOTS` (`fin`: the remainder before widening, 0 without a
-    /// player). Never stored in the row.
-    pub arc: Vec<NodeId>,
-    /// Does this outcome have a player at its end (`fin` is real)?
-    pub arc_fin: bool,
+    /// THE TRANSFER ROOTS (`search::arc_edges`, level-0 traces only).
+    /// Never stored in the row.
+    pub arc: Option<ArcRoots>,
 }
 
 impl<A: GraphArith> FrameOut<A> {
     /// What the outcome computes: its stored fields, guard (`live`), error
     /// and transfer roots.
     pub fn roots(&self) -> Roots {
-        Roots { fields: self.fields.iter().map(|f| f.1).collect(), live: self.guard, error: self.error, arc: self.arc.clone() }
+        Roots { fields: self.fields.iter().map(|f| f.1).collect(), live: self.guard, error: self.error, arc: self.arc }
     }
 }
-
-/// Roots per axis in `FrameOut::arc`: took, pre, frag, ox, fin.
-pub const ARC_AXIS_ROOTS: usize = 5;
 
 impl<A: GraphArith> Clone for FrameOut<A> {
     /// For `split_undecided_selects`: `Rt2::clone_block` shares the cart.
@@ -73,8 +67,7 @@ impl<A: GraphArith> Clone for FrameOut<A> {
             cells: self.cells.clone(),
             ubool_cells: self.ubool_cells.clone(),
             st: self.st.clone(),
-            arc: self.arc.clone(),
-            arc_fin: self.arc_fin,
+            arc: self.arc,
         }
     }
 }
@@ -109,7 +102,7 @@ fn out_fields<A: GraphArith>(
     // A near level's floor `state`s are an interval column in every outcome.
     let ival_always: Vec<Path> = super::widen::near_floor_states(st, d.level);
     for p in iface::scalars(st, &[])? {
-        if p.first() == Some(&iface::key("__button_states")) {
+        if p.first() == Some(&iface::key(super::game::BUTTONS)) {
             ubool.push(p);
             continue;
         }
@@ -187,17 +180,12 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     let widen = !spec.concrete;
     it.trace_start_nodes = it.d.node_count();
     let mut st = st;
-    it.d.forks = 0;
+    // A fresh frame: nothing an earlier trace (one that failed part-way
+    // included) accumulated survives.
+    it.d.frame = Default::default();
     it.d.graph.reset_forks();
-    it.d.clear_ranges();
-    it.d.clear_fork_memo();
-    it.d.unknown_atoms = 0;
-    it.arc_capture = widen;
-    // Left over by a trace that failed part-way.
     it.raised.clear();
-    it.d.escaped.clear();
-    it.d.fork_origins.clear();
-    it.d.evaluated.clear();
+    it.arc_capture = widen;
     let iface = iface::symbolize(&mut it.d, &mut st, roots, pin, ival)?;
     let refused = merge_refused_on
         .iter()
@@ -237,7 +225,7 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
         let r = it.d.restrict(cell, *lo, *hi);
         iface::set(&mut st, p, Value::Num(r))?;
         if let Some(pl) = &player {
-            for (k, f) in ["x", "y"].iter().enumerate() {
+            for (k, f) in super::game::AXES.iter().enumerate() {
                 if p.len() == pl.len() + 1 && p.starts_with(pl) && p[pl.len()] == iface::key(f) {
                     position[k] = Some((cell, (*lo, *hi)));
                 }
@@ -299,11 +287,11 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     // guards, transfers, derived errors - may read a pinned input; only the
     // pin's own check does (`error::pins_hold`, in `global`).
     {
-        let pinned: Vec<NodeId> = it.d.assumptions.iter().filter(|a| matches!(it.d.graph.get(**a).op, crate::transpile::graph::Op::Pin(_))).map(|a| it.d.graph.get(*a).args[0]).collect();
+        let pinned: Vec<NodeId> = it.d.frame.assumptions.iter().filter(|a| matches!(it.d.graph.get(**a).op, crate::transpile::graph::Op::Pin(_))).map(|a| it.d.graph.get(*a).args[0]).collect();
         if !pinned.is_empty() {
             let mut reads: Vec<NodeId> = derived.clone();
             for o in &outs {
-                reads.extend(o.fields.iter().map(|(_, n, _)| *n).chain([o.guard]).chain(o.arc.iter().copied()));
+                reads.extend(o.fields.iter().map(|(_, n, _)| *n).chain([o.guard]).chain(o.arc.iter().flat_map(ArcRoots::nodes)));
             }
             let reach = it.d.graph.reachable(&reads);
             for x in pinned {
@@ -316,12 +304,12 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     }
     if it.d.build_trace {
         let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
-        for (_, o) in &it.d.fork_origins {
+        for (_, o) in &it.d.frame.fork_origins {
             *by.entry(o.as_str()).or_default() += 1;
         }
-        eprintln!("[build] trace_frame (widen {widen}): {} outcomes, {} pins, {} forks by origin {by:?}", outs.len(), pin.len(), it.d.forks);
+        eprintln!("[build] trace_frame (widen {widen}): {} outcomes, {} pins, {} forks by origin {by:?}", outs.len(), pin.len(), it.d.frame.forks);
     }
-    let fork_ways: Vec<u8> = (0..it.d.forks).map(|d| it.d.graph.fork_ways(d)).collect();
+    let fork_ways: Vec<u8> = (0..it.d.frame.forks).map(|d| it.d.graph.fork_ways(d)).collect();
     let raise = {
         use super::domain::Domain;
         let raised = std::mem::take(&mut it.raised);
@@ -331,7 +319,7 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
         }
         r
     };
-    Ok(Frame { iface, fork_origins: it.d.fork_origins.clone(), forks: it.d.forks, fork_ways, outs, raise, in_cells, in_rt2 })
+    Ok(Frame { iface, fork_origins: it.d.frame.fork_origins.clone(), forks: it.d.frame.forks, fork_ways, outs, raise, in_cells, in_rt2 })
 }
 
 /// A finished path of the frame as an outcome: its absent-as-zero fields
@@ -352,26 +340,14 @@ fn finish_outcome<A: GraphArith>(
     // Absent-as-zero fields: shape, not precision, so every level.
     super::widen::materialize_absent_fields(&mut s, &mut it.d)?;
     // The transfer roots: the remainder read BEFORE the widenings.
-    let (arc, arc_fin) = match s.arc.as_deref() {
-        None => (Vec::new(), false),
+    let arc = match s.arc.as_deref() {
+        None => None,
         Some(axes) => {
-            let players = super::widen::objects_of_type(&s, "player");
-            anyhow::ensure!(players.len() <= 1, "arc capture: {} player objects at the frame's end", players.len());
-            let mut roots = Vec::with_capacity(2 * ARC_AXIS_ROOTS);
-            for (k, a) in axes.iter().enumerate() {
-                let fin = match players.first() {
-                    Some(pl) => match iface::get(&s, &super::widen::field(pl, &["rem", ["x", "y"][k]])) {
-                        Some(Value::Num(n)) => n,
-                        other => bail!("arc capture: the player's rem.{} is {other:?}", ["x", "y"][k]),
-                    },
-                    None => {
-                        let zero = A::lit(A::from_i16(0));
-                        it.d.graph.leaf(crate::transpile::graph::Op::Const(zero, zero))
-                    }
-                };
-                roots.extend([a.took, a.pre, a.frag, a.ox, fin]);
-            }
-            (roots, !players.is_empty())
+            let fins = super::state::arc_fins(&s)?;
+            let zero = A::lit(A::from_i16(0));
+            let [fx, fy] = fins.unwrap_or_else(|| [it.d.graph.leaf(crate::transpile::graph::Op::Const(zero, zero)); 2]);
+            let axis = |a: &super::state::ArcAxis<Symbolic<A>>, fin| AxisRoots { took: a.took, pre: a.pre, frag: a.frag, ox: a.ox, fin };
+            Some(ArcRoots { axes: [axis(&axes[0], fx), axis(&axes[1], fy)], fin: fins.is_some() })
         }
     };
     // THE WIDENINGS: before `out_fields` (reads the state), after `gc`.
@@ -400,7 +376,6 @@ fn finish_outcome<A: GraphArith>(
         ubool_cells: ubool_cells.to_vec(),
         st: s,
         arc,
-        arc_fin,
     })
 }
 
@@ -468,7 +443,6 @@ mod tests {
         let map = g.specialize_subset_into(&cfg, Some(&need), &mut out);
         Ok((out, map))
     }
-
 
     /// A body compiled for one pm1 key must REFUSE a state in another: a
     /// perturbed pinned cell's `Op::Pin` check declines the lane.

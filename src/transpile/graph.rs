@@ -1,8 +1,8 @@
 //! The graph IR: one traced frame as a pure, hash-consed DAG of `(op,
-//! [operand ids])` over input cells and literals. It describes ONE lane, has
-//! no effects (a body's `live` and `error` are boolean nodes), and no types
-//! beyond bool/number: exactness is a property of the value, so one op
-//! covers every width.
+//! [operand ids])` over input cells and literals. It describes ONE lane and
+//! has no effects (a body's `live` and `error` are boolean nodes). Every node
+//! has a lane TYPE (`Ty`: a boolean, a number, an interval), set by its op's
+//! signature (`Graph::type_of`) and an input cell's kind.
 
 use std::collections::HashMap;
 
@@ -63,7 +63,7 @@ pub enum Eval {
     /// `Exact`, so the two cannot diverge).
     Lenient,
     /// `Lenient`, `mget` over interval coordinates read as the SET of tiles
-    /// the rectangle holds (`TileSet::over`), and `defined` (`eval_full`):
+    /// the rectangle holds (`TileSet::over`), and `defined` (`Graph::eval`):
     /// the interval fold (`transpile::ival`).
     Fold,
     /// Forks resolved via `Frag`, an unmodelled node (`Mget`, roomless
@@ -74,6 +74,11 @@ pub enum Eval {
 
 /// In a `splits` vector: leave this fork standing.
 pub const OPEN: u8 = u8::MAX;
+
+/// The image of a node a rebuild did not build (`Graph::rebuild_into`).
+/// Deliberately not 0: an out-of-range id panics in `Graph::get`, where
+/// node 0 would quietly be some unrelated constant.
+pub const UNBUILT: NodeId = NodeId::MAX;
 
 /// OR-ed into a `splits` fragment index: that fragment with validity TRUE, for
 /// a DEAD fork whose fragments all give the same row (the OR of their
@@ -243,7 +248,7 @@ pub enum Unknown {
 
 /// A lane's value type: what a node computes on one lane, and how a cell or
 /// a root is laid out in a kernel's buffers (`asm::codegen`).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Ty {
     Num,
     /// An interval: its two ends.
@@ -296,7 +301,6 @@ impl Graph<Fixed> {
 }
 
 impl<A: GraphArith> Graph<A> {
-
     /// An empty graph on the same fork grid and cell kinds.
     pub fn like(&self) -> Self {
         Graph {
@@ -434,6 +438,14 @@ impl<A: GraphArith> Graph<A> {
         &self.nodes[id as usize]
     }
 
+    /// The value of node `n` if it is a literal POINT.
+    pub fn point(&self, n: NodeId) -> Option<A> {
+        match self.nodes[n as usize].op {
+            Op::Const(lo, hi) if lo == hi => Some(A::from_lit(lo)),
+            _ => None,
+        }
+    }
+
     /// Per node of the arena: does one of `roots` read it?
     pub fn reachable(&self, roots: &[NodeId]) -> Vec<bool> {
         let mut need = vec![false; self.len()];
@@ -474,36 +486,45 @@ impl<A: GraphArith> Graph<A> {
         matches!(node.op, Op::Fork(Cut::Floors | Cut::Ints, _)) && matches!(self.get(node.args[0]).op, Op::Const(lo, hi) if lo != hi)
     }
 
-    /// Rebuild into `out` with forks RESOLVED per `splits` (`OPEN` leaves one
-    /// standing), over a SUBSET (`need[i]` false maps `i` to `UNBUILT`),
-    /// folding as it goes; returns old -> new. `out` is shared and hash-consed,
-    /// so configurations computing the same thing share node ids.
-    pub fn specialize_subset_into(&self, splits: &[u8], need: Option<&[bool]>, out: &mut Graph<A>) -> Vec<NodeId> {
-        out.fork_ways = self.fork_ways.clone();
-        const UNBUILT: NodeId = NodeId::MAX;
-        let mut map: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
+    /// REBUILD into `out` the nodes `need` holds (every node for `None`),
+    /// in id order (an operand before its user): each one `special`'s image
+    /// of it from its operands' images, else `out.fold`ed from them. Returns
+    /// old -> new, `UNBUILT` where not built.
+    pub fn rebuild_into(
+        &self,
+        need: Option<&[bool]>,
+        out: &mut Graph<A>,
+        mut special: impl FnMut(NodeId, &Node<A>, &[NodeId], &mut Graph<A>) -> Option<NodeId>,
+    ) -> Vec<NodeId> {
+        let mut map = vec![UNBUILT; self.nodes.len()];
         for (i, node) in self.nodes.iter().enumerate() {
-            if let Some(need) = need {
-                if !need[i] {
-                    map.push(UNBUILT);
-                    continue;
-                }
+            if need.is_some_and(|n| !n[i]) {
+                continue;
             }
-            let arg = |map: &Vec<NodeId>, k: usize| map[node.args[k] as usize];
-            let s = splits;
-            let id = match node.op.clone() {
-                Op::Fork(cut, d) if s[d as usize] != OPEN => out.fold(Op::Frag(cut, s[d as usize] & !ANY_VALID), vec![arg(&map, 0)]),
-                Op::ForkValid(_, d) if s[d as usize] != OPEN && s[d as usize] & ANY_VALID != 0 => out.leaf(Op::ConstBool(true)),
-                Op::ForkValid(grid, d) if s[d as usize] != OPEN => out.fold(Op::FragOk(grid, s[d as usize]), vec![arg(&map, 0)]),
-                _ => {
-                    let args: Vec<NodeId> =
-                        node.args.iter().map(|a| map[*a as usize]).collect();
-                    out.fold(node.op.clone(), args)
-                }
+            let args: Vec<NodeId> = node.args.iter().map(|a| map[*a as usize]).collect();
+            map[i] = match special(i as NodeId, node, &args, out) {
+                Some(n) => n,
+                None => out.fold(node.op.clone(), args),
             };
-            map.push(id);
         }
         map
+    }
+
+    /// Rebuild into `out` with forks RESOLVED per `splits` (`OPEN` leaves one
+    /// standing), over a SUBSET (`rebuild_into`'s `need`), folding as it
+    /// goes; returns old -> new. `out` is shared and hash-consed, so
+    /// configurations computing the same thing share node ids.
+    pub fn specialize_subset_into(&self, splits: &[u8], need: Option<&[bool]>, out: &mut Graph<A>) -> Vec<NodeId> {
+        out.fork_ways = self.fork_ways.clone();
+        self.rebuild_into(need, out, |_, node, args, out| {
+            let s = |d: u8| splits[d as usize];
+            Some(match node.op {
+                Op::Fork(cut, d) if s(d) != OPEN => out.fold(Op::Frag(cut, s(d) & !ANY_VALID), vec![args[0]]),
+                Op::ForkValid(_, d) if s(d) != OPEN && s(d) & ANY_VALID != 0 => out.leaf(Op::ConstBool(true)),
+                Op::ForkValid(grid, d) if s(d) != OPEN => out.fold(Op::FragOk(grid, s(d)), vec![args[0]]),
+                _ => return None,
+            })
+        })
     }
 
     /// Is operand order meaningless (a canonical order, since interning is the
@@ -560,11 +581,7 @@ impl<A: GraphArith> Graph<A> {
             }
             // Two literal points are the same bits or not.
             Op::Same => {
-                let point = |g: &Graph<A>, i: usize| match g.nodes[args[i] as usize].op {
-                    Op::Const(lo, hi) if lo == hi => Some(A::from_lit(lo)),
-                    _ => None,
-                };
-                if let (Some(x), Some(y)) = (point(self, 0), point(self, 1)) {
+                if let (Some(x), Some(y)) = (self.point(args[0]), self.point(args[1])) {
                     return self.leaf(Op::ConstBool(A::bits(x) == A::bits(y)));
                 }
             }
@@ -588,11 +605,7 @@ impl<A: GraphArith> Graph<A> {
             // and what a specialization or a substitution folds overflows
             // nowhere.
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Min | Op::Max => {
-                let point = |g: &Graph<A>, i: usize| match g.nodes[args[i] as usize].op {
-                    Op::Const(lo, hi) if lo == hi => Some(A::from_lit(lo)),
-                    _ => None,
-                };
-                if let (Some(x), Some(y)) = (point(self, 0), point(self, 1)) {
+                if let (Some(x), Some(y)) = (self.point(args[0]), self.point(args[1])) {
                     let r = match op {
                         Op::Add => checked::<A>("+", A::add(x, y), x, y),
                         Op::Sub => checked::<A>("-", A::sub(x, y), x, y),
@@ -606,26 +619,19 @@ impl<A: GraphArith> Graph<A> {
                 }
             }
             Op::Neg | Op::Abs | Op::Flr => {
-                if let Op::Const(lo, hi) = self.nodes[args[0] as usize].op {
-                    if lo == hi {
-                        let x = A::from_lit(lo);
-                        let r = match op {
-                            Op::Neg => checked::<A>("unary -", A::neg(x), x, x),
-                            Op::Abs => checked::<A>("abs", A::abs(x), x, x),
-                            _ => A::flr(x),
-                        };
-                        let l = A::lit(r);
-                        return self.leaf(Op::Const(l, l));
-                    }
+                if let Some(x) = self.point(args[0]) {
+                    let r = match op {
+                        Op::Neg => checked::<A>("unary -", A::neg(x), x, x),
+                        Op::Abs => checked::<A>("abs", A::abs(x), x, x),
+                        _ => A::flr(x),
+                    };
+                    let l = A::lit(r);
+                    return self.leaf(Op::Const(l, l));
                 }
             }
             // A comparison of two literal POINTS is a constant.
             Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => {
-                let point = |g: &Graph<A>, i: usize| match g.nodes[args[i] as usize].op {
-                    Op::Const(lo, hi) if lo == hi => Some(A::from_lit(lo)),
-                    _ => None,
-                };
-                if let (Some(x), Some(y)) = (point(self, 0), point(self, 1)) {
+                if let (Some(x), Some(y)) = (self.point(args[0]), self.point(args[1])) {
                     let r = match op {
                         Op::Lt => A::lt(x, y),
                         Op::Le => A::le(x, y),
@@ -765,7 +771,7 @@ impl<A: GraphArith> Graph<A> {
     }
 
     /// Is `y` the negation of `x` (`Not(x)` or the opposite comparison)?
-    fn complements(&self, x: NodeId, y: NodeId) -> bool {
+    pub(crate) fn complements(&self, x: NodeId, y: NodeId) -> bool {
         let (nx, ny) = (&self.nodes[x as usize], &self.nodes[y as usize]);
         if (nx.op == Op::Not && nx.args[0] == y) || (ny.op == Op::Not && ny.args[0] == x) {
             return true;
@@ -779,28 +785,18 @@ impl<A: GraphArith> Graph<A> {
 
     /// Evaluate every node from the input cells in one forward pass, as
     /// `mode` says (`room`: the map, for `mget` and `tile_flag_at`).
+    ///
+    /// `defined` (`Eval::Fold`, `Eval::NarrowTop`): an operation's value need
+    /// cover only the lanes where it is DEFINED (`abs` of a hull holding MIN
+    /// is `[0, MAX]`, the MIN lane in error). Sound where that error is
+    /// charged to whatever reads the value: once the outcomes' errors are
+    /// derived and are roots of the graph evaluated (the lowering's fold), or
+    /// where the premises are taken as holding (level -1). NOT in the tracer,
+    /// which decides comparisons BEFORE the errors are derived: a decided one
+    /// would no longer reach the `abs`.
     pub fn eval(&self, cells: &HashMap<u32, Val<A>>, mode: Eval, room: Option<&Room>) -> Result<Vec<Val<A>>> {
         let (lenient, defined) = (matches!(mode, Eval::Lenient | Eval::Fold), matches!(mode, Eval::Fold | Eval::NarrowTop));
-        self.eval_full(cells, lenient, mode == Eval::Exact, room, mode == Eval::Fold, defined)
-    }
-
-    /// `defined` (`Eval::Fold`, `Eval::NarrowTop`): an operation's value need cover only the lanes
-    /// where it is DEFINED (`abs` of a hull holding MIN is `[0, MAX]`, the MIN
-    /// lane in error). Sound where that error is charged to whatever reads the
-    /// value: once the outcomes' errors are derived and are roots of the graph
-    /// evaluated (the lowering's fold), or where the premises are taken as
-    /// holding (level -1). NOT in the tracer, which decides comparisons BEFORE
-    /// the errors are derived: a decided one would no longer reach the `abs`.
-    fn eval_full(
-        &self,
-        cells: &HashMap<u32, Val<A>>,
-        frag_lenient: bool,
-        strict_err: bool,
-        room: Option<&Room>,
-        mget_sets: bool,
-        defined: bool,
-    ) -> Result<Vec<Val<A>>> {
-        let lenient = frag_lenient;
+        let (strict_err, mget_sets) = (mode == Eval::Exact, mode == Eval::Fold);
         // Per `Mget` node read as a set: the tiles its coordinates' rectangle holds.
         let mut tiles: HashMap<NodeId, TileSet> = HashMap::new();
         let full = Val::Num(A::unknown());
@@ -1037,48 +1033,16 @@ impl<A: GraphArith> Graph<A> {
                 }
                 })
             })();
-                // The ONE place `lenient` acts: TOP for its kind is sound.
+            // What it cannot compute is TOP for its type (sound), but `Exact`.
             let v = match computed {
                 Ok(v) => v,
-                Err(e) => {
-                    if strict_err {
-                        return Err(e);
-                    }
-                    Self::top_of(&node.op, &node.args, &out, full)
-                }
+                Err(e) if strict_err => return Err(e),
+                Err(_) if self.ty(i as NodeId).is_bool() => Val::Bool(None),
+                Err(_) => full,
             };
             out.push(v);
         }
         Ok(out)
-    }
-
-    /// The weakest value of this op: `Bool(None)` for booleans, the full
-    /// range for numbers; `Sel` follows its arms.
-    fn top_of(op: &Op<A>, args: &[NodeId], out: &[Val<A>], full: Val<A>) -> Val<A> {
-        match op {
-            Op::ConstBool(_)
-            | Op::ForkValid(..)
-            | Op::ForkOk(..)
-            | Op::NoWrap
-            | Op::FragOk(..)
-            | Op::Same
-            | Op::Lt
-            | Op::Le
-            | Op::Gt
-            | Op::Ge
-            | Op::Eq
-            | Op::Not
-            | Op::And
-            | Op::Or
-            | Op::Known
-            | Op::UnknownBool(_)
-            | Op::TileFlagAt => Val::Bool(None),
-            Op::Sel => match args.get(1).map(|x| out[*x as usize]) {
-                Some(Val::Bool(_)) => Val::Bool(None),
-                _ => full,
-            },
-            _ => full,
-        }
     }
 
     /// `tile_flag_at` over INTERVALS: FALSE if the UNION of the rectangles holds

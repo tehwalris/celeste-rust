@@ -48,6 +48,28 @@ sounds like one of these. The full write-ups are in git history.
 - **Kernel regions of 8 px** (2026-10-10): -20% instructions a slice, no
   measurable wave difference, 3.2x the kernels and +1.4-5.6 s at startup.
   Kernels stay at 16 px.
+- **Deleting the BDD, the list scheduler or the text peephole** (audit
+  N4, 2026-10-22, each the identity in a local build; trees, frame lines
+  and kernel coverage unchanged in every case; dynamic kernel instructions
+  of the pinned frames r10 / r42n / r62h / r60s):
+  - the BDD (`bdd::simplify_local`; both interval folds kept): +0.2 /
+    +0.0 / +3.0 / +3.9%, fused nodes up to +5.6% at `p`, spills +14% at
+    r62h; bodies the same. It earns its keep at `f` and `p`.
+  - the list scheduler (`reschedule`; `schedule`'s batched order kept):
+    +5.1 / +5.2 / +11.4 / -15.1%, spill slots x2-2.7 but at `p`. It stays,
+    and r60s says a pressure-aware order could still gain 15% there.
+  - the text peephole (`drop_redundant_reloads`): +7.9 / +5.9 / +7.1 /
+    +4.9%, constants +31-52%, reloads +11-32%. It stays as a pass over the
+    text: in the emitter every emission site would have to invalidate what
+    a register holds, and one that forgot would drop a needed reload.
+- **A fresh probe arena per configuration in `decided_roots`** (audit,
+  2026-10-22): the kernel build's user instructions moved +0.00% (r10),
+  +0.01% (r62h) and +0.19% (r60s). The build is the TRACER's (r62h profile:
+  `Heap::shape_and_order` 11%, allocation ~12%, `state::merge_inner`,
+  `String`/`BTreeMap` clones); specialization is ~5%. The kernel cache
+  (`compiled::cache`) takes the build out of repeated processes instead:
+  a hit is 3-11 G instructions against 151 G (r10), 676 G (r62h) and
+  4,338 G (r60s).
 
 ## The frame and storage
 

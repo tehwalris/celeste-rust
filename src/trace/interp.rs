@@ -25,7 +25,6 @@ impl<D: Domain> Flow<D> {
     fn is_normal(&self) -> bool {
         matches!(self, Flow::Normal)
     }
-
 }
 
 /// Can these two values be joined? Only numbers and booleans may differ.
@@ -559,20 +558,8 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     fn join_value(&mut self, cond: &D::Bool, a: &Value<D>, b: &Value<D>) -> Value<D> {
-        match (a, b) {
-            // As `state::join`.
-            (Value::Num(x), Value::Num(y)) => Value::Num(match self.d.join_num_independent(cond, x, y) {
-                Some(j) => j,
-                None => self.d.sel_num(cond, x, y),
-            }),
-            (Value::Bool(x), Value::Bool(y)) => Value::Bool(match self.d.join_bool_independent(cond, x, y) {
-                Some(j) => j,
-                None => self.d.sel_bool(cond, x, y),
-            }),
-            (x, _) => x.clone(),
-        }
+        super::state::join(&mut self.d, cond, a, b).expect("`joinable` values join")
     }
-
 
     /// Numeric `for`; a symbolic bound is unrolled (`run_for_symbolic`).
     fn exec_for(&mut self, f: &'a ast::NumericFor, st: State<D>) -> Result<Outcome<D>> {
@@ -711,8 +698,6 @@ impl<'a, D: Domain> Interp<'a, D> {
         done.extend(running);
         Ok(done)
     }
-
-
 
     fn truthy(&mut self, v: &Value<D>) -> D::Bool {
         // Lua: only nil and false are falsy.
@@ -996,8 +981,6 @@ impl<'a, D: Domain> Interp<'a, D> {
         Ok((v, None))
     }
 
-
-
     fn read_name(&mut self, name: &str, st: &State<D>) -> Value<D> {
         if let Some(v) = st.heap.lookup(st.scope, name) {
             return v.clone();
@@ -1187,7 +1170,7 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     fn room_has_flag(&mut self, st: &State<D>, flag: i16) -> Result<bool> {
-        let Some(Value::Table(rt)) = st.heap.tables[&st.globals].hash.get("room").cloned() else {
+        let Some(Value::Table(rt)) = st.heap.tables[&st.globals].hash.get(super::game::ROOM).cloned() else {
             bail!("tile_flag_at: no `room` global to check the flag against");
         };
         let coord = |k: &str| -> Result<i16> {
@@ -1400,12 +1383,15 @@ impl<'a, D: Domain> Interp<'a, D> {
             _ => None,
         };
         let parts: Vec<String> = spelled.as_deref().unwrap_or("").split('.').map(str::to_string).collect();
-        let (obj, axis) = match parts.as_slice() {
-            [obj, rem, axis] if rem == "rem" && (axis == "x" || axis == "y") => (obj.clone(), if axis == "x" { 0 } else { 1 }),
-            _ => bail!("arc capture: a split whose argument is not `<obj>.rem.<x|y>` ({spelled:?}): no way to tell whose remainder it splits"),
+        let site = match parts.as_slice() {
+            [obj, rem, axis] if rem == super::game::REM => super::game::AXES.iter().position(|a| a == axis).map(|k| (obj.clone(), k)),
+            _ => None,
+        };
+        let Some((obj, axis)) = site else {
+            bail!("arc capture: a split whose argument is not `<obj>.rem.<x|y>` ({spelled:?}): no way to tell whose remainder it splits")
         };
         let Value::Table(t) = self.read_name(&obj, st) else { bail!("arc capture: `{obj}` in a split of `{obj}.rem..` is not a table") };
-        let players = super::widen::objects_of_type(st, "player");
+        let players = super::widen::objects_of_type(st, super::game::PLAYER);
         anyhow::ensure!(players.len() <= 1, "arc capture: {} player objects", players.len());
         let is_player = players.first().is_some_and(|p| super::iface::get(st, p) == Some(Value::Table(t)));
         Ok(if is_player { SplitSite::Player(axis) } else { SplitSite::Other })
@@ -1416,7 +1402,7 @@ impl<'a, D: Domain> Interp<'a, D> {
     /// platform carrying the player) is refused: an arc edge is one rotation per
     /// axis per frame.
     fn capture_player_split(&mut self, st: &mut State<D>, axis: usize, x: &D::Num, v: &D::Num) -> Result<()> {
-        let name = if axis == 0 { "ox" } else { "oy" };
+        let name = super::game::MOVE_STEP[axis];
         let Value::Num(ox) = self.read_name(name, st) else { bail!("arc capture: the player's split on axis {axis} has no number `{name}` in scope") };
         let Some(arc) = st.arc.as_mut() else { bail!("arc capture: a player split on a path that does not capture") };
         let a = &mut arc[axis];
@@ -1828,7 +1814,6 @@ mod tests {
         full_moon::parse(src).expect("parse")
     }
 
-
     fn run<'a, D: Domain>(d: D, ast: &'a full_moon::ast::Ast) -> (Interp<'a, D>, Value<D>) {
         let mut it = Interp::new(d);
         let st = State::new(&mut it.d);
@@ -2056,7 +2041,7 @@ mod tests {
         assert_eq!(it.d.graph.get(r).op, Op::Const(-0x8000, 0x7fff), "the remainder is the literal [-0.5, 0.5)");
         let e = super::super::error::of(&mut it.d, &[r]);
         assert_eq!(it.d.graph.get(e).op, Op::ConstBool(false), "no lane errs");
-        assert_eq!(it.d.forks, 0, "no per-lane fork");
+        assert_eq!(it.d.frame.forks, 0, "no per-lane fork");
     }
 
     /// THE TRACER'S CONSTANT FOLDING never wraps: Lua arithmetic on

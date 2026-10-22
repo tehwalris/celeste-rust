@@ -27,7 +27,7 @@ const MIX_C2: u64 = 0x94d0_49bb_1331_11eb;
 
 /// The whole pixels of a position coordinate (raw 16.16): the bits the
 /// CELL holds (`flr` of the low end), so the key takes the rest only
-/// (`exact::Code::pos`).
+/// (`exact::Code::of_pos`).
 pub const POS_WHOLE: u32 = 0xffff_0000;
 
 /// One lane's abstract value, its numbers of type `N` (the arithmetic's).
@@ -88,6 +88,20 @@ pub enum Cell2<N = P8> {
     Bi(u32),
 }
 
+impl<N> Cell2<N> {
+    /// What the cell is, for messages.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Cell2::Val => "value",
+            Cell2::Obj(_) => "object",
+            Cell2::Arr(_) => "array",
+            Cell2::Unk => "unknown table",
+            Cell2::Clo(..) => "closure",
+            Cell2::Bi(_) => "builtin",
+        }
+    }
+}
+
 /// The names the engine reads itself, as their ids (`celeste_names`): the
 /// POSITION OBJECT (the player, else the player spawn, in `objects` by its
 /// `type`) and its fields. The game's other names are its caller's.
@@ -126,49 +140,6 @@ pub struct Rt2<N = P8> {
 }
 
 pub const NONE: u32 = u32::MAX;
-
-pub fn col_push<N: Copy + PartialEq>(col: &mut Col<N>, width: usize, v: AV<N>) {
-    match col {
-        Col::U(a) if *a == v => {} // still uniform
-        Col::U(a) => {
-            let a = *a;
-            *col = match (a, v) {
-                (AV::Num(x), AV::Num(y)) => {
-                    let mut vs = vec![x; width];
-                    vs.push(y);
-                    Col::N(vs)
-                }
-                (AV::Ival(x0, x1), AV::Ival(y0, y1)) => {
-                    let mut vs = vec![(x0, x1); width];
-                    vs.push((y0, y1));
-                    Col::I(vs)
-                }
-                _ => {
-                    let mut vs = vec![a; width];
-                    vs.push(v);
-                    Col::V(vs)
-                }
-            };
-        }
-        Col::N(vs) => match v {
-            AV::Num(n) => vs.push(n),
-            other => {
-                let mut nv: Vec<AV<N>> = vs.iter().map(|n| AV::Num(*n)).collect();
-                nv.push(other);
-                *col = Col::V(nv);
-            }
-        },
-        Col::I(vs) => match v {
-            AV::Ival(a, b) => vs.push((a, b)),
-            other => {
-                let mut nv: Vec<AV<N>> = vs.iter().map(|(a, b)| AV::Ival(*a, *b)).collect();
-                nv.push(other);
-                *col = Col::V(nv);
-            }
-        },
-        Col::V(vs) => vs.push(v),
-    }
-}
 
 /// V -> N / I when every lane is a number / interval.
 pub(crate) fn compress_num_v<N: Copy>(vs: Vec<AV<N>>) -> Col<N> {
@@ -270,11 +241,7 @@ impl<N: Arithmetic> Rt2<N> {
             row_keys: Vec::new(),
         }
     }
-
-
-
 }
-
 
 impl<N: Arithmetic> Rt2<N> {
     /// The cell a table-valued global points at, if any.
@@ -556,7 +523,6 @@ impl<N: Arithmetic> Rt2<N> {
         self.cols = new_cols;
     }
 
-
     /// The block as it is, CANONICAL (ids, shape hash; no widening): what a
     /// key space keys (`exact::KeySpace::row_keys`, `exact::exact_rows`).
     pub fn canonical(&mut self) {
@@ -650,7 +616,6 @@ impl<N: Arithmetic> Rt2<N> {
             row_keys: self.row_keys.clone(),
         }
     }
-
 }
 
 impl<N: Arithmetic> Rt2<N> {

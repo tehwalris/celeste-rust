@@ -296,21 +296,6 @@ impl Lower<'_, Float> {
         Ok(Value::Bool([MaskVal::Reg(self.fcmp(imm, xr, ys)), MaskVal::Const(true)]))
     }
 
-    /// A literal operand as an `i16` (the collision box's sizes and flag).
-    fn literal_i16(&self, id: NodeId, n: NumVal, what: &str) -> Result<i32> {
-        match n {
-            NumVal::ConstQ(bits) => {
-                let v = f64::from_bits(bits);
-                if v == v.floor() && (i16::MIN as f64..=i16::MAX as f64).contains(&v) {
-                    Ok(v as i16 as i32)
-                } else {
-                    bail!("node {}: tile_flag's {what} {v} is not an integer", id)
-                }
-            }
-            _ => bail!("node {}: tile_flag's {what} must be an exact constant", id),
-        }
-    }
-
     pub(super) fn lower_node_f64(&mut self, id: NodeId) -> Result<()> {
         if let Some(v) = self.lower_common(id)? {
             self.vals[id as usize] = Some(v);
@@ -320,35 +305,6 @@ impl Lower<'_, Float> {
         let a = node.args.clone();
         let wide = |l: &Self, k: usize| l.wide(a[k]);
         let val = match &node.op {
-            Op::Const(lo, hi) => {
-                if lo == hi {
-                    Value::Num(NumVal::ConstQ(*lo))
-                } else {
-                    Value::Ival([NumVal::ConstQ(*lo), NumVal::ConstQ(*hi)])
-                }
-            }
-            Op::Cell(c) => {
-                let off = *self.cell_off.get(c).expect("input cell offset assigned before lowering");
-                match self.g.cell_kind(*c) {
-                    Ty::Num => Value::Num(NumVal::Reg(self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off }))),
-                    Ty::Bool => {
-                        let v = self.pure(Key::LoadMask8(off), move |d| Inst::LoadMask8 { dst: d, off });
-                        Value::Bool([MaskVal::Reg(v), MaskVal::Const(true)])
-                    }
-                    Ty::UBool => {
-                        let known_off = off + 2;
-                        let v = self.pure(Key::LoadMask8(off), move |d| Inst::LoadMask8 { dst: d, off });
-                        let kn = self.pure(Key::LoadMask8(known_off), move |d| Inst::LoadMask8 { dst: d, off: known_off });
-                        Value::Bool([MaskVal::Reg(v), MaskVal::Reg(kn)])
-                    }
-                    Ty::Ival => {
-                        let hi_off = off + 64;
-                        let lo = self.pure(Key::Load(off), move |d| Inst::Load { dst: d, off });
-                        let hi = self.pure(Key::Load(hi_off), move |d| Inst::Load { dst: d, off: hi_off });
-                        Value::Ival([NumVal::Reg(lo), NumVal::Reg(hi)])
-                    }
-                }
-            }
             op @ (Op::Add | Op::Sub) => {
                 let fop = if matches!(op, Op::Add) { FOp::Add } else { FOp::Sub };
                 if wide(self, 0) || wide(self, 1) {
@@ -452,19 +408,12 @@ impl Lower<'_, Float> {
                 let x = self.as_num(a[0])?;
                 let xr = self.num_reg(x);
                 let dst = self.fresh();
-                self.insts.push(Inst::Call { op: CallOp::FSin, dst, args: vec![xr], scalars: Vec::new() });
+                self.insts.push(Inst::Call { op: CallOp::Sin, dst, args: vec![xr], scalars: Vec::new() });
                 Value::Num(NumVal::Reg(dst))
             }
             op @ (Op::Lt | Op::Le | Op::Gt | Op::Ge) => self.compare(op, [a[0], a[1]])?,
             Op::Eq => {
-                if self.g.ty(a[0]).is_bool() {
-                    let (p, q) = (self.as_bool(a[0])?, self.as_bool(a[1])?);
-                    // val = ~(pv ^ qv), known = pk & qk
-                    let x = self.m_xor(p[0], q[0]);
-                    let val = self.m_not(x);
-                    let known = self.m_and(p[1], q[1]);
-                    Value::Bool([val, known])
-                } else if wide(self, 0) || wide(self, 1) {
+                if wide(self, 0) || wide(self, 1) {
                     // As `refdomain`: two points (each end's bits one) by
                     // value, apart intervals unequal, else unknown.
                     let (x, y) = (self.as_ival(a[0])?, self.as_ival(a[1])?);
@@ -509,10 +458,7 @@ impl Lower<'_, Float> {
                     }
                 }
                 match self.g.ty(inner) {
-                    Ty::Bool | Ty::UBool => {
-                        let b = self.as_bool(inner)?;
-                        Value::Bool([b[1], MaskVal::Const(true)])
-                    }
+                    Ty::Bool | Ty::UBool => unreachable!("a boolean's `Known` is `lower_common`'s"),
                     // A number is decided where its ends are one value's bits
                     // (`Graph::eval`'s `as_point`).
                     Ty::Ival => {
@@ -588,31 +534,6 @@ impl Lower<'_, Float> {
                     _ => MaskVal::Const(true),
                 };
                 Value::Bool([ok, MaskVal::Const(true)])
-            }
-            Op::Mget => {
-                let (x, y) = (self.as_num(a[0])?, self.as_num(a[1])?);
-                let args = vec![self.num_reg(x), self.num_reg(y)];
-                let dst = self.fresh();
-                self.insts.push(Inst::Call { op: CallOp::FMget, dst, args, scalars: Vec::new() });
-                Value::Num(NumVal::Reg(dst))
-            }
-            Op::TileFlagAt => {
-                let (nx, ny) = (self.as_num(a[0])?, self.as_num(a[1])?);
-                let (x, y) = (self.num_reg(nx), self.num_reg(ny));
-                let (wv, hv, fv) = (self.as_num(a[2])?, self.as_num(a[3])?, self.as_num(a[4])?);
-                let flag = self.literal_i16(id, fv, "flag")?;
-                let dst = self.fresh();
-                match (wv, hv) {
-                    (NumVal::ConstQ(_), NumVal::ConstQ(_)) => {
-                        let (w, h) = (self.literal_i16(id, wv, "width")?, self.literal_i16(id, hv, "height")?);
-                        self.insts.push(Inst::Call { op: CallOp::FTileFlag, dst, args: vec![x, y], scalars: vec![w, h, flag] });
-                    }
-                    _ => {
-                        let (wr, hr) = (self.num_reg(wv), self.num_reg(hv));
-                        self.insts.push(Inst::Call { op: CallOp::FTileFlagLanes, dst, args: vec![x, y, wr, hr], scalars: vec![flag] });
-                    }
-                }
-                Value::Bool([MaskVal::Reg(dst), MaskVal::Const(true)])
             }
             other => bail!("node {}: op {:?} is not supported by the doubles' kernels", id, other),
         };

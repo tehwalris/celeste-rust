@@ -49,8 +49,6 @@ pub fn inject_tile_flag_at<D: Domain>(st: &mut State<D>) {
         .insert("tile_flag_at".to_string(), Value::Builtin("tile_flag_at"));
 }
 
-
-
 /// What ONE FRAME is, for the tracer (`trace_frame` runs the button reset
 /// before it). `_draw()` is NOT cosmetic: the player's screen clamp (`x` to
 /// [-1, 121], `spd.x = 0`) lives in the player's `draw`.

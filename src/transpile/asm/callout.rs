@@ -7,9 +7,10 @@
 //! is the scalar operation's by construction. The emitted code saves and
 //! restores the registers live across the call (`codegen::call_saves`).
 //!
-//! The doubles' kernels (8 `f64` lanes) call their own: the tools' `sin`
-//! (`LuaF64::lua_sin`, glibc's `sin`, lane by lane) and the collision
-//! look-ups on whole-number coordinates.
+//! The doubles' kernels (8 `f64` lanes) call their own `sin` (the tools'
+//! `LuaF64::lua_sin`, glibc's, lane by lane); the collision look-ups are
+//! one generic call-out per arithmetic's lanes (`CallLanes`), on whole-number
+//! coordinates and a box the lowering made whole.
 
 use std::os::raw::c_void;
 
@@ -27,8 +28,7 @@ unsafe fn num(p: *const i32, i: usize) -> P8 {
     P8::from_raw(*p.add(i))
 }
 
-/// A whole number of a 16.16 lane (the traced cart never makes a fraction
-/// where one is read: a coordinate, a box, a flag).
+/// A whole number of a 16.16 lane (`CallLanes::whole_lane`).
 #[inline]
 fn whole16(v: P8, what: &str) -> i16 {
     match v.as_i16() {
@@ -86,155 +86,138 @@ pub unsafe extern "C" fn co_sin(out: *mut i32, a: *const i32) {
         *out.add(i) = num(a, i).pico8_sin().as_raw_u32() as i32;
     }
 }
-/// `mget`, per lane: 0 outside the map (as PICO-8; a branch-free kernel
-/// reads there on lanes that do not take the iteration).
-pub unsafe extern "C" fn co_mget(_env: *const c_void, out: *mut i32, x: *const i32, y: *const i32) {
-    for i in 0..LANES {
-        let tile = CART.mget_whole(whole16(num(x, i), "mget: x"), whole16(num(y, i), "mget: y"));
-        *out.add(i) = P8::from_i16(tile as i16).as_raw_u32() as i32;
+
+/// The tools' `sin`, lane by lane (`LuaF64::lua_sin`). A lane whose
+/// argument is not finite is in error already (its operation's own); it
+/// gets NaN, which nothing reads.
+pub unsafe extern "C" fn co_fsin(out: *mut f64, a: *const f64) {
+    for i in 0..8 {
+        let r = LuaF64::new(*a.add(i)).and_then(LuaF64::lua_sin);
+        *out.add(i) = r.map_or(f64::NAN, LuaF64::value);
     }
 }
-/// `tile_flag_at` with a UNIFORM box (`w`/`h`/`flag` raw 16.16 scalars).
-/// Writes the 16-bit `val` mask to `*out_mask` (known is all-ones).
-pub unsafe extern "C" fn co_tile_flag(
-    env: *const c_void,
-    out_mask: *mut u16,
-    x: *const i32,
-    y: *const i32,
-    w: i32,
-    h: i32,
-    flag: i32,
-) {
-    let env = &*(env as *const CollisionEnv);
-    let (w, h, flag) = (whole16(P8::from_raw(w), "tile_flag_at: w"), whole16(P8::from_raw(h), "tile_flag_at: h"), whole16(P8::from_raw(flag), "tile_flag_at: flag"));
-    let lanes = (0..LANES).map(|i| (whole16(num(x, i), "tile_flag_at: x"), whole16(num(y, i), "tile_flag_at: y")));
-    *out_mask = env.tile_flags(w, h, flag, lanes);
+
+/// `mget`, per lane: 0 outside the map (as PICO-8; a branch-free kernel
+/// reads there on lanes that do not take the iteration).
+pub unsafe extern "C" fn co_mget<L: CallLanes>(_env: *const c_void, out: *mut L::Lane, x: *const L::Lane, y: *const L::Lane) {
+    for i in 0..L::N {
+        *out.add(i) = L::tile(CART.mget_whole(L::whole_lane(x, i, "mget: x"), L::whole_lane(y, i, "mget: y")));
+    }
 }
+
+/// `tile_flag_at` with a UNIFORM box (`w`/`h`/`flag` whole numbers, the
+/// lowering's): writes the lanes' `val` mask (known is all-ones).
+pub unsafe extern "C" fn co_tile_flag<L: CallLanes>(env: *const c_void, out_mask: *mut L::Mask, x: *const L::Lane, y: *const L::Lane, w: i32, h: i32, flag: i32) {
+    let env = &*(env as *const CollisionEnv);
+    let lanes = (0..L::N).map(|i| (L::whole_lane(x, i, "tile_flag_at: x"), L::whole_lane(y, i, "tile_flag_at: y")));
+    *out_mask = L::mask(env.tile_flags(w as i16, h as i16, flag as i16, lanes));
+}
+
 /// `tile_flag_at` with a PER-LANE box (`w`/`h` are columns; in the frame an
 /// object is created its hitbox depends on whether `type.init` replaced the
 /// default 8x8): always the scan, the precomputed maps being keyed by the box.
-pub unsafe extern "C" fn co_tile_flag_lanes(
-    env: *const c_void,
-    out_mask: *mut u16,
-    x: *const i32,
-    y: *const i32,
-    w: *const i32,
-    h: *const i32,
-    flag: i32,
-) {
+pub unsafe extern "C" fn co_tile_flag_lanes<L: CallLanes>(env: *const c_void, out_mask: *mut L::Mask, x: *const L::Lane, y: *const L::Lane, w: *const L::Lane, h: *const L::Lane, flag: i32) {
     let env = &*(env as *const CollisionEnv);
-    let flag = whole16(P8::from_raw(flag), "tile_flag_at: flag");
     let mut m = 0u16;
-    for i in 0..LANES {
-        let (xi, yi) = (whole16(num(x, i), "tile_flag_at: x"), whole16(num(y, i), "tile_flag_at: y"));
-        let (wi, hi) = (whole16(num(w, i), "tile_flag_at: w"), whole16(num(h, i), "tile_flag_at: h"));
-        if env.cache.flag_at(xi, yi, wi, hi, flag).expect("tile_flag_at") {
+    for i in 0..L::N {
+        let (xi, yi) = (L::whole_lane(x, i, "tile_flag_at: x"), L::whole_lane(y, i, "tile_flag_at: y"));
+        let (wi, hi) = (L::whole_lane(w, i, "tile_flag_at: w"), L::whole_lane(h, i, "tile_flag_at: h"));
+        if env.cache.flag_at(xi, yi, wi, hi, flag as i16).expect("tile_flag_at") {
             m |= 1 << i;
         }
     }
-    *out_mask = m;
+    *out_mask = L::mask(m);
 }
 
-/// The doubles' lanes a call-out reads.
-const F_LANES: usize = 8;
+/// An arithmetic's call-out lanes: its kernel's lanes a column holds (16.16
+/// sixteen `i32`s, the doubles eight `f64`s a half), their mask, and its
+/// own call-outs.
+pub trait CallLanes: Sized {
+    type Lane: Copy;
+    type Mask: Copy;
+    const N: usize;
+    /// `/` and `%`: 16.16's call-outs; the doubles compute theirs inline.
+    const DIV: Option<unsafe extern "C" fn(*mut Self::Lane, *const Self::Lane, *const Self::Lane)>;
+    const REM: Option<unsafe extern "C" fn(*mut Self::Lane, *const Self::Lane, *const Self::Lane)>;
+    const SIN: unsafe extern "C" fn(*mut Self::Lane, *const Self::Lane);
+    /// Lane `i` of a column as a whole number (a coordinate, a box): the
+    /// traced cart never makes a fraction where one is read; FATAL if it did.
+    unsafe fn whole_lane(p: *const Self::Lane, i: usize, what: &str) -> i16;
+    /// A tile number (`mget`'s result) as a lane.
+    fn tile(t: u8) -> Self::Lane;
+    /// The lanes' 16-bit answer as the kernel's mask.
+    fn mask(m: u16) -> Self::Mask;
+}
 
-/// A whole-number coordinate of the doubles (`LuaF64::as_i16`), as the
-/// 16.16 call-outs require of theirs.
-#[inline]
-unsafe fn whole(p: *const f64, i: usize, what: &str) -> i16 {
-    let v = *p.add(i);
-    match LuaF64::new(v).and_then(LuaF64::as_i16) {
-        Some(n) => n,
-        None => not_whole(v, i, what),
+impl CallLanes for P8 {
+    type Lane = i32;
+    type Mask = u16;
+    const N: usize = LANES;
+    const DIV: Option<unsafe extern "C" fn(*mut i32, *const i32, *const i32)> = Some(co_div);
+    const REM: Option<unsafe extern "C" fn(*mut i32, *const i32, *const i32)> = Some(co_rem);
+    const SIN: unsafe extern "C" fn(*mut i32, *const i32) = co_sin;
+    #[inline]
+    unsafe fn whole_lane(p: *const i32, i: usize, what: &str) -> i16 {
+        whole16(num(p, i), what)
+    }
+    fn tile(t: u8) -> i32 {
+        P8::from_i16(t as i16).as_raw_u32() as i32
+    }
+    fn mask(m: u16) -> u16 {
+        m
     }
 }
 
-/// `whole`'s panic, out of line (`not_whole16`).
+impl CallLanes for LuaF64 {
+    type Lane = f64;
+    type Mask = u8;
+    const N: usize = 8;
+    const DIV: Option<unsafe extern "C" fn(*mut f64, *const f64, *const f64)> = None;
+    const REM: Option<unsafe extern "C" fn(*mut f64, *const f64, *const f64)> = None;
+    const SIN: unsafe extern "C" fn(*mut f64, *const f64) = co_fsin;
+    /// `LuaF64::as_i16`, as 16.16's require of theirs.
+    #[inline]
+    unsafe fn whole_lane(p: *const f64, i: usize, what: &str) -> i16 {
+        let v = *p.add(i);
+        match LuaF64::new(v).and_then(LuaF64::as_i16) {
+            Some(n) => n,
+            None => not_whole(v, i, what),
+        }
+    }
+    fn tile(t: u8) -> f64 {
+        t as f64
+    }
+    fn mask(m: u16) -> u8 {
+        m as u8
+    }
+}
+
+/// `CallLanes::whole_lane`'s panic for the doubles, out of line (`not_whole16`).
 #[cold]
 #[inline(never)]
 fn not_whole(v: f64, i: usize, what: &str) -> ! {
     panic!("{what}: lane {i} holds {v}, not a whole number")
 }
 
-/// The tools' `sin`, lane by lane (`LuaF64::lua_sin`). A lane whose
-/// argument is not finite is in error already (its operation's own); it
-/// gets NaN, which nothing reads.
-pub unsafe extern "C" fn co_fsin(out: *mut f64, a: *const f64) {
-    for i in 0..F_LANES {
-        let r = LuaF64::new(*a.add(i)).and_then(LuaF64::lua_sin);
-        *out.add(i) = r.map_or(f64::NAN, LuaF64::value);
-    }
-}
-pub unsafe extern "C" fn co_fmget(_env: *const c_void, out: *mut f64, x: *const f64, y: *const f64) {
-    for i in 0..F_LANES {
-        *out.add(i) = CART.mget_whole(whole(x, i, "mget x"), whole(y, i, "mget y")) as f64;
-    }
-}
-/// `tile_flag_at` with a UNIFORM box (`w`/`h`/`flag` whole numbers):
-/// `co_tile_flag`'s, on whole-number coordinates. Writes the 8-lane mask.
-pub unsafe extern "C" fn co_ftile_flag(env: *const c_void, out_mask: *mut u8, x: *const f64, y: *const f64, w: i32, h: i32, flag: i32) {
-    let env = &*(env as *const CollisionEnv);
-    let lanes = (0..F_LANES).map(|i| (whole(x, i, "tile_flag_at x"), whole(y, i, "tile_flag_at y")));
-    *out_mask = env.tile_flags(w as i16, h as i16, flag as i16, lanes) as u8;
-}
-/// `tile_flag_at` with a PER-LANE box.
-pub unsafe extern "C" fn co_ftile_flag_lanes(env: *const c_void, out_mask: *mut u8, x: *const f64, y: *const f64, w: *const f64, h: *const f64, flag: i32) {
-    let env = &*(env as *const CollisionEnv);
-    let mut m = 0u8;
-    for i in 0..F_LANES {
-        let (xi, yi) = (whole(x, i, "tile_flag_at x"), whole(y, i, "tile_flag_at y"));
-        let (wi, hi) = (whole(w, i, "tile_flag_at w"), whole(h, i, "tile_flag_at h"));
-        if env.cache.flag_at(xi, yi, wi, hi, flag as i16).expect("tile_flag_at") {
-            m |= 1 << i;
-        }
-    }
-    *out_mask = m;
-}
-
 /// The kernel's third argument: the call-out function pointers plus the
-/// collision environment. Field ORDER is load-bearing - the emitter reads
-/// each pointer at a fixed byte offset (see `codegen::CTX_*`).
+/// collision environment, one layout for both arithmetics. Field ORDER is
+/// load-bearing - the emitter reads each pointer at a fixed byte offset
+/// (`codegen::CTX_*`).
 #[repr(C)]
-pub struct AsmCtx {
-    pub div: unsafe extern "C" fn(*mut i32, *const i32, *const i32),
-    pub rem: unsafe extern "C" fn(*mut i32, *const i32, *const i32),
-    pub sin: unsafe extern "C" fn(*mut i32, *const i32),
-    pub mget: unsafe extern "C" fn(*const c_void, *mut i32, *const i32, *const i32),
-    pub tile_flag:
-        unsafe extern "C" fn(*const c_void, *mut u16, *const i32, *const i32, i32, i32, i32),
-    pub tile_flag_lanes: unsafe extern "C" fn(
-        *const c_void,
-        *mut u16,
-        *const i32,
-        *const i32,
-        *const i32,
-        *const i32,
-        i32,
-    ),
+pub struct AsmCtx<L: CallLanes> {
+    pub div: Option<unsafe extern "C" fn(*mut L::Lane, *const L::Lane, *const L::Lane)>,
+    pub rem: Option<unsafe extern "C" fn(*mut L::Lane, *const L::Lane, *const L::Lane)>,
+    pub sin: unsafe extern "C" fn(*mut L::Lane, *const L::Lane),
+    pub mget: unsafe extern "C" fn(*const c_void, *mut L::Lane, *const L::Lane, *const L::Lane),
+    pub tile_flag: unsafe extern "C" fn(*const c_void, *mut L::Mask, *const L::Lane, *const L::Lane, i32, i32, i32),
+    pub tile_flag_lanes: unsafe extern "C" fn(*const c_void, *mut L::Mask, *const L::Lane, *const L::Lane, *const L::Lane, *const L::Lane, i32),
     pub env: *const c_void,
-    // The doubles' (`codegen::CTX_F*`), after `env`.
-    pub fsin: unsafe extern "C" fn(*mut f64, *const f64),
-    pub fmget: unsafe extern "C" fn(*const c_void, *mut f64, *const f64, *const f64),
-    pub ftile_flag: unsafe extern "C" fn(*const c_void, *mut u8, *const f64, *const f64, i32, i32, i32),
-    pub ftile_flag_lanes: unsafe extern "C" fn(*const c_void, *mut u8, *const f64, *const f64, *const f64, *const f64, i32),
 }
 
-impl AsmCtx {
-    /// A context wired to the real primitives, with `env` pointing at a
-    /// `CollisionEnv` the caller keeps alive.
-    pub fn new(env: *const c_void) -> AsmCtx {
-        AsmCtx {
-            div: co_div,
-            rem: co_rem,
-            sin: co_sin,
-            mget: co_mget,
-            tile_flag: co_tile_flag,
-            tile_flag_lanes: co_tile_flag_lanes,
-            env,
-            fsin: co_fsin,
-            fmget: co_fmget,
-            ftile_flag: co_ftile_flag,
-            ftile_flag_lanes: co_ftile_flag_lanes,
-        }
+impl<L: CallLanes> AsmCtx<L> {
+    /// A context wired to the arithmetic's primitives, with `env` pointing
+    /// at a `CollisionEnv` the caller keeps alive.
+    pub fn new(env: *const c_void) -> AsmCtx<L> {
+        AsmCtx { div: L::DIV, rem: L::REM, sin: L::SIN, mget: co_mget::<L>, tile_flag: co_tile_flag::<L>, tile_flag_lanes: co_tile_flag_lanes::<L>, env }
     }
 }

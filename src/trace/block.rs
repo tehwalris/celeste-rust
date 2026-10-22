@@ -33,7 +33,6 @@ use crate::trace::domain::Domain;
 use crate::trace::heap::{BodyId, ClosureId, Heap, Table, TableId, Value};
 use crate::trace::state::State;
 
-pub const BUTTON_GLOBAL: &str = "__button_states";
 
 /// The block of `st`, one lane: its structure, and its values by `num` and
 /// `boolean` (the domain's part). Canonical cell order, its shape hash set,
@@ -45,7 +44,7 @@ pub fn to_rt2<D: Domain, N: Arithmetic>(
     boolean: impl Fn(&D::Bool) -> Result<AV<N>>,
 ) -> Result<Rt2<N>> {
     let globals = &st.heap.tables[&st.globals].hash;
-    let buttons = match globals.get(BUTTON_GLOBAL) {
+    let buttons = match globals.get(super::game::BUTTONS) {
         Some(Value::Table(t)) => Some(*t),
         _ => None,
     };
@@ -271,7 +270,7 @@ pub fn from_block<N: Arithmetic, D: Domain<A = N>, E: Domain>(
             cx.heap.tables.get_mut(&globals).expect("just made").hash.entry(k.clone()).or_insert(Value::Builtin(n));
         }
     }
-    let buttons = match cx.heap.tables[&globals].hash.get(BUTTON_GLOBAL) {
+    let buttons = match cx.heap.tables[&globals].hash.get(super::game::BUTTONS) {
         Some(Value::Table(t)) => Some(*t),
         _ => None,
     };

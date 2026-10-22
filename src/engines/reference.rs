@@ -14,7 +14,8 @@ use full_moon::ast;
 
 use crate::abstraction::Level;
 use crate::search::rem::{Capture, Rem};
-use crate::trace::block::{self, fn_info_of, FnInfo, BUTTON_GLOBAL};
+use crate::trace::block::{self, fn_info_of, FnInfo};
+use crate::trace::game::{BUTTONS, PLAYER, PLAYER_SPAWN};
 use crate::trace::heap::{TableId, Value};
 use crate::trace::iface;
 use crate::trace::interp::Interp;
@@ -45,7 +46,6 @@ pub struct ReferenceEngine<A: Arithmetic> {
 pub type RefEngine = ReferenceEngine<Fixed>;
 /// The float tools' reference engine (Lua doubles).
 pub type FloatRefEngine = ReferenceEngine<Float>;
-
 
 impl<A: Arithmetic> ReferenceEngine<A> {
     /// Parse the cart, run its toplevel and `_init` for the start room of
@@ -92,9 +92,7 @@ impl<A: Arithmetic> ReferenceEngine<A> {
     }
 }
 
-impl<A: Arithmetic> ReferenceEngine<A>
-where
-{
+impl<A: Arithmetic> ReferenceEngine<A> {
     /// The room's start as a one-row block, without keys.
     pub fn initial(&self) -> Result<Rt2<A>> {
         to_block(&self.base, self.settings.room)
@@ -227,9 +225,7 @@ where
     /// (`Rem::transfer`; a refusal is fatal, as theirs).
     pub fn run_lane(&mut self, block: &Rt2<A>, lane: usize) -> Result<Vec<(Rt2<A>, <A as Rem>::Pair)>> {
         let (mut st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
-        let zero = A::point(A::from_i16(0));
-        let none = || ArcAxis { took: false, pre: zero, frag: zero, ox: zero };
-        st.arc = Some(Box::new([none(), none()]));
+        st.arc = Some(Box::new([ArcAxis::none(&mut self.it.d), ArcAxis::none(&mut self.it.d)]));
         self.it.arc_capture = true;
         let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, self.level, self.path_cap);
         self.it.arc_capture = false;
@@ -255,25 +251,17 @@ impl<A: crate::transpile::garith::GraphArith> ReferenceEngine<A> {
 /// at the frame's end (before any widening), decoded (`Rem::transfer`).
 fn transfer_of<N: Rem>(leaf: &State<RefDomain<N>>) -> Result<N::Pair> {
     let axes = leaf.arc.as_deref().ok_or_else(|| anyhow::anyhow!("arc capture: a leaf without one"))?;
-    let players = objects_of_type(leaf, "player");
-    ensure!(players.len() <= 1, "arc capture: {} player objects at the frame's end", players.len());
+    let fins = crate::trace::state::arc_fins(leaf)?;
     let ends = |v: &N::Ival| N::bounds(*v);
-    let axis = |k: usize| -> Result<Capture<N>> {
+    let axis = |k: usize| {
         let a = &axes[k];
-        let fin = match players.first() {
-            Some(pl) => match iface::get(leaf, &field(pl, &["rem", ["x", "y"][k]])) {
-                Some(Value::Num(n)) => Some(ends(&n)),
-                other => anyhow::bail!("arc capture: the player's rem.{} is {other:?}", ["x", "y"][k]),
-            },
-            None => None,
-        };
-        Ok(Capture { took: a.took, pre: ends(&a.pre), frag: ends(&a.frag), ox: ends(&a.ox), fin })
+        Capture { took: a.took, pre: ends(&a.pre), frag: ends(&a.frag), ox: ends(&a.ox), fin: fins.map(|f| ends(&f[k])) }
     };
-    N::transfer(&axis(0)?, &axis(1)?).map_err(|e| anyhow::anyhow!("the reference's transfer is refused: {e}"))
+    N::transfer(&axis(0), &axis(1)).map_err(|e| anyhow::anyhow!("the reference's transfer is refused: {e}"))
 }
 
 /// A fly fruit's `spd.y` and `rem.y` (at a fruit level the ranges
-/// `FLY_FRUIT_SPD_Y`/`FLY_FRUIT_REM_Y`) as the point 0, inside both. Exact
+/// `FLY_FRUIT_SPD_Y` and `REM`) as the point 0, inside both. Exact
 /// for a successor projected onto the level: the two decide only whether
 /// `move` runs (`spd ~= 0`) and its `y` amount, added to `y` (the unknown
 /// number, which stays unknown under any addition: `RefDomain::arith`), and
@@ -358,7 +346,7 @@ where
 /// What a reference frame ran from, for its error: the input and where every
 /// player and player spawn was.
 fn ran_from<A: Arithmetic>(st: &State<RefDomain<A>>, byte: Option<u8>) -> String {
-    let at: Vec<String> = ["player", "player_spawn"]
+    let at: Vec<String> = [PLAYER, PLAYER_SPAWN]
         .iter()
         .flat_map(|ty| objects_of_type(st, ty))
         .map(|o| {
@@ -376,7 +364,7 @@ fn ran_from<A: Arithmetic>(st: &State<RefDomain<A>>, byte: Option<u8>) -> String
 /// The positions of every player and player spawn, concrete.
 fn players<A: Arithmetic>(st: &State<RefDomain<A>>) -> Result<Vec<(A, A)>> {
     let mut out = Vec::new();
-    for ty in ["player", "player_spawn"] {
+    for ty in [PLAYER, PLAYER_SPAWN] {
         for o in objects_of_type(st, ty) {
             out.push(position(st, &o)?.ok_or_else(|| anyhow::anyhow!("{}: a player position that is not a point", iface::show(&o)))?);
         }
@@ -620,8 +608,8 @@ pub fn from_block<N: Arithmetic>(
 /// Set the six buttons of a reference state from an input byte (bit 0 left,
 /// 1 right, 2 up, 3 down, 4 jump, 5 dash). Returns the button table.
 pub fn set_buttons<A: celeste_core::arith::Arithmetic>(st: &mut State<RefDomain<A>>, byte: u8) -> Result<TableId> {
-    let Some(Value::Table(t)) = st.heap.tables[&st.globals].hash.get(BUTTON_GLOBAL).cloned() else {
-        bail!("no {BUTTON_GLOBAL} table")
+    let Some(Value::Table(t)) = st.heap.tables[&st.globals].hash.get(BUTTONS).cloned() else {
+        bail!("no {BUTTONS} table")
     };
     let arr = &mut st.heap.tables.get_mut(&t).expect("a live table").arr;
     for (i, b) in arr.iter_mut().enumerate() {
