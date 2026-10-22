@@ -222,14 +222,16 @@ impl Command {
     }
 }
 
+/// A search's horizon, levels, directory and outputs (`search`, `dual`).
 #[derive(clap::Args)]
 pub struct SearchArgs {
     /// The horizon in game frames (two steps each under --split-frame):
     /// every frame up to it is searched.
     #[arg(long)]
     frames: u32,
-    /// The horizon is a KNOWN solution's frame (a replayed TAS): a
-    /// refutation, or no concrete witness by it, is an error.
+    /// The horizon is a KNOWN solution's frame (a replayed TAS; `dual`: a
+    /// known dual run's): a refutation, or no concrete witness by it, is an
+    /// error.
     #[arg(long)]
     ceiling: bool,
     /// The levels (`Level::parse`), comma-separated, coarsest first:
@@ -240,55 +242,37 @@ pub struct SearchArgs {
     /// The search's directory: level i's tree goes to `level{i:02}/` under it.
     #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
     search_dir: String,
-    /// Stop at the arc bound (no concrete search).
+    /// Stop at the arc bound (`dual`: the dual bound), no concrete search.
     #[arg(long)]
     no_witness: bool,
     /// Write the web UI's arc pass into this directory (`export-ui --arc
     /// DIR`): the winning sets' support (`level0.marks.bin`) and the
     /// ARC-MARKED nodes (`arc.marks.bin`) as `(shape, cell, key, dist)` rows,
     /// `dist` the horizon less the last frame the node still wins from; and
-    /// `witness.txt` (inputs and player position per frame).
+    /// `witness.txt` (inputs and player position per frame). `dual`: the
+    /// FLOAT half's arc pass (the count) and the dual witness.
     #[arg(long)]
     save_marks: Option<String>,
     /// A known solution (a `tas/` file or a comma list of input bytes, the
     /// spawn prologue included): the concrete search tries its input first
     /// at every frame, so the witness is the optimum closest to it (every
     /// input is still tried). When it exits by the horizon it is also
-    /// CHECKED against every pruning step at every level (as `check known`):
-    /// the search fails if one drops it.
+    /// CHECKED against every pruning step at every level (as `check known`;
+    /// `dual`: each half's): the search fails if one drops it.
     #[arg(long)]
     prefer: Option<String>,
 }
 
 #[derive(clap::Args)]
 pub struct DualArgs {
-    /// The horizon in game frames (as `search --frames`).
-    #[arg(long)]
-    frames: u32,
-    /// The horizon is a KNOWN dual run's frame: a refutation, or no dual
-    /// witness by it, is an error.
-    #[arg(long)]
-    ceiling: bool,
-    #[arg(long, default_value = "r0sx")]
-    level: String,
-    #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
-    search_dir: String,
-    /// Stop at the dual bound (no concrete search).
-    #[arg(long)]
-    no_witness: bool,
-    /// A known run, tried first and checked against each half's pruning (as `search --prefer`).
-    #[arg(long)]
-    prefer: Option<String>,
+    #[command(flatten)]
+    search: SearchArgs,
     /// The float half's tool.
     #[arg(long, value_enum, default_value = "celia")]
     float_half: celeste_rust::settings::FloatTool,
     /// The float half's loading jank J (Celia only; default: its IL load's).
     #[arg(long)]
     float_loading_jank: Option<usize>,
-    /// The FLOAT half's arc pass (the count) and the dual witness, as
-    /// `search --save-marks`.
-    #[arg(long)]
-    save_marks: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -334,6 +318,20 @@ pub struct ExportUiArgs {
     /// byte (the tasdatabase upload the category runner verified).
     #[arg(long)]
     download: Option<String>,
+}
+
+/// THE TREE a command reads, its settings its records' (`TreeDir`).
+#[derive(clap::Args)]
+pub(crate) struct TreeArg {
+    /// The tree (a forward's `--tree`, or a search's `levelNN`).
+    #[arg(long)]
+    tree: std::path::PathBuf,
+}
+
+impl TreeArg {
+    pub(crate) fn open(&self, run: &Settings) -> Result<TreeDir> {
+        TreeDir::open(&self.tree, run)
+    }
 }
 
 /// THE ROW SELECTOR of the commands that read a frame's states: the frame
@@ -384,11 +382,10 @@ pub(crate) fn where_(c: u32) -> String {
 
 /// `search` and `dual` (`float`: the float half's settings): `search::run`,
 /// its verdict reported.
-#[allow(clippy::too_many_arguments)]
-fn search(cfg: &Settings, float: Option<&Settings>, horizon: u32, ceiling: bool, level: &str, dir: &str, bound_only: bool, save_marks: Option<&str>, prefer: Option<&str>) -> Result<()> {
-    let prefer = prefer.map(celeste_rust::concrete::read_inputs).transpose()?;
-    let dir = std::path::Path::new(dir);
-    let spec = celeste_rust::search::SearchSpec { settings: cfg, level, horizon, ceiling, dir, bound_only, save_marks: save_marks.map(std::path::Path::new), prefer: prefer.as_deref(), dual: float };
+fn search(cfg: &Settings, float: Option<&Settings>, a: &SearchArgs) -> Result<()> {
+    let prefer = a.prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
+    let dir = std::path::Path::new(&a.search_dir);
+    let spec = celeste_rust::search::SearchSpec { settings: cfg, level: &a.level, horizon: a.frames, ceiling: a.ceiling, dir, bound_only: a.no_witness, save_marks: a.save_marks.as_deref().map(std::path::Path::new), prefer: prefer.as_deref(), dual: float };
     report(&celeste_rust::search::run(&spec)?, dir)
 }
 /// A search's verdict (`search::run`'s record), printed; an error where it
@@ -485,10 +482,10 @@ fn main() -> Result<()> {
         }
     })?;
     match cli.command {
-        Command::Search(a) => search(&cfg, None, a.frames, a.ceiling, &a.level, &a.search_dir, a.no_witness, a.save_marks.as_deref(), a.prefer.as_deref()),
+        Command::Search(a) => search(&cfg, None, &a),
         Command::Dual(a) => {
             let float = cfg.float_half(a.float_half, a.float_loading_jank)?;
-            search(&cfg, Some(&float), a.frames, a.ceiling, &a.level, &a.search_dir, a.no_witness, a.save_marks.as_deref(), a.prefer.as_deref())
+            search(&cfg, Some(&float), &a.search)
         }
         Command::Forward(a) => {
             let t = std::time::Instant::now();

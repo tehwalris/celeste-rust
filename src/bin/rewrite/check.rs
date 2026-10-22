@@ -82,9 +82,8 @@ pub enum Command {
 
 #[derive(clap::Args)]
 pub struct RefArgs {
-    /// The tree (a forward's `--tree`, or a search's `levelNN`).
-    #[arg(long)]
-    tree: PathBuf,
+    #[command(flatten)]
+    tree: crate::TreeArg,
     #[command(flatten)]
     rows: Rows,
     /// Rows sampled.
@@ -109,9 +108,8 @@ pub struct RefArgs {
 
 #[derive(clap::Args)]
 pub struct ArcsArgs {
-    /// The tree (a forward's `--tree`, or a search's `levelNN`).
-    #[arg(long)]
-    tree: PathBuf,
+    #[command(flatten)]
+    tree: crate::TreeArg,
     /// The first step whose records are checked.
     #[arg(long, default_value_t = 1)]
     from_step: u32,
@@ -136,9 +134,8 @@ pub struct ArcsArgs {
 
 #[derive(clap::Args)]
 pub struct WidenArgs {
-    /// The tree (a forward's `--tree`, or a search's `levelNN`).
-    #[arg(long)]
-    tree: PathBuf,
+    #[command(flatten)]
+    tree: crate::TreeArg,
     /// The step whose stored rows are checked (default: the tree's last).
     #[arg(long)]
     step: Option<u32>,
@@ -165,9 +162,8 @@ pub struct KnownArgs {
 
 #[derive(clap::Args)]
 pub struct ReplayArgs {
-    /// The tree (a forward's `--tree`, or a search's `levelNN`).
-    #[arg(long)]
-    tree: PathBuf,
+    #[command(flatten)]
+    tree: crate::TreeArg,
     /// The last step replayed (default: the tree's last).
     #[arg(long)]
     steps: Option<u32>,
@@ -177,16 +173,16 @@ pub struct ReplayArgs {
 pub fn run(run: &Settings, c: Command) -> Result<()> {
     match c {
         Command::Ref(a) => {
-            let t = TreeDir::open(&a.tree, run)?;
+            let t = a.tree.open(run)?;
             celeste_rust::with_arith!(t.settings.arith, N => ref_check::<N>(&t, &a))
         }
         Command::Arcs(a) => {
-            let t = TreeDir::open(&a.tree, run)?;
+            let t = a.tree.open(run)?;
             let o = celeste_rust::search::arc_check::Opts { dir: &t.dir, from: a.from_step, to: t.frame(a.to_step)?, samples: a.samples, level: t.level, fault: a.fault.as_deref(), path_cap: a.path_cap, settings: &t.settings };
             celeste_rust::with_arith!(t.settings.arith, N => celeste_rust::search::arc_check::run::<N>(&o))
         }
         Command::Widen(a) => {
-            let t = TreeDir::open(&a.tree, run)?;
+            let t = a.tree.open(run)?;
             let frame = t.frame(a.step)?;
             celeste_rust::with_arith!(t.settings.arith, N => widen_check::<N>(&t, frame, a.emitted))
         }
@@ -196,7 +192,7 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
         }
         Command::Replay(a) => {
             use celeste_rust::search::hull_replay::replay;
-            let t = TreeDir::open(&a.tree, run)?;
+            let t = a.tree.open(run)?;
             let to = t.frame(a.steps)?;
             let tm = std::time::Instant::now();
             let frames = celeste_rust::with_arith!(t.settings.arith, N => replay::<N>(&t.dir, to, t.settings.threads())?);

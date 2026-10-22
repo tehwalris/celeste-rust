@@ -516,7 +516,8 @@ pub fn recorded_arith(dir: &Path) -> Result<Arith> {
     }
 }
 
-fn pair<T: std::str::FromStr>(s: &str, what: &str) -> std::result::Result<(T, T), String> {
+/// `"a,b"` (`what` names it in a refusal).
+pub fn pair<T: std::str::FromStr>(s: &str, what: &str) -> std::result::Result<(T, T), String> {
     let (a, b) = s.split_once(',').ok_or_else(|| format!("{what}: \"a,b\", not {s:?}"))?;
     let p = |t: &str| t.trim().parse::<T>().map_err(|_| format!("{what}: {t:?} is not a number"));
     Ok((p(a)?, p(b)?))

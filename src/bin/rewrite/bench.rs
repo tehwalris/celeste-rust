@@ -93,9 +93,8 @@ fn hex(s: &str) -> std::result::Result<u64, String> {
 
 #[derive(clap::Args)]
 pub struct FrameArgs {
-    /// The tree (a forward's `--tree`, or a search's `levelNN`).
-    #[arg(long)]
-    tree: PathBuf,
+    #[command(flatten)]
+    tree: crate::TreeArg,
     /// The step F to run F -> F+1 from (default: the tree's last).
     #[arg(long)]
     step: Option<u32>,
@@ -129,9 +128,8 @@ pub struct FrameArgs {
 
 #[derive(clap::Args)]
 pub struct BackwardArgs {
-    /// A search's tree (its `levelNN`: `frames/`, `edges/` under it).
-    #[arg(long)]
-    tree: PathBuf,
+    #[command(flatten)]
+    tree: crate::TreeArg,
     /// The search's horizon, in steps (default: the tree's last); the graph
     /// and the winning sets are built for it.
     #[arg(long)]
@@ -148,14 +146,14 @@ pub struct BackwardArgs {
 pub fn run(run: &Settings, c: Command) -> Result<()> {
     match c {
         Command::Frame(a) => {
-            let t = TreeDir::open(&a.tree, run)?;
+            let t = a.tree.open(run)?;
             if t.settings.arith != Arith::Fixed {
                 anyhow::ensure!(a.metrics.is_none(), "a float tree: bench frame --metrics (the kernel census) is 16.16's");
             }
             celeste_rust::with_arith!(t.settings.arith, N => bench_frame::<N>(&t, &a))
         }
         Command::Backward(a) => {
-            let t = TreeDir::open(&a.tree, run)?;
+            let t = a.tree.open(run)?;
             let horizon = t.frame(a.steps)?;
             celeste_rust::with_arith!(t.settings.arith, N => bench_backward::<N>(&t, horizon, a.step, a.reps))
         }

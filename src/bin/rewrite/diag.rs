@@ -7,20 +7,17 @@ use anyhow::Result;
 use celeste_engine::runtime2::{Rt2, P8};
 use celeste_rust::frame::wins_of;
 use celeste_rust::search::inspect::cell_names;
-use celeste_rust::search::tree::TreeDir;
 use celeste_rust::settings::{Arith, Settings};
 use celeste_rust::storage::layer::Tree;
 use celeste_rust::storage::Sk;
 use celeste_rust::engines::reference::RefEngine;
-use std::path::PathBuf;
 
 use crate::{prefixes, where_, Rows};
 
 #[derive(clap::Args)]
 pub struct CkhashArgs {
-    /// The tree (a forward's `--tree`, or a search's `levelNN`).
-    #[arg(long)]
-    tree: PathBuf,
+    #[command(flatten)]
+    tree: crate::TreeArg,
     /// The last step fingerprinted (default: the tree's last).
     #[arg(long)]
     steps: Option<u32>,
@@ -43,9 +40,8 @@ pub struct CkhashArgs {
 
 #[derive(clap::Args)]
 pub struct CensusArgs {
-    /// The tree (a forward's `--tree`, or a search's `levelNN`).
-    #[arg(long)]
-    tree: PathBuf,
+    #[command(flatten)]
+    tree: crate::TreeArg,
     #[command(flatten)]
     rows: Rows,
     /// Stop counting a column's distinct values past this many.
@@ -79,7 +75,7 @@ pub struct RobustArgs {
 }
 
 pub fn ckhash(run: &Settings, a: CkhashArgs) -> Result<()> {
-    let t = TreeDir::open(&a.tree, run)?;
+    let t = a.tree.open(run)?;
     let (dir, to, cfg) = (&t.dir, t.frame(a.steps)?, &t.settings);
     let (edges, hulls, dump_edges) = (a.edges, a.hulls, a.dump_edges);
     if cfg.arith != Arith::Fixed {
@@ -105,7 +101,7 @@ pub fn ckhash(run: &Settings, a: CkhashArgs) -> Result<()> {
 pub fn census(run: &Settings, a: CensusArgs) -> Result<()> {
     use celeste_engine::exact::Code;
     use celeste_engine::runtime2::{Cell2, Col, AV};
-    let t = TreeDir::open(&a.tree, run)?;
+    let t = a.tree.open(run)?;
     anyhow::ensure!(!t.float(), "census: a 16.16 tree only so far");
     let cfg = &t.settings;
     let (frame, only) = a.rows.of(&t)?;
@@ -273,8 +269,7 @@ pub fn trajectory(cfg: &Settings, a: TrajectoryArgs) -> Result<()> {
             if l == "-" {
                 return Ok(None);
             }
-            let (x, y) = l.split_once(',').ok_or_else(|| anyhow::anyhow!("{trajectory}: {l:?} is not \"x,y\" or \"-\""))?;
-            Ok(Some((x.trim().parse()?, y.trim().parse()?)))
+            Ok(Some(celeste_rust::settings::pair::<i32>(l, &trajectory).map_err(anyhow::Error::msg)?))
         })
         .collect::<Result<_>>()?;
     let mut eng = RefEngine::new(&cfg)?;
