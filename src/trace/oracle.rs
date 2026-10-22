@@ -59,30 +59,7 @@ pub struct Update {
     pub objects: Vec<(String, BTreeMap<String, Scalar>)>,
 }
 
-/// The original cart's objects the traced program does not have: they only
-/// draw (smoke, the title, the lifeup's "1000"), or only the summit's flag
-/// and room (3,1)'s memorial (`trace::cart::OBJECT_TILES`).
-pub const DRAW_ONLY: &[&str] = &["smoke", "room_title", "lifeup", "message", "flag"];
-
-/// A C99 hex float as LuaJIT's `string.format("%a")` writes it
-/// (`-0x1.999999999999ap-4`, `0x0p+0`): exact.
-fn hexfloat(s: &str) -> Result<f64> {
-    let (neg, t) = match s.strip_prefix('-') {
-        Some(t) => (true, t),
-        None => (false, s),
-    };
-    let t = t.strip_prefix("0x").ok_or_else(|| anyhow!("{s:?}: not a hex float"))?;
-    let (mant, exp) = t.split_once('p').ok_or_else(|| anyhow!("{s:?}: no exponent"))?;
-    let (int, frac) = mant.split_once('.').unwrap_or((mant, ""));
-    ensure!(int.len() == 1 && frac.len() <= 13, "{s:?}: not a normalized double");
-    let m = u64::from_str_radix(&format!("{int}{frac}"), 16).with_context(|| format!("{s:?}: the mantissa"))?;
-    let e: i32 = exp.parse().with_context(|| format!("{s:?}: the exponent"))?;
-    let e = e - 4 * frac.len() as i32;
-    ensure!(m < (1 << 53) && (-1000..1000).contains(&e), "{s:?}: out of the modelled range");
-    // m < 2^53 converts exactly; a power of two scales exactly.
-    let v = m as f64 * f64::powi(2.0, e);
-    Ok(if neg { -v } else { v })
-}
+use crate::tools::golden::{hexfloat, DRAW_ONLY};
 
 fn scalar(s: &str) -> Result<Scalar> {
     Ok(match s {
