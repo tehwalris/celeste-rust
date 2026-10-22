@@ -17,6 +17,7 @@ use celeste_rust::storage::Sk;
 use std::path::PathBuf;
 
 use celeste_rust::compiled::{KernelLanes, Kernels};
+use celeste_rust::differential;
 
 use crate::{where_, Rows};
 
@@ -234,10 +235,7 @@ where
     let geo = celeste_rust::storage::GEOMETRY;
     let picked: Vec<Sk> = match a.row {
         Some(r) => vec![*all.get(r).ok_or_else(|| anyhow::anyhow!("--row {r}: step {frame} has {} states", all.len()))?],
-        None => {
-            let n = a.samples.min(all.len());
-            (0..n).map(|k| all[k * all.len() / n]).collect()
-        }
+        None => differential::spread(all.len(), a.samples).into_iter().map(|k| all[k]).collect(),
     };
     let n = picked.len();
     let ids = celeste_rust::compiled::ids();
@@ -309,7 +307,8 @@ where
     };
     // The rows in parallel (the kernels' engine shared, a reference
     // engine per worker), reported in row order.
-    let done = celeste_rust::par::Pool::new(cfg.threads()).map_with(
+    let done = differential::run(
+        cfg.threads(),
         n,
         || {
             let mut reference = celeste_rust::engines::reference::ReferenceEngine::<A>::new(cfg)?.at_level(level);
@@ -321,7 +320,11 @@ where
         |reference, k| one(reference, picked[k]),
     )?;
     let (mut sound_gaps, mut precision_gaps, mut rows_bad, mut skipped, mut alike) = (0usize, 0usize, 0usize, 0usize, 0usize);
-    for (text, missing, extra, skip, lanes) in done {
+    for (text, missing, extra, skip, lanes) in done.into_iter().map(|r| match r {
+        differential::Ran::Done(r) => r,
+        // (`one` takes its own skips, its lanes counted.)
+        differential::Ran::Skipped(why) => (format!("[check ref] SKIPPED ({why})\n"), 0, 0, 1, 0),
+    }) {
         print!("{text}");
         sound_gaps += missing;
         precision_gaps += extra;
@@ -332,8 +335,7 @@ where
     println!("[check ref] {n} rows ({skipped} SKIPPED over the path cap): {rows_bad} differ; {sound_gaps} successors only in the reference, {precision_gaps} only in the kernels");
     println!("[check ref] the one converter: {alike} lanes (the rows, their kernel successors and reference leaves) convert alike on both sides");
     celeste_rust::compiled::dispatch::print_kernel_hits();
-    anyhow::ensure!(sound_gaps == 0, "check ref: {sound_gaps} reference successors the kernels miss (a SOUNDNESS gap)");
-    Ok(())
+    differential::verdict(n - skipped, sound_gaps, || format!("check ref: {sound_gaps} reference successors the kernels miss (a SOUNDNESS gap)"))
 }
 
 /// `check widen` of `frame` in the arithmetic of `N`.
@@ -360,8 +362,7 @@ fn widen_check<N: Rem + KernelLanes>(t: &TreeDir, frame: u32, emitted: usize) ->
             moved += 1;
             if shown + moved <= 8 {
                 let (pa, pb) = (project_all(&a).swap_remove(l), project_all(&b).swap_remove(l));
-                let diff: Vec<String> = pa.iter().filter(|(k, v)| pb.get(*k) != Some(v)).map(|(k, v)| format!("{k}: {v} -> {}", pb.get(k).map_or("-", |s| s.as_str()))).collect();
-                println!("[check widen] {what} row {l} of shape {:#x} MOVED: {}", a.shape_hash, diff.join(", "));
+                println!("[check widen] {what} row {l} of shape {:#x} MOVED: {}", a.shape_hash, differential::field_diff(&pa, &pb).join(", "));
             }
         }
         moved
@@ -377,9 +378,8 @@ fn widen_check<N: Rem + KernelLanes>(t: &TreeDir, frame: u32, emitted: usize) ->
         let kernels = Kernels::<N>::new(cfg, level)?;
         kernels.warm();
         let all: Vec<(usize, u32)> = blocks.iter().enumerate().flat_map(|(bi, (_, rt2))| (0..rt2.width as u32).map(move |r| (bi, r))).collect();
-        let n = emitted.min(all.len());
-        for k in 0..n {
-            let (bi, r) = all[k * all.len() / n];
+        for k in differential::spread(all.len(), emitted) {
+            let (bi, r) = all[k];
             let mut rt2 = blocks[bi].1.clone_block();
             rt2.retain_lanes(&[r]);
             for b in rerun(&kernels, rt2, frame)?.0 {
@@ -389,6 +389,5 @@ fn widen_check<N: Rem + KernelLanes>(t: &TreeDir, frame: u32, emitted: usize) ->
         }
     }
     println!("[check widen] step {frame} at {level}: {stored} stored rows, {emitted_rows} emitted from {emitted}; {moved} moved by the block side's widening");
-    anyhow::ensure!(moved == 0, "check widen: {moved} rows the block side's widening changes (the table's two sides disagree)");
-    Ok(())
+    differential::verdict(stored + emitted_rows, moved, || format!("check widen: {moved} rows the block side's widening changes (the table's two sides disagree)"))
 }
