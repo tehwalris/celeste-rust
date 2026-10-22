@@ -8,6 +8,8 @@
 //! for both: a guard and a MONOTONE action or a constant; the pull is
 //! exact on both.
 
+use super::rem::Word;
+
 /// Points on the circle: 1 px in raw 16.16 units.
 pub(crate) const CIRCLE: u32 = 1 << 16;
 
@@ -32,7 +34,7 @@ pub struct Seg<P = u32> {
 pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + PartialOrd + Ord + std::hash::Hash + Send + Sync + 'static {
     type P: Copy + Ord + std::hash::Hash + std::fmt::Debug + Default + Send + Sync + 'static;
     /// A stored point or count (arena words, hull bounds), in point order.
-    type W: Copy + Ord + std::hash::Hash + std::fmt::Debug + Default + Send + Sync + 'static;
+    type W: Word;
     /// A transfer's monotone action: 16.16's a translation, the doubles'
     /// `r -> fl(fl(r + ox) - k)`.
     type Mono: Copy + std::fmt::Debug + PartialEq + Eq + std::hash::Hash + Send + Sync + 'static;
@@ -42,23 +44,18 @@ pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + PartialOrd
     /// `p + 1` and `p - 1`.
     fn next(p: Self::P) -> Self::P;
     fn prev(p: Self::P) -> Self::P;
-    /// A point, or a count (at most `SIZE`, or `MAX_SEGS`), as a word.
-    fn store(p: Self::P) -> Self::W;
-    fn load(w: Self::W) -> Self::P;
-    fn count(n: usize) -> Self::W;
-    fn len(w: Self::W) -> usize;
     /// A point (or `SIZE`) as a number and back (the hull's arithmetic).
     fn wide(p: Self::P) -> u64;
     fn narrow(v: u64) -> Self::P;
-    /// A word's little-endian bytes on disk, and the hash of a hull's four
-    /// words (statistics, fingerprints, the push cache's slot).
-    const W_BYTES: usize;
-    fn put_word(w: Self::W, out: &mut Vec<u8>);
-    fn get_word(b: &[u8]) -> Self::W;
-    fn hash4(w: [Self::W; 4]) -> u64;
-    /// Are a hull's four words equal (`PushCache::get`)? 16.16's in one
-    /// 8-byte compare; the doubles' word by word (a miss differs early).
-    fn same4(a: [Self::W; 4], b: [Self::W; 4]) -> bool;
+    /// A point as a word, and back.
+    #[inline]
+    fn store(p: Self::P) -> Self::W {
+        Self::W::of(Self::wide(p))
+    }
+    #[inline]
+    fn load(w: Self::W) -> Self::P {
+        Self::narrow(w.get())
+    }
     /// The image of a guard's point `p` under `m` (inside the circle: the
     /// decode checked it).
     fn apply(m: &Self::Mono, p: Self::P) -> Self::P;
@@ -174,44 +171,12 @@ impl Circle for Fixed16 {
         p - 1
     }
     #[inline]
-    fn store(p: u32) -> u16 {
-        p as u16
-    }
-    #[inline]
-    fn load(w: u16) -> u32 {
-        w as u32
-    }
-    #[inline]
-    fn count(n: usize) -> u16 {
-        n as u16
-    }
-    #[inline]
-    fn len(w: u16) -> usize {
-        w as usize
-    }
-    #[inline]
     fn wide(p: u32) -> u64 {
         p as u64
     }
     #[inline]
     fn narrow(v: u64) -> u32 {
         v as u32
-    }
-    const W_BYTES: usize = 2;
-    fn put_word(w: u16, out: &mut Vec<u8>) {
-        out.extend_from_slice(&w.to_le_bytes());
-    }
-    fn get_word(b: &[u8]) -> u16 {
-        u16::from_le_bytes([b[0], b[1]])
-    }
-    /// The four words in one, low first: exact.
-    #[inline]
-    fn hash4(w: [u16; 4]) -> u64 {
-        w[0] as u64 | (w[1] as u64) << 16 | (w[2] as u64) << 32 | (w[3] as u64) << 48
-    }
-    #[inline]
-    fn same4(a: [u16; 4], b: [u16; 4]) -> bool {
-        a == b
     }
     #[inline]
     fn apply(d: &i32, p: u32) -> u32 {
@@ -294,7 +259,7 @@ pub(super) fn clip<P: Ord + Copy>(s: Seg<P>, g: Seg<P>) -> Option<Seg<P>> {
 impl<C: Circle> Region<C> {
     pub(crate) fn full() -> Self {
         let all = Stored::of::<C>(Seg { lo: C::P::default(), hi: C::SIZE });
-        Region { slabs: vec![Slab { y: all, end: C::count(1) }], xs: vec![all] }
+        Region { slabs: vec![Slab { y: all, end: C::W::of(1) }], xs: vec![all] }
     }
     pub(crate) fn as_ref(&self) -> RegionRef<'_, C> {
         RegionRef { slabs: &self.slabs, xs: &self.xs }
@@ -344,8 +309,8 @@ impl<C: Circle> Region<C> {
                     _ => merged.push(s),
                 }
             }
-            let start = out.slabs.last().map_or(0, |s| C::len(s.end));
-            let prev_start = if out.slabs.len() >= 2 { C::len(out.slabs[out.slabs.len() - 2].end) } else { 0 };
+            let start = out.slabs.last().map_or(0, |s| s.end.get() as usize);
+            let prev_start = if out.slabs.len() >= 2 { out.slabs[out.slabs.len() - 2].end.get() as usize } else { 0 };
             if let Some(last) = out.slabs.last_mut() {
                 if C::next(C::load(last.y.last)) == lo && out.xs[prev_start..start].iter().map(|s| s.seg::<C>()).eq(merged.iter().copied()) {
                     last.y = Stored::of::<C>(Seg { lo: C::load(last.y.lo), hi });
@@ -356,7 +321,7 @@ impl<C: Circle> Region<C> {
             if out.xs.len() > max {
                 return None;
             }
-            out.slabs.push(Slab { y: Stored::of::<C>(Seg { lo, hi }), end: C::count(out.xs.len()) });
+            out.slabs.push(Slab { y: Stored::of::<C>(Seg { lo, hi }), end: C::W::of(out.xs.len() as u64) });
         }
         Some(out)
     }
@@ -388,7 +353,7 @@ impl<'a, C: Circle> RegionRef<'a, C> {
     fn stored(self) -> impl Iterator<Item = (Seg<C::P>, &'a [Stored<C::W>])> + 'a {
         let mut start = 0;
         self.slabs.iter().map(move |s| {
-            let end = C::len(s.end);
+            let end = s.end.get() as usize;
             let xs = &self.xs[start..end];
             start = end;
             (s.y.seg::<C>(), xs)
@@ -403,8 +368,8 @@ impl<'a, C: Circle> RegionRef<'a, C> {
     fn slab_at(self, y: C::P) -> Option<&'a [Stored<C::W>]> {
         let i = self.slabs.partition_point(|s| C::load(s.y.last) < y);
         let s = self.slabs.get(i).filter(|s| C::load(s.y.lo) <= y)?;
-        let start = if i == 0 { 0 } else { C::len(self.slabs[i - 1].end) };
-        Some(&self.xs[start..C::len(s.end)])
+        let start = if i == 0 { 0 } else { self.slabs[i - 1].end.get() as usize };
+        Some(&self.xs[start..s.end.get() as usize])
     }
     fn holds(xs: &[Stored<C::W>], p: C::P) -> bool {
         let i = xs.partition_point(|s| C::load(s.last) < p);
@@ -562,7 +527,7 @@ pub(crate) fn region_hash<C: Circle>(r: RegionRef<C>) -> u64 {
 
 /// The set whose record starts `w`.
 fn record<C: Circle>(w: &[C::W]) -> RegionRef<'_, C> {
-    let (ns, nx) = (C::len(w[0]), C::len(w[1]));
+    let (ns, nx) = (w[0].get() as usize, w[1].get() as usize);
     let (s, x) = (&w[2..2 + 3 * ns], &w[2 + 3 * ns..2 + 3 * ns + 2 * nx]);
     const { assert!(std::mem::size_of::<Slab<C::W>>() == 3 * std::mem::size_of::<C::W>() && std::mem::size_of::<Stored<C::W>>() == 2 * std::mem::size_of::<C::W>()) };
     // SAFETY: `Slab` and `Stored` are `repr(C)` structs of 3 and 2 words
@@ -592,7 +557,7 @@ impl<C: Circle> RegionArena<C> {
             self.seal();
         }
         self.at.push((self.sealed.len() as u64) << 32 | self.open.len() as u64);
-        self.open.extend([C::count(r.slabs.len()), C::count(r.xs.len())]);
+        self.open.extend([C::W::of(r.slabs.len() as u64), C::W::of(r.xs.len() as u64)]);
         for s in r.slabs {
             self.open.extend([s.y.lo, s.y.last, s.end]);
         }

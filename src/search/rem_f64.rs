@@ -189,43 +189,12 @@ impl Circle for Doubles {
         p - 1
     }
     #[inline]
-    fn store(p: u64) -> u64 {
-        p
-    }
-    #[inline]
-    fn load(w: u64) -> u64 {
-        w
-    }
-    #[inline]
-    fn count(n: usize) -> u64 {
-        n as u64
-    }
-    #[inline]
-    fn len(w: u64) -> usize {
-        w as usize
-    }
-    #[inline]
     fn wide(p: u64) -> u64 {
         p
     }
     #[inline]
     fn narrow(v: u64) -> u64 {
         v
-    }
-    const W_BYTES: usize = 8;
-    fn put_word(w: u64, out: &mut Vec<u8>) {
-        out.extend_from_slice(&w.to_le_bytes());
-    }
-    fn get_word(b: &[u8]) -> u64 {
-        u64::from_le_bytes(b[..8].try_into().expect("8 bytes"))
-    }
-    #[inline]
-    fn hash4(w: [u64; 4]) -> u64 {
-        mix64(mix64(w[0] ^ w[1].rotate_left(32)) ^ w[2] ^ w[3].rotate_left(32))
-    }
-    #[inline]
-    fn same4(a: [u64; 4], b: [u64; 4]) -> bool {
-        a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3]
     }
     #[inline]
     fn apply(m: &Shift, i: u64) -> u64 {

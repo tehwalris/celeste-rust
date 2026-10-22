@@ -17,7 +17,7 @@
 use super::arcs::{clip, Circle, Fixed16, Seg, Transfer};
 #[cfg(test)]
 use super::arcs::{Piece, Region};
-use super::rem::Rem;
+use super::rem::{Rem, Word};
 use celeste_core::pico8_num::Pico8Num as P8;
 
 /// The points of `C`: `0..size`.
@@ -108,7 +108,7 @@ pub struct Hull<C: Circle = Fixed16> {
 impl<C: Circle> PartialEq for Hull<C> {
     #[inline]
     fn eq(&self, o: &Self) -> bool {
-        C::same4(self.words(), o.words())
+        <C::W as Word>::same4(self.words(), o.words())
     }
 }
 
@@ -120,7 +120,7 @@ pub(crate) type AccOf<N> = HullAcc<<N as Rem>::C>;
 
 impl<C: Circle> Hull<C> {
     /// Bytes a hull takes on disk (`to_bytes`).
-    pub(crate) const BYTES: usize = 4 * C::W_BYTES;
+    pub(crate) const BYTES: usize = 4 * <C::W as Word>::BYTES;
 
     /// The point `(x, y)` (a start's exact remainder).
     pub(crate) fn point(x: C::P, y: C::P) -> Self {
@@ -201,18 +201,18 @@ impl<C: Circle> Hull<C> {
     /// Its hash (`Circle::hash4`: 16.16's is the four words in one).
     #[inline]
     pub(crate) fn hash(&self) -> u64 {
-        C::hash4(self.words())
+        <C::W as Word>::hash4(self.words())
     }
 
     /// Append its `BYTES`: its words, little-endian.
     pub(crate) fn to_bytes(&self, out: &mut Vec<u8>) {
         for w in self.words() {
-            C::put_word(w, out);
+            w.put(out);
         }
     }
 
     pub(crate) fn from_bytes(b: &[u8]) -> Self {
-        let w = |i: usize| C::get_word(&b[i * C::W_BYTES..]);
+        let w = |i: usize| <C::W as Word>::read(&b[i * <C::W as Word>::BYTES..]);
         Hull { x: Arc { start: w(0), last: w(1) }, y: Arc { start: w(2), last: w(3) } }
     }
 }
