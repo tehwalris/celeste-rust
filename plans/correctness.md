@@ -26,9 +26,8 @@ settled here. Evidence is file:line at develop 19869c5d.
 - `ORB_MIN_FRAMES_AFTER_CHEST = 70` (frame.rs:284-286): "61 paused + 8 until
   the orb is collectable + 10 frozen = 79, taken as 70". No test derives or
   checks it against the cart.
-- Its ceiling is level -1's H (`ForwardState::ceiling` = `TreeFilter::ceiling`,
-  frame.rs:668-673, 863-868): without level -1 the orb room never gets the cut
-  (sound, but arbitrary coupling).
+- Its ceiling is level -1's H (`TreeL1::orb_ceiling`, frame.rs): without
+  level -1 the orb room never gets the cut (sound, but arbitrary coupling).
 - To do: check the bound with the reference engine (or derive it), and give
   the cut its own horizon (the search's).
 - It also mixes units: the cut compares steps with frames (frame.rs:160-163);
@@ -122,19 +121,33 @@ settled here. Evidence is file:line at develop 19869c5d.
   button memory (`h` always, extended to `jbuffer`); the concrete search runs
   it exactly. Then re-prove the at-risk rooms (results only stay or improve);
   `canonical_jumps` re-timing becomes unnecessary (TAS files play directly).
+- PROTOTYPED (2026-10-22, branch `cart-fidelity` ecebea1d, NOT merged;
+  report /var/tmp/cart-fidelity/report.md): the original's `jbuffer` exactly,
+  "held buttons" at every level plus `jbuffer` unknown. Abstract sets at every
+  level = today's `h` (all fixtures' counts identical); the buffered example
+  reproduced on PICO-8 and kept by `--prefer`; 29/30 community any% TAS
+  replay raw (develop's engine never exits on 14). COST: release +9-11% per
+  frame (the jump button's two classes emit the same successors twice; the
+  unchecked fix of reading jump as released at abstract levels LOSES states,
+  so any fix must be checked per kernel); concrete BFS x3.7 steps; `check
+  ref` 5 -> 19 GB. Re-proven under it: any% (0,0) 93, (1,0) 99, (4,0) 76,
+  summit 55, gemskip summit 57, (5,3) 79. Still at risk: nodiag (6,0) 73
+  (also C13), nodiag (6,1) 92, nodiag (1,2) 113, 100% (6,1) 114, 100% (4,3)
+  109. Decision pending (Philippe).
 
 ## C8. Death and exit in the same update counts as a win
 - `kill_player` (orig 121-122) then `next_room()` (orig 305) in one update:
   the search's win test is the room alone (frame.rs:189-212), so a dying exit
-  is a win (FAKE by the category rules; chain.py reports a death), and the
+  is a win (FAKE by the category rules; `rewrite pico8 chain` reports a death), and the
   next room's pending-reload start is never searched (MISSES).
 - Rooms with side spikes in row 0 next to the exit: (2,2), (6,2), (0,3),
   (2,3), (3,3). Not reached by any actual route yet.
 
 ## C9. The category runner falls back to the IL start
-- tools/category_runner.py:378-380: when the previous room's database file
-  breaks the boot chain, only the IL start is searched, which may not be a
-  real start (MISSES).
+- `tools::chain::entry_jank` (used by `rewrite category`): when the previous
+  room's database file breaks the boot chain, only the IL start is searched,
+  which may not be a real start (MISSES). `tools::uploads::boot` restarts the
+  chain its own way; the two stay apart until this is settled.
 
 ## C10. Smaller items
 - `rnd` is a free interval per call (stated best-case caveat); the original
@@ -146,12 +159,12 @@ settled here. Evidence is file:line at develop 19869c5d.
   truncation (all 15 fractional cart literals match bit for bit today).
 - A frame is always `_update();_draw()` (PICO-8 skips draws over the CPU
   budget): suspected safe.
-- Tooling: pico8_diff/replay.py cannot run the minimal cart on PICO-8 since
-  f3123072 (no `__split_by_round` stub); fails loudly.
 
 ## C11. Balloon seeds: PICO-8 verification hands them out in another order
-- pico8_diff/replay.py assigns a file's `[seeds]` in POP order (balloons at
-  the load, chests when opened); Rust's `--balloon-seeds`
+- The PICO-8 replay (`rewrite pico8 replay`, `tools::pico8::FENCED`:
+  `SeedOrder::Pop`; `--seed-order creation` is the alternative, implemented)
+  assigns a file's `[seeds]` in POP order (balloons at the load, chests when
+  opened); Rust's `--balloon-seeds`
   (`RoomObject::seeded`) and UCT use CREATION order. Where a chest precedes a
   balloon in creation order (rooms (3,3), (5,3)), the search's concrete
   balloons and the PICO-8 verification's get different seeds: 3 of 45
@@ -160,7 +173,8 @@ settled here. Evidence is file:line at develop 19869c5d.
   the replay match, and re-verify the (3,3) and (5,3) uploads.
 
 ## C12. Tooling degraded silently (FIXED, landed 4633008e)
-- Since f3123072 (2026-10-15) replay.py lacked the minimal cart's
+- Since f3123072 (2026-10-15) replay.py (now `rewrite pico8`, whose t0 test
+  checks every tracer hook has a stub) lacked the minimal cart's
   `__split_by_round` hook: every minimal-cart PICO-8 replay crashed, and the
   category runner's `canon_jumps` silently dropped every jump press
   ("original cart exit None -> None"). Re-check any runner result since then.
