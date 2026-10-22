@@ -441,7 +441,7 @@ fn forward<N: celeste_rust::search::rem::Rem>(
         Some(h) => println!("win at f{h} ({wall:.2} s)"),
         None => println!("no win by f{} ({wall:.2} s)", fwd.frames),
     }
-    celeste_rust::metrics::dump("forward", Some(dir), &[("level", level.to_string())]);
+    celeste_rust::compiled::dispatch::print_kernel_hits();
     Ok(())
 }
 

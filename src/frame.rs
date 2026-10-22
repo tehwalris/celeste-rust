@@ -751,16 +751,9 @@ fn ensure_disk_space(dir: &std::path::Path, last_free: &mut Option<u64>) -> Resu
     Ok(())
 }
 
-/// The per-frame `[fwd]` line, its record in the tree (`FORWARD_STATS`)
-/// and the walls' totals (`metrics`).
+/// The per-frame `[fwd]` line and its record in the tree (`FORWARD_STATS`).
 fn log_frame(dir: &std::path::Path, frame: u32, st: &Stats) -> Result<()> {
     eprintln!("[fwd] f{frame:03} {}", st.line());
-    use crate::storage::stats::Registry;
-    for &s in crate::storage::stats::ALL {
-        if s.unit() == crate::storage::stats::Unit::Wall {
-            crate::metrics::record(s.name(), st.time(s));
-        }
-    }
     append_forward_stats(dir, &forward_stats_row(frame, st))
 }
 
