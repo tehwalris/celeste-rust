@@ -9,20 +9,14 @@
 -- "[celia] FINISHED <n>f" is Celia's own count (the clean save's frames,
 -- what the tasdatabase counts: inputs - 1). A death is a failure: "[celia]
 -- DIED ..." (Celia keeps playing after one: the cart restarts the room).
--- `opts` (celia_opts.lua, written by validate.sh from its flags): the
+-- `opts` (celia_opts.lua, written by `rewrite validate celia` from its flags): the
 -- level, `dashes` (max_djump override, the gemskip categories: 1),
 -- `jank_offset` (Celia's loading-jank offset, default 0: key A), `trace`
 -- (one "[trace]" line per frame of the playback: the player and every
--- object with a phase, to compare with pico8_diff/replay.py).
+-- object with a phase, to compare with `rewrite pico8 replay --trace-objects`).
 local opts = require("celia_opts")
+local name_of = require("celeste_state").name_of
 local D = {t = 0, phase = "start", n = opts.level}
-
-local function name_of(o)
-  for k, v in pairs(pico8.cart) do
-    if o.type == v and type(v) == "table" and v ~= pico8.cart.objects then return k end
-  end
-  return "?"
-end
 
 local function trace()
   local cart = pico8.cart

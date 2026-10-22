@@ -47,6 +47,29 @@ pub enum Command {
     /// The tracer's probe corpora (`lua/probe/*.lua`) on PICO-8: their
     /// goldens rewritten where PICO-8 now says something else. READ THE DIFF.
     ProbeGoldens(P8Args),
+    /// The community TAS (`--name`, behind `--prologue` frames) and ours
+    /// (`--inputs`) frame by frame in the ORIGINAL cart, both started as the
+    /// search starts the room: a table; with `--out DIR` both paths for
+    /// `export-ui --witness DIR/ours.txt --reference DIR/reference.txt`.
+    Align(AlignArgs),
+}
+
+#[derive(clap::Args)]
+pub struct AlignArgs {
+    /// The database's name of the room's entry (`2900m`).
+    #[arg(long)]
+    name: String,
+    /// The frames before the community file's first input.
+    #[arg(long)]
+    prologue: i64,
+    /// Our witness (a `tas/` file or a comma list, from the room's load).
+    #[arg(long)]
+    inputs: String,
+    /// Where the two paths go.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    #[command(flatten)]
+    p8: P8Args,
 }
 
 #[derive(clap::Args)]
@@ -169,6 +192,12 @@ pub fn run(cfg: &Settings, c: Command) -> Result<()> {
                 let kind = if w.next() == Some("globals") && w.next().is_some_and(|g| chain::COSMETIC.contains(&g)) { "cosmetic" } else { "STATE" };
                 println!("varies ({kind}): {field}  [{} differ from {}]", cs.iter().cloned().collect::<Vec<_>>().join(", "), first.as_deref().unwrap_or(""));
             }
+            Ok(())
+        }
+        Command::Align(a) => {
+            let seeds: Vec<String> = cfg.balloon_seeds.as_deref().unwrap_or("").split(',').filter(|s| !s.is_empty()).map(str::to_string).collect();
+            let table = celeste_rust::tools::category::align(&a.p8.runner()?, cfg.room, cfg.category, &a.name, a.prologue, &celeste_rust::concrete::read_inputs(&a.inputs)?, a.out.as_deref(), &seeds, cfg.loading_jank)?;
+            print!("{table}");
             Ok(())
         }
         Command::ProbeGoldens(a) => {

@@ -1,10 +1,16 @@
-//! THE EXTERNAL TOOLS, driven from here: a real PICO-8 (`pico8`, its
-//! chains `chain`) and the community's tasdatabase (`tasdb`). What they say
-//! is the verdict on a witness; the game itself is this crate's.
+//! THE EXTERNAL TOOLS, driven from here: a real PICO-8 (`pico8`, its chains
+//! `chain`), UniversalClassicTas and Celia under LOVE (`love`), the
+//! community's tasdatabase (`tasdb`). What they say is the verdict on a
+//! witness; the game itself is this crate's.
 
+pub mod category;
 pub mod chain;
+pub mod golden;
+pub mod love;
 pub mod pico8;
+pub mod pyrandom;
 pub mod tasdb;
+pub mod uploads;
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;

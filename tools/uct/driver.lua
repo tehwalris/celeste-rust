@@ -7,10 +7,10 @@
 -- room (its balloons re-drawn with rnd(1), NOT the file's seeds) and the
 -- clean save keeps recording, so a later attempt that happens to exit is
 -- saved as if the file had finished.
--- `opts` (driver_opts.lua, written by validate.sh from its flags): the
+-- `opts` (driver_opts.lua, written by `rewrite validate uct` from its flags): the
 -- level, `dashes` (the dash count key), `trace` (one "[trace]" line per
 -- cart update of the playback: the player, the balloons' offset and y, to
--- compare with pico8_diff/replay.py).
+-- compare with `rewrite pico8 replay`).
 local opts = require("driver_opts")
 local D = {t = 0, phase = "start", n = opts.level, pressed = 0, waited = 0}
 local function press(k) love.keypressed(k) end

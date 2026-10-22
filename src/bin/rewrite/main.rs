@@ -22,6 +22,7 @@ mod diag;
 mod l1;
 mod pico8;
 mod run;
+mod validate;
 
 /// mimalloc, not glibc: glibc retains gigabytes of freed slot chunks across
 /// its arenas (plans/lessons.md). Counted (`metrics::Counting`): the `[mem]`
@@ -196,6 +197,22 @@ enum Command {
     /// room with, the probe goldens (`tools::pico8`, `tools::chain`).
     #[command(subcommand)]
     Pico8(pico8::Command),
+    /// The community's TAS tools: UniversalClassicTas and Celia headless,
+    /// and tasdatabase files in every tool and start mode (`tools::love`,
+    /// `tools::uploads`).
+    #[command(subcommand)]
+    Validate(validate::Command),
+    /// THE FLOAT ORACLE'S GOLDENS (`tools::golden`): the tool's exact traces
+    /// of the tasdatabase's files, random files and our witnesses, to
+    /// gates/TOOL (`local`: /var/tmp/float-goldens/TOOL) and its manifest.
+    /// READ THE DIFF: a golden that moved means the tool's run did.
+    Golden(validate::GoldenArgs),
+    /// THE CATEGORY RUNNER (`tools::category`): a queue of (category, room)
+    /// searches against the community tasdatabase, each result verified end
+    /// to end (the reference, the search, the witness in the original cart,
+    /// the upload valid in real play), one JSON line per job in
+    /// OUTDIR/results.jsonl. OUTDIR/STOP stops it before the next job.
+    Category(validate::CategoryArgs),
 }
 
 impl Command {
@@ -487,6 +504,9 @@ fn main() -> Result<()> {
         Command::Run(a) => run::run(&cfg, a),
         Command::Witness(a) => run::witness(&cfg, a),
         Command::Pico8(c) => pico8::run(&cfg, c),
+        Command::Validate(c) => validate::run(c),
+        Command::Golden(a) => validate::golden(a),
+        Command::Category(a) => validate::category(a),
         Command::Ckhash(a) => diag::ckhash(&cfg, a),
         Command::Check(c) => check::run(&cfg, c),
         Command::Bench(c) => bench::run(&cfg, c),

@@ -1,59 +1,20 @@
--- EXACT state traces from UniversalClassicTas (validate.sh --exact FILE), the float
--- oracle's ground truth (plans/float.md).
+-- EXACT state traces from UniversalClassicTas (`rewrite validate uct --exact
+-- FILE`), the float oracle's ground truth (plans/float.md).
 --
 -- Replaces love.run with a deterministic loop (one update and one draw per
--- iteration, as tools/uct/capture.lua: UCT's own loop is paced by the wall
--- clock and may update twice per draw) and, after every cart update of the
--- playback (the driver's "wait" phase, and the update it quits on) and its
--- draw, writes the cart's state to FILE:
+-- iteration: UCT's own loop is paced by the wall clock and may update twice
+-- per draw) and, after every cart update of the playback (the driver's
+-- "wait" phase, and the update it quits on) and its draw, writes the cart's
+-- state to FILE:
 --   u N kf K in I        the update's index in the playback, UCT's keypress
 --                        frame, the input it consumed (bits; -1: none);
 --   s ID                 a sound the update played through `psfx` (1: a
---                        jump, 2: a wall jump; tools/uct/canonical_jumps.py
---                        finds the jumps the jump buffer made with them);
---   g NAME VALUE         the scalar globals (`room.x`, `max_djump`, ...);
---   o INDEX TYPE         an object of `objects`, in order, then its fields:
---   f PATH VALUE         every number and boolean reachable from it (sorted,
---                        `spd.x`, `rem.y`, ...; no functions, no `type`, no
---                        `hair`), numbers as C99 hex floats (`%a`: the exact
---                        bits), booleans as true/false.
--- tools/uct/golden.py turns the traces into the goldens the oracle's tests
--- read (gates/uct/).
+--                        jump, 2: a wall jump: the jumps the jump buffer
+--                        made, `golden::canonical_jumps`);
+-- then its `g`, `o` and `f` lines (celeste_state.lua). `rewrite golden uct`
+-- turns the traces into the goldens the oracle's tests read (gates/uct/).
 local E = {}
-
-local function name_of(o)
-  for k, v in pairs(pico8.cart) do
-    if o.type == v and type(v) == "table" and v ~= pico8.cart.objects then return k end
-  end
-  return "?"
-end
-
-local function num(v)
-  return string.format("%a", v)
-end
-
-local function fields(t, prefix, out, seen)
-  if seen[t] then return end
-  seen[t] = true
-  local keys = {}
-  for k, _ in pairs(t) do keys[#keys + 1] = k end
-  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-  for _, k in ipairs(keys) do
-    local v = t[k]
-    local path = prefix == "" and tostring(k) or (prefix .. "." .. tostring(k))
-    if k ~= "type" and k ~= "hair" then
-      if type(v) == "number" then
-        out[#out + 1] = "f " .. path .. " " .. num(v)
-      elseif type(v) == "boolean" then
-        out[#out + 1] = "f " .. path .. " " .. tostring(v)
-      elseif type(v) == "table" then
-        fields(v, path, out, seen)
-      end
-    end
-  end
-end
-
-local GLOBALS = {"max_djump", "freeze", "has_dashed", "has_key", "will_restart", "delay_restart", "pause_player", "deaths", "new_bg"}
+local state = require("celeste_state")
 
 local function bits(kp)
   local b = 0
@@ -83,17 +44,7 @@ function E.install(drv)
     if (drv.phase ~= "wait" and drv.phase ~= "done") or not TAS.cart_update then return end
     local out = {string.format("u %d kf %d in %d", n, kf, input)}
     for _, id in ipairs(sounds) do out[#out + 1] = "s " .. id end
-    out[#out + 1] = "g room.x " .. num(cart.room.x)
-    out[#out + 1] = "g room.y " .. num(cart.room.y)
-    for _, g in ipairs(GLOBALS) do
-      local v = cart[g]
-      if type(v) == "number" then out[#out + 1] = "g " .. g .. " " .. num(v)
-      elseif type(v) == "boolean" then out[#out + 1] = "g " .. g .. " " .. tostring(v) end
-    end
-    for i, o in ipairs(cart.objects) do
-      out[#out + 1] = "o " .. i .. " " .. name_of(o)
-      fields(o, "", out, {})
-    end
+    state.lines(out, cart)
     file:write(table.concat(out, "\n"), "\n")
     file:flush()
     n = n + 1
