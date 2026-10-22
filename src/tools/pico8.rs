@@ -74,7 +74,7 @@ pub struct Fenced {
     pub seed_order: SeedOrder,
 }
 
-/// What this replay has always done (`replay.py` until 2026-10-21).
+/// What this replay has always done.
 pub const FENCED: Fenced = Fenced { loading_move: LoadingMove::Unguarded, seed_order: SeedOrder::Pop };
 
 /// One room of a CHAIN: its room, its `[seeds]` as written, its inputs

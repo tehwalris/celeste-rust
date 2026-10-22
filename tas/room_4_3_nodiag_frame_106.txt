@@ -12,6 +12,6 @@
 # Replayed on a real PICO-8, room changes to (5,3) during frame 106, in BOTH
 # celeste-minimal and the ORIGINAL cart (player first exists at frame 30 in
 # both), with balloon seeds 0 and 0.5 (and PICO-8's own rnd):
-#   pico8_diff/replay.py --room 4,3 --balloon-seeds 0,0,0 tas/room_4_3_nodiag_frame_106.txt
-#   pico8_diff/replay.py --lua ~/src/github.com/tehwalris/celeste_ocaml/celeste.lua --begin-game --room 4,3 --balloon-seeds 0,0,0 tas/room_4_3_nodiag_frame_106.txt
+#   rewrite pico8 replay --room 4,3 --balloon-seeds 0,0,0 --inputs tas/room_4_3_nodiag_frame_106.txt
+#   rewrite pico8 replay --original --room 4,3 --balloon-seeds 0,0,0 --inputs tas/room_4_3_nodiag_frame_106.txt
 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,16,0,1,1,0,16,0,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,34,0,0,0,0,0,0,0,0,0,0,0,0,0,36,0,0,0,0,0,0,2,2,2,2,2,0,18,0,2,0,2,16,34,0,0,0,0,0,0,36,0,0,0,0,0,0,0,16,0,0,16,0,0

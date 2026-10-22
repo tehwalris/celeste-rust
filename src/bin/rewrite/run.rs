@@ -1,8 +1,9 @@
 //! ONE CONCRETE RUN (`rewrite run`): the reference engine runs an input
 //! sequence from the room's entry, the player printed per frame, or the
-//! start state dumped as a real PICO-8's (`pico8_diff/replay.py --dump`).
+//! start state dumped as a real PICO-8's (`rewrite pico8 replay --dump`).
 
 use anyhow::Result;
+use celeste_core::arith::Arithmetic;
 use celeste_engine::runtime2::{Rt2, AV, NONE, P8};
 use celeste_rust::concrete::{format_input, num_at, objects_of_type};
 use celeste_rust::settings::Settings;
@@ -22,9 +23,9 @@ pub struct Args {
     #[arg(long)]
     object: Option<String>,
     /// Print the start state (every object's fields, as
-    /// `pico8_diff/replay.py --dump` prints them on a real PICO-8) and
+    /// `rewrite pico8 replay --dump` prints them on a real PICO-8) and
     /// exit: the search's room entry, to compare field by field with a
-    /// real chain's (`pico8_diff/chain.py --check-start`).
+    /// real chain's (`rewrite pico8 check-start`).
     #[arg(long)]
     dump_start: bool,
 }
@@ -76,20 +77,12 @@ pub fn witness(cfg: &Settings, a: WitnessArgs) -> Result<()> {
     Ok(())
 }
 
-/// The object types `--dump-start` names (pico8_diff/replay.py TYPES).
-const TYPES: &[&str] = &["player", "player_spawn", "spring", "balloon", "fall_floor", "smoke", "fruit", "fly_fruit", "lifeup", "fake_wall", "key", "chest", "platform", "message", "big_chest", "orb", "flag", "room_title"];
-
-/// PICO-8's `tostr(v, true)`: the 16.16 bits as `0xwwww.ffff`.
-fn hex(n: P8) -> String {
-    let b = n.to_bits();
-    format!("0x{:04x}.{:04x}", b >> 16, b & 0xffff)
-}
-
-/// One value as `replay.py`'s dump prints it; a table of numbers inline.
+/// One value as the PICO-8 replay's dump prints it (`tools::pico8`); a
+/// table of numbers inline.
 fn dump_value(st: &Rt2, c: u32) -> Option<String> {
     use celeste_engine::runtime2::Cell2;
     Some(match st.cols[c as usize].at(0) {
-        AV::Num(n) => hex(n),
+        AV::Num(n) => Arithmetic::hex(n),
         AV::Bool(b) => b.to_string(),
         AV::Ptr(t) => {
             let Cell2::Obj(fields) = &st.structure[t as usize] else { return None };
@@ -97,7 +90,7 @@ fn dump_value(st: &Rt2, c: u32) -> Option<String> {
             for k in ["x", "y", "w", "h"] {
                 if let Some(&(_, fc)) = fields.iter().find(|(f, _)| Some(*f) == celeste_names::field_id(k)) {
                     match st.cols[fc as usize].at(0) {
-                        AV::Num(n) => s += &format!("{k}={},", hex(n)),
+                        AV::Num(n) => s += &format!("{k}={},", Arithmetic::hex(n)),
                         AV::Bool(v) => s += &format!("{k}={v},"),
                         _ => {}
                     }
@@ -113,7 +106,7 @@ fn dump_value(st: &Rt2, c: u32) -> Option<String> {
 fn dump_start_state(st: &Rt2) {
     use celeste_engine::runtime2::Cell2;
     let mut names = std::collections::HashMap::new();
-    for t in TYPES {
+    for t in celeste_rust::tools::pico8::TYPES {
         for o in objects_of_type(st, t) {
             names.insert(o, *t);
         }

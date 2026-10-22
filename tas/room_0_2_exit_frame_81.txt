@@ -1,9 +1,9 @@
 # Room (0,2) "1700 m": exit at frame 81 for celeste-minimal, found by the
-# search (2026-10-01). Exits on a real PICO-8 (pico8_diff/replay.py --room
+# search (2026-10-01). Exits on a real PICO-8 (rewrite pico8 replay --room
 # 0,2: the player at (45,-3) on frame 80, room (1,2) during frame 81). Ties
 # the community TAS17 (81).
 #
-# Input bytes for rewrite run (-i) / pico8_diff/replay.py --room 0,2, one
+# Input bytes for rewrite run (-i) / rewrite pico8 replay --room 0,2, one
 # per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
 # bit4=jump bit5=dash.
 #

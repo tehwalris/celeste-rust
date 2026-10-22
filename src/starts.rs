@@ -6,8 +6,8 @@
 //! class covers every history (the category runner searches each).
 //!
 //! The ground truth for ONE history stays the boot chain on a real PICO-8
-//! (`pico8_diff/chain.py`): this is the sound over-approximation of all
-//! of them.
+//! (`rewrite pico8 chain`, `tools::chain`): this is the sound
+//! over-approximation of all of them.
 
 use anyhow::{Context, Result};
 
@@ -135,9 +135,8 @@ fn spawn_frame(s: &crate::settings::Settings, room: (i16, i16)) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    /// The starts of two rooms as the Python model gives them
-    /// (pico8_diff/chain.py on PICO-8, one `rewrite run --dump-start` per
-    /// J): room (3,0) takes J 3 or 4 into ONE class, room (4,1) J 2 and 3
+    /// The starts of two rooms as PICO-8 gives them (the boot chain,
+    /// `rewrite pico8 chain`, one `rewrite run --dump-start` per J): room (3,0) takes J 3 or 4 into ONE class, room (4,1) J 2 and 3
     /// into two.
     #[test]
     fn the_starts_of_two_rooms() {

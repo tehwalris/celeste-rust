@@ -86,7 +86,7 @@ pub fn check(r: &Runner, path: &Path, nudge: bool, cat: Option<Cat>) -> Result<S
             if result(&chain::single(r, cat, level, &sd, &inputs, None, false)?, 1).0 != il {
                 continue;
             }
-            let tmp = std::env::temp_dir().join(format!("check_uploads-{}-{level}.tas", std::process::id()));
+            let tmp = std::env::temp_dir().join(format!("nudge-{}-{level}.tas", std::process::id()));
             std::fs::write(&tmp, tasdb::text(&sd, &inputs))?;
             let u = love::play(Tool::Uct, level, &tmp, cat.one_dash(), None);
             let _ = std::fs::remove_file(&tmp);

@@ -6,8 +6,8 @@
 //!
 //! Each `lua/probe/*.lua` runs unchanged in the tracer (after the game's
 //! Lua builtins, as the cart does) and in PICO-8; its real stdout is checked
-//! in beside it (`./regen-pico8-golden.sh` needs a PICO-8 install, the tests
-//! do not). A corpus prints one value per call: `printh` for strings,
+//! in beside it (`rewrite pico8 probe-goldens` needs a PICO-8 install,
+//! the tests do not). A corpus prints one value per call: `printh` for strings,
 //! booleans and integers (the tracer has no `tostr` or `..`), and `__hex(x)`
 //! for any number, its exact 16.16 bits as `tostr(x, true)` prints them
 //! (`0x0000.5555`; `printh(tostr(x, true))` in the regen script's cart):

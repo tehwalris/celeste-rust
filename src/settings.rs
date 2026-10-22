@@ -166,7 +166,7 @@ pub struct Settings {
     #[arg(long, global = true, default_value = "any")]
     pub category: Category,
     /// The room as real play enters it: its loading frame from object J
-    /// (pico8_diff/chain.py), or `none` (the IL load).
+    /// (`rewrite pico8 entry-jank`), or `none` (the IL load).
     #[arg(long, global = true, default_value = "none", value_parser = parse_jank)]
     pub loading_jank: std::option::Option<usize>,
     /// The start room's balloons' phases fixed, "s1,s2,..", or `none`.

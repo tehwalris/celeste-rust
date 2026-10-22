@@ -258,9 +258,10 @@ pub fn room_objects((rx, ry): (i16, i16)) -> Vec<RoomObject> {
 /// (`--loading-jank J`): the leaving player's `_update` loads the room, and
 /// the frame's `foreach` goes on over the NEW room's objects from the
 /// player's index J - one update each (move, then update) - then the frame
-/// draws. J counts the ORIGINAL cart's objects (pico8_diff/chain.py reports
-/// it), translated to the minimal cart's list (no `message`, no `flag`).
-/// Measured against a real PICO-8 chain field by field (`chain.py --modes`).
+/// draws. J counts the ORIGINAL cart's objects (`rewrite pico8 chain`
+/// reports it), translated to the minimal cart's list (no `message`, no
+/// `flag`). Measured against a real PICO-8 chain field by field (`rewrite
+/// pico8 chain --modes`).
 fn apply_loading_frame(game: &str, j: usize, (rx, ry): (i16, i16)) -> Result<String> {
     let first = minimal_index((rx, ry), j);
     let call = format!("load_room({}, {})", rx, ry);

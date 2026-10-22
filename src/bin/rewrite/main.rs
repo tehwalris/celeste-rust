@@ -118,7 +118,7 @@ enum Command {
     /// ONE CONCRETE RUN: the reference engine plays inputs from the room's entry.
     ///
     /// Prints the player each frame (whole frames under `--split-frame`), in
-    /// `pico8_diff/replay.py`'s frame convention: the basis for checking a
+    /// `rewrite pico8 replay`'s frame convention: the basis for checking a
     /// witness against a real PICO-8. A frame that forks (`rnd`) is an
     /// error: give the balloons' seeds.
     Run(run::Args),
@@ -323,7 +323,7 @@ pub struct ExportUiArgs {
     arc: Option<String>,
     /// A concrete run to draw instead of the arc directory's witness:
     /// `[label TEXT]`, `inputs a,b,..`, `[dashes F:DIR ..]`, then `f x y`
-    /// per frame from 0 (`tools/align_tas.py ... OUTDIR` writes one).
+    /// per frame from 0 (`rewrite pico8 align --out DIR` writes one).
     #[arg(long)]
     witness: Option<String>,
     /// Another concrete run to draw next to it (same format): e.g. the

@@ -1,5 +1,5 @@
-# Our validated witnesses as float goldens (tools/uct/golden.py witness all,
-# tools/celia/golden.py witness all): KEY CATEGORY LEVEL FILE (the tool's
+# Our validated witnesses as float goldens (rewrite golden uct witness all,
+# rewrite golden celia witness all): KEY CATEGORY LEVEL FILE (the tool's
 # format: the first input on the player's first frame, the PICO-8 alignment).
 # room (1,0)'s arc gate witness (gates/known_room10_win9-101.txt, a synthetic
 # win at (9,101): the playback runs on past it)

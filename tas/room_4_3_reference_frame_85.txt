@@ -1,8 +1,8 @@
 # Room (4,3) reference for celeste-minimal, derived 2026-10-02 (rooms past the
 # orb start with max_djump=2, 26a0e54).
-#   pico8_diff/replay.py --room 4,3 --balloon-seeds 0,0,0 tas/room_4_3_reference_frame_85.txt
+#   rewrite pico8 replay --room 4,3 --balloon-seeds 0,0,0 --inputs tas/room_4_3_reference_frame_85.txt
 #
-# Input bytes for rewrite run (-i) / pico8_diff/replay.py --room 4,3, one
+# Input bytes for rewrite run (-i) / rewrite pico8 replay --room 4,3, one
 # per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
 # bit4=jump bit5=dash.
 #

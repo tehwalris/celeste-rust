@@ -476,7 +476,7 @@ fn inline(a: &InlineArgs) -> Result<()> {
     let bin = a.binary.to_string_lossy();
     let (mut ips, mut other, mut total): (HashMap<u64, usize>, HashMap<String, usize>, usize) = Default::default();
     for line in std::fs::read_to_string(&a.samples).with_context(|| a.samples.display().to_string())?.lines() {
-        // Python's `line.split(None, 3)`: three words, then the rest.
+        // Three whitespace-separated words, then the rest.
         let mut p: Vec<&str> = Vec::with_capacity(4);
         let mut rest = line.trim_start();
         while p.len() < 3 && !rest.is_empty() {

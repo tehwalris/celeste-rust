@@ -1,6 +1,6 @@
 # Room (6,0) "700 m" exit for celeste-minimal: frame 70 (derived 2026-09-30).
 #
-# Input bytes for rewrite run (-i) / pico8_diff/replay.py --room 6,0, one
+# Input bytes for rewrite run (-i) / rewrite pico8 replay --room 6,0, one
 # per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
 # bit4=jump bit5=dash.
 #
@@ -18,7 +18,7 @@
 #   steps, 0 dead ends; its per-step bytes folded to per-frame (step 2k is
 #   frame k's input; the part-a steps read no buttons).
 # - `rewrite run` (the unsplit game): player at (52,-2) on frame 69, the next
-#   room's spawn on frame 70. On a REAL PICO-8 (pico8_diff/replay.py --room
+#   room's spawn on frame 70. On a REAL PICO-8 (rewrite pico8 replay --room
 #   6,0): f69 player 52,-2, f70 room 7,0.
 # - This TIES the community TAS7 (47 inputs), it does not beat it. TAS7's
 #   input 0 goes on frame 24, the first frame the player exists (prologue

@@ -336,7 +336,7 @@ pub(crate) struct Witness {
     pub(crate) cells: Vec<u32>,
 }
 
-/// Inputs as a comma list (`rewrite run -i`, `pico8_diff/replay.py`).
+/// Inputs as a comma list (`rewrite run -i`, `rewrite pico8 replay --inputs`).
 pub(crate) fn inputs_text(inputs: &[u8]) -> String {
     inputs.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
 }

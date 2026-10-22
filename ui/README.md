@@ -194,7 +194,8 @@ a concrete witness, `witness.txt` (the inputs and the player's position per
 frame) is drawn over the room as a path (below). `--witness FILE` replaces
 it and `--reference FILE` adds a second one to compare with, in the same
 format plus an optional `label` line and `dashes F:DIR ...`:
-`tools/align_tas.py ROOM 2900m PROLOGUE OUR_TAS OUTDIR --cat CAT` writes both
+`rewrite pico8 align --room X,Y --category CAT --name 2900m --prologue P
+--inputs OUR_TAS --out OUTDIR` writes both
 (`ours.txt`, `reference.txt`) from a community TAS and ours replayed in the
 ORIGINAL cart, so the two are directly comparable.
 
@@ -222,7 +223,7 @@ database TAS - a UCT-style pad (the arrows, J jump, X dash) lit with the
 buttons held at the frame shown, and a strip of the frames around it, one
 lane per button, the frame shown outlined, a frame number every 10. The
 byte at frame f is `inputs[f-1]`, the one the game read to reach the box
-drawn at f (replay.py's convention), so a dash marked at f has X held at
+drawn at f (the PICO-8 replay's convention), so a dash marked at f has X held at
 f. A fresh press of jump or dash (held, and not on the last frame the
 player read input) is bright with a white edge, a held one dim. The two
 frames after each dash start are hatched and labelled `frozen`: the cart's

@@ -4,9 +4,9 @@
 # 0.95, or PICO-8's own rnd: the second dash (f56) needs the balloon's
 # refill, and the balloon is in reach only at those phases (seed 0: no
 # refill, the dash press at f56 does nothing).
-#   pico8_diff/replay.py --room 5,0 --balloon-seeds 0.636 tas/room_5_0_exit_frame_77.txt
+#   rewrite pico8 replay --room 5,0 --balloon-seeds 0.636 --inputs tas/room_5_0_exit_frame_77.txt
 #
-# Input bytes for rewrite run (-i) / pico8_diff/replay.py --room 5,0, one
+# Input bytes for rewrite run (-i) / rewrite pico8 replay --room 5,0, one
 # per frame starting at frame 1. bit0=left bit1=right bit2=up bit3=down
 # bit4=jump bit5=dash.
 #
