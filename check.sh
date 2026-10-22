@@ -325,16 +325,14 @@ export_ui() {
 }
 
 # THE REFERENCE FORWARD'S TREE IS THE KERNELS' [ARITH]: room (1,0) at the
-# exact level r0sx to f27, frames, edges and hulls alike (`ckhash --edges
-# --hulls`): the reference engine's successors and transfers are the
-# kernels'. Each tree goes to $C/t2/{kernels,reference}10[-float].
+# exact level r0sx to f27, frames, edges and hulls alike (`check reference`):
+# the reference engine's successors and transfers are the kernels'. The
+# kernels' tree (to f36: hull10 replays it) goes to
+# $C/t2/reference10[-float]-kernels.
 reference10() {
     local d=$C/t2/reference10${1:+-float}
     ./safe-run.sh --memory "$MEM" -- "$B" forward "$@" --steps 36 --room 1,0 --tree "$d-kernels" > /dev/null || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" forward "$@" --reference --steps 27 --room 1,0 --tree "$d-reference" > /dev/null || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$d-kernels" --steps 27 --edges --hulls > "$d-kernels.ckhash" || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$d-reference" --steps 27 --edges --hulls > "$d-reference.ckhash" || return 1
-    diff "$d-kernels.ckhash" "$d-reference.ckhash" >&2
+    ./safe-run.sh --memory "$MEM" -- "$B" check reference --tree "$d-kernels" --steps 27
 }
 # THE HULL FORWARD'S TREE REPLAYS FROM ITS RECORDED GRAPH [ARITH]:
 # reference10's kernels' tree (to f36), its hulls pushed along its recorded

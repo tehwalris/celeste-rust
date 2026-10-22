@@ -114,8 +114,9 @@ The steps run in four lanes:
   `gate10d-dual` (the dual search, its bound and witness), `search42-objects`
   (the objects ladder at a synthetic win, every `[gate]` line), and
   `export-ui` (the UI export of four of these searches, by digest);
-- **properties**: `reference10` and `reference10f` (`forward --reference`
-  against the kernels' forward, `ckhash --edges --hulls` f0-f27), and
+- **properties**: `reference10` and `reference10f` (`check reference`: the
+  reference engine's forward against the kernels', `ckhash --edges --hulls`
+  f0-f27), and
   `hull10[f]` (`check replay` over the kernels' tree to f36: its recorded
   edges reproduce its states at every frame);
 - **platforms**: `forward60-platforms` (room (6,0) `r0sxhfp` split frame to
