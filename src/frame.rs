@@ -138,7 +138,7 @@ fn reaches_win<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Re
 pub(crate) fn got_fruit<N: Arithmetic>(rt2: &Rt2<N>, (x, y): (i16, i16)) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{Cell2, Col, AV};
     let lanes = rt2.width;
-    let g = celeste_names::gen::global_id("got_fruit").expect("`got_fruit` is a global name");
+    let g = celeste_names::global("got_fruit");
     let i = crate::game_runner::level_index(x, y) as usize;
     let Some(arr) = rt2.global_target(g) else { return Ok(vec![false; lanes]) };
     let Cell2::Arr(items) = &rt2.structure[arr as usize] else { return Ok(vec![false; lanes]) };

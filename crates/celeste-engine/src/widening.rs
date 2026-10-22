@@ -633,8 +633,7 @@ struct Resolved {
 fn resolved() -> &'static [Resolved] {
     static R: std::sync::OnceLock<Vec<Resolved>> = std::sync::OnceLock::new();
     R.get_or_init(|| {
-        let g = |n: &str| celeste_names::global_id(n).unwrap_or_else(|| panic!("widening table: no global {n}"));
-        let f = |n: &str| celeste_names::field_id(n).unwrap_or_else(|| panic!("widening table: no field {n}"));
+        let (g, f) = (celeste_names::global, celeste_names::field);
         TABLE
             .iter()
             .map(|e| Resolved {

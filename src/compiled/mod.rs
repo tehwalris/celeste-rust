@@ -66,8 +66,7 @@ pub struct BoundaryIds {
 }
 
 fn boundary_ids() -> BoundaryIds {
-    let g = |name: &str| gen::global_id(name).unwrap_or_else(|| panic!("no global {}", name));
-    let f = |name: &str| gen::field_id(name).unwrap_or_else(|| panic!("no field {}", name));
+    let (g, f) = (gen::global, gen::field);
     let engine = runtime2::names();
     BoundaryIds {
         g_objects: engine.objects,

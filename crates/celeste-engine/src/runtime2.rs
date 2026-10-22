@@ -118,8 +118,7 @@ pub struct Names {
 pub fn names() -> &'static Names {
     static N: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
     N.get_or_init(|| {
-        let g = |n: &str| celeste_names::global_id(n).unwrap_or_else(|| panic!("no global {n}"));
-        let f = |n: &str| celeste_names::field_id(n).unwrap_or_else(|| panic!("no field {n}"));
+        let (g, f) = (celeste_names::global, celeste_names::field);
         Names { objects: g("objects"), player: g("player"), player_spawn: g("player_spawn"), type_: f("type"), x: f("x"), y: f("y") }
     })
 }
