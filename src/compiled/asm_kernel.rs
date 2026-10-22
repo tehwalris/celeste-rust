@@ -918,14 +918,16 @@ impl<N: KernelLanes> Registry<N> {
         let pool = crate::par::Pool::per_core().stack(128 * 1024 * 1024);
         let n_workers = pool.workers(refs.len());
         let built = pool.map(refs.len(), |si| {
-            let (key, r) = &refs[si];
+            let (region, r) = &refs[si];
             let mut times = r.lowered.times;
-            build_one_shape::<N>(r, si, &format!("_{si}"), build, &mut times).map(|(shape, kernel)| (shape, *key, kernel, times))
+            let (recipe, loaded, graphs) = build_one_shape::<N>(r, (r.frame.in_rt2.shape_hash_of(), *region), si, build, &mut times)?;
+            let key = (recipe.shape, recipe.region);
+            Ok((key, AsmKernel::of(recipe, loaded, r.cache.clone(), graphs)?, times))
         })?;
         let mut kernels = HashMap::new();
         let mut first: HashMap<(u64, Option<Region>), usize> = HashMap::new();
         let mut times = crate::transpile::lower::BuildTimes::default();
-        for (si, (shape, key, kernel, t)) in built.into_iter().enumerate() {
+        for (si, ((shape, key), kernel, t)) in built.into_iter().enumerate() {
             times.add(&t);
             if kernels.insert((shape, key), kernel).is_some() {
                 let slots = |i: usize| refs[i].1.frame.iface.slots.iter().map(crate::trace::iface::show).filter(|p| p.starts_with("__")).collect::<Vec<_>>();
@@ -1069,49 +1071,143 @@ fn apply_union<N: KernelLanes>(kernel: &mut AsmKernel<N>, unions: &HashMap<u64, 
     Ok(())
 }
 
-/// Assemble ONE frame (gcc + dlopen) and map its bodies onto output slots;
-/// `tag` distinguishes a shape's region kernels.
-fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, si: usize, tag: &str, build: &BuildOptions, times: &mut crate::transpile::lower::BuildTimes) -> Result<(u64, AsmKernel<N>)> {
+/// A KERNEL AS ITS BUILD LEFT IT: what tracing, lowering and assembling
+/// one (shape, region) made, as plain data; `AsmKernel::of` makes the
+/// rest.
+pub(crate) struct Recipe<N: Arithmetic = P8> {
+    pub(crate) shape: u64,
+    pub(crate) region: Option<Region>,
+    pub(crate) compiled: Compiled,
+    pub(crate) forks: u8,
+    pub(crate) fused_nodes: usize,
+    /// Per root slot: does it read the canonical output unknown
+    /// (`AsmField::may_unknown`)?
+    pub(crate) may_unknown: Vec<bool>,
+    pub(crate) bodies: Vec<BodySlots>,
+    /// Per outcome, its rows' skeleton (`AccTemplate::own`).
+    pub(crate) outcomes: Vec<Skeleton<N>>,
+    /// Per input cell, its traced path (named by packing failures).
+    pub(crate) input_names: Vec<String>,
+    /// `--metrics`: the kernel census.
+    pub(crate) census: Option<crate::compiled::mix::Census>,
+}
+
+/// A fused body's roots as output slots (`Compiled::root_offsets`'
+/// indices).
+pub(crate) struct BodySlots {
+    outcome: usize,
+    splits: Vec<u8>,
+    /// Per stored field, its cell and slot.
+    fields: Vec<(u32, u32)>,
+    error: u32,
+    live: u32,
+    /// The transfer roots' slots (`ArcRoots::nodes`' order), and `fin`.
+    arc: ([u32; 2 * crate::transpile::kernel::AxisRoots::N], bool),
+}
+
+/// An outcome's rows' skeleton: a field's column empty and typed, or
+/// uniform where every row holds one value (`OutField::uniform`, the
+/// buttons' unknown); its shape hash taken before (`Rt2::shape_hash_of`).
+pub(crate) struct Skeleton<N: Arithmetic = P8> {
+    shape_hash: u64,
+    structure: Vec<celeste_engine::runtime2::Cell2<N>>,
+    cols: Vec<Col<N>>,
+    globals: Vec<u32>,
+}
+
+impl<N: Arithmetic> Skeleton<N> {
+    /// Outcome `oi` of a lowered frame's.
+    fn of<A: KernelLanes>(r: &crate::trace::lower::LoweredFrame<A>, oi: usize) -> Skeleton<A> {
+        // Canonical: `block::skeleton` ends in `Rt2::canonicalize_ids`.
+        let mut own = reshape(&r.frame.outs[oi].rt2, 0);
+        let shape_hash = own.shape_hash_of();
+        for f in &r.bound.outcomes[oi].fields {
+            own.cols[f.cell as usize] = match f.uniform {
+                Some(av) => Col::U(av),
+                None => typed(f.ty),
+            };
+        }
+        for &cell in &r.frame.outs[oi].ubool_cells {
+            own.cols[cell as usize] = Col::U(AV::UBool);
+        }
+        Skeleton { shape_hash, structure: own.structure, cols: own.cols, globals: own.globals }
+    }
+
+    /// As a block of no rows in `cache`'s room.
+    fn rt2(&self, cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>) -> Rt2<N> {
+        let mut b = Rt2::empty(0, self.globals.len(), celeste_names::STRINGS, cache);
+        b.globals = self.globals.clone();
+        b.structure = self.structure.clone();
+        b.cols = self.cols.clone();
+        b
+    }
+}
+
+impl<N: Arithmetic> AccTemplate<N> {
+    /// The template of skeleton `own` (`shape_hash` its shape's): the key's
+    /// uniform fields (every value cell uniform here, at its widened value)
+    /// and the shape's record.
+    fn of(own: Rt2<N>, shape_hash: u64) -> AccTemplate<N> {
+        let pos = own.position_cells();
+        let mut uniform = Vec::new();
+        for (c, cell) in own.structure.iter().enumerate() {
+            let (celeste_engine::runtime2::Cell2::Val, Col::U(v)) = (cell, &own.cols[c]) else {
+                continue;
+            };
+            let pos = pos.is_some_and(|(x, y)| c as u32 == x || c as u32 == y);
+            uniform.push((c as u32, if pos { Code::of_pos(*v) } else { Code::of(*v) }));
+        }
+        let mut canon = own.clone_block();
+        canon.shape_hash = shape_hash;
+        AccTemplate { shape_hash, uniform, record: ShapeRecord::of(&canon), union: std::sync::Arc::new(own.clone_block()), own }
+    }
+}
+
+/// `--kernel-explain`'s fused graph and roots of a kernel.
+type Graphs<N> = Option<(crate::transpile::graph::Graph<N>, Vec<crate::transpile::graph::NodeId>)>;
+
+/// Assemble ONE lowered frame (gcc + dlopen) as kernel `key`'s recipe and
+/// its loaded code; `tag` distinguishes a shape's region kernels. With
+/// `keep_graphs` (`--kernel-explain`), also its fused graph and roots.
+fn build_one_shape<N: KernelLanes>(
+    r: &crate::trace::lower::LoweredFrame<N>,
+    key: (u64, Option<Region>),
+    si: usize,
+    build: &BuildOptions,
+    times: &mut crate::transpile::lower::BuildTimes,
+) -> Result<(Recipe<N>, Loaded, Graphs<N>)> {
+    use crate::transpile::graph::NodeId;
     use crate::transpile::lower::Phase;
-    let shape = r.frame.in_rt2.shape_hash_of();
-    let room = Room { cache: r.cache.clone() };
+    let shape = key.0;
     let (fused, bodies) = (&r.lowered.fused, &r.lowered.bodies);
     // One output SLOT per DISTINCT root node, numbered by first appearance
     // in the bodies' roots in the kernel's order (`Roots::flat`).
     let (flat_roots, slot_of) = times.time(Phase::Fuse, || {
-        let mut flat_roots: Vec<crate::transpile::graph::NodeId> = Vec::new();
-        let mut slot_of: HashMap<crate::transpile::graph::NodeId, usize> = HashMap::new();
+        let mut flat_roots: Vec<NodeId> = Vec::new();
+        let mut slot_of: HashMap<NodeId, u32> = HashMap::new();
         for n in bodies.iter().flat_map(|b| b.roots.flat()) {
             slot_of.entry(n).or_insert_with(|| {
                 flat_roots.push(n);
-                flat_roots.len() - 1
+                flat_roots.len() as u32 - 1
             });
         }
         (flat_roots, slot_of)
     });
-    let slot = |n: crate::transpile::graph::NodeId| slot_of[&n];
-    let (compiled, loaded) = times
+    let slot = |n: NodeId| slot_of[&n];
+    let tag = format!("_{si}");
+    let (mut compiled, loaded) = times
         .time(Phase::Assemble, || crate::transpile::asm::compile_and_load(fused, &flat_roots, &format!("k{shape:016x}{tag}"), build.asm))
         .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
-
     // Which fused nodes read the canonical output unknown (`may_unknown`).
     let reads_unknown_output: Vec<bool> = {
         let mut out = vec![false; fused.len()];
         for n in 0..fused.len() {
-            let node = fused.get(n as crate::transpile::graph::NodeId);
+            let node = fused.get(n as NodeId);
             out[n] = node.op == crate::transpile::graph::Op::UnknownBool(crate::transpile::graph::Unknown::Output) || node.args.iter().any(|a| out[*a as usize]);
         }
         out
     };
-    let acc_templates: Vec<AccTemplate<N>> = (0..r.bound.outcomes.len()).map(|oi| acc_template(r, oi)).collect();
-    // Per outcome, its position coordinates' cells (keyed without their whole pixels).
-    let pos_cells: Vec<Option<(u32, u32)>> = acc_templates.iter().map(|t| t.own.position_cells()).collect();
-    // Each body's roots onto their slots.
-    let off = |n: crate::transpile::graph::NodeId| compiled.root_offsets[slot(n)] as usize;
-    let kind = |n: crate::transpile::graph::NodeId| compiled.root_kinds[slot(n)];
-    let mut asm_bodies = Vec::with_capacity(bodies.len());
-    // What each body reads at emission (`emit::Plan`).
-    let mut reads = Vec::with_capacity(bodies.len());
+    let mut slots = Vec::with_capacity(bodies.len());
     for b in bodies {
         let outcome = &r.bound.outcomes[b.outcome];
         anyhow::ensure!(
@@ -1121,45 +1217,17 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, si:
             outcome.fields.len(),
             b.roots.fields.len()
         );
-        let fields = outcome
-            .fields
-            .iter()
-            .zip(&b.roots.fields)
-            .map(|(f, &n)| AsmField { cell: f.cell as usize, off: off(n), kind: kind(n), may_unknown: reads_unknown_output[n as usize] })
-            .collect();
-        // A uniform field is the key's constant prefix, not a per-lane field.
-        let key_fields = outcome
-            .fields
-            .iter()
-            .zip(&b.roots.fields)
-            .filter(|(f, _)| f.uniform.is_none())
-            .map(|(f, &n)| {
-                let pos = pos_cells[b.outcome].is_some_and(|(x, y)| f.cell == x || f.cell == y);
-                // A number stored `[v, v]` keys as the number.
-                KeyField::new(f.cell, off(n), kind(n), pos)
-            })
-            .collect::<Result<Vec<_>>>()?;
         // Every body computes its transfer (the rotation graph needs it).
         let a = b.roots.arc.ok_or_else(|| anyhow::anyhow!("shape {si} outcome {}: no transfer roots", b.outcome))?;
-        let arc = ArcSlots { roots: a.nodes().map(|n| (off(n), kind(n))), fin: a.fin };
-        asm_bodies.push(AsmBody {
+        slots.push(BodySlots {
             outcome: b.outcome,
             splits: b.splits.clone(),
-            fields,
-            error_root: slot(b.roots.error),
-            error_off: off(b.roots.error),
-            live_off: off(b.roots.live),
-            dup_refs: Vec::new(),
+            fields: outcome.fields.iter().zip(&b.roots.fields).map(|(f, &n)| (f.cell, slot(n))).collect(),
+            error: slot(b.roots.error),
+            live: slot(b.roots.live),
+            arc: (a.nodes().map(slot), a.fin),
         });
-        reads.push(emit::BodyReads { outcome: b.outcome, shape: acc_templates[b.outcome].shape_hash, key_fields, arc, pos: None });
     }
-
-    for (b, rd) in asm_bodies.iter().zip(reads.iter_mut()) {
-        rd.pos = pos_sources(&acc_templates[b.outcome].own, &b.fields)?;
-    }
-    let dup_pairs = dup_refs(&mut asm_bodies, &reads);
-    let plan = emit::Plan::of(&reads);
-
     let input_names: Vec<String> = compiled
         .input_cells
         .iter()
@@ -1172,47 +1240,105 @@ fn build_one_shape<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, si:
                 .unwrap_or_else(|| format!("cell {c}, not an input slot"))
         })
         .collect();
-    let mut compiled = compiled;
-    let mix_slices = if build.asm.mix {
+    let census = if build.asm.mix {
         use crate::compiled::mix::{ROLE_ARC, ROLE_ERROR, ROLE_FIELD, ROLE_LIVE};
         let mut roles = vec![0u8; flat_roots.len()];
         for b in bodies {
             for &n in &b.roots.fields {
-                roles[slot(n)] |= ROLE_FIELD;
+                roles[slot(n) as usize] |= ROLE_FIELD;
             }
-            roles[slot(b.roots.error)] |= ROLE_ERROR;
-            roles[slot(b.roots.live)] |= ROLE_LIVE;
+            roles[slot(b.roots.error) as usize] |= ROLE_ERROR;
+            roles[slot(b.roots.live) as usize] |= ROLE_LIVE;
             for n in b.roots.arc.iter().flat_map(|a| a.nodes()) {
-                roles[slot(n)] |= ROLE_ARC;
+                roles[slot(n) as usize] |= ROLE_ARC;
             }
         }
         let guards: Vec<_> = bodies.iter().map(|b| (b.roots.error, b.roots.live)).collect();
         let census = N::mix_report(&crate::compiled::mix::Input { traced: &r.bound.graph, fused, roots: &flat_roots, roles: &roles, bodies: &guards, compiled: &compiled })
             .with_context(|| format!("the census of {}", compiled.sym))?;
         compiled.asm = String::new();
-        Some(crate::compiled::mix::counter(&compiled.sym, census))
+        Some(census)
     } else {
         None
     };
-    Ok((
+    let recipe = Recipe {
         shape,
-        AsmKernel {
+        region: key.1,
+        compiled,
+        forks: r.bound.forks,
+        fused_nodes: fused.len(),
+        may_unknown: flat_roots.iter().map(|n| reads_unknown_output[*n as usize]).collect(),
+        bodies: slots,
+        outcomes: (0..r.bound.outcomes.len()).map(|oi| Skeleton::<N>::of(r, oi)).collect(),
+        input_names,
+        census,
+    };
+    let graphs = build.keep_graphs.then(|| (fused.clone(), flat_roots));
+    Ok((recipe, loaded, graphs))
+}
+
+impl<N: KernelLanes> AsmKernel<N> {
+    /// The kernel of `recipe`, its code `loaded`, in `cache`'s room (`graphs`:
+    /// `--kernel-explain`'s fused graph and roots): its accumulator
+    /// templates, its bodies on their slots with what each reads at
+    /// emission (`emit::Plan`), the earlier bodies each repeats.
+    fn of(
+        recipe: Recipe<N>,
+        loaded: Loaded,
+        cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
+        graphs: Graphs<N>,
+    ) -> Result<AsmKernel<N>> {
+        let Recipe { compiled, forks, fused_nodes, may_unknown, bodies, outcomes, input_names, census, .. } = recipe;
+        let acc_templates: Vec<AccTemplate<N>> = outcomes.iter().map(|sk| AccTemplate::of(sk.rt2(cache.clone()), sk.shape_hash)).collect();
+        // Per outcome, its position coordinates' cells (keyed without their whole pixels).
+        let pos_cells: Vec<Option<(u32, u32)>> = acc_templates.iter().map(|t| t.own.position_cells()).collect();
+        let off = |s: u32| compiled.root_offsets[s as usize] as usize;
+        let kind = |s: u32| compiled.root_kinds[s as usize];
+        let mut asm_bodies = Vec::with_capacity(bodies.len());
+        // What each body reads at emission (`emit::Plan`).
+        let mut reads = Vec::with_capacity(bodies.len());
+        for b in bodies {
+            let own = &acc_templates[b.outcome].own;
+            let fields = b.fields.iter().map(|&(cell, s)| AsmField { cell: cell as usize, off: off(s), kind: kind(s), may_unknown: may_unknown[s as usize] }).collect();
+            // A uniform field is the key's constant prefix, not a per-lane field.
+            let key_fields = b
+                .fields
+                .iter()
+                .filter(|(cell, _)| !matches!(own.cols[*cell as usize], Col::U(_)))
+                .map(|&(cell, s)| {
+                    let pos = pos_cells[b.outcome].is_some_and(|(x, y)| cell == x || cell == y);
+                    // A number stored `[v, v]` keys as the number.
+                    KeyField::new(cell, off(s), kind(s), pos)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let arc = ArcSlots { roots: b.arc.0.map(|s| (off(s), kind(s))), fin: b.arc.1 };
+            asm_bodies.push(AsmBody { outcome: b.outcome, splits: b.splits, fields, error_root: b.error as usize, error_off: off(b.error), live_off: off(b.live), dup_refs: Vec::new() });
+            reads.push(emit::BodyReads { outcome: b.outcome, shape: acc_templates[b.outcome].shape_hash, key_fields, arc, pos: None });
+        }
+        for (b, rd) in asm_bodies.iter().zip(reads.iter_mut()) {
+            rd.pos = pos_sources(&acc_templates[b.outcome].own, &b.fields)?;
+        }
+        let dup_pairs = dup_refs(&mut asm_bodies, &reads);
+        let plan = emit::Plan::of(&reads);
+        let mix_slices = census.map(|c| crate::compiled::mix::counter(&compiled.sym, c));
+        let (fused, flat_roots) = graphs.unwrap_or_default();
+        Ok(AsmKernel {
             loaded,
             compiled,
             bodies: asm_bodies,
             dup_pairs,
             plan,
             acc_templates,
-            forks: r.bound.forks,
+            forks,
             body_cols: Vec::new(),
-            fused_nodes: fused.len(),
+            fused_nodes,
             mix_slices,
-            fused: if build.keep_graphs { fused.clone() } else { crate::transpile::graph::Graph::default() },
-            flat_roots: if build.keep_graphs { flat_roots } else { Vec::new() },
-            room,
+            fused,
+            flat_roots,
+            room: Room { cache },
             input_names,
-        },
-    ))
+        })
+    }
 }
 
 /// Every body's `dup_refs`: the earlier bodies of its outcome one fork away.
@@ -1308,37 +1434,6 @@ fn pos_sources<N: Arithmetic>(template: &Rt2<N>, fields: &[AsmField]) -> Result<
         return Ok(None);
     };
     Ok(Some([px, py, rx, ry]))
-}
-
-/// The accumulator recipe for one outcome, with `shape_hash` and its key's
-/// uniform fields.
-fn acc_template<N: KernelLanes>(r: &crate::trace::lower::LoweredFrame<N>, oi: usize) -> AccTemplate<N> {
-    // Canonical: `block::skeleton` ends in `Rt2::canonicalize_ids`.
-    let mut own = reshape(&r.frame.outs[oi].rt2, 0);
-    let shape_hash = own.shape_hash_of();
-    for f in &r.bound.outcomes[oi].fields {
-        own.cols[f.cell as usize] = match f.uniform {
-            Some(av) => Col::U(av),
-            None => typed(f.ty),
-        };
-    }
-    for &cell in &r.frame.outs[oi].ubool_cells {
-        own.cols[cell as usize] = Col::U(AV::UBool);
-    }
-    // The key's uniform fields: every value cell uniform here, at its
-    // widened value.
-    let pos = own.position_cells();
-    let mut uniform = Vec::new();
-    for (c, cell) in own.structure.iter().enumerate() {
-        let (celeste_engine::runtime2::Cell2::Val, Col::U(v)) = (cell, &own.cols[c]) else {
-            continue;
-        };
-        let pos = pos.is_some_and(|(x, y)| c as u32 == x || c as u32 == y);
-        uniform.push((c as u32, if pos { Code::of_pos(*v) } else { Code::of(*v) }));
-    }
-    let mut canon = own.clone_block();
-    canon.shape_hash = shape_hash;
-    AccTemplate { shape_hash, uniform, record: ShapeRecord::of(&canon), union: std::sync::Arc::new(own.clone_block()), own }
 }
 
 /// Kernel call counters: [0] calls, [1] rows offered, [2] slice-lanes
