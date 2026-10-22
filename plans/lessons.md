@@ -113,8 +113,8 @@ sounds like one of these. The full write-ups are in git history.
   resident; fused graphs are dropped after assembly.
 - **`MIMALLOC_PURGE_DELAY` 0 or 10 ms**: a unit takes ~12 ms, so freed pages
   went before the next unit reused them (3.0M faults on the reference
-  frame at 0, 0.93M at 100 ms, for ~0.25 GB of peak). `safe-run.sh` sets
-  100.
+  frame at 0, 0.93M at 100 ms, for ~0.25 GB of peak). `rewrite` sets
+  100 (`compiled::set_purge_delay`).
 
 ## The backward
 

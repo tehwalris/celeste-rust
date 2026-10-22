@@ -68,14 +68,6 @@ else
 fi
 echo "[safe-run] memory limit $MEMORY_LIMIT (MemAvailable $(( avail_mib / 1024 )) GB)" >&2
 
-# mimalloc: freed pages go back to the OS after 100 ms (mimalloc v2's own
-# default is 10). A wave unit takes ~12 ms and frees its buffers (the
-# chunks it hands to the region jobs, its decoded rows) on whatever thread
-# finishes them; at 0 every unit faulted them in again (9x the faults): at
-# 100 ms the wave is 6-10% faster for a 10% higher anonymous peak, at 10 ms
-# half of both. Read by mimalloc at process start, so it has to come from
-# the environment, not from `main`.
-export MIMALLOC_PURGE_DELAY="${MIMALLOC_PURGE_DELAY:-100}"
 systemd-run --user --scope --quiet -p MemoryMax="$MEMORY_LIMIT" -p MemorySwapMax=0 -- "$@"
 EXIT_CODE=$?
 

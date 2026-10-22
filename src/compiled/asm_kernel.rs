@@ -1546,22 +1546,15 @@ struct BuildPurgeDelay;
 /// Builds in progress, and the purge delay they found.
 static BUILDS: std::sync::Mutex<(usize, std::os::raw::c_long)> = std::sync::Mutex::new((0, 0));
 
-/// `mi_option_purge_delay` (unbound in libmimalloc-sys 0.1.44); checked
-/// against the environment's value in `start`.
-const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
-
 impl BuildPurgeDelay {
     fn start() -> BuildPurgeDelay {
         let mut b = BUILDS.lock().unwrap();
         if b.0 == 0 {
-            // SAFETY: plain option reads and writes, mimalloc's documented API.
-            let before = unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) };
-            if let Some(env) = std::env::var("MIMALLOC_PURGE_DELAY").ok().and_then(|v| v.parse::<std::os::raw::c_long>().ok()) {
-                assert_eq!(before, env, "mimalloc option {MI_OPTION_PURGE_DELAY} is not the purge delay MIMALLOC_PURGE_DELAY set");
-            }
+            // SAFETY: a plain option read, mimalloc's documented API.
+            let before = unsafe { libmimalloc_sys::mi_option_get(super::MI_OPTION_PURGE_DELAY) };
             b.1 = before;
             if (0..1000).contains(&before) {
-                unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 1000) };
+                super::set_purge_delay(1000);
             }
         }
         b.0 += 1;
@@ -1574,7 +1567,7 @@ impl Drop for BuildPurgeDelay {
         let mut b = BUILDS.lock().unwrap();
         b.0 -= 1;
         if b.0 == 0 {
-            unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, b.1) };
+            super::set_purge_delay(b.1);
             // Purge what the (exited) builder threads freed under the delay.
             unsafe { libmimalloc_sys::mi_collect(true) };
         }

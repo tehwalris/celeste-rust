@@ -16,6 +16,22 @@ pub mod mix;
 
 pub use asm_kernel::{KernelLanes, Registry, Resident, Scratch};
 
+/// `mi_option_purge_delay` (unbound in libmimalloc-sys 0.1.44).
+const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+
+/// mimalloc's PURGE DELAY: freed pages go back to the OS `ms` after they
+/// are freed. `rewrite` sets 100 at its start (mimalloc v2's default is 10;
+/// the environment's `MIMALLOC_PURGE_DELAY` is overridden): a wave unit
+/// takes ~12 ms and frees its buffers (the chunks it hands to the region
+/// jobs, its decoded rows) on whatever thread finishes them; at 0 every
+/// unit faulted them in again (9x the faults), at 100 ms the wave is 6-10%
+/// faster for a 10% higher anonymous peak, at 10 ms half of both. A kernel
+/// build raises it to a second while it runs (`asm_kernel`).
+pub fn set_purge_delay(ms: std::os::raw::c_long) {
+    // SAFETY: a plain option write, mimalloc's documented API.
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, ms) };
+}
+
 /// THE GAME'S NAMES the search reads off a block, as ids (`celeste_names`).
 /// The position object's are the engine's own (`runtime2::names`), shared.
 pub struct BoundaryIds {

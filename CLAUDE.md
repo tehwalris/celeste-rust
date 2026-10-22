@@ -150,7 +150,8 @@ wrapper took the whole session down).
   GB: check `df` first.
 - Reading memory: the `[fwd]` line's `rss` is the ANONYMOUS resident set;
   `file` is mapped files (reclaimable); `peak` is `VmHWM`, both together.
-- `safe-run.sh` sets `MIMALLOC_PURGE_DELAY=100` (why, in the script).
+- `rewrite` sets mimalloc's purge delay to 100 ms at its start, whatever
+  `MIMALLOC_PURGE_DELAY` says (why: `compiled::set_purge_delay`).
 - A search RESUMES from its checkpoint directory: rerun the same command;
   delete the directory for a fresh run.
 

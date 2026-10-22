@@ -464,6 +464,8 @@ fn tree_flags_given(m: &clap::ArgMatches) -> Vec<String> {
 }
 
 fn main() -> Result<()> {
+    // Before anything frees: the allocator's purge delay (why: there).
+    celeste_rust::compiled::set_purge_delay(100);
     // `--version`: the file formats a tree is written in (tools/fixtures.sh).
     let matches = Cli::command().version(&*Box::leak(celeste_rust::settings::formats().into_boxed_str())).get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
