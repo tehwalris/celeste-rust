@@ -19,7 +19,7 @@ use super::arcs::Circle;
 use super::rem::{Point, Rem};
 use crate::abstraction::Level;
 use crate::frame::wins_of;
-use crate::settings::{Clock, Settings};
+use crate::settings::Settings;
 use crate::storage::Sk;
 use crate::engines::reference::ReferenceEngine;
 
@@ -35,9 +35,10 @@ pub(super) trait Concrete: Sync {
     fn engines(&self, n: usize) -> Result<Vec<Self::Engine>>;
     /// The start, and its label (the witness's first).
     fn start(&self, eng: &mut Self::Engine) -> Result<(Self::State, Self::Label)>;
-    /// `st`'s successors under `byte` at W step `t`, in leaf order (a win,
-    /// or a state inside W), and the buttons the frame read. A state `known`
-    /// may be left out before its W lookup; `steps` counts leaves.
+    /// `st`'s successors under `byte` into layer `t` (a search's: frame
+    /// `t`, W's step `clock.steps(t)`), in leaf order (a win, or a state
+    /// inside W), and the buttons the frame read. A state `known` may be left
+    /// out before its W lookup; `steps` counts leaves.
     #[allow(clippy::too_many_arguments)]
     fn successors(&self, eng: &mut Self::Engine, st: &Self::State, byte: u8, t: u32, known: &dyn Fn(&Self::Key) -> bool, steps: &mut u64) -> Result<(Vec<Next<Self>>, u8)>;
     /// The depth-first try's budget, in steps.
@@ -49,7 +50,8 @@ pub(super) trait Concrete: Sync {
 }
 
 pub(super) enum Next<C: Concrete + ?Sized> {
-    Win(C::Label),
+    /// A win: its leaf, its label.
+    Win(C::State, C::Label),
     State(C::State, C::Key, C::Label),
 }
 
@@ -59,141 +61,217 @@ pub(super) struct Path<L> {
     pub(crate) labels: Vec<L>,
 }
 
-/// THE CONCRETE SEARCH of `c`: a depth-first try at `bound`, then
-/// breadth-first to `frames` (both frames; W at frame `k` is step
-/// `clock.steps(k)`, a boundary, where a state keys exactly). `None`: no win.
-pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, clock: Clock, prefer: Option<&[u8]>, workers: usize) -> Result<Option<Path<C::Label>>> {
+/// THE CONCRETE SEARCH of `c`: a depth-first try at `bound`
+/// (`dfs_at_bound`), then breadth-first layers (`layers`) to `frames`
+/// (frames both; W at frame `k` is step `clock.steps(k)`, a boundary, where
+/// a state keys exactly). `None`: no win.
+pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, prefer: Option<&[u8]>, workers: usize) -> Result<Option<Path<C::Label>>> {
     let name = C::NAME;
     ensure!(bound <= frames, "the bound f{bound} is past the horizon f{frames}");
     let engines: Vec<std::sync::Mutex<C::Engine>> = c.engines(workers.max(1))?.into_iter().map(std::sync::Mutex::new).collect();
     let (start, start_label) = c.start(&mut engines[0].lock().expect("an engine"))?;
     let t0 = std::time::Instant::now();
     crate::metrics::mem_phase(&format!("{name}: engines up"));
-
-    // THE FAST PATH: depth-first for a win AT the bound, inside `W_{H -
-    // bound + k}`. A win here is at the lower bound, hence optimal; an
-    // exhausted or abandoned try proves nothing.
-    {
-        struct Dfs<'a, C: Concrete> {
-            c: &'a C,
-            eng: &'a mut C::Engine,
-            from: u32,
-            frames: u32,
-            clock: Clock,
-            prefer: Option<&'a [u8]>,
-            /// Exhausted states by (identity, frame).
-            dead: FxHashSet<(C::Key, u32)>,
-            path: Vec<(u8, C::Label)>,
-            steps: u64,
-            budget: u64,
+    if let Some(path) = dfs_at_bound(c, &mut engines[0].lock().expect("an engine"), &start, frames, bound, prefer)? {
+        let (inputs, labels) = path.into_iter().unzip::<_, _, Vec<u8>, Vec<C::Label>>();
+        return Ok(Some(Path { inputs, labels: std::iter::once(start_label).chain(labels).collect() }));
+    }
+    // BREADTH-FIRST: the first layer with a win is the optimum.
+    let mut t = std::time::Instant::now();
+    let ls = layers(c, &engines, start, frames, &Policy { inputs: &|k| Some(input_order(prefer, k).collect()), replay: false }, |k, before, next, won, steps| {
+        eprintln!(
+            "[{name}] layer {:3}: {before} states -> {} inside W{}{}; {steps} steps so far, {:.1} s, rss {:.1} GB",
+            k + 1,
+            next.len(),
+            c.note(next),
+            if won { ", A WIN" } else { "" },
+            t.elapsed().as_secs_f64(),
+            crate::metrics::current_rss_gb()
+        );
+        t = std::time::Instant::now();
+    })?;
+    let steps = ls.steps;
+    let Some((at, wins)) = ls.won else {
+        match ls.died {
+            Some(k) => println!("NO {} WIN by f{frames}: no state inside W past layer {k} ({steps} steps)", name.to_uppercase()),
+            None => println!("NO {} WIN by f{frames} ({steps} steps)", name.to_uppercase()),
         }
-        /// `Ok(None)`: out of budget.
-        fn dfs<C: Concrete>(cx: &mut Dfs<C>, st: &C::State, k: u32) -> Result<Option<bool>> {
-            if k >= cx.frames {
-                return Ok(Some(false));
+        return Ok(None);
+    };
+    ensure!(at >= bound, "a {name} win at f{at} before the bound f{bound}: a backward lost a path");
+    let (parent, byte, label, _) = wins.into_iter().next().expect("a win");
+    let (mut inputs, mut labels) = (vec![byte], vec![label]);
+    let mut p = parent;
+    for layer in ls.back.iter().rev() {
+        let (pp, b, l) = layer[p as usize];
+        inputs.push(b);
+        labels.push(l);
+        p = pp;
+    }
+    inputs.reverse();
+    labels.push(start_label);
+    labels.reverse();
+    eprintln!("[{name}] a win at f{} after {steps} steps, {:.1} s", inputs.len(), t0.elapsed().as_secs_f64());
+    Ok(Some(Path { inputs, labels }))
+}
+
+/// THE FAST PATH of the concrete search: depth-first for a win AT the
+/// bound, inside `W_{H - bound + k}`: its inputs and labels. A win here is
+/// at the lower bound, hence optimal; an exhausted or abandoned try (out of
+/// `Concrete::budget`) proves nothing.
+fn dfs_at_bound<C: Concrete>(c: &C, eng: &mut C::Engine, start: &C::State, frames: u32, bound: u32, prefer: Option<&[u8]>) -> Result<Option<Vec<(u8, C::Label)>>> {
+    struct Dfs<'a, C: Concrete> {
+        c: &'a C,
+        eng: &'a mut C::Engine,
+        from: u32,
+        frames: u32,
+        prefer: Option<&'a [u8]>,
+        /// Exhausted states by (identity, frame).
+        dead: FxHashSet<(C::Key, u32)>,
+        path: Vec<(u8, C::Label)>,
+        steps: u64,
+        budget: u64,
+    }
+    /// `Ok(None)`: out of budget.
+    fn dfs<C: Concrete>(cx: &mut Dfs<C>, st: &C::State, k: u32) -> Result<Option<bool>> {
+        if k >= cx.frames {
+            return Ok(Some(false));
+        }
+        let mut ran = Covered::default();
+        for byte in input_order(cx.prefer, k) {
+            if ran.covers(byte) {
+                continue;
             }
-            let mut ran = Covered::default();
-            for byte in input_order(cx.prefer, k) {
-                if ran.covers(byte) {
-                    continue;
-                }
-                let t = cx.clock.steps(cx.from + k + 1);
-                let (next, read) = cx.c.successors(cx.eng, st, byte, t, &|_| false, &mut cx.steps).map_err(|e| e.context(format!("the frame after {k} frames of the depth-first try, with input {byte}")))?;
-                ran.push(byte, read);
-                if cx.steps > cx.budget {
-                    return Ok(None);
-                }
-                for n in next {
-                    match n {
-                        Next::Win(label) => {
-                            // A win before the lower bound means a lost path.
-                            ensure!(k + 1 == cx.frames, "a {} win at f{} before the bound f{}: a backward lost a path", C::NAME, k + 1, cx.frames);
-                            cx.path.push((byte, label));
-                            return Ok(Some(true));
+            let (next, read) = cx.c.successors(cx.eng, st, byte, cx.from + k + 1, &|_| false, &mut cx.steps).map_err(|e| e.context(format!("the frame after {k} frames of the depth-first try, with input {byte}")))?;
+            ran.push(byte, read);
+            if cx.steps > cx.budget {
+                return Ok(None);
+            }
+            for n in next {
+                match n {
+                    Next::Win(_, label) => {
+                        // A win before the lower bound means a lost path.
+                        ensure!(k + 1 == cx.frames, "a {} win at f{} before the bound f{}: a backward lost a path", C::NAME, k + 1, cx.frames);
+                        cx.path.push((byte, label));
+                        return Ok(Some(true));
+                    }
+                    Next::State(next, key, label) => {
+                        let memo = (key, k + 1);
+                        if cx.dead.contains(&memo) {
+                            continue;
                         }
-                        Next::State(next, key, label) => {
-                            let memo = (key, k + 1);
-                            if cx.dead.contains(&memo) {
-                                continue;
-                            }
-                            cx.path.push((byte, label));
-                            match dfs(cx, &next, k + 1)? {
-                                Some(true) => return Ok(Some(true)),
-                                None => return Ok(None),
-                                Some(false) => {}
-                            }
-                            cx.path.pop();
-                            cx.dead.insert(memo);
+                        cx.path.push((byte, label));
+                        match dfs(cx, &next, k + 1)? {
+                            Some(true) => return Ok(Some(true)),
+                            None => return Ok(None),
+                            Some(false) => {}
                         }
+                        cx.path.pop();
+                        cx.dead.insert(memo);
                     }
                 }
             }
-            Ok(Some(false))
         }
-        let t = std::time::Instant::now();
-        let mut eng = engines[0].lock().expect("an engine");
-        let mut cx = Dfs { c, eng: &mut eng, from: frames - bound, frames: bound, clock, prefer, dead: FxHashSet::default(), path: Vec::new(), steps: 0, budget: c.budget() };
-        let found = dfs(&mut cx, &start, 0)?;
-        eprintln!(
-            "[{name}] depth-first at the bound f{bound}: {} after {} steps, {:.1} s",
-            match found {
-                Some(true) => "a win",
-                Some(false) => "no win (exhaustive)",
-                None => "out of budget",
-            },
-            cx.steps,
-            t.elapsed().as_secs_f64()
-        );
-        if found == Some(true) {
-            let (inputs, labels) = cx.path.iter().copied().unzip::<_, _, Vec<u8>, Vec<C::Label>>();
-            return Ok(Some(Path { inputs, labels: std::iter::once(start_label).chain(labels).collect() }));
-        }
+        Ok(Some(false))
     }
+    let t = std::time::Instant::now();
+    let mut cx = Dfs { c, eng, from: frames - bound, frames: bound, prefer, dead: FxHashSet::default(), path: Vec::new(), steps: 0, budget: c.budget() };
+    let found = dfs(&mut cx, start, 0)?;
+    eprintln!(
+        "[{}] depth-first at the bound f{bound}: {} after {} steps, {:.1} s",
+        C::NAME,
+        match found {
+            Some(true) => "a win",
+            Some(false) => "no win (exhaustive)",
+            None => "out of budget",
+        },
+        cx.steps,
+        t.elapsed().as_secs_f64()
+    );
+    Ok((found == Some(true)).then_some(cx.path))
+}
 
-    // BREADTH-FIRST: per layer k >= 1, each state's (parent, input, label).
-    let mut back: Vec<Vec<(u32, u8, C::Label)>> = Vec::new();
-    let mut cur: Vec<C::State> = vec![start];
-    let mut steps = 0u64;
-    /// A successor in (parent, input, leaf) order; `next: None`: the win.
+/// How a layered search runs (`layers`).
+pub(super) struct Policy<'p> {
+    /// The inputs after layer `k`, in the order tried (`None`: the search
+    /// ends - a route's inputs are over).
+    pub(super) inputs: &'p (dyn Fn(u32) -> Option<Vec<u8>> + Sync),
+    /// A REPLAY: no input skipped, every layer's states kept with the
+    /// parents dedup merged, every win of the first layer with one. Else A
+    /// SEARCH: an input `Covered` by one run is skipped (its successors are
+    /// repeats), back-links only (keeping a layer took 100 GB), the first
+    /// win in order ends it.
+    pub(super) replay: bool,
+}
+
+/// A layered search's outcome.
+pub(super) struct Layers<C: Concrete> {
+    /// Per layer `k >= 1` each state's (parent, input, label).
+    pub(super) back: Vec<Vec<(u32, u8, C::Label)>>,
+    /// A replay's: every layer's states (the start's first), and per layer
+    /// the `(state, parent)` pairs dedup merged (the start's none).
+    pub(super) states: Vec<Vec<C::State>>,
+    pub(super) merged: Vec<Vec<(u32, u32)>>,
+    /// The first layer with a win, and its wins `(parent, input, label, leaf)`.
+    pub(super) won: Option<(u32, Vec<(u32, u8, C::Label, C::State)>)>,
+    /// The layer after which no state was left (no win).
+    pub(super) died: Option<u32>,
+    pub(super) steps: u64,
+}
+
+/// THE LAYERED SEARCH of `c` from `start` for at most `n` layers: per layer
+/// each state's successors under the policy's inputs (chunks of states in
+/// parallel, a free engine each, merged in order: the same at any thread
+/// count), each state once (by its key, the first in order), to the first
+/// layer with a win. `note(k, states, next layer's, won, steps)` after
+/// each layer.
+pub(super) fn layers<C: Concrete>(c: &C, engines: &[std::sync::Mutex<C::Engine>], start: C::State, n: u32, how: &Policy, mut note: impl FnMut(u32, usize, &[C::State], bool, u64)) -> Result<Layers<C>> {
+    /// A successor in (parent, input, leaf) order; `Err`: a win's leaf.
     struct Succ<C: Concrete> {
         parent: u32,
         byte: u8,
         label: C::Label,
-        next: Option<(C::State, C::Key)>,
+        next: std::result::Result<(C::State, C::Key), C::State>,
     }
-    for k in 0..frames {
-        let t = std::time::Instant::now();
-        let t_w = clock.steps(k + 1);
-        // Chunks of 16 parents, a free engine a worker.
-        const CHUNK: usize = 16;
+    /// Parents a task takes.
+    const CHUNK: usize = 16;
+    let mut out = Layers { back: Vec::new(), states: Vec::new(), merged: Vec::new(), won: None, died: None, steps: 0 };
+    if how.replay {
+        out.merged.push(Vec::new());
+    }
+    let mut cur: Vec<C::State> = vec![start];
+    for k in 0..n {
+        let Some(inputs) = (how.inputs)(k) else { break };
+        let cur_ref = &cur;
         let parts: Vec<(Vec<Succ<C>>, u64)> = crate::par::Pool::new(engines.len()).map_with(
             cur.len().div_ceil(CHUNK),
-            || engines.iter().find_map(|e| e.try_lock().ok()).ok_or_else(|| anyhow::anyhow!("no free {name} engine")),
+            || engines.iter().find_map(|e| e.try_lock().ok()).ok_or_else(|| anyhow::anyhow!("no free {} engine", C::NAME)),
             |eng, ch| {
                 let (mut got, mut steps) = (Vec::new(), 0u64);
-                // Dedup within the chunk already (the first in order, as the
-                // merge keeps it): most successors are repeats.
+                // A search dedups within the chunk already (the first in
+                // order, as the merge keeps it): most successors are repeats.
                 let mut chunk_seen: FxHashSet<C::Key> = FxHashSet::default();
-                'chunk: for (p, st) in cur.iter().enumerate().skip(ch * CHUNK).take(CHUNK) {
+                'chunk: for (p, st) in cur_ref.iter().enumerate().skip(ch * CHUNK).take(CHUNK) {
                     let mut ran = Covered::default();
-                    for byte in input_order(prefer, k) {
-                        if ran.covers(byte) {
+                    for &byte in &inputs {
+                        if !how.replay && ran.covers(byte) {
                             continue;
                         }
-                        let (next, read) = c.successors(eng, st, byte, t_w, &|key| chunk_seen.contains(key), &mut steps).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))?;
+                        let (next, read) = c.successors(eng, st, byte, k + 1, &|key| !how.replay && chunk_seen.contains(key), &mut steps).map_err(|e| e.context(format!("the frame after layer {k} with input {byte}")))?;
                         ran.push(byte, read);
-                        for n in next {
-                            match n {
-                                // A win keeps no state and ends its chunk:
-                                // the earliest (chunks merge in order) ends the
-                                // search (keeping the last layer took 100 GB).
-                                Next::Win(label) => {
-                                    got.push(Succ { parent: p as u32, byte, label, next: None });
-                                    break 'chunk;
+                        for x in next {
+                            match x {
+                                Next::Win(leaf, label) => {
+                                    got.push(Succ { parent: p as u32, byte, label, next: Err(leaf) });
+                                    // A search's win ends its chunk: the
+                                    // earliest (chunks merge in order) ends it.
+                                    if !how.replay {
+                                        break 'chunk;
+                                    }
                                 }
                                 Next::State(next, key, label) => {
-                                    if chunk_seen.insert(key.clone()) {
-                                        got.push(Succ { parent: p as u32, byte, label, next: Some((next, key)) });
+                                    if how.replay || chunk_seen.insert(key.clone()) {
+                                        got.push(Succ { parent: p as u32, byte, label, next: Ok((next, key)) });
                                     }
                                 }
                             }
@@ -203,60 +281,53 @@ pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, clock: Clock, 
                 Ok((got, steps))
             },
         )?;
-        steps += parts.iter().map(|p| p.1).sum::<u64>();
-        // Each state once, in order; the first win ends the search.
-        let mut seen: FxHashSet<C::Key> = FxHashSet::default();
-        let (mut next, mut links): (Vec<C::State>, Vec<(u32, u8, C::Label)>) = (Vec::new(), Vec::new());
-        let mut won: Option<(u32, u8, C::Label)> = None;
+        out.steps += parts.iter().map(|p| p.1).sum::<u64>();
+        // Each state once, in order.
+        let mut seen: rustc_hash::FxHashMap<C::Key, u32> = Default::default();
+        let (mut next, mut links, mut merged, mut wins) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for s in parts.into_iter().flat_map(|p| p.0) {
             match s.next {
-                None => {
-                    won = Some((s.parent, s.byte, s.label));
-                    break;
+                Err(leaf) => {
+                    wins.push((s.parent, s.byte, s.label, leaf));
+                    if !how.replay {
+                        break;
+                    }
                 }
-                Some((state, key)) => {
-                    if seen.insert(key) {
+                Ok((state, key)) => match seen.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        if how.replay {
+                            merged.push((*e.get(), s.parent));
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(next.len() as u32);
                         next.push(state);
                         links.push((s.parent, s.byte, s.label));
                     }
-                }
+                },
             }
         }
-        eprintln!(
-            "[{name}] layer {:3}: {} states -> {} inside W{}{}; {steps} steps so far, {:.1} s, rss {:.1} GB",
-            k + 1,
-            cur.len(),
-            next.len(),
-            c.note(&next),
-            if won.is_some() { ", A WIN" } else { "" },
-            t.elapsed().as_secs_f64(),
-            crate::metrics::current_rss_gb()
-        );
-        if let Some((parent, byte, label)) = won {
-            ensure!(k + 1 >= bound, "a {name} win at f{} before the bound f{bound}: a backward lost a path", k + 1);
-            let (mut inputs, mut labels) = (vec![byte], vec![label]);
-            let mut p = parent;
-            for layer in back.iter().rev() {
-                let (pp, b, l) = layer[p as usize];
-                inputs.push(b);
-                labels.push(l);
-                p = pp;
-            }
-            inputs.reverse();
-            labels.push(start_label);
-            labels.reverse();
-            eprintln!("[{name}] a win at f{} after {steps} steps, {:.1} s", inputs.len(), t0.elapsed().as_secs_f64());
-            return Ok(Some(Path { inputs, labels }));
+        note(k, cur.len(), &next, !wins.is_empty(), out.steps);
+        if !wins.is_empty() {
+            out.won = Some((k + 1, wins));
+            break;
         }
         if next.is_empty() {
-            println!("NO {} WIN by f{frames}: no state inside W past layer {k} ({steps} steps)", name.to_uppercase());
-            return Ok(None);
+            out.died = Some(k);
+            break;
         }
-        back.push(links);
-        cur = next;
+        out.back.push(links);
+        if how.replay {
+            out.merged.push(merged);
+            out.states.push(std::mem::replace(&mut cur, next));
+        } else {
+            cur = next;
+        }
     }
-    println!("NO {} WIN by f{frames} ({steps} steps)", name.to_uppercase());
-    Ok(None)
+    if how.replay {
+        out.states.push(cur);
+    }
+    Ok(out)
 }
 
 /// One arithmetic's level as the concrete searches admit states: W, its
@@ -313,11 +384,11 @@ impl<N: Rem> Concrete for Single<'_, '_, N> {
             *steps += 1;
             let cell = crate::storage::cells::block_cells(&b)?[0];
             if self.0.wins(&b)? {
-                out.push(Next::Win(cell));
+                out.push(Next::Win(b, cell));
                 continue;
             }
             let exact = exact_state(&b, cell);
-            if known(&exact) || !self.0.inside(&b, t)? {
+            if known(&exact) || !self.0.inside(&b, self.0.s.clock().steps(t))? {
                 continue;
             }
             out.push(Next::State(b, exact, cell));
@@ -361,7 +432,7 @@ pub(super) fn concrete_search<N: Rem>(side: &Side<'_, N>, horizon: u32, bound: u
     let (s, clock) = (side.s, side.s.clock());
     ensure!(clock.boundary(horizon), "the horizon {horizon} is not a whole number of frames ({} steps each)", clock.per_frame);
     eprintln!("[concrete] {} nodes; {} workers; the arc bound f{bound}", side.w.len(), s.threads().max(1));
-    let path = search(&Single(side), clock.frame_of(horizon), bound, clock, prefer, s.threads())?;
+    let path = search(&Single(side), clock.frame_of(horizon), bound, prefer, s.threads())?;
     Ok(path.map(|p| Witness { inputs: p.inputs, cells: p.labels }))
 }
 

@@ -7,10 +7,12 @@
 //! (`level_minus_one::check_route`) and the robustness report (`robust`).
 
 use anyhow::Result;
+use celeste_engine::exact::ExactRow;
 use celeste_engine::runtime2::Rt2;
 
-use super::concrete::exact_state;
+use super::concrete::{exact_state, layers, Concrete, Next, Policy};
 use super::rem::Rem;
+use crate::engines::reference::ReferenceEngine;
 use crate::frame::wins_of;
 use celeste_core::arith::Arithmetic;
 
@@ -29,46 +31,60 @@ pub(crate) struct Replay<N: Arithmetic> {
     pub(crate) seeded: bool,
 }
 
+/// A route stepped as a layered search (`concrete::layers`): a SEARCH STEP
+/// a layer, every leaf, a win a leaf the room's win takes.
+struct Route<'s, N>(&'s crate::settings::Settings, std::marker::PhantomData<N>);
+
+impl<N: Rem> Concrete for Route<'_, N> {
+    type Engine = ReferenceEngine<N>;
+    type State = Rt2<N>;
+    type Key = ExactRow;
+    type Label = ();
+    const NAME: &'static str = "replay";
+
+    fn engines(&self, n: usize) -> Result<Vec<Self::Engine>> {
+        Ok(super::concrete::concrete_engines::<N>(n, self.0)?.0)
+    }
+
+    fn start(&self, eng: &mut Self::Engine) -> Result<(Rt2<N>, ())> {
+        Ok((eng.initial()?.canonicalized(), ()))
+    }
+
+    fn successors(&self, eng: &mut Self::Engine, st: &Rt2<N>, byte: u8, _t: u32, _: &dyn Fn(&ExactRow) -> bool, steps: &mut u64) -> Result<(Vec<Next<Self>>, u8)> {
+        let mut out = Vec::new();
+        for c in eng.step(st, byte)? {
+            *steps += 1;
+            if wins_of(&c, self.0)?.iter().any(|&x| x) {
+                out.push(Next::Win(c, ()));
+                continue;
+            }
+            let key = exact_state(&c, crate::storage::cells::block_cells(&c)?[0]);
+            out.push(Next::State(c, key, ()));
+        }
+        Ok((out, u8::MAX))
+    }
+
+    fn budget(&self) -> u64 {
+        0
+    }
+}
+
 impl<N: Rem> Replay<N> {
     /// `inputs` from the room's start under `s`, through step `horizon`
     /// (`None`: every input), or to the first win.
     pub(crate) fn of(inputs: &[u8], horizon: Option<u32>, s: &crate::settings::Settings) -> Result<Self> {
         let clock = s.clock();
-        let (mut engines, seeded) = super::concrete::concrete_engines::<N>(1, s)?;
-        let eng = &mut engines[0];
-        let mut layers: Vec<Vec<(u32, Rt2<N>)>> = vec![vec![(0, eng.initial()?.canonicalized())]];
-        let mut merged: Vec<Vec<(u32, u32)>> = vec![Vec::new()];
+        let route = Route::<N>(s, std::marker::PhantomData);
+        let mut eng = route.engines(1)?.remove(0);
+        let (start, ()) = route.start(&mut eng)?;
+        let engines = [std::sync::Mutex::new(eng)];
         let last = horizon.unwrap_or(clock.steps(inputs.len() as u32));
-        for step in 0..last {
-            // The step to `step + 1` is in frame `frame_of(step + 1)`: its input.
-            let Some(&byte) = inputs.get(clock.frame_of(step + 1) as usize - 1) else { break };
-            let (mut next, mut more, mut won) = (Vec::new(), Vec::new(), Vec::new());
-            let mut seen: rustc_hash::FxHashMap<celeste_engine::exact::ExactRow, u32> = Default::default();
-            for (p, (_, b)) in layers.last().expect("the start").iter().enumerate() {
-                for c in eng.step(b, byte)? {
-                    if wins_of(&c, s)?.iter().any(|&x| x) {
-                        won.push((p as u32, c));
-                        continue;
-                    }
-                    match seen.entry(exact_state(&c, crate::storage::cells::block_cells(&c)?[0])) {
-                        std::collections::hash_map::Entry::Occupied(e) => more.push((*e.get(), p as u32)),
-                        std::collections::hash_map::Entry::Vacant(e) => {
-                            e.insert(next.len() as u32);
-                            next.push((p as u32, c));
-                        }
-                    }
-                }
-            }
-            if !won.is_empty() {
-                return Ok(Replay { layers, merged, exit: Some((step + 1, won)), seeded });
-            }
-            if next.is_empty() {
-                break;
-            }
-            layers.push(next);
-            merged.push(more);
-        }
-        Ok(Replay { layers, merged, exit: None, seeded })
+        // The step to `k + 1` is in frame `frame_of(k + 1)`: its input.
+        let policy = Policy { inputs: &|k| inputs.get(clock.frame_of(k + 1) as usize - 1).map(|&b| vec![b]), replay: true };
+        let ls = layers(&route, &engines, start, last, &policy, |_, _, _, _, _| {})?;
+        let layers = ls.states.into_iter().enumerate().map(|(k, st)| st.into_iter().enumerate().map(|(i, b)| (if k == 0 { 0 } else { ls.back[k - 1][i].0 }, b)).collect()).collect();
+        let exit = ls.won.map(|(step, wins)| (step, wins.into_iter().map(|(p, _, _, leaf)| (p, leaf)).collect()));
+        Ok(Replay { layers, merged: ls.merged, exit, seeded: s.concrete().1 })
     }
 
     /// The first frame a leaf wins in (`None`: none).
