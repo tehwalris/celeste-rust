@@ -15,6 +15,7 @@ use celeste_engine::exact::{Code, KeySpace, Provisional, ShapeRecord};
 use celeste_engine::runtime2::{Col, Rt2, AV};
 use celeste_engine::slots::reshape;
 
+use crate::storage::stats::S;
 use crate::transpile::asm::{AsmCtx, CollisionEnv, Compiled, Loaded};
 use crate::transpile::graph::Ty;
 use crate::transpile::graph::{Eval, Room};
@@ -218,19 +219,19 @@ impl<N: KernelLanes> AsmKernel<N> {
     /// `live & !error` lanes into the sink with their edges. Any `live &
     /// error` (declined) fails the call: a coverage gap.
     fn run(&self, chunk: &Rt2<N>, lanes: &[usize], sink: &mut crate::storage::unit::UnitSink<N>) -> bool {
-        stats([1, 0, 0, 0, 0, 0, 0]);
+        sink.stats.add(S::KernelCalls, 1);
         for part in lanes.chunks(16) {
-            if !self.run_slice(chunk, part, ((1u32 << part.len()) - 1) as u16, sink) {
+            if !self.run_slice(chunk, part, sink) {
                 return false;
             }
         }
         true
     }
 
-    /// Run ONE slice of up to 16 lanes (of any id groups), keeping lanes in
-    /// `only`: the kernel, each body's lanes (`live & !error`, less those
-    /// an earlier body emits identically), then their EMISSION (`emit`).
-    fn run_slice(&self, chunk: &Rt2<N>, lanes: &[usize], only: u16, sink: &mut crate::storage::unit::UnitSink<N>) -> bool {
+    /// Run ONE slice of up to 16 lanes (of any id groups): the kernel, each
+    /// body's lanes (`live & !error`, less those an earlier body emits
+    /// identically), then their EMISSION (`emit`).
+    fn run_slice(&self, chunk: &Rt2<N>, lanes: &[usize], sink: &mut crate::storage::unit::UnitSink<N>) -> bool {
         let t_setup = sink.stats.tick_start();
         let n = lanes.len();
         debug_assert!((1..=16).contains(&n));
@@ -245,12 +246,12 @@ impl<N: KernelLanes> AsmKernel<N> {
         let Scratch { inbuf, outbuf, took, takes, parts, dups, .. } = &mut sc;
         dups.next(self.dup_pairs.pairs.len());
 
-        // Utilization tallies, folded into `CALL_STATS[3..]` at the end.
+        // Utilization tallies, into the sink's stats at the end.
         let (mut n_bodies, mut n_bodies_taken, mut n_lanes) = (0u64, 0u64, 0u64);
-        let t_ph = sink.stats.tick(crate::storage::stats::S::PhSetup, t_setup);
+        let t_ph = sink.stats.tick(S::PhSetup, t_setup);
         let ((ihalf, ohalf), _) = self.halves();
         self.pack_input(&views, lanes, inbuf, ihalf);
-        let t_ph = sink.stats.tick(crate::storage::stats::S::PhPack, t_ph);
+        let t_ph = sink.stats.tick(S::PhPack, t_ph);
         // The spill frame is on THIS thread's stack: refuse rather than overrun.
         let (frame, stack) = (self.compiled.frame_bytes as usize, thread_stack());
         assert!(
@@ -268,8 +269,8 @@ impl<N: KernelLanes> AsmKernel<N> {
                 &ctx as *const AsmCtx<N> as *const c_void,
             );
         }
-        let t_emit = sink.stats.tick(crate::storage::stats::S::PhKernel, t_ph);
-        let valid = (((1u32 << n) - 1) as u16) & only;
+        let t_emit = sink.stats.tick(S::PhKernel, t_ph);
+        let valid = ((1u32 << n) - 1) as u16;
         for (bi, body) in self.bodies.iter().enumerate() {
             // Tri-state masks, each read where it MAY hold.
             let error = read_zb_may::<N>(outbuf, ohalf, body.error_off);
@@ -304,12 +305,14 @@ impl<N: KernelLanes> AsmKernel<N> {
                 n_lanes += take.count_ones() as u64;
             }
         }
-        let n_unique = self.emit(emit::Slice { chunk, lanes, buf: outbuf, half: ohalf, takes, parts }, sink);
+        self.emit(emit::Slice { chunk, lanes, buf: outbuf, half: ohalf, takes, parts }, sink);
         if t_emit != 0 {
-            sink.stats.tick(crate::storage::stats::S::PhEmit, t_emit);
+            sink.stats.tick(S::PhEmit, t_emit);
         }
         sc.put_back();
-        stats([0, only.count_ones().min(n as u32) as u64, 16, n_bodies, n_bodies_taken, n_lanes, n_unique]);
+        for (k, v) in [(S::KernelRows, n as u64), (S::KernelSlices, 1), (S::KernelBodies, n_bodies), (S::KernelBodiesTaken, n_bodies_taken), (S::KernelTakes, n_lanes)] {
+            sink.stats.add(k, v);
+        }
         true
     }
 
@@ -859,7 +862,7 @@ impl<N: KernelLanes> Registry<N> {
         // slices of 16 (a slice may span id groups): a unit's cell order
         // changes region every ~12 rows, so slices in lane order would run
         // once per region they hold.
-        stats([1, 0, 0, 0, 0, 0, 0]);
+        sink.stats.add(S::KernelCalls, 1);
         let mut by_region: Vec<(Option<Region>, usize)> =
             lanes.iter().map(|&l| (grid.of_cell(cell_in[l]), l)).collect();
         by_region.sort_unstable();
@@ -872,7 +875,7 @@ impl<N: KernelLanes> Registry<N> {
             for part in run.chunks(16) {
                 idx.clear();
                 idx.extend(part.iter().map(|&(_, l)| l));
-                if !k.run_slice(chunk, &idx, ((1u32 << idx.len()) - 1) as u16, sink) {
+                if !k.run_slice(chunk, &idx, sink) {
                     return false;
                 }
             }
@@ -1479,47 +1482,6 @@ fn pos_sources<N: Arithmetic>(template: &Rt2<N>, fields: &[AsmField]) -> Result<
     Ok(Some([px, py, rx, ry]))
 }
 
-/// Kernel call counters: [0] calls, [1] rows offered, [2] slice-lanes
-/// executed (`[2] - [1]` is padding), [3] (body, slice) evaluations, [4]
-/// those that took a lane, [5] lane emissions, [6] after the dedup cache.
-static CALL_STATS: [std::sync::atomic::AtomicU64; 7] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 7];
-
-thread_local! {
-    /// This thread's share of `CALL_STATS`, folded in by `fold_call_stats`:
-    /// six shared atomic adds per slice from every worker cost more than the
-    /// slice's kernel.
-    static LOCAL_STATS: std::cell::Cell<[u64; 7]> = const { std::cell::Cell::new([0; 7]) };
-}
-
-/// Add `d` to this thread's counters (one thread-local access per slice).
-#[inline]
-fn stats(d: [u64; 7]) {
-    LOCAL_STATS.with(|c| {
-        let mut v = c.get();
-        for (a, b) in v.iter_mut().zip(d) {
-            *a += b;
-        }
-        c.set(v);
-    });
-}
-
-/// Fold this thread's counters into the shared ones (a wave worker's end).
-pub(crate) fn fold_call_stats() {
-    let v = LOCAL_STATS.with(|c| c.replace([0; 7]));
-    for (a, n) in CALL_STATS.iter().zip(v) {
-        if n != 0 {
-            a.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-}
-
-/// Take (and reset) the call-shape counters.
-pub(crate) fn take_call_stats() -> [u64; 7] {
-    fold_call_stats();
-    std::array::from_fn(|i| CALL_STATS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
-}
-
 /// An arithmetic's resident kernel set and what it was built under.
 pub type Resident<N> = Option<(crate::abstraction::Level, crate::settings::Settings, std::sync::Arc<Registry<N>>)>;
 
@@ -1546,22 +1508,15 @@ struct BuildPurgeDelay;
 /// Builds in progress, and the purge delay they found.
 static BUILDS: std::sync::Mutex<(usize, std::os::raw::c_long)> = std::sync::Mutex::new((0, 0));
 
-/// `mi_option_purge_delay` (unbound in libmimalloc-sys 0.1.44); checked
-/// against the environment's value in `start`.
-const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
-
 impl BuildPurgeDelay {
     fn start() -> BuildPurgeDelay {
         let mut b = BUILDS.lock().unwrap();
         if b.0 == 0 {
-            // SAFETY: plain option reads and writes, mimalloc's documented API.
-            let before = unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) };
-            if let Some(env) = std::env::var("MIMALLOC_PURGE_DELAY").ok().and_then(|v| v.parse::<std::os::raw::c_long>().ok()) {
-                assert_eq!(before, env, "mimalloc option {MI_OPTION_PURGE_DELAY} is not the purge delay MIMALLOC_PURGE_DELAY set");
-            }
+            // SAFETY: a plain option read, mimalloc's documented API.
+            let before = unsafe { libmimalloc_sys::mi_option_get(super::MI_OPTION_PURGE_DELAY) };
             b.1 = before;
             if (0..1000).contains(&before) {
-                unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, 1000) };
+                super::set_purge_delay(1000);
             }
         }
         b.0 += 1;
@@ -1574,7 +1529,7 @@ impl Drop for BuildPurgeDelay {
         let mut b = BUILDS.lock().unwrap();
         b.0 -= 1;
         if b.0 == 0 {
-            unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, b.1) };
+            super::set_purge_delay(b.1);
             // Purge what the (exited) builder threads freed under the delay.
             unsafe { libmimalloc_sys::mi_collect(true) };
         }

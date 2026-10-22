@@ -9,12 +9,14 @@
 use anyhow::Result;
 use celeste_engine::runtime2::Rt2;
 use celeste_rust::abstraction::Level;
-use celeste_rust::frame::{wins_of, FrameStep};
+use celeste_rust::frame::FrameStep;
 use celeste_rust::search::inspect::{brief, cell_names, project_all, project_onto, project_row, Proj};
 use celeste_rust::search::rem::Rem;
 use celeste_rust::search::tree::TreeDir;
 use celeste_rust::settings::Settings;
 use celeste_rust::storage::layer::Tree;
+use celeste_rust::storage::stats::Stats;
+use celeste_rust::storage::wave::one_frame;
 use celeste_rust::storage::Sk;
 use std::path::PathBuf;
 
@@ -233,18 +235,6 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
     }
 }
 
-/// Every row of `rt2` (of layer `layer`) through ONE forward frame of
-/// `engine` (an empty visited set, no filter): the successors and whether
-/// one wins.
-pub(crate) fn rerun<N: celeste_rust::search::rem::Rem>(engine: &dyn FrameStep<N>, rt2: Rt2<N>, layer: u32) -> Result<(Vec<Rt2<N>>, bool)> {
-    let next = celeste_rust::storage::wave::one_frame(engine, vec![rt2], layer + 1)?;
-    let mut won = false;
-    for b in &next {
-        won |= wins_of(b, &engine.settings())?.contains(&true);
-    }
-    Ok((next, won))
-}
-
 /// `check ref` in arithmetic `A`.
 fn ref_check<A>(t: &TreeDir, a: &RefArgs) -> Result<()>
 where
@@ -262,8 +252,9 @@ where
     let n = picked.len();
     let ids = celeste_rust::compiled::ids();
     // One row: (its report, reference-only successors, kernel-only,
-    // skipped over the path cap, lanes converted alike).
-    let one = |reference: &mut celeste_rust::engines::reference::ReferenceEngine<A>, sk: Sk| -> Result<(String, usize, usize, usize, usize)> {
+    // skipped over the path cap, lanes converted alike, the kernels' frame
+    // stats).
+    let one = |reference: &mut celeste_rust::engines::reference::ReferenceEngine<A>, sk: Sk| -> Result<(String, usize, usize, usize, usize, Stats)> {
         let rt2 = tree.row(frame, sk, cfg.room)?;
         let at = where_(sk.cell());
         let id = sk.show();
@@ -274,8 +265,9 @@ where
             Ok(())
         };
         agree(reference, &rt2)?;
-        // The kernels' successors (with `--row`, printed).
-        let (next, _) = rerun(&kernels, rt2.clone_block(), frame)?;
+        // The kernels' successors (with `--row`, printed): ONE forward
+        // frame of the row (an empty visited set, no filter).
+        let (next, kstats) = one_frame(&kernels, vec![rt2.clone_block()], frame + 1)?;
         let mut kset: std::collections::BTreeSet<Proj> = Default::default();
         let mut shown = String::new();
         let me = project_row(&rt2, &cell_names(&rt2, ids), 0, &[]);
@@ -300,7 +292,7 @@ where
         let mut rset: std::collections::BTreeSet<Proj> = Default::default();
         let leaves = match reference.run_lane(&input, 0) {
             Err(e) if e.downcast_ref::<celeste_rust::engines::reference::TooManyPaths>().is_some() => {
-                return Ok((format!("[check ref] state {id} at {at}: SKIPPED ({e})\n"), 0, 0, 1, alike));
+                return Ok((format!("[check ref] state {id} at {at}: SKIPPED ({e})\n"), 0, 0, 1, alike, kstats));
             }
             other => other?,
         };
@@ -325,7 +317,7 @@ where
                 out += &format!("    a kernel successor: {p:?}\n");
             }
         }
-        Ok((out, missing.len(), extra.len(), 0, alike))
+        Ok((out, missing.len(), extra.len(), 0, alike, kstats))
     };
     // The rows in parallel (the kernels' engine shared, a reference
     // engine per worker), reported in row order.
@@ -342,10 +334,11 @@ where
         |reference, k| one(reference, picked[k]),
     )?;
     let (mut sound_gaps, mut precision_gaps, mut rows_bad, mut skipped, mut alike) = (0usize, 0usize, 0usize, 0usize, 0usize);
-    for (text, missing, extra, skip, lanes) in done.into_iter().map(|r| match r {
+    let mut kernel_stats = Stats::default();
+    for (text, missing, extra, skip, lanes, kstats) in done.into_iter().map(|r| match r {
         differential::Ran::Done(r) => r,
         // (`one` takes its own skips, its lanes counted.)
-        differential::Ran::Skipped(why) => (format!("[check ref] SKIPPED ({why})\n"), 0, 0, 1, 0),
+        differential::Ran::Skipped(why) => (format!("[check ref] SKIPPED ({why})\n"), 0, 0, 1, 0, Stats::default()),
     }) {
         print!("{text}");
         sound_gaps += missing;
@@ -353,10 +346,11 @@ where
         rows_bad += (missing + extra > 0) as usize;
         skipped += skip;
         alike += lanes;
+        kernel_stats.merge(&kstats);
     }
     println!("[check ref] {n} rows ({skipped} SKIPPED over the path cap): {rows_bad} differ; {sound_gaps} successors only in the reference, {precision_gaps} only in the kernels");
     println!("[check ref] the one converter: {alike} lanes (the rows, their kernel successors and reference leaves) convert alike on both sides");
-    celeste_rust::compiled::dispatch::print_kernel_hits();
+    celeste_rust::compiled::print_kernel_stats(&kernel_stats);
     differential::verdict(n - skipped, sound_gaps, || format!("check ref: {sound_gaps} reference successors the kernels miss (a SOUNDNESS gap)"))
 }
 
@@ -404,7 +398,7 @@ fn widen_check<N: Rem + KernelLanes>(t: &TreeDir, frame: u32, emitted: usize) ->
             let (bi, r) = all[k];
             let mut rt2 = blocks[bi].1.clone_block();
             rt2.retain_lanes(&[r]);
-            for b in rerun(&kernels, rt2, frame)?.0 {
+            for b in one_frame(&kernels, vec![rt2], frame + 1)?.0 {
                 emitted_rows += b.width;
                 moved += check(&b, "emitted", moved);
             }

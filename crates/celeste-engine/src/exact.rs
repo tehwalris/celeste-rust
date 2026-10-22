@@ -980,10 +980,10 @@ mod tests {
         use crate::runtime2::{Col, NONE};
         let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(1, 0));
         let mut b = Rt2::<P8>::empty(1, celeste_names::GLOBAL_NAMES.len(), celeste_names::STRINGS, cache);
-        let x = celeste_names::field_id("x").expect("a field `x`");
+        let x = celeste_names::field("x");
         b.structure = vec![Cell2::Val, Cell2::Obj(vec![(x, 2)]), Cell2::Val];
         b.cols = vec![Col::U(AV::Ptr(1)), Col::U(AV::Nil), Col::U(AV::Num(P8::from_i16(3)))];
-        b.globals[celeste_names::global_id("objects").expect("a global `objects`") as usize] = 0;
+        b.globals[celeste_names::global("objects") as usize] = 0;
         b.canonicalize_ids();
         let (hash, sig) = (b.shape_hash_of(), shape_sig(&b));
         b.globals.push(NONE);

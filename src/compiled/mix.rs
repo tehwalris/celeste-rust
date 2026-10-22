@@ -39,8 +39,8 @@ pub type Census = BTreeMap<String, u64>;
 /// A kernel built with the census on: its symbol, slice counter and census.
 type Counted = (String, Arc<AtomicU64>, Census);
 
-/// Every kernel built with the census on (a process-wide stats sink, like
-/// the dispatch's hit counters).
+/// Every kernel built with the census on (process-wide: the census is of
+/// the whole kernel set).
 static KERNELS: Mutex<Vec<Counted>> = Mutex::new(Vec::new());
 
 /// A fresh slice counter for kernel `sym`, with its census.

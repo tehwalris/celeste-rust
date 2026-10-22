@@ -150,7 +150,8 @@ wrapper took the whole session down).
   GB: check `df` first.
 - Reading memory: the `[fwd]` line's `rss` is the ANONYMOUS resident set;
   `file` is mapped files (reclaimable); `peak` is `VmHWM`, both together.
-- `safe-run.sh` sets `MIMALLOC_PURGE_DELAY=100` (why, in the script).
+- `rewrite` sets mimalloc's purge delay to 100 ms at its start, whatever
+  `MIMALLOC_PURGE_DELAY` says (why: `compiled::set_purge_delay`).
 - A search RESUMES from its checkpoint directory: rerun the same command;
   delete the directory for a fresh run.
 
@@ -227,7 +228,10 @@ registry, `src/settings.rs`, the `rewrite` binary in `src/bin/rewrite/`). Detail
 There is NO checked-in kernel artifact: the registry retraces the start
 room's shapes at startup, specializes them for the level and assembles
 them with gcc + dlopen. What runs is what the tracer makes of this
-checkout's Lua.
+checkout's Lua. A set built before from the same sources (the whole tree),
+profile, toolchain, cart and settings loads from `/var/tmp/celeste-kernels`
+instead (`compiled::cache`; files hash-checked); the `[asm build]` line says
+HIT or MISS.
 
 ## The commands
 
