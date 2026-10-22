@@ -16,7 +16,9 @@ use celeste_rust::storage::layer::Tree;
 use celeste_rust::storage::Sk;
 use std::path::PathBuf;
 
-use crate::{where_, KernelsNew, Rows};
+use celeste_rust::compiled::{KernelLanes, Kernels};
+
+use crate::{where_, Rows};
 
 #[derive(clap::Subcommand)]
 pub enum Command {
@@ -175,7 +177,7 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
     match c {
         Command::Ref(a) => {
             let t = TreeDir::open(&a.tree, run)?;
-            celeste_rust::with_arith!(t.settings.arith, N => ref_check::<celeste_rust::compiled::Kernels<N>, N>(&t, &a))
+            celeste_rust::with_arith!(t.settings.arith, N => ref_check::<N>(&t, &a))
         }
         Command::Arcs(a) => {
             let t = TreeDir::open(&a.tree, run)?;
@@ -185,7 +187,7 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
         Command::Widen(a) => {
             let t = TreeDir::open(&a.tree, run)?;
             let frame = t.frame(a.step)?;
-            celeste_rust::with_arith!(t.settings.arith, N => widen_check::<celeste_rust::compiled::Kernels<N>, N>(&t, frame, a.emitted))
+            celeste_rust::with_arith!(t.settings.arith, N => widen_check::<N>(&t, frame, a.emitted))
         }
         Command::Known(a) => {
             let inputs = celeste_rust::concrete::read_inputs(&a.inputs)?;
@@ -219,15 +221,13 @@ pub(crate) fn rerun<N: celeste_rust::search::rem::Rem>(engine: &dyn FrameStep<N>
     Ok((next, won))
 }
 
-/// `check ref` in arithmetic `A`, its kernels `K`.
-fn ref_check<K, A>(t: &TreeDir, a: &RefArgs) -> Result<()>
+/// `check ref` in arithmetic `A`.
+fn ref_check<A>(t: &TreeDir, a: &RefArgs) -> Result<()>
 where
-    K: FrameStep<A> + KernelsNew,
-    A: celeste_rust::transpile::garith::GraphArith,
-    A: Rem,
+    A: celeste_rust::transpile::garith::GraphArith + Rem + KernelLanes,
 {
     let (cfg, level) = (&t.settings, t.level);
-    let kernels = K::new(cfg, level)?;
+    let kernels = Kernels::<A>::new(cfg, level)?;
     kernels.warm();
     // Every candidate state, then `samples` evenly spaced.
     let (tree, frame, all) = a.rows.states::<A>(t)?;
@@ -336,12 +336,8 @@ where
     Ok(())
 }
 
-/// `check widen` of `frame` in the arithmetic of `N`, its kernels `K`.
-fn widen_check<K, N>(t: &TreeDir, frame: u32, emitted: usize) -> Result<()>
-where
-    K: FrameStep<N> + KernelsNew,
-    N: Rem,
-{
+/// `check widen` of `frame` in the arithmetic of `N`.
+fn widen_check<N: Rem + KernelLanes>(t: &TreeDir, frame: u32, emitted: usize) -> Result<()> {
     let (cfg, level): (&Settings, Level) = (&t.settings, t.level);
     anyhow::ensure!(
         !(level.floors_near && !cfg.clock().boundary(frame)),
@@ -378,7 +374,7 @@ where
         moved += check(rt2, "stored", moved);
     }
     if emitted > 0 {
-        let kernels = K::new(cfg, level)?;
+        let kernels = Kernels::<N>::new(cfg, level)?;
         kernels.warm();
         let all: Vec<(usize, u32)> = blocks.iter().enumerate().flat_map(|(bi, (_, rt2))| (0..rt2.width as u32).map(move |r| (bi, r))).collect();
         let n = emitted.min(all.len());

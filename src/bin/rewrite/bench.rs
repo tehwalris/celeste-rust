@@ -10,7 +10,6 @@ use celeste_rust::search::tree::TreeDir;
 use celeste_rust::settings::{Arith, Settings};
 use std::path::PathBuf;
 
-use crate::KernelsNew;
 
 #[derive(clap::Subcommand)]
 pub enum Command {
@@ -103,7 +102,7 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
             if t.settings.arith != Arith::Fixed {
                 anyhow::ensure!(a.metrics.is_none(), "a float tree: bench frame --metrics (the kernel census) is 16.16's");
             }
-            celeste_rust::with_arith!(t.settings.arith, N => bench_frame::<celeste_rust::compiled::Kernels<N>, N>(&t, &a))
+            celeste_rust::with_arith!(t.settings.arith, N => bench_frame::<N>(&t, &a))
         }
         Command::Backward(a) => {
             let t = TreeDir::open(&a.tree, run)?;
@@ -113,13 +112,9 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
     }
 }
 
-/// `bench frame` in the arithmetic of `N`, its kernels `K` (`--metrics`,
-/// the kernel census, is 16.16's).
-fn bench_frame<K, N>(t: &TreeDir, a: &FrameArgs) -> Result<()>
-where
-    K: FrameStep<N> + KernelsNew,
-    N: Rem,
-{
+/// `bench frame` in the arithmetic of `N` (`--metrics`, the kernel census,
+/// is 16.16's).
+fn bench_frame<N: Rem + celeste_rust::compiled::KernelLanes>(t: &TreeDir, a: &FrameArgs) -> Result<()> {
     use celeste_rust::compiled::dispatch::{print_stats, take_kernel_stats};
     let (cfg, level, dir) = (&t.settings, t.level, &t.dir);
     let (edges, checkpoint, reps) = (a.edges, a.checkpoint, a.reps);
@@ -127,7 +122,7 @@ where
     anyhow::ensure!(!a.pin || (a.expect.is_some() || a.metrics.is_some()), "--pin writes --expect and --metrics: give one");
     anyhow::ensure!(!a.pin || a.expect.is_none() || checkpoint, "--pin --expect: a pin holds every line (--edges --checkpoint)");
     let frame = t.frame(a.step)?;
-    let engine = K::new(cfg, level)?;
+    let engine = celeste_rust::compiled::Kernels::<N>::new(cfg, level)?;
     let t = std::time::Instant::now();
     engine.warm();
     let t_kernels = t.elapsed().as_secs_f64();

@@ -147,8 +147,8 @@ enum Command {
     ///
     /// One "x,y" per line from frame 1 (`-` accepts any), followed
     /// breadth-first over the reference engine's concrete step, deduplicated
-    /// exactly. Prints the input bytes for `rewrite run -i` /
-    /// `pico8_diff/replay.py`, or the first frame it could not follow.
+    /// exactly, to its first win. Prints the input bytes for `rewrite run -i`
+    /// / `rewrite pico8 replay`, or the first frame it could not follow.
     Trajectory(diag::TrajectoryArgs),
     /// A float witness's ROBUSTNESS to the host libm (plans/float.md, `search::robust`).
     ///
@@ -262,9 +262,9 @@ pub struct DualArgs {
     /// A known run, tried first and checked against each half's pruning (as `search --prefer`).
     #[arg(long)]
     prefer: Option<String>,
-    /// The float half's tool: `celia` (default) or `uct`.
-    #[arg(long, default_value = "celia")]
-    float_half: String,
+    /// The float half's tool.
+    #[arg(long, value_enum, default_value = "celia")]
+    float_half: celeste_rust::settings::FloatTool,
     /// The float half's loading jank J (Celia only; default: its IL load's).
     #[arg(long)]
     float_loading_jank: Option<usize>,
@@ -365,16 +365,6 @@ pub(crate) fn where_(c: u32) -> String {
     celeste_rust::search::pos_graph::cell_xy(c).map(|(x, y)| format!("({x}, {y})")).unwrap_or_else(|| "no player".to_string())
 }
 
-/// The kernels of a level (`compiled::Kernels::new`), for the commands
-/// generic over the arithmetic.
-pub(crate) trait KernelsNew: Sized {
-    fn new(cfg: &celeste_rust::settings::Settings, level: Level) -> Result<Self>;
-}
-impl<N: celeste_rust::compiled::KernelLanes> KernelsNew for celeste_rust::compiled::Kernels<N> {
-    fn new(cfg: &celeste_rust::settings::Settings, level: Level) -> Result<Self> {
-        celeste_rust::compiled::Kernels::<N>::new(cfg, level)
-    }
-}
 /// `search` and `dual` (`float`: the float half's settings): `search::run`,
 /// its verdict reported.
 #[allow(clippy::too_many_arguments)]
@@ -480,12 +470,7 @@ fn main() -> Result<()> {
     match cli.command {
         Command::Search(a) => search(&cfg, None, a.frames, a.ceiling, &a.level, &a.search_dir, a.no_witness, a.save_marks.as_deref(), a.prefer.as_deref()),
         Command::Dual(a) => {
-            let tool = match a.float_half.as_str() {
-                "celia" => celeste_rust::settings::FloatTool::Celia,
-                "uct" => celeste_rust::settings::FloatTool::Uct,
-                t => anyhow::bail!("--float-half: `celia` or `uct`, not {t:?}"),
-            };
-            let float = cfg.float_half(tool, a.float_loading_jank)?;
+            let float = cfg.float_half(a.float_half, a.float_loading_jank)?;
             search(&cfg, Some(&float), a.frames, a.ceiling, &a.level, &a.search_dir, a.no_witness, a.save_marks.as_deref(), a.prefer.as_deref())
         }
         Command::Forward(a) => {

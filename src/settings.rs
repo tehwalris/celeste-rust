@@ -52,7 +52,7 @@ macro_rules! with_arith {
 }
 
 /// The float tool a float run models (`--arith float-celia|float-uct`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum FloatTool {
     /// UniversalClassicTas: the room loaded alone (the IL load), the file's
     /// seeds set on its balloons and chests (`set_seeds`). A secondary
