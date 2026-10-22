@@ -24,6 +24,20 @@ use std::path::{Path, PathBuf};
 /// (tools/fixtures.sh rebuilds its fixtures on a change).
 pub const VERSION: u32 = 3;
 
+/// The order of a tree's transfer table (`storage::edges::XferTable`):
+/// a frame's new transfers are numbered at each slice's GATHER (the pairs
+/// first met in the slice, by content: `XferTable::merge`). A frame check
+/// encodes a fixture's transfers by their ids, so its edge bytes follow it.
+const XFER_ORDER: &str = "gather";
+
+/// THE FILE FORMATS a tree is written in: what a stored tree, a fixture
+/// among them, is a function of besides its settings and the code
+/// (`rewrite --version` prints it; tools/fixtures.sh keys its store and
+/// rebuilds its fixtures by it).
+pub fn formats() -> String {
+    format!("checkpoint {} edges {} settings {VERSION} xfers {XFER_ORDER}", crate::storage::file::FORMAT_VERSION, crate::storage::edges::VERSION)
+}
+
 /// The game's arithmetic (`--arith`): 16.16, or the float tools' doubles
 /// with the tool (which decides the room's start and the seeds' meaning).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

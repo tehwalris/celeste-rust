@@ -465,7 +465,8 @@ fn tree_flags_given(m: &clap::ArgMatches) -> Vec<String> {
 }
 
 fn main() -> Result<()> {
-    let matches = Cli::command().get_matches();
+    // `--version`: the file formats a tree is written in (tools/fixtures.sh).
+    let matches = Cli::command().version(&*Box::leak(celeste_rust::settings::formats().into_boxed_str())).get_matches();
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     if cli.command.reads_trees() {
         let given = tree_flags_given(&matches);

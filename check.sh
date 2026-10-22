@@ -50,7 +50,6 @@ export BIN=$B
 # unit (the quick profile's 16 units re-partition on unrelated edits, which
 # moves a frame's instructions by 2-3%).
 RB=$T/release/rewrite
-F=${CELESTE_FIXTURES:-$(tools/fixtures.sh root)}
 G=gates/fixtures
 C=${CHECK_DIR:-/var/tmp/celeste-check-${PWD##*/}-$(printf %s "$PWD" | sha1sum | cut -c1-8)}
 TH=${THREADS:-16}
@@ -120,6 +119,9 @@ ignoredtests() {
 
 build() {
     step build ./safe-run.sh --memory 20G -- ./one-cargo.sh cargo build --profile quick --bins
+    # The fixtures' store: one directory per file-format set, as the binary
+    # states the formats (`tools/fixtures.sh root`).
+    F=${CELESTE_FIXTURES:-$(tools/fixtures.sh root)}
 }
 
 t0() {
@@ -277,27 +279,32 @@ t2_platforms() {
 # edges (with their transfers) and hulls f0-f44, and the arc gate.
 gate10_forward() {
     ./safe-run.sh --memory "$MEM" -- "$B" forward --steps 44 --room 1,0 --tree "$C/t2/g10" > "$C/t2/g10.out" || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10" --steps 44 --edges --hulls | diff gates/ckhash_room10_f000-044.txt - >&2
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10" --steps 44 --edges --hulls > "$C/t2/g10.ckhash" || return 1
+    same "$C/t2/g10.ckhash" gates/ckhash_room10_f000-044.txt
 }
 gate10_arc() {
     ./safe-run.sh --memory "$MEM" -- "$B" search --frames 35 --win-at 9,101 --search-dir "$C/t2/arc10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10-marks" > "$C/t2/arc10.out" || return 1
-    grep '^\[gate\]' "$C/t2/arc10.out" | diff gates/arc_room10_win9-101_h35.txt - >&2
+    grep '^\[gate\]' "$C/t2/arc10.out" > "$C/t2/arc10.gate"
+    same "$C/t2/arc10.gate" gates/arc_room10_win9-101_h35.txt
 }
 # The same oracles in float (`--arith float`, plans/float.md).
 gate10f_forward() {
     ./safe-run.sh --memory "$MEM" -- "$B" forward --arith float --steps 44 --room 1,0 --tree "$C/t2/g10f" > "$C/t2/g10f.out" || return 1
-    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10f" --steps 44 --edges --hulls | diff gates/float_ckhash_room10_f000-044.txt - >&2
+    ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10f" --steps 44 --edges --hulls > "$C/t2/g10f.ckhash" || return 1
+    same "$C/t2/g10f.ckhash" gates/float_ckhash_room10_f000-044.txt
 }
 gate10f_arc() {
     ./safe-run.sh --memory "$MEM" -- "$B" search --arith float --frames 35 --win-at 9,101 --search-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10f-marks" > "$C/t2/arc10f.out" || return 1
-    grep '^\[gate\]' "$C/t2/arc10f.out" | diff gates/float_arc_room10_win9-101_h35.txt - >&2
+    grep '^\[gate\]' "$C/t2/arc10f.out" > "$C/t2/arc10f.gate"
+    same "$C/t2/arc10f.gate" gates/float_arc_room10_win9-101_h35.txt
 }
 # The dual search (`rewrite dual`) at the same synthetic win, the known
 # route valid in both: its bound and witness pinned (each half's [gate]
 # lines are the two gates above).
 gate10d_dual() {
     ./safe-run.sh --memory "$MEM" -- "$B" dual --frames 35 --win-at 9,101 --search-dir "$C/t2/dual10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/dual10-marks" > "$C/t2/dual10.out" || return 1
-    grep -E '^DUAL BOUND|^\[gate\] h35 dual' "$C/t2/dual10.out" | diff gates/dual_room10_win9-101_h35.txt - >&2
+    grep -E '^DUAL BOUND|^\[gate\] h35 dual' "$C/t2/dual10.out" > "$C/t2/dual10.gate"
+    same "$C/t2/dual10.gate" gates/dual_room10_win9-101_h35.txt
 }
 # The objects ladder (r0sxhn filtering r0sxh) at a synthetic win, its
 # witness as the known route: every level's [gate] lines pinned.
@@ -338,7 +345,8 @@ hull10() {
 }
 
 # A platform room (platforms unknown, split frame) to step 71: the tree's
-# fingerprint is the r60s fixture's pin.
+# fingerprint is the r60s fixture's pin, which only `tools/fixtures.sh pin
+# r60s` writes (so not `same`: t2 --pin leaves it).
 forward60() {
     ./safe-run.sh --memory "$MEM" -- "$B" forward --room 6,0 --level r0sxhfp --steps 71 --split-frame --tree "$C/t2/p60" > /dev/null || return 1
     ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/p60" --steps 71 --edges --hulls 2> /dev/null | diff "$G/r60s.ckhash" - >&2

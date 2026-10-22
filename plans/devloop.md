@@ -215,7 +215,8 @@ For a profile, `perf record -g -m 8 -- rewrite bench frame ...`:
 ## The fixtures
 
 `tools/fixtures.sh ensure|build|pin|verify|list NAME...` (`all`, `big`).
-The trees live under `/var/tmp/celeste-fixtures/FORMATS` (one directory per
+The trees live under `/var/tmp/celeste-fixtures/FORMATS` (FORMATS as the
+binary states them, `rewrite --version`; one directory per
 file-format set, `tools/fixtures.sh root`; `CELESTE_FIXTURES` overrides), so
 checkouts on different formats never rebuild each other's fixtures; they are
 never committed.
@@ -262,7 +263,11 @@ Say which in the commit.
 
 - `tools/fixtures.sh pin NAME...`: a fixture's own frames;
 - `./check.sh t1 --pin`, `t2 --pin`, `big --pin`: frame lines, metrics, gate
-  lines, the UI digests;
+  lines (the room (1,0) oracles and their float and dual twins too), the UI
+  digests: every comparison of a tier goes through check.sh's `same`, so
+  `--pin` re-pins exactly what the tier compares. The one exception is t2's
+  `forward60`, which compares with the r60s fixture's pin (`fixtures.sh
+  pin r60s` writes it);
 - `./check.sh perf --pin`: the instruction budget.
 
 `git diff gates/` shows what moved. A file-format change rebuilds every

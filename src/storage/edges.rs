@@ -198,7 +198,7 @@ impl Flush {
 
 const MAGIC: &[u8; 4] = b"CSE2";
 /// The edge files' own format version (older trees are rebuilt).
-const VERSION: u32 = 6;
+pub(crate) const VERSION: u32 = 6;
 
 /// One segment's place in an edge file.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
