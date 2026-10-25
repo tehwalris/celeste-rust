@@ -393,11 +393,13 @@ mod tests {
         })).collect()
     }
 
-    /// The six "pm1 key" paths (`has_dashed`, `freeze`, and the
-    /// player's `dash_time`, `djump`, `p_dash`, `p_jump`).
+    /// The four "pm1 key" paths (`has_dashed`, `freeze`, and the player's
+    /// `dash_time`, `djump`). The held buttons (`p_dash`, `p_jump`) are no
+    /// part of it: every level reads them both ways (C7), so no body reads
+    /// their cells.
     fn pm1_paths(player: &Path) -> Vec<Path> {
         let mut v: Vec<Path> = vec![vec![iface::key("has_dashed")], vec![iface::key("freeze")]];
-        for f in ["dash_time", "djump", "p_dash", "p_jump"] {
+        for f in ["dash_time", "djump"] {
             let mut q = player.clone();
             q.push(iface::key(f));
             v.push(q);
@@ -426,10 +428,16 @@ mod tests {
     }
 
     /// A traced frame's graph with its six buttons RESOLVED to `bits` (in
-    /// `__button_states` order) for the concrete evaluator: the outcomes' cone
-    /// specialized into a fresh graph, and the map. Other forks stay standing.
+    /// `__button_states` order) for the concrete evaluator, and the buttons'
+    /// memory, which every level widens (C7), as a state with no button held
+    /// has it: the held buttons (`p_jump`, `p_dash`, read both ways)
+    /// released, the jump buffer's unknown number (the level's only
+    /// countdown) 0. Its comparisons stay undecided atoms, so a buffered
+    /// jump's outcome may claim a lane too. The outcomes' cone specialized
+    /// into a fresh graph, and the map. Other forks stay standing.
     fn at_buttons<A: GraphArith>(g: &Graph<A>, f: &Frame<A>, bits: &[bool; 6]) -> Result<(Graph<A>, Vec<NodeId>)> {
-        let buttons: Vec<u8> = f.fork_origins.iter().filter(|(_, o)| o == super::super::domain::UNKNOWN_BOOL_ORIGIN).map(|(d, _)| *d).collect();
+        let forks = |origin: &str| -> Vec<u8> { f.fork_origins.iter().filter(|(_, o)| o == origin).map(|(d, _)| *d).collect() };
+        let buttons = forks(super::super::domain::UNKNOWN_BOOL_ORIGIN);
         if buttons.len() != 6 {
             bail!("the frame minted {} unknown booleans, not the six buttons", buttons.len());
         }
@@ -437,15 +445,27 @@ mod tests {
         for (d, b) in buttons.iter().zip(bits) {
             cfg[*d as usize] = *b as u8;
         }
+        for held in ["p_jump", "p_dash"] {
+            for d in forks(held) {
+                cfg[d as usize] = 0;
+            }
+        }
         let roots: Vec<NodeId> = f.outs.iter().flat_map(|o| o.fields.iter().map(|x| x.1).chain([o.guard, o.error])).collect();
         let need = g.reachable(&roots);
-        let mut out = g.like();
-        let map = g.specialize_subset_into(&cfg, Some(&need), &mut out);
-        Ok((out, map))
+        let mut forked = g.like();
+        let map = g.specialize_subset_into(&cfg, Some(&need), &mut forked);
+        let mut out = forked.like();
+        let unbuffered = forked.rebuild_into(None, &mut out, |_, node, _, out| {
+            use crate::transpile::graph::Op;
+            (node.op == Op::UnknownNum { countdown: true }).then(|| out.leaf(Op::Const(A::lit(A::from_i16(0)), A::lit(A::from_i16(0)))))
+        });
+        Ok((out, map.iter().map(|&n| if n == crate::transpile::graph::UNBUILT { n } else { unbuffered[n as usize] }).collect()))
     }
 
     /// A body compiled for one pm1 key must REFUSE a state in another: a
-    /// perturbed pinned cell's `Op::Pin` check declines the lane.
+    /// perturbed pinned cell's `Op::Pin` check declines the lane in every
+    /// outcome that claims it (with the jump buffer unknown, a lane with no
+    /// button held both jumps and does not).
     #[test]
     fn a_body_pinned_to_a_pm1_key_refuses_any_other_key() {
         let s = crate::settings::Settings::default();
@@ -467,9 +487,9 @@ mod tests {
             roots.push(vec![iface::key(g)]);
         }
         let key = pm1_key(&player, &st, &it.d).expect("pm1 key");
-        assert_eq!(key.len(), 6, "the pm1 key is six cells");
+        assert_eq!(key.len(), 4, "the pm1 key is four cells");
         let f = trace_frame(&mut it, &chunks, st, &TraceSpec { roots: &roots, pin: &key, concrete: true, ..Default::default() }).expect("trace");
-        assert_eq!(f.iface.pins.len(), 6, "all six pinned");
+        assert_eq!(f.iface.pins.len(), 4, "all four pinned");
 
         // No error in whichever outcome claims this assignment.
         let (g, map) = at_buttons(&it.d.graph, &f, &[false; 6]).expect("the six buttons");
@@ -477,8 +497,10 @@ mod tests {
         let ok_at = |cells: &[Conc]| -> bool {
             let v = g.eval(&exact(cells), Eval::Exact, Some(&room)).expect("the frame at a point");
             let live: Vec<&FrameOut> = f.outs.iter().filter(|o| v[map[o.guard as usize] as usize] == Val::Bool(Some(true))).collect();
-            assert_eq!(live.len(), 1, "exactly one outcome claims a lane");
-            v[map[live[0].error as usize] as usize] == Val::Bool(Some(false))
+            assert!(!live.is_empty(), "an outcome claims the lane");
+            let ok: Vec<bool> = live.iter().map(|o| v[map[o.error as usize] as usize] == Val::Bool(Some(false))).collect();
+            assert!(ok.iter().all(|&k| k == ok[0]), "the claiming outcomes disagree on the key");
+            ok[0]
         };
 
         assert!(ok_at(&f.iface.init), "the key it was compiled for is accepted");

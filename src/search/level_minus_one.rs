@@ -411,13 +411,12 @@ impl<A: GraphArith> Table<'_, A> {
         }
         let pin_list: Vec<(Path, Conc<A>)> = pins.iter().map(|(p, c)| (p.clone(), *c)).collect();
         let bound_list: Vec<(Path, (A::Lit, A::Lit))> = bounds.iter().map(|(p, r)| (p.clone(), (A::lit(r.0), A::lit(r.1)))).collect();
-        // Held trails are unknown booleans, not forks. A fly fruit as the `f`
-        // level widens it (exact, it outgrows every range and fork arity):
+        // A fly fruit as the `f` level widens it (exact, it outgrows every range and fork arity):
         // only the player is measured, so that only weakens d; the spawn
         // prefix (no player) stays exact. `level_minus_one`: move forks take
         // the ranges' full width, undecided selects stay selects (joined).
         let fruit = player.is_some() && !crate::trace::widen::objects_of_type(&st, "fly_fruit").is_empty();
-        let level = crate::abstraction::Level { held: false, fruit, ..tr.it.d.level };
+        let level = crate::abstraction::Level { fruit, ..tr.it.d.level };
         let spec = crate::trace::frame::TraceSpec { roots: &roots, pin: &pin_list, ival: &ival, bounds: &bound_list, level: Some(level), level_minus_one: true, ..Default::default() };
         let f = crate::trace::frame::trace_frame(&mut tr.it, tr.chunks, st.clone(), &spec).map_err(|e| anyhow!("level -1 trace of shape {id}: {e:#}"))?;
         let t_trace = t0.elapsed();
@@ -1635,7 +1634,7 @@ fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate
     let room0 = s.room;
     let spd_px = i16::try_from(spd_px).map_err(|_| anyhow!("the speed bound {spd_px} px is out of range"))?;
     let walk = crate::trace::walk::Walk { settings: s, only: None };
-    let lw = crate::trace::walk::room_constant_lattice::<A>(crate::abstraction::Level { held: true, ..crate::abstraction::Level::EXACT }, &walk)?;
+    let lw = crate::trace::walk::room_constant_lattice::<A>(crate::abstraction::Level::EXACT, &walk)?;
     say!(rep, "room {room0:?}: lattice walk {} shapes, {:.1} s", lw.lattice.len(), t_all.elapsed().as_secs_f64())?;
     let mut tr = lw.tracer.clone();
     let mut table = Table {

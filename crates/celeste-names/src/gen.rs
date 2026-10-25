@@ -153,6 +153,8 @@ pub static FIELD_NAMES: &[&str] = &[
     "solid",
     "offset",
     "hide_for",
+    // The jump buffer (plans/correctness.md C7).
+    "jbuffer",
 ];
 pub static FN_NAMES: &[&str] = &[
     "__init",

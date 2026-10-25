@@ -9,7 +9,7 @@
 use anyhow::{anyhow, bail, Result};
 
 use celeste_engine::widening::{range, widen_level, Holds, Lit, Widener, TABLE};
-use celeste_engine::widening::{floor_player_window, Entry, Flag, Hook, Input, Level, Slot, Stored, Target, FLOOR_HITBOX, PLATFORM_PATH, PLAYER_HITBOX, REM};
+use celeste_engine::widening::{floor_player_window, Entry, Hook, Input, Level, Slot, Stored, Target, FLOOR_HITBOX, PLATFORM_PATH, PLAYER_HITBOX, REM};
 
 use super::domain::{Domain, Symbolic};
 use super::heap::Value;
@@ -104,12 +104,6 @@ pub fn stores_widened(s: &Slot) -> bool {
 pub fn interval_input(s: &Slot) -> bool {
     matches!(s.input, Input::Stored | Input::Literal | Input::Hook)
         && matches!(s.stored, Stored::Range { .. } | Stored::Band { .. } | Stored::Phase { .. } | Stored::UnknownBool | Stored::SameAs(_))
-}
-
-/// Is a slot a COUNTDOWN a near level stores as the unknown number (its
-/// unknown number a countdown's, `Op::UnknownNum`)?
-fn countdown(e: &Entry, s: &Slot) -> bool {
-    e.flag == Flag::Near && s.stored == Stored::UnknownNum
 }
 
 /// A table RANGE `[lo, hi]` (raw 16.16) as one graph literal, as the block
@@ -334,7 +328,7 @@ fn read_slot<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, e:
         (Input::BothWays, Some(Value::Bool(_))) => Value::Bool(d.both_values(s.field.last().expect("a field"))),
         (Input::Atom, Some(Value::Bool(_))) => Value::Bool(d.unknown_bool_atom()),
         (Input::BothWays | Input::Atom, _) => return Err(what("boolean")),
-        (Input::Unknown, Some(Value::Num(_))) => Value::Num(d.unknown_num(countdown(e, s))),
+        (Input::Unknown, Some(Value::Num(_))) => Value::Num(d.unknown_num(matches!(s.stored, Stored::UnknownNum { countdown: true }))),
         (Input::Literal, Some(Value::Num(v))) => {
             let Stored::Range { lo, hi, .. } = s.stored else { bail!("{}: a literal input reads a range", iface::show(p)) };
             pin_literal(d, v, lo, hi);

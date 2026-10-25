@@ -38,32 +38,32 @@ L1_62="--category 100 --loading-jank 2 --level-minus-one 94,5"
 spec() {
     TREE=.; FLAGS=""
     case $1 in
-        # Room (1,0) 200m r0sxh, the mid frame f55 -> f56 (85k new states
+        # Room (1,0) 200m r0sx, the mid frame f55 -> f56 (85k new states
         # and 125k grown in: 2.2M emissions, 2.5M edges re-pushed).
-        r10) CMD="forward --room 1,0 --level r0sxh --steps 56"; LAST=56 ;;
-        # Room (6,2) 100% 2300m r0sxhf under level -1 (94,5), f50 -> f51
+        r10) CMD="forward --room 1,0 --level r0sx --steps 56"; LAST=56 ;;
+        # Room (6,2) 100% 2300m r0sxf under level -1 (94,5), f50 -> f51
         # (305k new states and 579k grown in: 6.6M emissions, 8.3M edges
         # re-pushed); the reference frame is r62h57.
-        r62h) FLAGS=$L1_62; CMD="forward --room 6,2 --level r0sxhf --steps 51"; LAST=51 ;;
-        # Room (4,2) 2100m at the object level r0sxhn under level -1 (71,5), f60 -> f61.
-        r42n) FLAGS="--level-minus-one 71,5"; CMD="forward --room 4,2 --level r0sxhn --steps 61"; LAST=61 ;;
-        # The same room with its objects exact (r0sxh): the reference
-        # checks' object room (the reference forks r0sxhn's widened objects
+        r62h) FLAGS=$L1_62; CMD="forward --room 6,2 --level r0sxf --steps 51"; LAST=51 ;;
+        # Room (4,2) 2100m at the object level r0sxn under level -1 (71,5), f60 -> f61.
+        r42n) FLAGS="--level-minus-one 71,5"; CMD="forward --room 4,2 --level r0sxn --steps 61"; LAST=61 ;;
+        # The same room with its objects exact (r0sx): the reference
+        # checks' object room (the reference forks r0sxn's widened objects
         # into thousands of paths a row: plans/devloop.md).
-        r42x) FLAGS="--level-minus-one 71,5"; CMD="forward --room 4,2 --level r0sxh --steps 56"; LAST=56 ;;
+        r42x) FLAGS="--level-minus-one 71,5"; CMD="forward --room 4,2 --level r0sx --steps 56"; LAST=56 ;;
         # Room (6,0) 700m, platforms unknown, split frame: steps 70 -> 71.
-        r60s) FLAGS="--split-frame"; CMD="forward --room 6,0 --level r0sxhfp --steps 71"; LAST=71 ;;
-        # A finished search for the backward: room (1,0) r0sxh, synthetic
+        r60s) FLAGS="--split-frame"; CMD="forward --room 6,0 --level r0sxfp --steps 71"; LAST=71 ;;
+        # A finished search for the backward: room (1,0) r0sx, synthetic
         # win at (40,64) (first win f47, optimum 49), horizon 56.
-        r10arc) CMD="search --room 1,0 --level r0sxh --frames 56 --win-at 40,64"; TREE=level00; LAST=56 ;;
+        r10arc) CMD="search --room 1,0 --level r0sx --frames 56 --win-at 40,64"; TREE=level00; LAST=56 ;;
         # FLOAT twins (`--arith float`, Celia's start: plans/float.md):
         # r10's, r42n's and r42x's frames in the doubles' kernels.
-        f10) FLAGS="--arith float"; CMD="forward --room 1,0 --level r0sxh --steps 56"; LAST=56 ;;
-        f42n) FLAGS="--arith float --level-minus-one 71,5"; CMD="forward --room 4,2 --level r0sxhn --steps 61"; LAST=61 ;;
-        f42x) FLAGS="--arith float --level-minus-one 71,5"; CMD="forward --room 4,2 --level r0sxh --steps 56"; LAST=56 ;;
-        f10arc) FLAGS="--arith float"; CMD="search --room 1,0 --level r0sxh --frames 56 --win-at 40,64"; TREE=level00; LAST=56 ;;
+        f10) FLAGS="--arith float"; CMD="forward --room 1,0 --level r0sx --steps 56"; LAST=56 ;;
+        f42n) FLAGS="--arith float --level-minus-one 71,5"; CMD="forward --room 4,2 --level r0sxn --steps 61"; LAST=61 ;;
+        f42x) FLAGS="--arith float --level-minus-one 71,5"; CMD="forward --room 4,2 --level r0sx --steps 56"; LAST=56 ;;
+        f10arc) FLAGS="--arith float"; CMD="search --room 1,0 --level r0sx --frames 56 --win-at 40,64"; TREE=level00; LAST=56 ;;
         # BIG (a minute, ~10 GB): the reference frame (6,2) 100% f56 -> f57.
-        r62h57) FLAGS=$L1_62; CMD="forward --room 6,2 --level r0sxhf --steps 57"; LAST=57 ;;
+        r62h57) FLAGS=$L1_62; CMD="forward --room 6,2 --level r0sxf --steps 57"; LAST=57 ;;
         *) echo "fixtures: no fixture $1 (tools/fixtures.sh list)" >&2; exit 2 ;;
     esac
 }

@@ -158,13 +158,13 @@ widencheck() {
 }
 
 # refcheck NAME FRAME: the kernels against the reference engine, 32
-# sampled rows of a fixture's frame (an r0sxh fixture's).
+# sampled rows of a fixture's frame (an r0sx fixture's).
 refcheck() {
     ./safe-run.sh --memory "$MEM" -- "$B" check ref --tree "$F/$1" --step "$2" --samples 32 --threads "$TH"
 }
 
 # arccheck NAME FLAGS...: the recorded transfers of a fixture's f56
-# against the reference engine, 32 sampled records (an r0sxh fixture's).
+# against the reference engine, 32 sampled records (an r0sx fixture's).
 arccheck() {
     local name=$1; shift
     ./safe-run.sh --memory "$MEM" -- "$B" check arcs --tree "$F/$name" --from-step 56 --to-step 56 --samples 32 --threads "$TH" --path-cap 4096 "$@"
@@ -306,10 +306,10 @@ gate10d_dual() {
     grep -E '^DUAL BOUND|^\[gate\] h35 dual' "$C/t2/dual10.out" > "$C/t2/dual10.gate"
     same "$C/t2/dual10.gate" gates/dual_room10_win9-101_h35.txt
 }
-# The objects ladder (r0sxhn filtering r0sxh) at a synthetic win, its
+# The objects ladder (r0sxn filtering r0sx) at a synthetic win, its
 # witness as the known route: every level's [gate] lines pinned.
 search42() {
-    ./safe-run.sh --memory "$MEM" -- "$B" search --room 4,2 --level r0sxhn,r0sxh --frames 50 --win-at 32,56 --search-dir "$C/t2/s42" --prefer "$G/known_room42_win32-56.txt" --save-marks "$C/t2/s42-marks" > "$C/t2/s42.out" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" search --room 4,2 --level r0sxn,r0sx --frames 50 --win-at 32,56 --search-dir "$C/t2/s42" --prefer "$G/known_room42_win32-56.txt" --save-marks "$C/t2/s42-marks" > "$C/t2/s42.out" || return 1
     grep '^\[gate\]' "$C/t2/s42.out" > "$C/t2/s42.gate"
     same "$C/t2/s42.gate" "$G/search42.gate"
 }
@@ -346,7 +346,7 @@ hull10() {
 # fingerprint is the r60s fixture's pin, which only `tools/fixtures.sh pin
 # r60s` writes (so not `same`: t2 --pin leaves it).
 forward60() {
-    ./safe-run.sh --memory "$MEM" -- "$B" forward --room 6,0 --level r0sxhfp --steps 71 --split-frame --tree "$C/t2/p60" > /dev/null || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" forward --room 6,0 --level r0sxfp --steps 71 --split-frame --tree "$C/t2/p60" > /dev/null || return 1
     ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/p60" --steps 71 --edges --hulls 2> /dev/null | diff "$G/r60s.ckhash" - >&2
 }
 

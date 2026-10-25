@@ -788,7 +788,7 @@ mod tests {
     #[test]
     fn a_record_reads_back() {
         let dir = std::env::temp_dir().join(format!("celeste-settings-back-{}", std::process::id()));
-        let lvl = crate::abstraction::Level::parse("r0sxhf").expect("a level");
+        let lvl = crate::abstraction::Level::parse("r0sxf").expect("a level");
         let run = Settings { threads: Some(3), diag: Diagnostics { key_check: true, ..Default::default() }, ..Settings::default() };
         let all = Settings { room: (6, 2), win_at: Some((8, 10, 64, 64)), split_frame: true, region: None, category: Category::GemskipNodiag, loading_jank: Some(2), balloon_seeds: Some("0,1".into()), ..run.clone() };
         let float = Settings { arith: Arith::Float(FloatTool::Uct), loading_jank: None, category: Category::Onlydiag, ..all.clone() };
@@ -842,41 +842,41 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mkdir");
         let lvl = |l: &str| crate::abstraction::Level::parse(l).expect("a level");
         let sample = Settings { room: (6, 2), category: Category::Hundred, loading_jank: Some(2), ..Settings::default() };
-        let e = sample.check(&dir, lvl("r0sxhf")).expect_err("no record");
+        let e = sample.check(&dir, lvl("r0sxf")).expect_err("no record");
         assert!(e.to_string().contains("has no record"), "{e}");
-        sample.write(&dir, lvl("r0sxhf")).expect("write");
-        sample.check(&dir, lvl("r0sxhf")).expect("the same settings");
+        sample.write(&dir, lvl("r0sxf")).expect("write");
+        sample.check(&dir, lvl("r0sxf")).expect("the same settings");
         let harmless = Settings { threads: Some(3), level_minus_one: Some((94, 5)), diag: Diagnostics { key_check: true, ..Default::default() }, ..sample.clone() };
-        harmless.check(&dir, lvl("r0sxhf")).expect("threads, level -1 and diagnostics are not a tree's settings");
+        harmless.check(&dir, lvl("r0sxf")).expect("threads, level -1 and diagnostics are not a tree's settings");
         let other = Settings { category: Category::Any, split_frame: true, win_at: Some((8, 8, 64, 64)), ..sample.clone() };
-        let e = other.check(&dir, lvl("r0sxh")).expect_err("other settings").to_string();
-        for k in ["category: the tree's 100, this run's any", "split_frame: the tree's 0, this run's 1", "win_at: the tree's none, this run's 8..8,64..64", "level: the tree's r0sxhf, this run's r0sxh"] {
+        let e = other.check(&dir, lvl("r0sx")).expect_err("other settings").to_string();
+        for k in ["category: the tree's 100, this run's any", "split_frame: the tree's 0, this run's 1", "win_at: the tree's none, this run's 8..8,64..64", "level: the tree's r0sxf, this run's r0sx"] {
             assert!(e.contains(k), "{k} not in {e}");
         }
         assert!(!e.contains("room:"), "{e}");
         // The arithmetic: a fixed record has no line for it; either way
         // across is refused.
-        assert!(!sample.recorded("r0sxhf").iter().any(|(k, _)| *k == "arith"));
+        assert!(!sample.recorded("r0sxf").iter().any(|(k, _)| *k == "arith"));
         let float = Settings { arith: Arith::Float(FloatTool::Uct), ..sample.clone() };
-        let e = float.check(&dir, lvl("r0sxhf")).expect_err("a float run on a fixed tree").to_string();
+        let e = float.check(&dir, lvl("r0sxf")).expect_err("a float run on a fixed tree").to_string();
         assert!(e.contains("arith: the tree's (missing), this run's float-uct"), "{e}");
-        float.write(&dir, lvl("r0sxhf")).expect("write");
-        let e = sample.check(&dir, lvl("r0sxhf")).expect_err("a fixed run on a float tree").to_string();
+        float.write(&dir, lvl("r0sxf")).expect("write");
+        let e = sample.check(&dir, lvl("r0sxf")).expect_err("a fixed run on a float tree").to_string();
         assert!(e.contains("arith: in the tree's record"), "{e}");
         // A reader that is not the run (the UI export) reads it back.
         assert_eq!(recorded_arith(&dir).expect("a record"), Arith::Float(FloatTool::Uct));
-        sample.write(&dir, lvl("r0sxhf")).expect("write");
+        sample.write(&dir, lvl("r0sxf")).expect("write");
         assert_eq!(recorded_arith(&dir).expect("a record"), Arith::Fixed);
         // `--override-settings`: only the region grid, and only with the flag.
         let grid = Settings { region: None, ..sample.clone() };
-        let e = grid.check(&dir, lvl("r0sxhf")).expect_err("another grid, no override").to_string();
+        let e = grid.check(&dir, lvl("r0sxf")).expect_err("another grid, no override").to_string();
         assert!(e.contains("region: the tree's 16,6, this run's none") && e.contains("--override-settings proceeds"), "{e}");
-        Settings { override_settings: true, ..grid.clone() }.check(&dir, lvl("r0sxhf")).expect("the grid overridden");
-        let e = Settings { override_settings: true, category: Category::Any, ..grid }.check(&dir, lvl("r0sxhf")).expect_err("a category is not overridable").to_string();
+        Settings { override_settings: true, ..grid.clone() }.check(&dir, lvl("r0sxf")).expect("the grid overridden");
+        let e = Settings { override_settings: true, category: Category::Any, ..grid }.check(&dir, lvl("r0sxf")).expect_err("a category is not overridable").to_string();
         assert!(e.contains("category: the tree's 100, this run's any") && e.contains("region:"), "{e}");
         // A line that is no setting is refused.
         crate::storage::record::update(&dir, "storage_region", "8").expect("write");
-        let e = sample.check(&dir, lvl("r0sxhf")).expect_err("an unknown line").to_string();
+        let e = sample.check(&dir, lvl("r0sxf")).expect_err("an unknown line").to_string();
         assert!(e.contains("storage_region: in the tree's record, not a setting"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }

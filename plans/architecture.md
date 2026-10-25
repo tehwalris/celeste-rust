@@ -416,10 +416,10 @@ act" distributes over unions, so the union over all paths is exact.
 The outcome goes to `<dir>/result.json` (levels, bounds, verdict, witness).
 
 **When to use the ladder.** One level where the bound is tight; the
-objects ladder (`--level r0sxhn,r0sxh`) where the level-0 bound is well
-below the reference. Room (7,0) at `r0sxhn` alone: bound 80 against 84,
+objects ladder (`--level r0sxn,r0sx`) where the level-0 bound is well
+below the reference. Room (7,0) at `r0sxn` alone: bound 80 against 84,
 the concrete region 6.5x larger per frame of slack (~300M steps to 84);
-with the ladder, the filtered `r0sxh` forward 6.9 s, bound 84, the
+with the ladder, the filtered `r0sx` forward 6.9 s, bound 84, the
 witness in 292 steps. Count up from the level-0 bound on a kept tree
 rather than setting the horizon at the reference: reach marks and level -1
 both shrink with H.
@@ -494,7 +494,7 @@ verification surface behind it:
 - **The split frame with `p`** reaches slightly fewer states than unsplit
   in room (2,1) (unexplained).
 - **`check arcs` at object levels** forks every straddling comparison on a
-  widened phase (balloons, springs): room (7,0) `r0sxhn` exceeds its path
+  widened phase (balloons, springs): room (7,0) `r0sxn` exceeds its path
   cap. A different probe (concrete members of the row) is needed.
 - **The transfer capture costs the forward** (five roots per axis per body
   where the transfer depends only on the fork configuration and `ox`).

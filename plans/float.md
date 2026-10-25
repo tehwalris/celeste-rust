@@ -111,7 +111,7 @@ One axis, one frame: `r1 = fl(r + ox)`, `k = floor(fl(r1 + 0.5))`,
   tables built in every room of the Celia goldens but the platform rooms
   and the summit, which fixed refuses too; room (1,0)'s start d is 44, as
   fixed's.
-- The objects ladder (`--level r0sxhn,r0sxh`) and `check known` run in
+- The objects ladder (`--level r0sxn,r0sx`) and `check known` run in
   float.
 
 ## The kernels' safety
@@ -214,7 +214,7 @@ tool file starts on the player's first frame.
   and over one UCT golden only.
 - At `n`, `check ref` and `check arcs` skip most rows over the path cap (the
   reference forks a widened object per path), in both arithmetics; object
-  rooms are checked at `r0sxh`.
+  rooms are checked at `r0sx`.
 - The robustness report has not been run on the earlier float witnesses.
 - `-0`/`+0` are different codes (exact); a canonicalization is deferred
   until a proof that no read tells them apart.

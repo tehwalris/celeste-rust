@@ -506,7 +506,7 @@ struct Piped<N: Rem> {
 /// one sink each (`UnitSink`), no barrier but its end; then the workers'
 /// transfers and stats collected.
 fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, cx: &WaveCtx<N>, front: &Frontier<N>, plan: &Plan, prov: &Provisional<N>, spool: Option<&super::scratch::Scratch>) -> Result<Piped<N>> {
-    let (level, s) = (engine.level(), &engine.settings());
+    let s = &engine.settings();
     let (visited, base): (&VisitedSet<N>, &XferTable<N>) = (cx.visited, cx.xfers);
     let workers = s.threads();
     let routes = Routes::default();
@@ -514,7 +514,7 @@ fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, cx: &WaveCtx<N>, front: &Frontier
     // frame's end; the gather numbers the workers' new pairs (`Gather::fresh`).
     let xtabs: Vec<std::sync::RwLock<Vec<N::Pair>>> = (0..workers).map(|_| Default::default()).collect();
     let xfers_before = base.pairs.len();
-    let mut sinks: Vec<UnitSink<N>> = (0..workers).map(|w| UnitSink::new(visited, &routes, cx.skeletons, prov, cx.filters, cx.frame, level, w as u32, base, &xtabs[w], s)).collect();
+    let mut sinks: Vec<UnitSink<N>> = (0..workers).map(|w| UnitSink::new(visited, &routes, cx.skeletons, prov, cx.filters, cx.frame, w as u32, base, &xtabs[w], s)).collect();
     let mut scratch: Vec<super::route::JobScratch> = (0..workers).map(|_| super::route::JobScratch::default()).collect();
     let pipe: Pipe<N> = Pipe {
         xtabs: &xtabs,

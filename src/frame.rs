@@ -1099,13 +1099,13 @@ mod tests {
     }
 
     /// Does `registry` run `r`'s one lane (else its kernel declines)?
-    fn kernel_runs(registry: &Registry<P8>, r: &Rt2, level: Level, s: &Settings) -> bool {
+    fn kernel_runs(registry: &Registry<P8>, r: &Rt2, s: &Settings) -> bool {
         let cells = crate::storage::cells::block_cells(r).expect("cells");
         let visited = crate::storage::visited::VisitedSet::new();
         let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
         let prov = celeste_engine::exact::Provisional::default();
         let (base, xtab) = (crate::storage::edges::XferTable::default(), Default::default());
-        let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &base, &xtab, s);
+        let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, 0, &base, &xtab, s);
         sink.begin(0);
         let si = sink.push_source(0, (0, 0));
         sink.push_lane(si, cells[0], Hull::full());
@@ -1118,7 +1118,7 @@ mod tests {
     fn the_mark_filter_admits_up_to_the_deadline() {
         let s = Settings::default();
         let block = start_blocks(&s).pop().expect("a block");
-        let coarse = Level::parse("r0sxh").expect("level");
+        let coarse = Level::parse("r0sx").expect("level");
         // The coarse key space holds the projection's codes.
         let mut w = block.clone_block();
         w.widen_to(coarse);
@@ -1312,7 +1312,7 @@ mod tests {
         let base = crate::testutil::TestDir::new("done-marker");
         let (a, b) = (base.join("uninterrupted"), base.join("killed"));
         // The kernels (they record transfers), past the spawn.
-        let level = Level::parse("r0sxh").expect("level");
+        let level = Level::parse("r0sx").expect("level");
         let e = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
         let start = RefEngine::new(&s).expect("engine").initial().expect("init");
         let init = || vec![start.clone_block().canonicalized()];
@@ -1402,7 +1402,7 @@ mod tests {
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels, ~20 CPU-s"]
     fn a_lane_outside_its_kernels_bounds_declines() {
         let s = Settings::default();
-        let level = Level::parse("r0sxh").expect("level");
+        let level = Level::parse("r0sx").expect("level");
         let grid = s.region_grid().expect("the default region grid");
         let registry = crate::compiled::asm_kernel::registry(level, &s);
         let row = standing_row(&s, level);
@@ -1426,7 +1426,7 @@ mod tests {
         let runs = |r: &Rt2| -> bool {
             let cells = crate::storage::cells::block_cells(r).expect("cells");
             assert!(grid.of_cell(cells[0]).is_some(), "the lane has a region");
-            kernel_runs(&registry, r, level, &s)
+            kernel_runs(&registry, r, &s)
         };
         let px = |n: i16| P8::from_i16(n);
         let half = P8::from_parts(0, 0x8000);
@@ -1447,7 +1447,7 @@ mod tests {
     #[ignore = "slow, ./check.sh t2 runs it: room (2,1)'s platform kernels, ~100 CPU-s"]
     fn a_lane_outside_its_platform_bounds_declines() {
         let s = Settings { room: (2, 1), ..Default::default() };
-        let level = Level::parse("r0sxhnp").expect("level");
+        let level = Level::parse("r0sxnp").expect("level");
         let registry = crate::compiled::asm_kernel::registry(level, &s);
         let row = standing_row(&s, level);
         let ids = crate::compiled::ids();
@@ -1471,7 +1471,7 @@ mod tests {
             };
             r
         };
-        let runs = |r: &Rt2| kernel_runs(&registry, r, level, &s);
+        let runs = |r: &Rt2| kernel_runs(&registry, r, &s);
         let px = |n: i16| P8::from_i16(n);
         let (path_lo, path_hi) = (px(celeste_engine::widening::PLATFORM_PATH.0), px(celeste_engine::widening::PLATFORM_PATH.1));
         let half = P8::from_parts(0, 0x8000);
@@ -1508,7 +1508,7 @@ mod tests {
     }
 
     /// THE SPLIT FRAME at a near level reaches the unsplit (pinned) state
-    /// counts at every boundary, room (2,1) `r0sxhn`. Guards nil-global
+    /// counts at every boundary, room (2,1) `r0sxn`. Guards nil-global
     /// removal and the mid-frame cut not widening floors the player reads.
     /// (A mid-frame state's hull merges its sources' and part b moves no
     /// remainder, so the boundaries' hulls are the unsplit frame's.)
@@ -1516,7 +1516,7 @@ mod tests {
     #[ignore = "slow, ./check.sh t2 runs it: room (2,1)'s split kernels and a forward, ~55 CPU-s"]
     fn split_frame_reaches_the_unsplit_frontier_at_a_near_level() {
         let s = Settings { room: (2, 1), split_frame: true, ..Default::default() };
-        let level = Level::parse("r0sxhn").expect("level");
+        let level = Level::parse("r0sxn").expect("level");
         let dir = &std::path::PathBuf::from(format!("/var/tmp/celeste-frame-split-near-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("checkpoint dir");

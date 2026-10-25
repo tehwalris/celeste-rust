@@ -155,12 +155,12 @@ mod tests {
         assert_eq!(done(&dir).expect("none"), None);
         let mut rec = Record::default();
         rec.set("room", "1,0");
-        rec.set("level", "r0sxh");
+        rec.set("level", "r0sx");
         rec.write(&dir).expect("write");
         set_done(&dir, 7, 12).expect("done");
         update(&dir, "room", "2,0").expect("update");
         let back = Record::read(&dir).expect("read").expect("some");
-        assert_eq!(back.lines().collect::<Vec<_>>(), [("room", "2,0"), ("level", "r0sxh"), ("done", "7 xfers 12")]);
+        assert_eq!(back.lines().collect::<Vec<_>>(), [("room", "2,0"), ("level", "r0sx"), ("done", "7 xfers 12")]);
         assert_eq!(done(&dir).expect("done"), Some(Done { frame: 7, xfers: 12 }));
         for bad in ["tree record 0\nroom 1,0\n", "tree settings 2\nroom 1,0\n", "tree record 3\nroom 1,0\nroom 2,0\n", "tree record 3\nroom\n"] {
             let bad = bad.replace("tree record 3", &head());

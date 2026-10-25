@@ -1471,7 +1471,7 @@ mod tests {
     /// `x == k` on an interval `x` may be true where `k` is in `x` and false
     /// where `x` is not exactly `k` (`[0, 2]`, `[1, 1]`, `[0, 0]` vs `k = 1`),
     /// also with the fly fruit unknown elsewhere in the frame (room (3,0)
-    /// `r0sxhfn`'s hidden near floor).
+    /// `r0sxfn`'s hidden near floor).
     #[test]
     fn an_equality_on_an_interval_may_answer_as_its_ends_allow() {
         use crate::transpile::graph::Val;

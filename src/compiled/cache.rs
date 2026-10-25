@@ -217,7 +217,7 @@ mod tests {
     /// toolchain.
     #[test]
     fn a_kernel_cache_key_moves_with_every_input() {
-        let level = Level::parse("r0sxh").expect("level");
+        let level = Level::parse("r0sx").expect("level");
         let base = Settings::default();
         let k = |s: &Settings, l: Level| super::key::<Pico8Num>(l, s).expect("key").name;
         let at = k(&base, level);
@@ -235,20 +235,20 @@ mod tests {
         for (what, s) in &changed {
             assert_ne!(at, k(s, level), "{what}: the key did not move");
         }
-        assert_ne!(at, k(&base, Level::parse("r0sxhn").expect("level")), "the level");
+        assert_ne!(at, k(&base, Level::parse("r0sxn").expect("level")), "the level");
         assert_ne!(at, super::key::<LuaF64>(level, &base).expect("key").name, "the arithmetic");
         let text = super::key::<Pico8Num>(level, &base).expect("key").text;
         assert!(text.contains(super::SOURCES) && text.contains("gcc ") && text.contains("glibc "), "{text}");
     }
 
-    /// CACHED = FRESH: two fresh builds of room (1,0)'s r0sxh kernels store
+    /// CACHED = FRESH: two fresh builds of room (1,0)'s r0sx kernels store
     /// the same entry (recipes and code, byte for byte), a third build loads
     /// it (the same kernel text), and a damaged entry is a miss, rebuilt.
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: three builds of room (1,0)'s kernels, ~15 s"]
     fn a_cached_kernel_set_is_the_fresh_one() {
         use super::super::asm_kernel::Registry;
-        let level = Level::parse("r0sxh").expect("level");
+        let level = Level::parse("r0sx").expect("level");
         let s = Settings::default();
         let roots: Vec<std::path::PathBuf> = (0..2).map(|i| std::env::temp_dir().join(format!("celeste-kernel-cache-{}-{i}", std::process::id()))).collect();
         for r in &roots {

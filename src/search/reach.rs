@@ -387,7 +387,7 @@ mod tests {
         use crate::engines::reference::RefEngine;
         let s = crate::settings::Settings { win_at: Some((9, 9, 101, 101)), threads: Some(4), ..Default::default() };
         let dir = crate::testutil::TestDir::new("reach");
-        let level = crate::abstraction::Level::parse("r0sxh").expect("level");
+        let level = crate::abstraction::Level::parse("r0sx").expect("level");
         crate::frame::grow_tree(&dir, 35, None, None, level, || Ok(Box::new(crate::compiled::FrameEngine::new(&s, level)?)), || Ok(vec![RefEngine::new(&s)?.initial()?.canonicalized()]), &s).expect("forward");
         let p0 = (super::super::arcs::point(0), super::super::arcs::point(0));
         let tree = crate::storage::layer::Tree::open(&dir, 35).expect("tree");

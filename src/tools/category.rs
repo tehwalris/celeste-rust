@@ -3,7 +3,7 @@
 //! result verified end to end.
 //!
 //! JOBS is a JSON list of `{"cat": "nodiag", "room": "0,0", "name": "100m",
-//! "offset": 27, "levels": "r0sxhn,r0sxh", "l1": true, "mem": "60G"}`;
+//! "offset": 27, "levels": "r0sxn,r0sx", "l1": true, "mem": "60G"}`;
 //! optional: `flags` (more flags for the search, e.g. `["--split-frame"]`),
 //! `tag`, `timeout` (s), `reuse` (a level-0 tree directory, moved in when it
 //! exists and moved back there when the job ends: jobs can count horizons
@@ -767,7 +767,7 @@ mod tests {
     /// A job with a key the runner does not know is refused.
     #[test]
     fn an_unknown_job_key_is_refused() {
-        let job: serde_json::Map<String, Value> = serde_json::from_str(r#"{"cat": "100", "room": "4,0", "name": "500m", "offset": 25, "levels": "r0sxh", "flgs": []}"#).expect("json");
+        let job: serde_json::Map<String, Value> = serde_json::from_str(r#"{"cat": "100", "room": "4,0", "name": "500m", "offset": 25, "levels": "r0sx", "flgs": []}"#).expect("json");
         let e = check_job(Job(job)).expect_err("a typo").to_string();
         assert_eq!(e, "job 100/500m: unknown keys ['flgs'] (the module's doc lists them)");
     }

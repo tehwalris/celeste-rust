@@ -74,6 +74,7 @@ player =
 		this.p_jump=false
 		this.p_dash=false
 		this.grace=0
+		this.jbuffer=0
 		this.djump=max_djump
 		this.dash_time=0
 		this.dash_effect_time=0
@@ -99,15 +100,13 @@ player =
 		local on_ground=this.is_solid(0,1)
 		local on_ice=this.is_ice(0,1)
 
-		-- TODO: classic Celeste buffers a jump press for 4 frames (jbuffer);
-		-- this minimal version dropped it, so a press during dash frames or
-		-- before a wall comes in range is LOST instead of buffered. This is
-		-- NOT a no-op simplification: TAS inputs for classic must be re-timed
-		-- to the execution frame (see tas/room_1_0_exit_frame_100.txt).
-		-- Reachability and optimal frame counts are unaffected, since a
-		-- buffered jump executes identically to an exactly-timed press.
 		local jump = btn(k_jump) and not this.p_jump
 		this.p_jump = btn(k_jump)
+		if (jump) then
+			this.jbuffer=4
+		elseif this.jbuffer>0 then
+		 this.jbuffer = this.jbuffer - (1)
+		end
 
 		local dash = btn(k_dash) and not this.p_dash
 		this.p_dash = btn(k_dash)
@@ -167,15 +166,17 @@ player =
 			end
 
 			-- jump
-			if jump then
+			if this.jbuffer>0 then
 		 	if this.grace>0 then
 		  	-- normal jump
+		  	this.jbuffer=0
 		  	this.grace=0
 					this.spd.y=-2
 				else
 					-- wall jump
 					local wall_dir=(this.is_solid(-3,0) and -1 or this.is_solid(3,0) and 1 or 0)
 					if wall_dir~=0 then
+			 		this.jbuffer=0
 			 		this.spd.y=-2
 			 		this.spd.x=-wall_dir*(maxrun+1)
 					end
