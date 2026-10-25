@@ -16,7 +16,7 @@ use std::os::raw::c_void;
 
 use celeste_core::arith::{Arithmetic, Fixed, Float};
 use celeste_core::cart_data::CART;
-use celeste_core::collision_cache::CollisionCache;
+use celeste_core::room::Room;
 use celeste_core::lua_f64::LuaF64;
 use celeste_core::pico8_num::Pico8Num as P8;
 
@@ -804,7 +804,7 @@ both!(a_literals_split_ok_folds_to_the_kernels, a_literals_split_ok_folds_to_the
 /// and a per-lane one, call-outs into the real collision cache, a result
 /// feeding arithmetic.
 fn collision_lookups<A: TestArith>() {
-    let cache = CollisionCache::new(1, 0);
+    let cache = Room::new(1, 0);
     let env = CollisionEnv { cache: &cache };
     let mut g = Graph::<A>::default();
     let c = cells(&mut g, &[Ty::Num; 4]);
@@ -827,7 +827,7 @@ both!(collision_lookups, collision_lookups_fixed, collision_lookups_float);
 /// map answers the tile scan at every position of an ice room ((3,1)), and
 /// is true somewhere.
 fn the_ice_map_is_the_tile_scan<A: TestArith>() {
-    let cache = CollisionCache::new(3, 1);
+    let cache = Room::new(3, 1);
     let env = CollisionEnv { cache: &cache };
     let p = |v: i16| P8::from_i16(v);
     let scan = |x: i16, y: i16, w: i16, h: i16| -> bool {

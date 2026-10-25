@@ -609,7 +609,7 @@ impl<N: KernelLanes> AsmKernel<N> {
         for bi in bodies() {
             c.pos_need[plan.bodies[bi].pos as usize] |= takes[bi];
         }
-        let start = (self.room.cache.room_x, self.room.cache.room_y);
+        let start = (self.room.cache.x, self.room.cache.y);
         for (k, set) in plan.pos.iter().enumerate() {
             if c.pos_need[k] != 0 {
                 cells_of::<N>(set, buf, half, c.pos_need[k], start, &mut c.cells[k]);

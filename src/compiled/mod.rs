@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use celeste_core::collision_cache::CollisionCache;
+use celeste_core::room::Room;
 use celeste_engine::runtime2;
 
 use celeste_names as gen;
@@ -97,13 +97,13 @@ pub fn ids() -> &'static BoundaryIds {
 /// keyed on the room). Every block carries it (the kernels read tiles
 /// through it; the map itself is `cart_data::CART`); anything that builds a
 /// block outside an engine attaches the same one.
-pub fn collision_cache((room_x, room_y): (i16, i16)) -> Arc<CollisionCache> {
-    static CACHES: std::sync::Mutex<Vec<((i16, i16), Arc<CollisionCache>)>> = std::sync::Mutex::new(Vec::new());
+pub fn collision_cache((room_x, room_y): (i16, i16)) -> Arc<Room> {
+    static CACHES: std::sync::Mutex<Vec<((i16, i16), Arc<Room>)>> = std::sync::Mutex::new(Vec::new());
     let mut all = CACHES.lock().unwrap();
     if let Some((_, c)) = all.iter().find(|(r, _)| *r == (room_x, room_y)) {
         return c.clone();
     }
-    let cache = Arc::new(CollisionCache::new(room_x, room_y));
+    let cache = Arc::new(Room::new(room_x, room_y));
     all.push(((room_x, room_y), cache.clone()));
     cache
 }

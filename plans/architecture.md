@@ -35,7 +35,7 @@ A cargo workspace. The dependency order is load-bearing.
 
 ```
 crates/celeste-core     numbers (Pico8Num 16.16, LuaF64: `Arithmetic`),       deps: -
-                        cart data, collision cache, builtins
+                        cart data, the room's tiles (`room::Room`), builtins
 crates/celeste-names    FROZEN name tables (GLOBAL_NAMES order = canonical      deps: -
                         cell order; append only)
 crates/celeste-engine   Rt2 blocks, exact keys, the widening table          deps: core, names

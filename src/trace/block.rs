@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, ensure, Result};
-use celeste_core::collision_cache::CollisionCache;
+use celeste_core::room::Room;
 use celeste_core::arith::Arithmetic;
 use celeste_engine::runtime2::{Cell2, Col, Rt2, AV, NONE};
 use celeste_names as gen;
@@ -39,7 +39,7 @@ use crate::trace::state::State;
 /// no row keys.
 pub fn to_rt2<D: Domain, N: Arithmetic>(
     st: &State<D>,
-    cache: Arc<CollisionCache>,
+    cache: Arc<Room>,
     num: impl Fn(&D::Num) -> Result<AV<N>>,
     boolean: impl Fn(&D::Bool) -> Result<AV<N>>,
 ) -> Result<Rt2<N>> {
@@ -126,7 +126,7 @@ fn the_topology_is_the_shapes<N: Arithmetic>(rt2: &Rt2<N>) {
 /// The tracer's block of `st`: its shape, every number and boolean `Nil`
 /// (the kernels compute them). What a traced frame's input and outcomes bind
 /// against.
-pub fn skeleton<D: Domain, N: Arithmetic>(st: &State<D>, cache: Arc<CollisionCache>) -> Result<Rt2<N>> {
+pub fn skeleton<D: Domain, N: Arithmetic>(st: &State<D>, cache: Arc<Room>) -> Result<Rt2<N>> {
     to_rt2(st, cache, |_| Ok(AV::Nil), |_| Ok(AV::Nil))
 }
 

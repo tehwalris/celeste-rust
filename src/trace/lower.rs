@@ -120,7 +120,7 @@ pub struct LoweredFrame<A: GraphArith = Fixed> {
     pub frame: Frame<A>,
     pub bound: Bound<A>,
     pub lowered: Lowered<A>,
-    pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
+    pub cache: std::sync::Arc<celeste_core::room::Room>,
 }
 
 /// The constant-lattice walk's frames for the start room, lowered, in walk

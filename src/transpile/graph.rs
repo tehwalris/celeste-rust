@@ -11,7 +11,6 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Result};
 
 use celeste_core::cart_data::CART;
-use celeste_core::collision_cache::CollisionCache;
 
 use celeste_core::arith::{Arithmetic, Fixed};
 use celeste_core::pico8_num::Pico8Num;
@@ -88,7 +87,7 @@ pub const ANY_VALID: u8 = 0x80;
 /// The room's collision cache, for the evaluator (the map is `CART`'s).
 #[derive(Clone)]
 pub struct Room {
-    pub cache: Arc<CollisionCache>,
+    pub cache: Arc<celeste_core::room::Room>,
 }
 
 /// What a `Pin` reads its input as: a number (a point, or a literal

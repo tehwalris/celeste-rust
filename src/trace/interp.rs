@@ -59,7 +59,7 @@ pub struct Interp<'a, D: Domain> {
     /// liveness. Reset per trace by `frame::trace_frame`.
     pub raised: Vec<(D::Bool, String)>,
     /// The room's collision cache (`cart::boot`; none in unit tests).
-    pub cache: Option<std::sync::Arc<celeste_core::collision_cache::CollisionCache>>,
+    pub cache: Option<std::sync::Arc<celeste_core::room::Room>>,
     /// Budgets, so a blow-up is a DIAGNOSIS naming the construct, not a hang.
     pub max_states: usize,
     pub max_nodes: usize,

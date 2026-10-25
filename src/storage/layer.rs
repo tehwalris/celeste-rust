@@ -148,7 +148,7 @@ impl<N: Arithmetic> SkelRecord<N> {
     }
 
     /// The skeleton as an empty block over `cache` (a room's).
-    pub(crate) fn rt2(&self, cache: Arc<celeste_core::collision_cache::CollisionCache>) -> Rt2<N> {
+    pub(crate) fn rt2(&self, cache: Arc<celeste_core::room::Room>) -> Rt2<N> {
         let mut rt2 = Rt2::empty(0, self.globals.len(), &[], cache);
         rt2.structure = self.structure.clone();
         rt2.globals = self.globals.clone();

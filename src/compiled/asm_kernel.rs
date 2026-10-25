@@ -1205,7 +1205,7 @@ impl<N: Arithmetic> Skeleton<N> {
     }
 
     /// As a block of no rows in `cache`'s room.
-    fn rt2(&self, cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>) -> Rt2<N> {
+    fn rt2(&self, cache: std::sync::Arc<celeste_core::room::Room>) -> Rt2<N> {
         let mut b = Rt2::empty(0, self.globals.len(), celeste_names::STRINGS, cache);
         b.globals = self.globals.clone();
         b.structure = self.structure.clone();
@@ -1368,7 +1368,7 @@ impl<N: KernelLanes> AsmKernel<N> {
     fn of(
         recipe: Recipe<N>,
         loaded: Loaded,
-        cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
+        cache: std::sync::Arc<celeste_core::room::Room>,
         graphs: Graphs<N>,
     ) -> Result<AsmKernel<N>> {
         let Recipe { shape: recipe_shape, compiled, forks, fused_nodes, may_unknown, bodies, outcomes, input_names, census, .. } = recipe;

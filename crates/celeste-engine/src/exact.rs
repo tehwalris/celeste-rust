@@ -1300,7 +1300,7 @@ mod tests {
     #[test]
     fn an_absent_global_is_not_in_a_shapes_identity() {
         use crate::runtime2::{Col, NONE};
-        let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(1, 0));
+        let cache = std::sync::Arc::new(celeste_core::room::Room::new(1, 0));
         let mut b = Rt2::<P8>::empty(1, celeste_names::GLOBAL_NAMES.len(), celeste_names::STRINGS, cache);
         let x = celeste_names::field("x");
         b.structure = vec![Cell2::Val, Cell2::Obj(vec![(x, 2)]), Cell2::Val];
@@ -1470,7 +1470,7 @@ mod tests {
     #[should_panic(expected = "declared key dependency is VIOLATED")]
     fn a_follower_other_than_the_record_is_fatal_at_the_boundary() {
         use crate::runtime2::Col;
-        let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(1, 0));
+        let cache = std::sync::Arc::new(celeste_core::room::Room::new(1, 0));
         let mut b = Rt2::<P8>::empty(2, celeste_names::GLOBAL_NAMES.len(), celeste_names::STRINGS, cache);
         b.structure = vec![Cell2::Val, Cell2::Val, Cell2::Val];
         let num = |x: i16| AV::Num(P8::from_i16(x));

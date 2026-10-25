@@ -15,7 +15,7 @@
 use std::os::raw::c_void;
 
 use celeste_core::cart_data::CART;
-use celeste_core::collision_cache::CollisionCache;
+use celeste_core::room::Room;
 use celeste_core::lua_f64::LuaF64;
 use celeste_core::pico8_num::Pico8Num as P8;
 
@@ -47,25 +47,22 @@ fn not_whole16(v: P8, what: &str) -> ! {
     panic!("{what}: {v:?} is not an integer")
 }
 
-/// The room's collision cache the collision wrappers query (the map is
-/// `CART`'s). Held behind `AsmCtx::env`.
+/// The room the collision wrappers query (the map is `CART`'s). Held
+/// behind `AsmCtx::env`.
 #[repr(C)]
 pub struct CollisionEnv<'a> {
-    pub cache: &'a CollisionCache,
+    pub cache: &'a Room,
 }
 
 impl CollisionEnv<'_> {
-    /// `tile_flag_at` with one box for every lane: the precomputed map for
-    /// the flag and box where there is one (`CollisionCache::flag_map`),
-    /// else the scan. Bit `l` of the mask is lane `l`'s answer.
+    /// `tile_flag_at` with one box for every lane: the box's precomputed
+    /// map where there is one (`Room::map`), picked once, else the scan
+    /// (`Room::flag_at`). Bit `l` of the mask is lane `l`'s answer.
     fn tile_flags(&self, w: i16, h: i16, flag: i16, lanes: impl Iterator<Item = (i16, i16)>) -> u16 {
-        let map = self.cache.flag_map(w, h, flag);
+        let map = self.cache.map(w, h, flag);
         let scan = |x: i16, y: i16| self.cache.flag_at(x, y, w, h, flag).expect("tile_flag_at");
         lanes.enumerate().fold(0u16, |m, (l, (x, y))| {
-            let hit = match &map {
-                Some((map, dx, dy)) => map.get(x + dx, y + dy).unwrap_or_else(|| scan(x, y)),
-                None => scan(x, y),
-            };
+            let hit = map.and_then(|map| map.get(x, y)).unwrap_or_else(|| scan(x, y));
             m | (hit as u16) << l
         })
     }

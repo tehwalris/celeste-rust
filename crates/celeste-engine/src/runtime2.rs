@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use celeste_core::arith::Arithmetic;
-use celeste_core::collision_cache::CollisionCache;
+use celeste_core::room::Room;
 use celeste_core::pico8_num::Pico8Num;
 use serde::{Deserialize, Serialize};
 
@@ -144,7 +144,7 @@ pub struct Rt2<N = P8> {
     pub cols: Vec<Col<N>>,
     pub globals: Vec<u32>,
     pub strings: Vec<String>,
-    pub cache: Arc<CollisionCache>,
+    pub cache: Arc<Room>,
     /// Set by `boundary`: the canonical structure hash (the shape key).
     pub shape_hash: u64,
     /// A stored piece's per-lane EXACT keys (its tree's `exact::KeySpace`);
@@ -241,7 +241,7 @@ impl<N: Arithmetic> Rt2<N> {
         width: usize,
         globals_len: usize,
         static_strings: &[&str],
-        cache: Arc<CollisionCache>,
+        cache: Arc<Room>,
     ) -> Rt2<N> {
         Rt2 {
             width,
