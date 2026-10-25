@@ -1109,7 +1109,7 @@ impl<N: Arithmetic> Skeleton<N> {
     }
 
     /// As a block of no rows in `cache`'s room.
-    fn rt2(&self, cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>) -> Rt2<N> {
+    fn rt2(&self, cache: std::sync::Arc<celeste_core::room::Room>) -> Rt2<N> {
         let mut b = Rt2::empty(0, self.globals.len(), celeste_names::STRINGS, cache);
         b.globals = self.globals.clone();
         b.structure = self.structure.clone();
@@ -1232,7 +1232,7 @@ impl<N: KernelLanes> AsmKernel<N> {
     /// (`counting`: it counts its slices): its accumulator templates, its
     /// bodies on their slots with what each reads at emission
     /// (`emit::Plan`), the earlier bodies each repeats.
-    fn of(recipe: Recipe<N>, loaded: Loaded, cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>, counting: bool) -> Result<AsmKernel<N>> {
+    fn of(recipe: Recipe<N>, loaded: Loaded, cache: std::sync::Arc<celeste_core::room::Room>, counting: bool) -> Result<AsmKernel<N>> {
         let Recipe { shape: recipe_shape, compiled, forks, fused_nodes, may_unknown, bodies, outcomes, .. } = recipe;
         let acc_templates: Vec<AccTemplate<N>> = outcomes.iter().map(|sk| AccTemplate::of(sk.rt2(cache.clone()), sk.shape_hash)).collect::<Result<_>>()?;
         // Per outcome, its position coordinates' cells (keyed without their whole pixels).

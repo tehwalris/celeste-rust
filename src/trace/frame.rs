@@ -309,7 +309,7 @@ fn finish_outcome<A: GraphArith>(
     mut s: State<Symbolic<A>>,
     widen: bool,
     global: NodeId,
-    cache: &std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
+    cache: &std::sync::Arc<celeste_core::room::Room>,
 ) -> Result<FrameOut<A>> {
     s.gc();
     // Integer keys as a block holds them: a state traced from the outcome's
@@ -562,7 +562,7 @@ mod tests {
         assert!(icy > 0 && dry > 0, "the map has rooms with and without ice");
     }
 
-    /// The native `tile_flag_at` (the cached maps and the scan) answers what
+    /// The native `tile_flag_at` (the precomputed maps and the scan) answers what
     /// the CART'S OWN Lua `tile_flag_at` answers - its loop with a fractional
     /// limit - at every box near the room's edges, outside it included, in every
     /// room (a box wholly left of or above the room scans nothing).
@@ -572,8 +572,8 @@ mod tests {
         let s = crate::settings::Settings::default();
         let chunks = cart::Chunks::parse(&s).expect("chunks");
         let keep = full_moon::parse("lua_tile_flag_at = tile_flag_at").expect("parse");
-        // Positions -24..8 and 120..152 on each axis, five boxes: the cached
-        // sizes, an odd one, and the ice map's.
+        // Positions -24..8 and 120..152 on each axis, five boxes: the
+        // mapped ones (`room::MAPPED`) and two the scan answers.
         let probe = full_moon::parse(
             "
 boxes = { {1, 1, 0}, {6, 5, 0}, {8, 8, 0}, {3, 10, 0}, {6, 5, 4} }

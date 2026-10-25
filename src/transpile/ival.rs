@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn a_collision_test_is_decided_at_a_known_position_and_not_at_an_unknown_one() {
         let (rx, ry) = crate::settings::Settings::default().room;
-        let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(rx, ry));
+        let cache = std::sync::Arc::new(celeste_core::room::Room::new(rx, ry));
         let room = Room { cache: cache.clone() };
 
         let at = |x: i16, y: i16| -> Option<bool> {
@@ -162,7 +162,7 @@ mod tests {
         let mut open_seen = false;
         for y in (0..128).step_by(8) {
             for x in (0..128).step_by(8) {
-                let want = cache.solid_at(x, y, 8, 8).expect("solid_at");
+                let want = cache.flag_at(x, y, 8, 8, 0).expect("tile_flag_at");
                 assert_eq!(at(x, y), Some(want), "at ({}, {})", x, y);
                 solid_seen |= want;
                 open_seen |= !want;
@@ -195,7 +195,7 @@ mod tests {
                 if (rx, ry) == (7, 3) {
                     continue; // the summit: no level room
                 }
-                let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(rx, ry));
+                let cache = std::sync::Arc::new(celeste_core::room::Room::new(rx, ry));
                 let room = Room { cache: cache.clone() };
                 // The player's hitbox (6x5) and a whole tile.
                 for (w, h) in [(6i16, 5i16), (8, 8)] {
@@ -216,7 +216,7 @@ mod tests {
                             // (beyond [-16, 144] every rectangle misses the room).
                             let any_solid = (-16..=144i16).any(|v| {
                                 let (x, y) = if top_is_y { (at, v) } else { (v, at) };
-                                cache.solid_at(x, y, w, h).expect("solid_at")
+                                cache.flag_at(x, y, w, h, 0).expect("tile_flag_at")
                             });
                             checked += 1;
                             decided += got.is_some() as usize;
@@ -247,7 +247,7 @@ mod tests {
         let (mut decided_false, mut kept) = (0usize, 0usize);
         for ry in 0..4i16 {
             for rx in 0..8i16 {
-                let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(rx, ry));
+                let cache = std::sync::Arc::new(celeste_core::room::Room::new(rx, ry));
                 let room = Room { cache };
                 let tile = |i: i16, j: i16| cart.mget_whole(rx * 16 + i, ry * 16 + j) as i16;
                 for (i0, j0) in [(0i16, 0i16), (3, 1), (7, 12), (13, 13), (-1, 14), (14, -1)] {

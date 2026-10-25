@@ -116,7 +116,7 @@ pub(crate) fn whole_range_col<N: Arithmetic>(rt2: &Rt2<N>, cell: u32) -> Option<
 /// a non-numeric position: `NO_CELL`); the start room is its cache's.
 pub fn block_cells<N: Arithmetic>(rt2: &Rt2<N>) -> Result<Vec<u32>> {
     let ids = crate::compiled::ids();
-    let start = (rt2.cache.room_x, rt2.cache.room_y);
+    let start = (rt2.cache.x, rt2.cache.y);
     let lanes = rt2.width;
     let axis = |obj: u32, f: u32| rt2.obj_field_cell(obj, f).and_then(|c| whole_i16_col(rt2, c));
     let room = rt2

@@ -33,6 +33,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime2::{mix64, Cell2, Rt2, AV, P8};
+use crate::shape::Kind;
 
 /// A packed key: (bits 64..127, bits 0..63). Bit 127 tags a PROVISIONAL key.
 pub type Key = (u64, u64);
@@ -511,6 +512,35 @@ pub fn follower_violation<N: Arithmetic>(shape: u64, leader: u32, lcode: Code<N>
     );
 }
 
+/// THE POINTER TOPOLOGY IS THE SHAPE'S: a field holding a pointer holds
+/// no other code. A shape's signature names a value cell, never what it
+/// points at (`Rt2::shape_words`), and a kernel is bound by path against
+/// one representative of its shape (`trace::bind`): two states of one
+/// shape whose pointers differ would run a kernel bound to the other's
+/// cells. FATAL (`check_pointer`).
+#[cold]
+#[inline(never)]
+fn pointer_violation<N: Arithmetic>(shape: u64, cell: u32, had: Code<N>, got: Code<N>, at: &str) -> ! {
+    panic!(
+        "exact keys: shape {shape:#x}: cell {cell} holds {:?} beside {:?} ({at}): a field holding a pointer holds exactly one code, \
+         but the POINTER TOPOLOGY, which a kernel binds by path against one representative, varies under one shape hash",
+        got.value(),
+        had.value()
+    );
+}
+
+/// `code` joins a field (or a follower's column) whose first code is
+/// `first`: fatal where either is a pointer and they differ
+/// (`pointer_violation`).
+#[inline]
+fn check_pointer<N: Arithmetic>(shape: u64, cell: u32, first: Option<Code<N>>, code: Code<N>, at: &str) {
+    if let Some(first) = first {
+        if (first.kind == K_PTR || code.kind == K_PTR) && first != code {
+            pointer_violation(shape, cell, first, code, at);
+        }
+    }
+}
+
 /// One shape's dictionaries (by cell; `None` for a cell that is not a value,
 /// or a follower: `Follow`).
 #[derive(Clone, Debug)]
@@ -525,23 +555,9 @@ impl<N: Arithmetic> ShapeKeys<N> {
     /// A record's dictionaries; its dependencies must name its value cells
     /// (leaders and followers all distinct, none a position cell).
     fn new(record: ShapeRecord) -> Result<ShapeKeys<N>, String> {
-        // The signature names each cell's kind: a `Val` is a lone 1.
-        let mut fields = Vec::new();
-        let sig = &record.sig;
-        let mut i = 0;
-        while sig[i] != u32::MAX {
-            let (val, step) = match sig[i] {
-                1 => (true, 1),
-                2 => (false, 2 + 2 * sig[i + 1] as usize),
-                3 => (false, 2 + sig[i + 1] as usize),
-                4 => (false, 1),
-                5 => (false, 3),
-                _ => (false, 2),
-            };
-            fields.push(val.then(FieldDict::new));
-            i += step;
-        }
         let hash = record.hash;
+        let kinds = crate::shape::sig::kinds(&record.sig).map_err(|e| format!("exact keys: shape {hash:#x}: {e}"))?;
+        let mut fields: Vec<Option<FieldDict<N>>> = kinds.iter().map(|&k| (k == Kind::Val).then(FieldDict::new)).collect();
         let mut taken = std::collections::BTreeSet::new();
         for d in &record.deps {
             if d.followers.is_empty() || d.followers.windows(2).any(|w| w[0] >= w[1]) {
@@ -833,6 +849,7 @@ impl<N: Arithmetic> KeySpace<N> {
         for (i, (_, fol)) in rows.iter().enumerate() {
             assert_eq!(fol.len(), fl.cells.len(), "exact keys: shape {shape:#x}: a leader code with {} of its {} followers' codes", fol.len(), fl.cells.len());
             for (slot, &code) in fol.iter().enumerate() {
+                check_pointer(shape, fl.cells[slot], fl.cols[slot].first().copied(), code, "a follower's code added");
                 adds.codes.push((shape, fl.cells[slot], first + i as u32, code));
                 fl.cols[slot].push(code);
             }
@@ -902,6 +919,7 @@ impl<N: Arithmetic> KeySpace<N> {
         }
         for &c in codes {
             assert!(f.find(c) == NONE, "exact keys: shape {shape:#x} cell {cell}: code {c:?} added twice");
+            check_pointer(shape, cell, f.codes.first().copied(), c, "added");
             adds.codes.push((shape, cell, f.codes.len() as u32, c));
             f.push(c);
         }
@@ -936,12 +954,14 @@ impl<N: Arithmetic> KeySpace<N> {
             if let Some((g, slot)) = s.follower(cell) {
                 let col = &mut s.follows[g].cols[slot];
                 anyhow::ensure!(idx as usize == col.len(), "exact keys: shape {shape:#x} follower cell {cell}: leader index {idx} recorded after {}", col.len());
+                check_pointer(shape, cell, col.first().copied(), code, "a follower's code replayed");
                 col.push(code);
                 continue;
             }
             let f = s.fields.get_mut(cell as usize).and_then(|f| f.as_mut()).ok_or_else(|| anyhow::anyhow!("exact keys: shape {shape:#x} cell {cell} is not a value"))?;
             anyhow::ensure!(idx as usize == f.len(), "exact keys: shape {shape:#x} cell {cell}: index {idx} recorded after {} codes", f.len());
             anyhow::ensure!(f.find(code) == NONE, "exact keys: shape {shape:#x} cell {cell}: code {code:?} recorded twice");
+            check_pointer(shape, cell, f.codes.first().copied(), code, "replayed");
             f.push(code);
         }
         adds.runs.sort_unstable_by_key(|&(s, c, n, _, _)| (s, c, n));
@@ -1280,7 +1300,7 @@ mod tests {
     #[test]
     fn an_absent_global_is_not_in_a_shapes_identity() {
         use crate::runtime2::{Col, NONE};
-        let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(1, 0));
+        let cache = std::sync::Arc::new(celeste_core::room::Room::new(1, 0));
         let mut b = Rt2::<P8>::empty(1, celeste_names::GLOBAL_NAMES.len(), celeste_names::STRINGS, cache);
         let x = celeste_names::field("x");
         b.structure = vec![Cell2::Val, Cell2::Obj(vec![(x, 2)]), Cell2::Val];
@@ -1450,7 +1470,7 @@ mod tests {
     #[should_panic(expected = "declared key dependency is VIOLATED")]
     fn a_follower_other_than_the_record_is_fatal_at_the_boundary() {
         use crate::runtime2::Col;
-        let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(1, 0));
+        let cache = std::sync::Arc::new(celeste_core::room::Room::new(1, 0));
         let mut b = Rt2::<P8>::empty(2, celeste_names::GLOBAL_NAMES.len(), celeste_names::STRINGS, cache);
         b.structure = vec![Cell2::Val, Cell2::Val, Cell2::Val];
         let num = |x: i16| AV::Num(P8::from_i16(x));
@@ -1466,6 +1486,53 @@ mod tests {
         ks.add_misses(&[first], &mut adds);
         // Lane 0 is the record's; lane 1's cell 2 is not.
         ks.row_keys(&b);
+    }
+
+    fn ptr(t: u32) -> Code {
+        Code::of(AV::Ptr(t))
+    }
+
+    /// `f` panics, on the pointer topology (`pointer_violation`).
+    fn breaks_the_topology(what: &str, f: impl FnOnce()) {
+        let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err(what);
+        let msg = e.downcast_ref::<String>().map_or("(not a formatted panic)", |m| m.as_str());
+        assert!(msg.contains("the POINTER TOPOLOGY"), "{what}: {msg}");
+    }
+
+    /// THE POINTER TOPOLOGY IS THE SHAPE'S: a pointer field holds one code
+    /// (no bits), and a second one beside it is FATAL, whichever comes
+    /// first; replayed from records too.
+    #[test]
+    fn a_pointer_field_holds_exactly_one_code() {
+        let rec = ShapeRecord { hash: 9, sig: vec![1, 1, u32::MAX], pos: None, deps: Vec::new() };
+        let mut ks = KeySpace::new();
+        let mut adds = KeyAdditions::default();
+        ks.add_shape(&rec, &mut adds);
+        ks.add_codes(9, 0, &[ptr(3)], &mut adds);
+        assert_eq!(ks.shape(9).unwrap().field(0).unwrap().bits(), 0, "one pointer: no key bits");
+        for (cell, first, second) in [(0, None, ptr(4)), (0, None, Code::of(AV::Nil)), (1, Some(n(1)), ptr(4))] {
+            let (mut ks, mut adds) = (ks.clone(), adds.clone());
+            if let Some(c) = first {
+                ks.add_codes(9, cell, &[c], &mut adds);
+            }
+            breaks_the_topology("a pointer field took a second code", || ks.add_codes(9, cell, &[second], &mut adds));
+        }
+        let replay = KeyAdditions { shapes: vec![rec], codes: vec![(9, 0, 0, ptr(3)), (9, 0, 1, ptr(4))], runs: vec![(9, 0, 0, 0, 1)] };
+        breaks_the_topology("a replay gave a pointer field two codes", || drop(KeySpace::<P8>::from_additions(replay)));
+    }
+
+    /// A follower holding one pointer at every leader index is fine; two
+    /// are FATAL.
+    #[test]
+    fn a_followers_pointer_is_one_code() {
+        let (mut ks, mut adds) = dep_space();
+        let miss = |l: i32, p: u32| MissKey { shape: 5, partial: (0, 0), missing: vec![(0, n(l)), (1, ptr(p)), (2, n(0))] };
+        ks.add_misses(&[miss(1, 7), miss(2, 7)], &mut adds);
+        let replay = adds.clone();
+        breaks_the_topology("a follower's pointer differed between leader codes", || ks.add_misses(&[miss(3, 8)], &mut adds));
+        let mut bad = replay;
+        bad.codes.iter_mut().filter(|c| c.1 == 1 && c.2 == 1).for_each(|c| c.3 = ptr(8));
+        breaks_the_topology("a replayed follower's pointer differed", || drop(KeySpace::<P8>::from_additions(bad)));
     }
 
     /// Past 127 bits is fatal, never truncated.

@@ -98,7 +98,7 @@ pub(crate) fn decode_rows<N: Arithmetic>(keys: &KeySpace<N>, skel: &Rt2<N>, rows
     };
     // Position: the cell's pixels less the room offset, plus the fraction.
     let ids = crate::compiled::ids();
-    let start = (skel.cache.room_x, skel.cache.room_y);
+    let start = (skel.cache.x, skel.cache.y);
     let room = out.global_target(ids.g_room).ok_or_else(|| anyhow!("decode: no `room` global"))?;
     let room_field = |fid: u32| -> Result<(usize, &FieldDict<N>)> {
         let c = out.obj_field_cell(room, fid).ok_or_else(|| anyhow!("decode: no room field {fid}"))? as usize;

@@ -69,7 +69,7 @@ pub type ShapeKey = u64;
 pub type WalkNode = (ShapeKey, Option<Region>);
 
 /// The shape key of a state (its skeleton's shape hash).
-pub fn shape_key<A: GraphArith>(st: &super::state::State<super::domain::Symbolic<A>>, cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>) -> Result<ShapeKey> {
+pub fn shape_key<A: GraphArith>(st: &super::state::State<super::domain::Symbolic<A>>, cache: std::sync::Arc<celeste_core::room::Room>) -> Result<ShapeKey> {
     Ok(super::block::skeleton::<_, A>(st, cache)?.shape_hash)
 }
 
@@ -82,12 +82,12 @@ struct Reps<A: GraphArith> {
     fn_info: super::block::FnInfo,
     /// The boot state: the builtins a block drops.
     base: super::state::State<super::domain::Symbolic<A>>,
-    cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
+    cache: std::sync::Arc<celeste_core::room::Room>,
     blocks: std::collections::BTreeMap<ShapeKey, celeste_engine::runtime2::Rt2<A>>,
 }
 
 impl<A: GraphArith> Reps<A> {
-    fn new(start: &super::state::State<super::domain::Symbolic<A>>, cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>) -> Result<Self> {
+    fn new(start: &super::state::State<super::domain::Symbolic<A>>, cache: std::sync::Arc<celeste_core::room::Room>) -> Result<Self> {
         Ok(Reps { fn_info: super::block::fn_info_of(start)?, base: start.clone(), cache, blocks: Default::default() })
     }
 
@@ -998,7 +998,7 @@ pub struct LatticeWalk<A: GraphArith = Fixed> {
     pub reps: std::collections::BTreeMap<ShapeKey, super::state::State<super::domain::Symbolic<A>>>,
     /// Per (shape, region), its converged frame, bounds and binding.
     pub frames: std::collections::BTreeMap<WalkNode, WalkFrame<A>>,
-    pub cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
+    pub cache: std::sync::Arc<celeste_core::room::Room>,
     /// Per shape, input slots a reachable frame wrote an `rnd`-derived interval
     /// to, typed as interval inputs.
     pub ival_extra: std::collections::BTreeMap<ShapeKey, std::collections::BTreeSet<super::iface::Path>>,

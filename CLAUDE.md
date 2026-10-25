@@ -218,13 +218,17 @@ same-length variant valid in both.
 ## Code layout
 
 A cargo workspace; the dependency order is load-bearing: `celeste-core`
-(numbers, the arithmetic trait, cart, collision) and `celeste-names`
-(frozen tables) <- `celeste-engine` (`Rt2` blocks, exact keys, the
-widening table) <- `celeste-rust` (`src/frame.rs` the
+(numbers, the arithmetic trait, cart, the room's tiles `room::Room`) and
+`celeste-names` (frozen tables) <- `celeste-engine` (`Rt2` blocks, exact
+keys, the shape's signature `shape`, the widening table) <- `celeste-rust` (`src/frame.rs` the
 forward, `src/storage/`, `src/search/` the backward, the concrete search
 and level -1, `src/trace/` the tracer, `src/engines/` the reference
 engine, `src/transpile/` graph IR and assembler, `src/compiled/` the kernel
-registry, `src/settings.rs`, the `rewrite` binary in `src/bin/rewrite/`). Details: plans/architecture.md.
+registry, `src/settings.rs`, the `rewrite` binary in `src/bin/rewrite/`).
+The checks and diagnostics are TOOLS, not core: `src/check/` (the
+differential harness, check arcs, check replay, the census, explain); the
+core names none of it (a conventions test).
+Details: plans/architecture.md.
 
 There is NO checked-in kernel artifact: the registry retraces the start
 room's shapes at startup, specializes them for the level and assembles
