@@ -46,8 +46,7 @@ tree records the ones that change it (<level dir>/tree.txt) and refuses a
 run under others; flags never default to the record. A command that reads a
 finished tree (ckhash, census, export-ui, check, bench) takes them
 from the tree's record instead, and refuses them on its command line.
---override-settings proceeds past a different --region only. CELESTE_*
-environment variables are refused. Run everything under ./safe-run.sh (a
+CELESTE_* environment variables are refused. Run everything under ./safe-run.sh (a
 memory cap).
 
 UNITS are in the flag names: --frames counts game frames (the search's

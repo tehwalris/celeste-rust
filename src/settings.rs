@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 /// The tree record's format (`storage::record`): a tree without one, or
 /// with another, is refused where its settings are checked
 /// (tools/fixtures.sh rebuilds its fixtures on a change).
-pub const VERSION: u32 = 3;
+pub const VERSION: u32 = 4;
 
 /// The order of a tree's transfer table (`storage::edges::XferTable`):
 /// a frame's new transfers are numbered at each slice's GATHER (the pairs
@@ -169,10 +169,6 @@ pub struct Settings {
     /// Two search steps a frame (the split cart, `Clock`).
     #[arg(long, global = true)]
     pub split_frame: bool,
-    /// The kernels' region grid "px,S" (px a multiple of 8, 1 <= S <= 7),
-    /// or `off`.
-    #[arg(long, global = true, default_value = "16,6", value_parser = parse_region)]
-    pub region: std::option::Option<(i32, i32)>,
     /// The category, as the tasdatabase names it (`Category`): `100` and
     /// `gemskip100` win a room only with its berry, `nodiag` and
     /// `gemskipnodiag` forbid a diagonal dash start, `onlydiag` a straight
@@ -187,6 +183,13 @@ pub struct Settings {
     #[arg(long, global = true, default_value = "none", value_parser = parse_seeds)]
     pub balloon_seeds: std::option::Option<String>,
     // NOT recorded.
+    /// The kernels' region grid "px,S" (px a multiple of 8, 1 <= S <= 7),
+    /// or `off`. It specializes the kernels only: a tree is the same under
+    /// every grid (measured, plans/correctness.md C14), so a run extends or
+    /// reads one under any grid; one the kernels cannot be built on fails
+    /// at their build.
+    #[arg(long, global = true, default_value = "16,6", value_parser = parse_region)]
+    pub region: std::option::Option<(i32, i32)>,
     /// The level -1 filter "H,S": H in game frames (the search's horizon),
     /// S the table's speed bound (the tree records it, H in steps, as
     /// `frame::TreeL1`: `minus_one`).
@@ -199,12 +202,6 @@ pub struct Settings {
     /// Worker threads (default: one per physical core).
     #[arg(long, global = true, value_parser = parse_threads)]
     pub threads: Option<usize>,
-    /// Use a tree recorded under other settings that do not change what it
-    /// holds (only `--region`), under this run's; every difference is logged.
-    /// Any other difference (room, win, split frame, category, loading jank,
-    /// balloons, level) is still refused. A tree without a record is refused.
-    #[arg(long, global = true)]
-    pub override_settings: bool,
     /// The start room's CHESTS seeded by `--balloon-seeds` too, in 16.16,
     /// as the TAS tools seed them (each one's last shake draws its seed + 1:
     /// `trace::cart::tool_seeds`): a tool file replayed as the tools play it
@@ -286,7 +283,7 @@ impl Settings {
             row("room", format!("{},{}", self.room.0, self.room.1), true),
             row("win_at", none(self.win_at.map(|(x0, x1, y0, y1)| format!("{x0}..{x1},{y0}..{y1}"))), true),
             switch("split_frame", self.split_frame, true),
-            row("region", none(self.region.map(|(px, s)| format!("{px},{s}"))), true),
+            row("region", none(self.region.map(|(px, s)| format!("{px},{s}"))), false),
             row("category", self.category.to_string(), true),
             row("loading_jank", none(self.loading_jank.map(|j| j.to_string())), true),
             row("balloon_seeds", none(self.balloon_seeds.clone()), true),
@@ -294,7 +291,6 @@ impl Settings {
             row("level_minus_one", none(self.level_minus_one.map(|(h, s)| format!("{h},{s}"))), false),
             row("concrete_balloon_seeds", none(self.concrete_balloon_seeds.clone()), false),
             row("threads", none(self.threads.map(|t| t.to_string())), false),
-            switch("override_settings", self.override_settings, false),
             switch("key_check", self.diag.key_check, false),
             switch("kernel_explain", self.diag.kernel_explain, false),
             switch("build_trace", self.diag.build_trace, false),
@@ -450,7 +446,7 @@ impl Settings {
             level_minus_one: minus_one,
             concrete_balloon_seeds: run.concrete_balloon_seeds.clone(),
             threads: run.threads,
-            override_settings: false,
+            region: run.region,
             diag: run.diag.clone(),
             ..flags.s
         };
@@ -475,22 +471,11 @@ impl Settings {
         if diffs.is_empty() {
             return Ok(());
         }
-        let show = |d: &[(&str, String)]| d.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n  ");
-        let (soft, hard): (Vec<_>, Vec<_>) = diffs.into_iter().partition(|(k, _)| OVERRIDABLE.contains(k));
-        anyhow::ensure!(
-            hard.is_empty(),
-            "{}: the tree was built under other settings than this run's:\n  {}\n(a tree's frames are one search: delete it, or run with its flags; --override-settings overrides only {OVERRIDABLE:?})",
+        anyhow::bail!(
+            "{}: the tree was built under other settings than this run's:\n  {}\n(a tree's frames are one search: delete it, or run with its flags)",
             dir.display(),
-            show(&[hard, soft].concat())
-        );
-        anyhow::ensure!(
-            self.override_settings,
-            "{}: the tree was built under other settings than this run's:\n  {}\n(they do not change what the tree holds: --override-settings proceeds under this run's, or run with the tree's flags)",
-            dir.display(),
-            show(&soft)
-        );
-        eprintln!("[settings] OVERRIDE (--override-settings) {}: the tree's record stays, this run proceeds under its own:\n  {}", dir.display(), show(&soft));
-        Ok(())
+            diffs.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>().join("\n  ")
+        )
     }
 }
 
@@ -505,14 +490,6 @@ fn read_record(dir: &Path) -> Result<std::collections::BTreeMap<String, String>>
     let rec = crate::storage::record::Record::of(dir)?;
     Ok(rec.lines().map(|(k, v)| (k.to_string(), v.to_string())).collect())
 }
-
-/// The recorded settings `--override-settings` may override: those that do
-/// not change what a tree holds. The kernels' region grid (`--region`) only
-/// specializes the kernels: they are exact on every grid, and a lane outside
-/// a grid's bounds is a fatal coverage gap, never another successor. Every
-/// other line - the room, the win, the split frame, the category, the
-/// loading jank, the balloons, the level - is the search.
-pub const OVERRIDABLE: &[&str] = &["region"];
 
 /// The record's file in a level's tree.
 fn path(dir: &Path) -> PathBuf {
@@ -784,13 +761,14 @@ mod tests {
 
     /// A tree's record reads back into the settings it was written from
     /// (`of_tree`), every recorded setting off its default, fixed and float;
-    /// the run's own settings come from the run.
+    /// the run's own settings (the region grid among them) come from the
+    /// run.
     #[test]
     fn a_record_reads_back() {
         let dir = std::env::temp_dir().join(format!("celeste-settings-back-{}", std::process::id()));
         let lvl = crate::abstraction::Level::parse("r0sxhf").expect("a level");
-        let run = Settings { threads: Some(3), diag: Diagnostics { key_check: true, ..Default::default() }, ..Settings::default() };
-        let all = Settings { room: (6, 2), win_at: Some((8, 10, 64, 64)), split_frame: true, region: None, category: Category::GemskipNodiag, loading_jank: Some(2), balloon_seeds: Some("0,1".into()), ..run.clone() };
+        let run = Settings { threads: Some(3), region: Some((8, 6)), diag: Diagnostics { key_check: true, ..Default::default() }, ..Settings::default() };
+        let all = Settings { room: (6, 2), win_at: Some((8, 10, 64, 64)), split_frame: true, category: Category::GemskipNodiag, loading_jank: Some(2), balloon_seeds: Some("0,1".into()), ..run.clone() };
         let float = Settings { arith: Arith::Float(FloatTool::Uct), loading_jank: None, category: Category::Onlydiag, ..all.clone() };
         for s in [Settings { threads: Some(3), ..run.clone() }, all, float] {
             let _ = std::fs::remove_dir_all(&dir);
@@ -867,13 +845,11 @@ mod tests {
         assert_eq!(recorded_arith(&dir).expect("a record"), Arith::Float(FloatTool::Uct));
         sample.write(&dir, lvl("r0sxhf")).expect("write");
         assert_eq!(recorded_arith(&dir).expect("a record"), Arith::Fixed);
-        // `--override-settings`: only the region grid, and only with the flag.
-        let grid = Settings { region: None, ..sample.clone() };
-        let e = grid.check(&dir, lvl("r0sxhf")).expect_err("another grid, no override").to_string();
-        assert!(e.contains("region: the tree's 16,6, this run's none") && e.contains("--override-settings proceeds"), "{e}");
-        Settings { override_settings: true, ..grid.clone() }.check(&dir, lvl("r0sxhf")).expect("the grid overridden");
-        let e = Settings { override_settings: true, category: Category::Any, ..grid }.check(&dir, lvl("r0sxhf")).expect_err("a category is not overridable").to_string();
-        assert!(e.contains("category: the tree's 100, this run's any") && e.contains("region:"), "{e}");
+        // The kernels' region grid is no tree's setting: a tree is the same
+        // under every grid (plans/correctness.md C14), read and extended
+        // under any.
+        assert!(!sample.recorded("r0sxhf").iter().any(|(k, _)| *k == "region"));
+        Settings { region: None, ..sample.clone() }.check(&dir, lvl("r0sxhf")).expect("another grid");
         // A line that is no setting is refused.
         crate::storage::record::update(&dir, "storage_region", "8").expect("write");
         let e = sample.check(&dir, lvl("r0sxhf")).expect_err("an unknown line").to_string();
