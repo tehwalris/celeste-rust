@@ -92,15 +92,21 @@ settled here. Evidence is file:line at develop 19869c5d.
   hulls); concrete members in place of `step_at`'s pins (audit
   kernel-pipeline.md K10).
 
-## C6. Closure captures are not part of a state's exact identity
+## C6. Closure captures are not part of a state's exact identity (FIXED, branch correctness-batch)
 - `shape_sig`/`shape_hash_of` hash a closure's function id and capture COUNT
   (exact.rs:435, runtime2.rs:391-395); `exact_rows` reads only `Val` cells
   (exact.rs:964-1000): capture targets are hashed nowhere.
-- Fixed by structure today (the converter refuses non-table captures; "every
-  capture in this cart is the owning object", trace/block.rs:198-205), and the
-  forward's `Skeletons::register` would catch a mismatch, but the concrete and
-  dual searches dedup on `ExactRow` without that check.
-- To do: assert in `trace::block` that a capture IS the closure's owner.
+- FIXED: the one converter (`trace::block::ToRt2::closure`) asserts every
+  capture IS the closure's OWNER, the one table holding it (`obj.move`
+  captures `obj`), which the block's structure already says; a capture of
+  another table, a closure with captures held by two tables or by a global,
+  is refused with an error naming the closure. Every block passes through it
+  (the tracer's skeletons and outcomes, the reference engine's rows), so the
+  concrete and dual searches' `ExactRow` dedup is exact by construction.
+  Test: `trace::block::tests::a_closure_capturing_another_table_than_its_owner_is_refused`
+  (room (1,0)'s start converts; with every captured name rebound to the
+  globals table it is refused); the whole ladder converts every block of the
+  real cart through the assert.
 
 ## C7. HIGH: the jump buffer is removed, so the search MISSES real states
 - The original buffers a jump press for 4 updates (orig 136-142, 211-212);

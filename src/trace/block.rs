@@ -52,7 +52,7 @@ pub fn to_rt2<D: Domain, N: Arithmetic>(
     let mut cx = ToRt2 { st, rt2, tables: HashMap::new(), closures: HashMap::new(), buttons, num, boolean };
     for (g, name) in gen::GLOBAL_NAMES.iter().enumerate() {
         if let Some(v) = globals.get(*name) {
-            cx.rt2.globals[g] = cx.slot(v, false)?;
+            cx.rt2.globals[g] = cx.slot(v, false, None)?;
         }
     }
     let mut rt2 = cx.rt2;
@@ -122,7 +122,8 @@ struct ToRt2<'a, D: Domain, E: Arithmetic, N, B> {
     st: &'a State<D>,
     rt2: Rt2<E>,
     tables: HashMap<TableId, u32>,
-    closures: HashMap<ClosureId, u32>,
+    /// Each closure's cell and the table holding it (`closure`).
+    closures: HashMap<ClosureId, (u32, Option<TableId>)>,
     /// The table `__button_states` holds: its booleans are written `UBool`.
     buttons: Option<TableId>,
     num: N,
@@ -141,8 +142,9 @@ where
     }
 
     /// A slot holding `v`: its own `Val` cell, or a builtin's `Bi` cell.
-    /// `button`: a slot of the button table.
-    fn slot(&mut self, v: &Value<D>, button: bool) -> Result<u32> {
+    /// `button`: a slot of the button table; `holder`: the table whose slot
+    /// it is (`None`: a global).
+    fn slot(&mut self, v: &Value<D>, button: bool, holder: Option<TableId>) -> Result<u32> {
         if let Value::Builtin(name) = v {
             let i = BUILTIN_NAMES.iter().position(|n| n == name).ok_or_else(|| anyhow!("unknown builtin {name:?}"))?;
             return Ok(self.cell(Cell2::Bi(i as u32), Col::U(AV::Nil)));
@@ -157,7 +159,7 @@ where
                 AV::Str((self.rt2.strings.len() - 1) as u32)
             }
             Value::Table(t) => AV::Ptr(self.table(*t)?),
-            Value::Func(c) => AV::Ptr(self.closure(*c)?),
+            Value::Func(c) => AV::Ptr(self.closure(*c, holder)?),
             Value::Builtin(_) => unreachable!("a builtin is its own cell"),
         };
         Ok(self.cell(Cell2::Val, Col::U(av)))
@@ -181,14 +183,14 @@ where
             let mut fields = Vec::new();
             for (name, v) in &table.hash {
                 if let Some(f) = gen::field_id(name) {
-                    fields.push((f, self.slot(v, button)?));
+                    fields.push((f, self.slot(v, button, Some(t))?));
                 }
             }
             Cell2::Obj(fields)
         } else if !arr.is_empty() {
             let mut items = Vec::with_capacity(arr.len());
             for v in &arr {
-                items.push(self.slot(v, button)?);
+                items.push(self.slot(v, button, Some(t))?);
             }
             Cell2::Arr(items)
         } else {
@@ -198,24 +200,33 @@ where
         Ok(cell)
     }
 
-    fn closure(&mut self, c: ClosureId) -> Result<u32> {
-        if let Some(&h) = self.closures.get(&c) {
-            return Ok(h);
-        }
-        let cell = self.cell(Cell2::Unk, Col::U(AV::Nil));
-        self.closures.insert(c, cell);
+    /// Closure `c`'s cell, reached through a slot of `holder`. Its captures
+    /// are columns on the cell, but a state's EXACT identity reads none of
+    /// them (`exact::exact_rows` reads `Val` cells; the shape counts them):
+    /// the block is exact only because every capture IS the closure's
+    /// OWNER, the one table holding it (`obj.move` captures `obj`), which
+    /// the block's structure already says. Any other capture - another
+    /// table, a closure held by two tables or by a global - is refused,
+    /// naming the closure (plans/correctness.md C6).
+    fn closure(&mut self, c: ClosureId, holder: Option<TableId>) -> Result<u32> {
         let st = self.st;
         let cl = &st.heap.closures[&c];
         // The engine names a closure by `FN_NAMES` index (`Interp::fn_id_of`);
         // the cart's anonymous functions never outlive their frame.
         let f = cl.fn_id.ok_or_else(|| anyhow!("anonymous closure #{c} at a frame boundary"))?;
-        // The captures are columns on the closure cell, hashed into the row
-        // key. Every capture in this cart is the owning object: a table.
+        let name = gen::FN_NAMES[f as usize];
+        if let Some(&(h, owner)) = self.closures.get(&c) {
+            ensure!(cl.captures.is_empty() || owner == holder, "closure {name} (#{c}) captures {:?} and is held by two tables, #{owner:?} and #{holder:?}: a capture is identity no key reads (plans/correctness.md C6)", cl.captures);
+            return Ok(h);
+        }
+        let cell = self.cell(Cell2::Unk, Col::U(AV::Nil));
+        self.closures.insert(c, (cell, holder));
         let mut caps = Vec::with_capacity(cl.captures.len());
-        for name in &cl.captures {
-            match st.heap.lookup(cl.env, name) {
-                Some(Value::Table(t)) => caps.push(Col::U(AV::Ptr(self.table(*t)?))),
-                other => bail!("capture {name:?} of closure #{c} holds {other:?}, not a table"),
+        for cap in &cl.captures {
+            match st.heap.lookup(cl.env, cap) {
+                Some(Value::Table(t)) if Some(*t) == holder => caps.push(Col::U(AV::Ptr(self.table(*t)?))),
+                Some(Value::Table(t)) => bail!("closure {name} (#{c}): its capture {cap:?} is table #{t}, not its owner #{holder:?} (the table holding it): a capture is identity no key reads (plans/correctness.md C6)"),
+                other => bail!("closure {name} (#{c}): its capture {cap:?} holds {other:?}, not a table"),
             }
         }
         self.rt2.structure[cell as usize] = Cell2::Clo(f, caps.into_boxed_slice());
@@ -386,3 +397,28 @@ impl<N: Arithmetic, D: Domain<A = N>> FromBlock<'_, N, D> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    /// A CLOSURE'S CAPTURE IS ITS OWNER, or the block refuses it, naming the
+    /// closure (plans/correctness.md C6): room (1,0)'s start converts; with
+    /// every captured name rebound to the globals table, the conversion
+    /// fails on the first closure it meets.
+    #[test]
+    fn a_closure_capturing_another_table_than_its_owner_is_refused() {
+        use crate::trace::heap::Value;
+        let s = crate::settings::Settings::default();
+        let eng = crate::engines::reference::RefEngine::new(&s).expect("ref engine");
+        let start = eng.start_state();
+        crate::engines::reference::to_block(start, s.room).expect("the start converts");
+        let mut st = start.clone();
+        let rebind: Vec<(crate::trace::heap::ScopeId, String)> = st.heap.closures.values().flat_map(|cl| cl.captures.iter().map(move |c| (cl.env, c.clone()))).collect();
+        assert!(!rebind.is_empty(), "the start's objects hold closures with captures");
+        let globals = st.globals;
+        for (env, cap) in &rebind {
+            assert!(st.heap.assign(*env, cap, Value::Table(globals)), "the capture's binding");
+        }
+        let Err(e) = crate::engines::reference::to_block(&st, s.room) else { panic!("a capture that is not the owner converted") };
+        let e = e.to_string();
+        assert!(e.starts_with("closure ") && e.contains("not its owner"), "{e}");
+    }
+}
