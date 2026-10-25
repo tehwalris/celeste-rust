@@ -5,7 +5,7 @@
 //! first reach and kept (decoding them every frame made a frame's cost grow
 //! with the reach). Its flows: `inside_w` (a `Region` inside W, the next
 //! level's filter), `exact` (a test oracle: with W = everything, what the
-//! hull forward's soundness is checked against) and `hull_replay` (the
+//! hull forward's soundness is checked against) and `check::replay` (the
 //! hull forward without its engine).
 
 use anyhow::Result;

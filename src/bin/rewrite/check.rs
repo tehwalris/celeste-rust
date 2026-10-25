@@ -21,7 +21,7 @@ use celeste_rust::storage::Sk;
 use std::path::PathBuf;
 
 use celeste_rust::compiled::{KernelLanes, Kernels};
-use celeste_rust::differential;
+use celeste_rust::check::differential;
 
 use crate::{where_, Rows};
 
@@ -75,7 +75,7 @@ pub enum Command {
     /// with the step, the node and the state (and, where the tree lost it,
     /// the kernels' successors of its state a frame before).
     Known(KnownArgs),
-    /// THE TREE REPLAYS FROM ITS RECORDED GRAPH (`search::hull_replay`).
+    /// THE TREE REPLAYS FROM ITS RECORDED GRAPH (`check::replay`).
     ///
     /// The start's hull pushed along the recorded edges through their
     /// transfers, frame by frame, must reach exactly the tree's states first
@@ -200,8 +200,8 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
         }
         Command::Arcs(a) => {
             let t = a.tree.open(run)?;
-            let o = celeste_rust::search::arc_check::Opts { dir: &t.dir, from: a.from_step, to: t.frame(a.to_step)?, samples: a.samples, level: t.level, fault: a.fault.as_deref(), path_cap: a.path_cap, settings: &t.settings };
-            celeste_rust::with_arith!(t.settings.arith, N => celeste_rust::search::arc_check::run::<N>(&o))
+            let o = celeste_rust::check::arcs::Opts { dir: &t.dir, from: a.from_step, to: t.frame(a.to_step)?, samples: a.samples, level: t.level, fault: a.fault.as_deref(), path_cap: a.path_cap, settings: &t.settings };
+            celeste_rust::with_arith!(t.settings.arith, N => celeste_rust::check::arcs::run::<N>(&o))
         }
         Command::Widen(a) => {
             let t = a.tree.open(run)?;
@@ -222,7 +222,7 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
             res
         }
         Command::Replay(a) => {
-            use celeste_rust::search::hull_replay::replay;
+            use celeste_rust::check::replay::{replay, verdict};
             let t = a.tree.open(run)?;
             let to = t.frame(a.steps)?;
             let tm = std::time::Instant::now();
@@ -231,6 +231,7 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
             for (f, x) in frames.iter().enumerate() {
                 println!("f{f:03} {} {}", x.states, x.edges);
             }
+            verdict(&t.dir, &frames)?;
             println!("[check replay] {}: the replay reaches the tree's states at every frame to f{to} ({:.1} s)", t.dir.display(), tm.elapsed().as_secs_f64());
             Ok(())
         }

@@ -5,7 +5,6 @@ pub mod compiled;
 pub mod frame;
 pub mod game_runner;
 pub mod concrete;
-pub mod differential;
 pub mod engines;
 pub mod metrics;
 pub mod par;

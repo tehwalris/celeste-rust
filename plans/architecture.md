@@ -51,8 +51,8 @@ celeste-rust (src/)
                         exact), concrete (the concrete search; dual: over
                         pairs), known, arcs (the sets; both circles),
                         hull, rem (the decode, the transfer records),
-                        arc_check, hull_replay, tree (a finished
-                        tree opened), result, ui_export, inspect, level_minus_one
+                        tree (a finished tree opened), result, ui_export,
+                        inspect, level_minus_one
                         (the cost-to-go table, its one builder), robust (a
                         float witness against the libm)
   trace/                the tracer: interp, state, heap, domain (Symbolic) and
@@ -67,7 +67,11 @@ celeste-rust (src/)
   compiled/             FrameEngine, the kernel registry, emission, the
                         kernel cache
   check/                the tools outside the core, which names none of
-                        them: census (the kernel census, rebuilt)
+                        them (`conventions`): differential (the checks'
+                        one harness and verdict), arcs (the transfers
+                        against the reference), replay (the tree from its
+                        recorded graph), census (the kernel census,
+                        rebuilt), explain (a kernel's decline, rebuilt)
   settings.rs           the run's settings (flags), the tree's record
   starts.rs             the feasible loading-jank J's and their classes
   par.rs, metrics.rs, concrete.rs, game_runner.rs

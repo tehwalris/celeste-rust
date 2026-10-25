@@ -10,8 +10,8 @@
 use anyhow::{anyhow, Result};
 use celeste_engine::runtime2::{Col, Rt2, AV};
 
-use super::arcs::{Act, Circle, Doubles, Fixed16, Seg, Transfer, CIRCLE, POINTS};
-use super::rem::{Point, Rem, Xfer};
+use crate::search::arcs::{Act, Circle, Doubles, Fixed16, Seg, Transfer, CIRCLE, POINTS};
+use crate::search::rem::{Point, Rem, Xfer};
 use crate::abstraction::Level;
 use crate::frame::widened_keys;
 use crate::storage::edges::EdgeStore;
@@ -198,7 +198,7 @@ where
         let probes: Vec<(Point<N>, Point<N>)> = if has_player {
             vec![(gx.lo, gy.lo), (last(gx), last(gy)), (N::C::mid(gx), N::C::mid(gy)), (gx.lo, last(gy))]
         } else {
-            let z = super::rem::start_point::<N>();
+            let z = crate::search::rem::start_point::<N>();
             vec![z]
         };
         for p in probes {
@@ -276,8 +276,8 @@ where
         }
         // `samples` records evenly spaced, checked in parallel (a reference
         // engine per worker), reported in record order.
-        let picked: Vec<&Rec<N>> = crate::differential::stride(recs.len(), o.samples).into_iter().map(|k| &recs[k]).collect();
-        let done = crate::differential::run(
+        let picked: Vec<&Rec<N>> = super::differential::stride(recs.len(), o.samples).into_iter().map(|k| &recs[k]).collect();
+        let done = super::differential::run(
             workers,
             picked.len(),
             || {
@@ -291,8 +291,8 @@ where
         )?;
         for (k, o) in done.into_iter().enumerate() {
             let o = match o {
-                crate::differential::Ran::Done(o) => o,
-                crate::differential::Ran::Skipped(why) => {
+                super::differential::Ran::Done(o) => o,
+                super::differential::Ran::Skipped(why) => {
                     let r = picked[k];
                     Sampled { skipped: 1, msgs: vec![format!("[check arcs] f{frame} pred {} -> {}: SKIPPED ({why})", r.src.show(), r.target.show())], ..Default::default() }
                 }
@@ -329,5 +329,5 @@ where
         total.no_player, total.skipped, total.inside, total.inside_bad, total.unpredicted, total.outside, total.outside_bad, total.steps
     );
     let bad = missing_total + total.inside_bad + total.unpredicted + total.outside_bad;
-    crate::differential::verdict((sampled - total.skipped) as usize, bad as usize, || "check arcs: disagreement".into())
+    super::differential::verdict((sampled - total.skipped) as usize, bad as usize, || "check arcs: disagreement".into())
 }

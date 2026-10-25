@@ -254,19 +254,24 @@ mod tests {
         replay_all(FloatTool::Celia);
     }
 
-    /// Every golden of the tool's manifest, replayed in parallel.
+    /// Every golden of the tool's manifest, replayed in parallel on the
+    /// differential harness (`check::differential`): every update of every
+    /// golden compared (one SKIPPED fails it too), and at least one.
     fn replay_all(tool: FloatTool) {
+        use crate::check::differential::{run, verdict, Ran};
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("gates").join(tool_dir(tool));
         let manifest = std::fs::read_to_string(dir.join("manifest.txt")).unwrap_or_else(|e| panic!("{}: {e}", dir.join("manifest.txt").display()));
         let lines: Vec<&str> = manifest.lines().filter(|l| !l.trim().is_empty()).collect();
-        let compared: usize = crate::par::Pool::new(16)
-            .stack(64 << 20)
-            .map(lines.len(), |i| replay_golden(&dir, lines[i], tool).map_err(|e| e.context(lines[i].to_string())))
-            .unwrap_or_else(|e| panic!("{e:#}"))
-            .into_iter()
-            .sum();
+        let done = run(16, lines.len(), || Ok(()), |_, i| replay_golden(&dir, lines[i], tool).map_err(|e| e.context(lines[i].to_string()))).unwrap_or_else(|e| panic!("{e:#}"));
+        let (mut compared, mut skipped) = (0usize, Vec::new());
+        for (r, line) in done.into_iter().zip(&lines) {
+            match r {
+                Ran::Done(n) => compared += n,
+                Ran::Skipped(why) => skipped.push(format!("{line}: {why}")),
+            }
+        }
         eprintln!("[{}] {} goldens, {compared} updates compared", tool_dir(tool), lines.len());
-        assert!(compared > 0, "no golden compared anything");
+        verdict(compared, skipped.len(), || format!("goldens SKIPPED: {}", skipped.join("; "))).unwrap_or_else(|e| panic!("{e:#}"));
     }
 
     fn tool_dir(tool: FloatTool) -> &'static str {

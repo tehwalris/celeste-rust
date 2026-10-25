@@ -4,5 +4,8 @@
 //! field of a production type, and the core names none of them
 //! (`conventions`).
 #![warn(unreachable_pub)]
+pub mod arcs;
 pub mod census;
+pub mod differential;
 pub mod explain;
+pub mod replay;
