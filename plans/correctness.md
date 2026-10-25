@@ -90,9 +90,12 @@ settled here. Evidence is file:line at develop 19869c5d.
   modulo the handled differences), so the minimal cart and the native
   builtins are checked, not trusted.
 
-## C5. Verification gaps at the object and platform levels
-- At `p` the reference engine refuses to run (engines/reference.rs:539): the
-  platform kernels are checked only against regression pins.
+## C5. Verification gaps at the object levels
+- (`p` is gone, C13: platforms are exact and the reference runs them.)
+- `check reference` cannot compare at `f`: in room (6,0) at `r0sxhf` the
+  kernels make 2 states a step, the reference 1 (the reference widens only
+  the held buttons, the kernels the fruit too; plans/architecture.md "Open
+  issues"). The fruit level is checked only by pins and the concrete search.
 - At `n`, `check ref` and `check arcs` skip most rows over the reference's
   path cap; room (7,0) `check arcs` is an open issue.
 - Proposals: a reachable-sample soundness check at every level (audit
@@ -176,7 +179,7 @@ settled here. Evidence is file:line at develop 19869c5d.
   so any fix must be checked per kernel); concrete BFS x3.7 steps; `check
   ref` 5 -> 19 GB. Re-proven under it: any% (0,0) 93, (1,0) 99, (4,0) 76,
   summit 55, gemskip summit 57, (5,3) 79. Still at risk: nodiag (6,0) 73
-  (also C13), nodiag (6,1) 92, nodiag (1,2) 113, 100% (6,1) 114, 100% (4,3)
+  (C13 since fixed), nodiag (6,1) 92, nodiag (1,2) 113, 100% (6,1) 114, 100% (4,3)
   109. Decision pending (Philippe).
 
 ## C8. Death and exit in the same update counts as a win (FIXED, branch correctness-batch)
@@ -265,7 +268,7 @@ settled here. Evidence is file:line at develop 19869c5d.
 - The runner also passed `--room` to export-ui, which refuses it, so its UI
   step failed on every improvement.
 
-## C13. HIGH, CONFIRMED: the platform-world table misses real positions
+## C13. FIXED (branch `platforms-exact`): the platform-world table missed real positions
 - `platform_worlds(frames, s)` (concrete.rs:99) records the world over
   `0..=frames` `step_one`s of a NO-INPUT reference run; its one call site
   (walk.rs:490) passes 127. Under `--split-frame` a step is half a frame, so
@@ -302,11 +305,23 @@ settled here. Evidence is file:line at develop 19869c5d.
   and (6,1) re-run without `p`.
 - C3 is NOT explained by this (proven: its comparison stayed within f34, and
   (2,1)'s split and unsplit tables are identical).
-- Fix (not applied): count game frames (`s.clock().steps(frames)`); make the
-  generator immune to the idle player (step only the platforms, or refuse
-  loudly on a restart or freeze during generation); have `platform_worlds`
-  return the frames it covers and guard on THAT. Then re-run (6,0)'s two
-  results.
+- FIXED by deleting the table (2026-10-25, branch `platforms-exact`,
+  Philippe's decision): platforms are EXACT at every level. 3e245528 keys
+  room (6,0)'s ten by the first one's `spd.x` and `rem.x` (`exact::Deps`,
+  followers recorded per leader code and checked on every row, a
+  difference FATAL; plans/architecture.md "Keys"); a83674e6 deletes `p`,
+  `concrete::platform_worlds`, its guard, `split::Points` and `sides()`,
+  and the reference engine's refusal (a spec holding `p` is refused).
+  Every platform result re-proven on the final code, release, each with
+  `--prefer` its stored witness (all kept; every witness the stored route):
+  (2,1) any% 82 `r0sxhn` (arc bound 82, 6 min, 9.6 GB); (2,1) nodiag 85
+  (bound 85, 3 min, 6.7 GB); (6,0) any% 70 split `r0sxhf` (bound 70, 11 min,
+  18.2 GB, 1.61G visited, 42 key bits); (6,0) nodiag 73 (bound 73, 11 min,
+  12.4 GB); (1,2) any% 103 `r0sxhn` (bound 99, the concrete search's first
+  win 103, 8 min, 6.7 GB); (1,2) nodiag 113 `r0sxhn,r0sxh,r0sx` (bounds
+  109, 113, 113, 2 min, 5.6 GB). So (6,0)'s refutations hold again: no
+  any% win before 70 and no nodiag win before 73, by the arcs over exact
+  platforms (plans/results.md, "The platform rooms without `p`").
 
 ## C14. Checks that can pass with nothing compared (FIXED but (f), branch correctness-batch)
 - FIXED 99fd23ad: `differential::verdict` FAILS a check that compared

@@ -239,8 +239,7 @@ fn configurations<A: GraphArith>(
                 if valid[i] <= 2 {
                     return (0..valid[i]).collect();
                 }
-                // Per fork, its values that agree, compared decided as the body is (a
-                // test against one platform world folds only with the ranges).
+                // Per fork, its values that agree, compared decided as the body is.
                 let plain: Vec<Vec<u8>> = (0..valid[i]).map(with).collect();
                 let sigs = decided_roots(graph, &plain, this, room);
                 (0..valid[i]).filter(|&v| !sigs[..v as usize].contains(&sigs[v as usize])).collect()

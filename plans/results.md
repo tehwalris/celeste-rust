@@ -36,18 +36,18 @@ is the first level whose first win equals H. (3,3) is the first arc result.
 | (3,0) | 400 m | 89 | TAS4, 27 + 62 = 89 | `r0sxhfb, r1sxhb..r15sxhb, r15sxh, rxsx`; h88 refuted at level 6 | `room_3_0_exit_frame_89.txt` | 09-19 | `8533314` | the mark filter's deadline; the fly fruit is taken (looks necessary); TAS4's raw inputs do not transfer to the minimal cart, its route does |
 | (4,0) | 500 m | 76 | TAS5, 29 + 47 = 76 | default ladder; h75 refuted at level 9 | `room_4_0_optimal_frame_76.txt` | 09-16 | `e0d5852` | the key's `spr`/`flip` pinned with the timers; 3:54 end to end |
 | (5,0) | 600 m | 77 | TAS6, offset 29, its seed | rerun 10-04: `r0sxhn..r4sxhn, r4sxh..r15sxh, rxsx` (level -1 refused), `--ceiling 77`; h76 refuted at level 6 | `room_5_0_exit_frame_77.txt` (TAS6's seed 0.636; seeds 0.6-0.9) | 10-04 | `d3e58d5` | the balloon's `offset` canonical [0,1) restored cross-frame dedup (f60 10.6M -> 1.1M, `4e19168`); the second dash is the balloon's refill |
-| (6,0) | 700 m | 70 | TAS7, 23 + 47 = 70 | split frame, `r0sxhfp, r0sxhf, r0sxh, r1sxh..r15sxh, rxsx`; frames 64-69 refuted (h72's level 7 first win at frame 70) | `room_6_0_exit_frame_70.txt` | 09-30 | `7811208` | platforms make every frame's states new: `p` + POINTS + the split frame |
+| (6,0) | 700 m | 70 | TAS7, 23 + 47 = 70 | split frame, `r0sxhfp, r0sxhf, r0sxh, r1sxh..r15sxh, rxsx`; frames 64-69 refuted (h72's level 7 first win at frame 70). RE-PROVEN 10-25 with the platforms exact (no `p`, correctness.md C13): split `r0sxhf` alone, arc bound 70, 11 min | `room_6_0_exit_frame_70.txt` | 09-30 | `7811208` | platforms make every frame's states new: `p` + POINTS + the split frame, until the ten platforms exact, keyed by the first one's (`exact::Deps`, 42 key bits), 10-25 |
 | (7,0) | 800 m | 84 | TAS8, offset 23, seed 0 | rechecked 10-02: `r0sxhn..r4sxhn, r4sxh..r15sxh, rxsx`, level -1 (84,5); h83 refuted at level 10 | `room_7_0_exit_frame_84.txt` (seeds 0, 0.25) | 10-01 | `c76bf10` | the floor-collision join bug `7f6b96e`; the `n` level |
 | (0,1) | 900 m | 100 | TAS9, offset 27 | `r0sxhn, r1sxhn, r1sxh..r15sxh, rxsx` at h100; first win 100 from level 10 | `room_0_1_exit_frame_100.txt` | 10-01 | `b97fa9a` | objects abstract one rem rung longer: level 0 40M -> 14.8M states, the first exact level 26.5M -> 88k |
 | (1,1) | 1000 m | 94 | TAS10, offset 25 | `r0sxhn..r8sxhn, r8sxh..r15sxh, rxsx` at h94; first win 94 from level 11 | `room_1_1_exit_frame_94.txt` | 10-01 | `267b136` | floors abstract through rem 8; stale edge runs of a killed level (fixed: a fresh forward clears its dirs) |
-| (2,1) | 1100 m | 82 | TAS11, offset 24 | `r0sxhnp, r0sxhn, r1sxhn..r8sxhn, r8sxh..r15sxh, rxsx` at h82; first win 82 from level 8. RE-PROVEN 10-21 by `search --level r0sxhn` alone (the platform exact, no `p`: correctness.md C13): arc bound 82, 22 min | `room_2_1_exit_frame_82.txt` | 10-01 | `029b1c0` | an exact platform is a frame counter; the balloon's bob `y` doubled every state |
+| (2,1) | 1100 m | 82 | TAS11, offset 24 | `r0sxhnp, r0sxhn, r1sxhn..r8sxhn, r8sxh..r15sxh, rxsx` at h82; first win 82 from level 8. RE-PROVEN 10-25 by `search --level r0sxhn` alone (the platform exact, `p` deleted: correctness.md C13): arc bound 82, 6 min | `room_2_1_exit_frame_82.txt` | 10-01 | `029b1c0` | an exact platform is a frame counter; the balloon's bob `y` doubled every state |
 | (3,1) | 1200 m | 71 | TAS12, offset 25 | `r0sxhf..r5sxhf, r5sxh..r15sxh, rxsx` at h71; first win 71 from level 4 | `room_3_1_exit_frame_71.txt` | 10-01 | `4b2a0f4` | ice modelled (`4f1ed71`: only tile flag 0 was) |
 | (4,1) | 1300 m | 95 | TAS13, offset 25, its seeds | `r0sxhn..r8sxhn, r8sxh..r15sxh, rxsx` at h95; first win 95 from level 9 | `room_4_1_exit_frame_95.txt` (TAS13's seeds, rnd) | 10-01 | `f8ea434` | abstract balloons held a spurious 91 through rem 8 (marks 2.9M -> 121M); the first exact level refuted it at once |
 | (5,1) | 1400 m | 104 | TAS14, offset 25 | `r0sxhn..r4sxhn, r4sxh..r15sxh, rxsx` at h104, level -1 (104,5) from f88; first win 104 from level 5 | `room_5_1_exit_frame_104.txt` | 10-01 | `39f35db` | the spring's speeds (2,903 `spd.x` values) handled by level -1, not buckets |
 | (6,1) | 1500 m | 89 | TAS15, offset 25 | split frame, `r0sxhn..r4sxhn, r4sxh..r15sxh, rxsx`, level -1 (178,5) steps; h176 steps refuted at level 5 | `room_6_1_exit_frame_89.txt` | 10-02 | `7c09449` | the split frame: kernels 288k -> 23k bodies, f2-f45 955 s -> 152 s, identical states |
 | (7,1) | 1600 m | 86 | TAS16, offset 27 | `r0sxhn..r4sxhn, r4sxh..r15sxh, rxsx` at h86; first win 86 from level 8 | `room_7_1_exit_frame_86.txt` | 10-01 | `2cd72d5` | the slack past the exact-object level was rem precision, refuted a frame per rung |
 | (0,2) | 1700 m | 81 | TAS17, offset 25 | `r0sxhn..r4sxhn, r4sxh..r15sxh, rxsx`, level -1 (81,5); h80 refuted at level 11 | `room_0_2_exit_frame_81.txt` | 10-01 | `2a97a47` | the map-row nibble swap (`5746919`: rows 2-3 were garbage); `tile_flag_over` read only tile row 0 for an unknown `y` (`52a368a`, a spurious 80) |
-| (1,2) | 1800 m | 103 | TAS18, offset 27, its seed | `r0sxhnp, r0sxhn, r1sxhn..r4sxhn, r4sxh..r15sxh, rxsx`; h102 refuted at level 8 | `room_1_2_exit_frame_103.txt` (seeds 0.9397, 0, rnd) | 10-02 | `f5661ef` | the platform exact at level 1 marked 253M states: keep `p` longer |
+| (1,2) | 1800 m | 103 | TAS18, offset 27, its seed | `r0sxhnp, r0sxhn, r1sxhn..r4sxhn, r4sxh..r15sxh, rxsx`; h102 refuted at level 8. RE-PROVEN 10-25 by `r0sxhn` alone (no `p`): arc bound 99, the concrete search's first win 103, 8 min | `room_1_2_exit_frame_103.txt` (seeds 0.9397, 0, rnd) | 10-02 | `f5661ef` | the platform exact at level 1 marked 253M states: keep `p` longer |
 | (2,2) | 1900 m | 74 | TAS19, offset 23 | `r0sxh..r15sxh, rxsx`, level -1 (74,5); h73 refuted at level 5 | `room_2_2_exit_frame_74.txt` | 10-02 | `9a449c8` | no object to abstract |
 | (3,2) | 2000 m | 128 | TAS20, offset 31, its seeds | `r0sxhn..r4sxhn, r4sxh..r15sxh, rxsx`, level -1 (128,5); h127 refuted at level 6 | `room_3_2_exit_frame_128.txt` (TAS20's seeds, rnd) | 10-02 | `b250941` | abstract-balloon marks grew with rem (31M -> 171M) until the first exact-balloon level (6.6M) |
 | (4,2) | 2100 m | 71 | TAS21, offset 37 | `r0sxhn..r4sxhn, r4sxh..r15sxh, rxsx`, level -1 (71,5); h70 refuted at level 7 | `room_4_2_exit_frame_71.txt` (seeds 0, 0.5, rnd) | 10-02 | `540871f` | the default offset scan (20-32) found nothing: the player first exists on frame 38 |
@@ -81,6 +81,24 @@ The cost is the concrete search's region, the concrete states the level
 lets into W: a few hundred steps where the bound is the optimum, ~6.5x a
 frame of slack in (7,0), where the objects ladder takes over.
 
+### The platform rooms without `p` (2026-10-25)
+
+`p` and its platform-world table are gone (correctness.md C13): every
+platform result re-proven with the platforms EXACT (room (6,0)'s ten keyed
+by the first one's, `exact::Deps`), release, `--frames C --ceiling`,
+`--prefer` the stored witness, no level -1, on `platforms-exact` merged
+with develop b479001c. Every known route survives every pruning step, and
+every witness is the stored route.
+
+| room | category | level | arc bound | concrete search | found | wall | peak |
+|---|---|---|---|---|---|---|---|
+| (2,1) | any% | `r0sxhn` | 82 | DFS at the bound, 84 steps | 82 | 5:56 | 9.6 GB |
+| (2,1) | nodiag | `r0sxhn` | 85 | DFS, 87 steps | 85 | 3:03 | 6.7 GB |
+| (6,0) | any% | split `r0sxhf` (1.61G visited, 42 key bits) | 70 | DFS, 70 steps | 70 | 11:17 | 18.2 GB |
+| (6,0) | nodiag | split `r0sxhf` | 73 | DFS, 73 steps | 73 | 10:34 | 12.4 GB |
+| (1,2) | any% | `r0sxhn` | 99 | DFS at 99: none (exhaustive, 22k steps); BFS 4.62M steps | 103 | 8:22 | 6.7 GB |
+| (1,2) | nodiag | `r0sxhn,r0sxh,r0sx` (369M visited at level 0) | 109, 113, 113 | DFS at 113, 115 steps | 113 | 1:48 | 5.6 GB |
+
 ## No Diagonal Dashes (2026-10-04 .. 10-08; every improvement submitted)
 
 `--category nodiag`: the cart's diagonal dash arm raises, so a diagonal
@@ -95,14 +113,14 @@ level; witnesses `tas/room_X_Y_nodiag_frame_N.txt`, uploads
 | (2,0) 300m | 95 | 108 (TAS3) | **100, -8** | `r0sxh --to 100` alone (`n` was 2.4x the states): bound 100; 47 min, 36 GB |
 | (3,0) 400m | 89 | 93 (TAS4) | 93, tie | `r0sxhfn,r0sxhn,r0sxh --to 93`, `--region 8,6`: bounds 76, 93; the witness is TAS4's route |
 | (5,0) 600m | 77 | 94 (TAS6) | **93, -1** | no level -1: bounds 91, 93 |
-| (6,0) 700m | 70 | 74 (TAS7) | **73, -1** | split, `r0sxhfp,r0sxh,r0sx`, no level -1: bounds 68, 73; `--to 69` refuted |
+| (6,0) 700m | 70 | 74 (TAS7) | **73, -1** | split, `r0sxhfp,r0sxh,r0sx`, no level -1: bounds 68, 73; `--to 69` refuted. RE-PROVEN 10-25 with the platforms exact: split `r0sxhf` alone, bound 73, 11 min |
 | (7,0) 800m | 84 | 99 (TAS8) | 99, tie | bound 99 at both levels |
 | (0,1) 900m | 100 | 108 (TAS9) | 108, tie | bounds 106, 108 |
-| (2,1) 1100m | 82 | 87 (TAS11) | **85, -2** | `r0sxhnp,r0sxhn`, no level -1: bounds 82, 85. RE-PROVEN 10-21 by `r0sxhn` alone (no `p`, C13): bound 85, 11 min |
+| (2,1) 1100m | 82 | 87 (TAS11) | **85, -2** | `r0sxhnp,r0sxhn`, no level -1: bounds 82, 85. RE-PROVEN 10-25 by `r0sxhn` alone (no `p`, C13): bound 85, 3 min |
 | (5,1) 1400m | 104 | 121 (TAS14) | **119, -2** | level -1 (121,5): bounds 100, 119; level 0 1.02G visited, 62.5M kept at its widest; 60 GB |
 | (6,1) 1500m | 89 | 93 (TAS15) | **92, -1** | split, `r0sxhn`, level -1 (186,5) steps: bound 90; `--to 91` no concrete win (exhaustive); `--to 92` wins |
 | (0,2) 1700m | 81 | 89 (TAS17) | **87, -2** | bound 87 at level 0 |
-| (1,2) 1800m | 103 | 118 (TAS18) | **113, -5** | `r0sxhnp,r0sxhn,r0sxh,r0sx`, no level -1: bounds 107, 109, 113; `--to 112` refuted. Upload 85f (real play) |
+| (1,2) 1800m | 103 | 118 (TAS18) | **113, -5** | `r0sxhnp,r0sxhn,r0sxh,r0sx`, no level -1: bounds 107, 109, 113; `--to 112` refuted. RE-PROVEN 10-25 without `p`: `r0sxhn,r0sxh,r0sx`, bounds 109, 113, 113, 2 min. Upload 85f (real play) |
 | (3,2) 2000m | 128 | 152 (TAS20) | **148, -4** | bounds 133, 148 (the reach filter); exits under TAS20's seeds 0,0,0,0 only; peak 75 GB |
 | (4,2) 2100m | 71 | 71 (TAS21) | 71, tie | the any% recipe (validation) |
 | (5,2) 2200m | 150 | 158 (TAS22) | **157, -1** | `r0sxhn` alone: bound 157 |
@@ -139,7 +157,7 @@ and the upload carries the one that works. Witnesses
 | (2,0) 300m | 103 | 129 | - | `r0sxh` | OPEN: level 0 past 55 GB before level -1 cuts |
 | (3,0) 400m | 61 | 89 | 89 (61f), tie | real play J 3: `r0sxhfn,r0sxhn,r0sxh`, `--to 88` refuted | optimal (the any% witness takes the fruit) |
 | (4,0) 500m | 123 | 153 | **152 (122f), -1** | `r0sxhn,r0sxh`: 152 | optimal; VALID (chest seed -1) |
-| (6,0) 700m | 75 | 99 | - | split `r0sxhfp,r0sxh,r0sx` | OPEN: the arc phase past 55 GB (`f` cannot see that an early dash sends the fruit off) |
+| (6,0) 700m | 75 | 99 | - | split `r0sxhfp,r0sxh,r0sx` | OPEN: the arc phase past 55 GB (`f` cannot see that an early dash sends the fruit off); measured at `p`, not re-run with the platforms exact |
 | (0,1) 900m | 94 | 122 | 122 (94f), tie | 114, 122 | |
 | (3,1) 1200m | 52 | 78 | 78 (52f), tie | `r0sxhf,r0sxh`: 76, 78 | |
 | (4,1) 1300m | 127 | 153 | 153 (127f), tie | 153 | |
@@ -248,8 +266,9 @@ room alone and misses it; Celia models it.
 ```
 
 - The level: `r0sx` without objects; `r0sxhn` with springs, fall floors,
-  balloons, key and chest; `f` for a fly fruit, `p` for platforms
-  (`r0sxhnp`; level -1 refuses `p`). `--split-frame` where the kernels are
+  balloons, key and chest; `f` for a fly fruit. Moving platforms need no
+  flag: they are exact (room (6,0) split `r0sxhf`; (2,1), (1,2) `r0sxhn`).
+  `--split-frame` where the kernels are
   too big ((6,0), (6,1)): `--frames` and level -1's H stay in frames.
 - **The ladder** where the level-0 bound is well below the reference; down
   to `r0sxh` (and `r0sx`) the arc bound is the answer, so a lower horizon

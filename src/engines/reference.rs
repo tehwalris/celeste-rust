@@ -520,10 +520,7 @@ pub fn run_frame_all<'a, A: Arithmetic>(
     // An unknown fly fruit needs nothing here: its `fly` is an unknown boolean
     // (forked below), `step`/`y` the unknown number and `spd.y`/`rem.y`
     // intervals, whose comparisons the domain forks as the kernels' undecided
-    // atoms do. Unknown platforms have no reference form yet.
-    if level.platforms {
-        anyhow::bail!("the reference engine does not run platforms-unknown levels (`p`, plans/abstractions.md)");
-    }
+    // atoms do.
     loop {
         it.d.cursor.reset();
         it.prints.clear();

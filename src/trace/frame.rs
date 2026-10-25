@@ -205,9 +205,6 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     // The BOUNDED inputs (the region's square, speed and remainder; the
     // no-player phase's hulls), each read through its restriction. Nothing
     // seeds the raw cell, so nothing folds the check away.
-    let player = super::shapes::player_path(&st);
-    // The player's raw input position and region, for `Points`.
-    let mut position: [Option<(NodeId, (A::Lit, A::Lit))>; 2] = [None, None];
     for (p, (lo, hi)) in bounds {
         let i = iface.slots.iter().position(|q| q == p).ok_or_else(|| anyhow!("bounded {} is not an input slot", iface::show(p)))?;
         let cell = it.d.graph.leaf(crate::transpile::graph::Op::Cell(i as u32));
@@ -224,13 +221,6 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
         }
         let r = it.d.restrict(cell, *lo, *hi);
         iface::set(&mut st, p, Value::Num(r))?;
-        if let Some(pl) = &player {
-            for (k, f) in super::game::AXES.iter().enumerate() {
-                if p.len() == pl.len() + 1 && p.starts_with(pl) && p[pl.len()] == iface::key(f) {
-                    position[k] = Some((cell, (*lo, *hi)));
-                }
-            }
-        }
     }
     // The engine numbering for the INPUT shape.
     let Some(cache) = it.cache.clone() else { bail!("tracing a frame needs the room's collision cache") };
@@ -241,13 +231,10 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     let mut st = st;
     // The level's widened slots read as the table says, after the input
     // shape, before any read.
-    let owed = super::widen::read_inputs(&mut st, &mut it.d)?;
-    // THE KERNEL'S ADMISSIBLE INPUTS: every pin holds, and what the inputs'
-    // hooks owe; a lane outside is an error of the whole frame.
-    let mut admissible = super::error::pins_hold(&mut it.d);
-    for ob in owed {
-        admissible = it.d.graph.fold(crate::transpile::graph::Op::And, vec![admissible, ob]);
-    }
+    super::widen::read_inputs(&mut st, &mut it.d)?;
+    // THE KERNEL'S ADMISSIBLE INPUTS: every pin holds; a lane outside is an
+    // error of the whole frame.
+    let admissible = super::error::pins_hold(&mut it.d);
     // The arc capture is per FRAME; drop a representative's old one.
     st.arc = if it.arc_capture {
         let (x, y) = (super::state::ArcAxis::none(&mut it.d), super::state::ArcAxis::none(&mut it.d));
@@ -270,9 +257,7 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     }
     // Split selects on conditions a lane can hold undecided, until none is.
     if !it.d.no_known_forks {
-        let points = if it.d.level.platforms { Some(super::split::Points::new(&it.d, position)?) } else { None };
-        let room = crate::transpile::graph::Room { cache: cache.clone() };
-        outs = super::split::split_undecided_selects(&mut it.d, outs, points, Some(&room))?;
+        outs = super::split::split_undecided_selects(&mut it.d, outs)?;
         // The conditions operators were EVALUATED under are read by the error
         // derivation: three-valued, like the guards (unknown reads as error).
         super::split::three_valued_evaluated(&mut it.d, &outs);

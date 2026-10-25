@@ -20,7 +20,7 @@
 
 use celeste_core::arith::Arithmetic;
 
-use crate::runtime2::{collapse_uniform, names, Col, Rt2, AV, NONE};
+use crate::runtime2::{collapse_uniform, names, Cell2, Col, Rt2, AV, NONE};
 
 /// A LEVEL: which objects the forward widens (plans/abstractions.md), on
 /// top of what every level widens (`Flag::Always`: the remainder, and the
@@ -35,22 +35,19 @@ pub struct Level {
     /// `collideable` unknown except where the player overlaps it at the
     /// frame's end, the objects' phases their ranges.
     pub floors_near: bool,
-    /// `p`: every moving platform's `x` and `last` the interval of its whole
-    /// path, its `rem.x` the whole remainder (its phase forgotten).
-    pub platforms: bool,
 }
 
 impl Level {
     /// Every object exact (`r0sx`).
-    pub const EXACT: Level = Level { fruit: false, floors_near: false, platforms: false };
+    pub const EXACT: Level = Level { fruit: false, floors_near: false };
 
-    /// A level from `r0sx[f][n][p]`: the fixed prefix, then the flags in
+    /// A level from `r0sx[f][n]`: the fixed prefix, then the flags in
     /// that order (each absent = exact).
     pub fn parse(spec: &str) -> Result<Level, String> {
         let s = spec.trim();
         let mut rest = s
             .strip_prefix("r0sx")
-            .ok_or_else(|| format!("level {spec:?}: expected r0sx[f][n][p] (the remainder is the arcs', the speed exact)"))?;
+            .ok_or_else(|| format!("level {spec:?}: expected r0sx[f][n] (the remainder is the arcs', the speed exact)"))?;
         if rest.contains('h') {
             return Err(format!("level {spec:?}: `h` was removed: held buttons are widened at every level (plans/correctness.md C7)"));
         }
@@ -63,9 +60,12 @@ impl Level {
                 None => false,
             }
         };
-        let level = Level { fruit: flag('f'), floors_near: flag('n'), platforms: flag('p') };
+        let level = Level { fruit: flag('f'), floors_near: flag('n') };
+        if rest.contains('p') {
+            return Err(format!("level {spec:?}: `p` (widened platforms) was removed: platforms are exact (plans/correctness.md C13)"));
+        }
         if !rest.is_empty() {
-            return Err(format!("level {spec:?}: unexpected {rest:?} (flags are f, n, p in that order)"));
+            return Err(format!("level {spec:?}: unexpected {rest:?} (flags are f, n in that order)"));
         }
         Ok(level)
     }
@@ -75,7 +75,6 @@ impl Level {
             Flag::Always => true,
             Flag::Fruit => self.fruit,
             Flag::Near => self.floors_near,
-            Flag::Platforms => self.platforms,
         }
     }
 
@@ -89,7 +88,7 @@ impl std::fmt::Display for Level {
     /// The spec `parse` reads.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "r0sx")?;
-        for (on, c) in [(self.fruit, 'f'), (self.floors_near, 'n'), (self.platforms, 'p')] {
+        for (on, c) in [(self.fruit, 'f'), (self.floors_near, 'n')] {
             if on {
                 write!(f, "{c}")?;
             }
@@ -107,8 +106,6 @@ pub enum Flag {
     Fruit,
     /// `n`.
     Near,
-    /// `p`.
-    Platforms,
 }
 
 /// Where an entry's slots live.
@@ -150,8 +147,6 @@ pub enum Stored {
     /// A full-period interval (width at least `period`, raw) stored as the
     /// canonical `[0, period]`; owed: the width. A point is left as it is.
     FullPeriod(i32),
-    /// The stored value of the entry's slot named here; owed: equal to it.
-    SameAs(&'static str),
     /// An absent field written as the number 0, in every frame's outcome
     /// whether the level widens or not (it is heap SHAPE): `trace::widen::
     /// materialize_absent_fields`. Nothing on blocks (a row a frame made
@@ -195,17 +190,11 @@ pub enum Hook {
     /// The near floors (`n`): `state`/`collideable` stored as their slots say
     /// EXCEPT where a player certainly overlaps the floor at the frame's end (a
     /// per-lane condition on ANOTHER object's fields); there the cart's
-    /// invariant (hidden: `state` 2, `collideable` false) is stored, owed (with
-    /// `p`: the computed value); mid split frame the computed `collideable` is
-    /// kept in the player's probe window; the input derives `collideable` from
-    /// `state`. Both sides: `Rt2::widen_near_floors`,
-    /// `trace::widen::widen_near_floors`.
+    /// invariant (hidden: `state` 2, `collideable` false) is stored, owed; mid
+    /// split frame the computed `collideable` is kept in the player's probe
+    /// window; the input derives `collideable` from `state`. Both sides:
+    /// `Rt2::widen_near_floors`, `trace::widen::widen_near_floors`.
     NearFloor,
-    /// The moving platforms' INPUT (`p`): which world platform each is, `x`
-    /// restricted to the path and recorded as the world's cell, `spd.x` bound by
-    /// the worlds, `rem.x` the owed literal (`trace::widen::platform_inputs`).
-    /// Their stored values are plain entries.
-    PlatformInputs,
 }
 
 /// One slot of an entry: a field path below the target, what it stores,
@@ -286,14 +275,8 @@ pub fn player_overlaps_floor<N: Arithmetic>(window: [(N, N); 2], x: (N, N), y: (
     lt(xlo, x.0) && lt(x.1, xhi) && lt(ylo, y.0) && lt(y.1, yhi)
 }
 
-/// A moving platform's `x` (and `last`) range in pixels: it wraps between
-/// -16 and 128.
-pub const PLATFORM_PATH: (i16, i16) = (-16, 128);
-
 /// The fly fruit's widened `spd.y` (raw, inclusive).
 pub const FLY_FRUIT_SPD_Y: (i32, i32) = (-0x3_8000, 0x8000);
-
-const PATH_RAW: (i32, i32) = ((PLATFORM_PATH.0 as i32) << 16, (PLATFORM_PATH.1 as i32) << 16);
 
 /// THE TABLE, in the order both sides apply it (the tracer's node order
 /// follows it). plans/abstractions.md lists exactly these entries
@@ -504,35 +487,9 @@ pub static TABLE: &[Entry] = &[
         hook: Some(Hook::NearFloor),
         why: "Each fall floor's `state` [0, 2] and `collideable` unknown, EXCEPT where a player \
               certainly overlaps the floor at the frame's end (there the cart's invariant, hidden, \
-              owed; with `p` the computed value). The input derives `collideable` as `state ~= 2` \
+              owed). The input derives `collideable` as `state ~= 2` \
               (the cart keeps them in step). Refuted by the CONCRETE SEARCH or the ladder \
               `r0sxn,r0sx`.",
-    },
-    Entry {
-        name: "platform path",
-        flag: Flag::Platforms,
-        target: Target::Objects("platform"),
-        slots: &[
-            slot(&["x"], Stored::Range { lo: PATH_RAW.0, hi: PATH_RAW.1 }, Input::Hook),
-            slot(&["last"], Stored::SameAs("x"), Input::Hook),
-        ],
-        kind: Kind::Over,
-        hook: Some(Hook::PlatformInputs),
-        why: "Every moving platform's `x` the interval of its whole path [-16, 128] (the wrap keeps \
-              it inside, proved on the traced select or owed), `last` the same node (`last == x` at \
-              every frame boundary, checked). The worlds (`concrete::platform_worlds`) keep the \
-              platforms mutually consistent (`split::Points`). Refuted by the CONCRETE SEARCH (the \
-              reference engine refuses `p`).",
-    },
-    Entry {
-        name: "platform remainder",
-        flag: Flag::Platforms,
-        target: Target::Objects("platform"),
-        slots: &[slot(&["rem", "x"], Stored::Range { lo: REM.0, hi: REM.1 }, Input::Hook)],
-        kind: Kind::Over,
-        hook: Some(Hook::PlatformInputs),
-        why: "A platform's `rem.x` the whole remainder, read as the literal (owed per lane): a \
-              pixel of slack at this level. Refuted by the CONCRETE SEARCH.",
     },
     Entry {
         name: "balloon offset",
@@ -570,6 +527,99 @@ pub static TABLE: &[Entry] = &[
     },
 ];
 
+/// A CLOCK: objects whose every field is a function of the time since the
+/// room loaded (each moves on its own, nothing else writes it). They are
+/// EXACT at every level; where a shape holds two or more, a few fields of
+/// the FIRST instance key them all (`leads`, in order): every other value
+/// cell of every instance is a FOLLOWER of one of them (`exact::Deps`,
+/// `key_deps`) and carries no key bits. Nothing is widened: a follower's
+/// code is recorded per leader code and every row is checked against it
+/// wherever a key is formed, a difference FATAL (`exact`'s module doc), so
+/// `why` is checked, never trusted.
+pub struct Clock {
+    pub objects: &'static str,
+    pub leads: &'static [Lead],
+    pub why: &'static str,
+}
+
+/// A leader: a field of a clock's first instance, and what follows it.
+pub struct Lead {
+    pub field: &'static [&'static str],
+    pub follows: Follows,
+}
+
+pub enum Follows {
+    /// The same field of every other instance.
+    SameField,
+    /// Every value cell of every instance that no earlier lead holds.
+    Rest,
+}
+
+pub const CLOCKS: &[Clock] = &[Clock {
+    objects: "platform",
+    leads: &[Lead { field: &["spd", "x"], follows: Follows::SameField }, Lead { field: &["rem", "x"], follows: Follows::Rest }],
+    why: "A platform moves `dir * 0.65` an update (`move`: `rem.x` the sub-pixel remainder, `x` \
+          the pixels, wrapping between -16 and 128), `last` is `x` after its update, `spd.x` is \
+          set from `dir` by the update; nothing but its own update writes them, so every \
+          platform is a function of the updates since the room loaded (a restart reloads them \
+          all). `rem.x` steps by +-0x0000a666 modulo 1, so no value repeats within 32768 \
+          updates - except the first: `move` reads `spd.x` before the first update sets it, so \
+          that update leaves `rem.x` (and everything but `spd.x`) as loaded. `spd.x` is 0 only \
+          before it: `spd.x` tells those two apart and leads the other `spd.x`s, `rem.x` leads \
+          the rest.",
+}];
+
+/// The key dependencies `rt2`'s shape declares (`CLOCKS`), from its names:
+/// none where no clock has two or more instances.
+pub fn key_deps<N: Arithmetic>(rt2: &Rt2<N>) -> Vec<crate::exact::Deps> {
+    let mut out = Vec::new();
+    for clock in CLOCKS {
+        let ty = celeste_names::global(clock.objects);
+        let objs = rt2.objects_of_type(ty);
+        if objs.len() < 2 {
+            continue;
+        }
+        let path = |field: &[&str]| -> Vec<u32> { field.iter().map(|n| celeste_names::field(n)).collect() };
+        let cell = |obj: u32, field: &[&str]| rt2.slot_cell(Some(obj), &path(field)).unwrap_or_else(|| panic!("clock {}: an instance has no `{}`", clock.objects, field.join(".")));
+        let leaders: Vec<u32> = clock.leads.iter().map(|l| cell(objs[0], l.field)).collect();
+        let mut taken: std::collections::BTreeSet<u32> = leaders.iter().copied().collect();
+        for (lead, &leader) in clock.leads.iter().zip(&leaders) {
+            let mut followers: Vec<u32> = match lead.follows {
+                Follows::SameField => objs[1..].iter().map(|&o| cell(o, lead.field)).collect(),
+                Follows::Rest => objs.iter().flat_map(|&o| rt2.own_value_cells(o)).collect(),
+            };
+            followers.sort_unstable();
+            followers.dedup();
+            followers.retain(|c| !taken.contains(c));
+            taken.extend(followers.iter().copied());
+            out.push(crate::exact::Deps { leader, followers });
+        }
+    }
+    out
+}
+
+impl<N: Arithmetic> Rt2<N> {
+    /// An object's own value cells: its value fields and those of the
+    /// tables they point to (`rem`, `spd`, `hitbox`, ...), not its `type`'s.
+    fn own_value_cells(&self, obj: u32) -> Vec<u32> {
+        let val = |c: u32| matches!(self.structure[c as usize], Cell2::Val);
+        let mut out = Vec::new();
+        let Cell2::Obj(fields) = &self.structure[obj as usize] else { return out };
+        for &(name, cell) in fields.iter().filter(|f| val(f.1)) {
+            out.push(cell);
+            if name == names().type_ {
+                continue;
+            }
+            if let Col::U(AV::Ptr(sub)) = self.cols[cell as usize] {
+                if let Cell2::Obj(sub_fields) = &self.structure[sub as usize] {
+                    out.extend(sub_fields.iter().map(|f| f.1).filter(|&c| val(c)));
+                }
+            }
+        }
+        out
+    }
+}
+
 /// The `AbsentAsZero` slots: `(type global, field)`.
 pub fn absent_as_zero() -> impl Iterator<Item = (&'static str, &'static str)> {
     TABLE.iter().filter_map(|e| match (e.target, e.slots) {
@@ -601,7 +651,6 @@ impl std::fmt::Display for Stored {
             Stored::Num(k) => write!(f, "{} (dead)", show_raw(*k)),
             Stored::Bool(b) => write!(f, "{b} (dead)"),
             Stored::FullPeriod(p) => write!(f, "a full period as [0, {}]; owed: the width", show_raw(*p)),
-            Stored::SameAs(x) => write!(f, "`{x}`'s; owed: equal to `{x}`"),
             Stored::AbsentAsZero => write!(f, "0 where absent"),
         }
     }
@@ -629,7 +678,6 @@ pub fn render_markdown() -> String {
             Flag::Always => "every",
             Flag::Fruit => "`f`",
             Flag::Near => "`n`",
-            Flag::Platforms => "`p`",
         };
         let target = match e.target {
             Target::Objects(t) => format!("`{t}`"),
@@ -764,90 +812,65 @@ pub trait Widener {
     /// Where a slot lives.
     type Place;
     type Val;
-    /// What a widening owes, as the target records it.
-    type Owed: Clone;
     type N: Arithmetic;
 
     fn instances(&mut self, ei: usize) -> anyhow::Result<Vec<Self::Instance>>;
     /// Slot `k` of the instance (`None`: absent).
     fn slot(&mut self, ei: usize, at: &Self::Instance, k: usize) -> anyhow::Result<Option<Self::Place>>;
-    fn read(&mut self, p: &Self::Place) -> Self::Val;
     fn write(&mut self, p: &Self::Place, v: Self::Val) -> anyhow::Result<()>;
     fn check(&mut self, ei: usize, p: &Self::Place, holds: Holds) -> anyhow::Result<()>;
     fn value(&mut self, v: Lit<Self::N>) -> Self::Val;
     /// `max(v, m)` of the slot's number, the cart's (a double's tie, `-0`
     /// against `0`, gives `m`).
     fn at_least(&mut self, ei: usize, p: &Self::Place, m: Self::N) -> anyhow::Result<Self::Val>;
-    /// Owe the slot's number inside `[lo, hi]` (`None`: proved).
-    fn owe_inside(&mut self, ei: usize, p: &Self::Place, lo: Self::N, hi: Self::N) -> anyhow::Result<Option<Self::Owed>>;
+    /// Owe the slot's number inside `[lo, hi]` (nothing where proved).
+    fn owe_inside(&mut self, ei: usize, p: &Self::Place, lo: Self::N, hi: Self::N) -> anyhow::Result<()>;
     /// Slot `k`'s `Band` (`radius` around the instance's constant field
-    /// `around`), owed as `owe_inside`; and the band.
-    fn band(&mut self, ei: usize, k: usize, at: &Self::Instance, p: &Self::Place, radius: Self::N) -> anyhow::Result<(Option<Self::Owed>, Self::Val)>;
+    /// `around`), owed as `owe_inside`; the band.
+    fn band(&mut self, ei: usize, k: usize, at: &Self::Instance, p: &Self::Place, radius: Self::N) -> anyhow::Result<Self::Val>;
     /// Is the slot's number a point on every lane?
     fn exact(&mut self, ei: usize, p: &Self::Place) -> anyhow::Result<bool>;
     /// Owe the slot's width at least `period`.
-    fn owe_width(&mut self, ei: usize, p: &Self::Place, period: Self::N) -> anyhow::Result<Self::Owed>;
-    /// A `SameAs` slot is its twin, both before widening.
-    fn same(&mut self, ei: usize, p: &Self::Place, twin: &Self::Place) -> anyhow::Result<()>;
-    /// Owe the twin's obligation again, at a `SameAs` slot.
-    fn reowe(&mut self, p: &Self::Place, owed: Self::Owed);
-    /// `Hook::NearFloor`, per side (they differ mid split frame and with the
-    /// platforms unknown; their comments).
+    fn owe_width(&mut self, ei: usize, p: &Self::Place, period: Self::N) -> anyhow::Result<()>;
+    /// `Hook::NearFloor`, per side (they differ mid split frame; their
+    /// comments).
     fn near_floors(&mut self, ei: usize) -> anyhow::Result<()>;
 }
 
 /// THE OUTPUT SIDE, both targets: `level`'s entries (`TABLE`, in order)
 /// applied to `w`, per instance, per slot in order.
 pub fn widen_level<W: Widener>(w: &mut W, level: Level) -> anyhow::Result<()> {
-    type Step<W> = (Option<<W as Widener>::Owed>, Option<<W as Widener>::Val>);
     /// A slot checked, then overwritten by a literal.
-    fn checked<W: Widener>(w: &mut W, ei: usize, p: &W::Place, holds: Holds, v: Lit<W::N>) -> anyhow::Result<Step<W>> {
+    fn checked<W: Widener>(w: &mut W, ei: usize, p: &W::Place, holds: Holds, v: Lit<W::N>) -> anyhow::Result<Option<W::Val>> {
         w.check(ei, p, holds)?;
-        Ok((None, Some(w.value(v))))
+        Ok(Some(w.value(v)))
     }
     for (ei, e) in TABLE.iter().enumerate().filter(|(_, e)| level.has(e.flag)) {
         if e.hook == Some(Hook::NearFloor) {
             w.near_floors(ei)?;
             continue;
         }
-        let twin = |other: &str| e.slots.iter().position(|t| t.field == [other]).expect("SameAs names a slot of its entry");
         for at in w.instances(ei)? {
             let places: Vec<Option<W::Place>> = (0..e.slots.len()).map(|k| w.slot(ei, &at, k)).collect::<anyhow::Result<_>>()?;
-            let present = |k: usize| places[k].as_ref().ok_or_else(|| anyhow::anyhow!("widening {:?}: no `{}`", e.name, e.slots[k].field.join(".")));
-            for (k, s) in e.slots.iter().enumerate() {
-                if let (Stored::SameAs(other), Some(p)) = (s.stored, &places[k]) {
-                    w.same(ei, p, present(twin(other))?)?;
-                }
-            }
-            // Per slot, what it owes (a `SameAs` owes its twin's).
-            let mut owed: Vec<Option<W::Owed>> = Vec::with_capacity(e.slots.len());
             for (k, s) in e.slots.iter().enumerate() {
                 let Some(p) = &places[k] else {
                     anyhow::ensure!(s.optional, "widening {:?}: no `{}`", e.name, s.field.join("."));
-                    owed.push(None);
                     continue;
                 };
-                let (o, new): Step<W> = match s.stored {
+                let new = match s.stored {
                     Stored::Range { lo, hi } => {
                         let (lo, hi) = range::<W::N>(lo, hi);
-                        (w.owe_inside(ei, p, lo, hi)?, Some(w.value(Lit::Ival(lo, hi))))
+                        w.owe_inside(ei, p, lo, hi)?;
+                        Some(w.value(Lit::Ival(lo, hi)))
                     }
-                    Stored::Band { radius, .. } => {
-                        let (o, v) = w.band(ei, k, &at, p, constant(radius))?;
-                        (o, Some(v))
+                    Stored::Band { radius, .. } => Some(w.band(ei, k, &at, p, constant(radius))?),
+                    Stored::AtLeast(m) => Some(w.at_least(ei, p, constant(m))?),
+                    Stored::FullPeriod(_) if w.exact(ei, p)? => None,
+                    Stored::FullPeriod(period) => {
+                        w.owe_width(ei, p, constant(period))?;
+                        Some(w.value(Lit::Ival(constant(0), constant(period))))
                     }
-                    Stored::AtLeast(m) => (None, Some(w.at_least(ei, p, constant(m))?)),
-                    Stored::FullPeriod(_) if w.exact(ei, p)? => (None, None),
-                    Stored::FullPeriod(period) => (Some(w.owe_width(ei, p, constant(period))?), Some(w.value(Lit::Ival(constant(0), constant(period))))),
-                    Stored::SameAs(other) => {
-                        let j = twin(other);
-                        if let Some(o) = &owed[j] {
-                            w.reowe(p, o.clone());
-                        }
-                        // Widened before: the twin comes first in its entry.
-                        (owed[j].clone(), Some(w.read(present(j)?)))
-                    }
-                    Stored::AbsentAsZero => (None, None),
+                    Stored::AbsentAsZero => None,
                     Stored::Phase { lo, hi } => checked(w, ei, p, Holds::Number, Lit::Ival(constant(lo), constant(hi)))?,
                     Stored::UnknownNum { countdown } => checked(w, ei, p, Holds::NumberOrUnknown, Lit::UnknownNum { countdown })?,
                     Stored::UnknownBool => checked(w, ei, p, Holds::Boolean, Lit::UnknownBool)?,
@@ -857,7 +880,6 @@ pub fn widen_level<W: Widener>(w: &mut W, level: Level) -> anyhow::Result<()> {
                 if let Some(v) = new {
                     w.write(p, v)?;
                 }
-                owed.push(o);
             }
         }
     }
@@ -908,7 +930,6 @@ impl<N: Arithmetic> Widener for Rt2<N> {
     type Instance = Option<u32>;
     type Place = u32;
     type Val = Col<N>;
-    type Owed = ();
     type N = N;
 
     fn instances(&mut self, ei: usize) -> anyhow::Result<Vec<Option<u32>>> {
@@ -919,9 +940,6 @@ impl<N: Arithmetic> Widener for Rt2<N> {
     }
     fn slot(&mut self, ei: usize, at: &Option<u32>, k: usize) -> anyhow::Result<Option<u32>> {
         Ok(self.slot_cell(*at, &resolved()[ei].fields[k]))
-    }
-    fn read(&mut self, c: &u32) -> Col<N> {
-        self.cols[*c as usize].clone()
     }
     fn write(&mut self, c: &u32, v: Col<N>) -> anyhow::Result<()> {
         self.cols[*c as usize] = v;
@@ -956,12 +974,11 @@ impl<N: Arithmetic> Widener for Rt2<N> {
             col => collapse_uniform(crate::runtime2::compress_num_v((0..self.width).map(|l| at_least(col.at(l))).collect::<anyhow::Result<_>>()?)),
         })
     }
-    fn owe_inside(&mut self, ei: usize, c: &u32, lo: N, hi: N) -> anyhow::Result<Option<()>> {
+    fn owe_inside(&mut self, ei: usize, c: &u32, lo: N, hi: N) -> anyhow::Result<()> {
         let le = N::le;
-        self.check_lanes(ei, *c, "outside the widening", |v| span(v).is_some_and(|(a, b)| le(lo, a) && le(b, hi)))?;
-        Ok(None)
+        self.check_lanes(ei, *c, "outside the widening", |v| span(v).is_some_and(|(a, b)| le(lo, a) && le(b, hi)))
     }
-    fn band(&mut self, ei: usize, k: usize, at: &Option<u32>, c: &u32, r: N) -> anyhow::Result<(Option<()>, Col<N>)> {
+    fn band(&mut self, ei: usize, k: usize, at: &Option<u32>, c: &u32, r: N) -> anyhow::Result<Col<N>> {
         let name = TABLE[ei].name;
         let le = N::le;
         let f = resolved()[ei].around[k].expect("a band's centre field");
@@ -980,7 +997,7 @@ impl<N: Arithmetic> Widener for Rt2<N> {
             anyhow::ensure!(span(v).is_some_and(|(a, b)| le(lo, a) && le(b, hi)), "widening {name:?}: lane {lane} holds {v:?}, outside the band [{lo:?}, {hi:?}]");
             band.push((lo, hi));
         }
-        Ok((None, collapse_uniform(Col::I(band))))
+        Ok(collapse_uniform(Col::I(band)))
     }
     fn exact(&mut self, _ei: usize, c: &u32) -> anyhow::Result<bool> {
         Ok((0..self.width).all(|lane| matches!(self.cols[*c as usize].at(lane), AV::Num(_))))
@@ -989,13 +1006,6 @@ impl<N: Arithmetic> Widener for Rt2<N> {
         let le = N::le;
         self.check_lanes(ei, *c, "not a full period", |v| matches!(v, AV::Ival(lo, hi) if N::sub(hi, lo).is_some_and(|w| le(period, w))))
     }
-    fn same(&mut self, ei: usize, c: &u32, twin: &u32) -> anyhow::Result<()> {
-        let s = &TABLE[ei].slots;
-        let at = |c: u32| (0..self.width).map(|lane| self.cols[c as usize].at(lane)).collect::<Vec<_>>();
-        anyhow::ensure!(at(*c) == at(*twin), "widening {:?}: a row where a `SameAs` slot ({}) is not its twin", TABLE[ei].name, s.iter().map(|s| s.field.join(".")).collect::<Vec<_>>().join(", "));
-        Ok(())
-    }
-    fn reowe(&mut self, _c: &u32, _owed: ()) {}
     fn near_floors(&mut self, ei: usize) -> anyhow::Result<()> {
         self.widen_near_floors(&resolved()[ei]);
         Ok(())
@@ -1005,8 +1015,8 @@ impl<N: Arithmetic> Widener for Rt2<N> {
 impl<N: Arithmetic> Rt2<N> {
     /// `Hook::NearFloor` on blocks (`trace::widen::widen_near_floors`): `state`
     /// and `collideable` widened except where a player certainly overlaps the
-    /// floor (kept as they are: the kernels store the cart's invariant there, or
-    /// with `p` the computed value - either is what a concrete row holds).
+    /// floor (kept as they are: the kernels store the cart's invariant there,
+    /// which is what a concrete row holds).
     fn widen_near_floors(&mut self, r: &Resolved) {
         let le = N::le;
         let (slo, shi) = range::<N>(FLOOR_STATE_RANGE.0, FLOOR_STATE_RANGE.1);
@@ -1073,11 +1083,11 @@ mod tests {
     #[test]
     fn levels_parse_and_print() {
         assert_eq!(Level::parse("r0sx").unwrap(), Level::EXACT);
-        for spec in ["r0sx", "r0sxf", "r0sxn", "r0sxnp", "r0sxfn"] {
+        for spec in ["r0sx", "r0sxf", "r0sxn", "r0sxfn"] {
             assert_eq!(Level::parse(spec).unwrap().to_string(), spec);
         }
         let n = Level::parse("r0sxn").unwrap();
-        assert!(n.floors_near && !n.fruit && !n.platforms);
+        assert!(n.floors_near && !n.fruit);
         // `h` is gone: the buttons are widened at every level.
         for spec in ["r0sxh", "r0sxhn", "r0sxnh", "r0sxfhn"] {
             let e = Level::parse(spec).expect_err("`h`");
@@ -1089,7 +1099,11 @@ mod tests {
         assert!(Level::parse("r0s16").is_err());
         assert!(Level::parse("y2r0sx").is_err());
         assert!(Level::parse("r0sxb").is_err(), "floors unknown `b` is gone");
-        assert!(Level::parse("r0sxpn").is_err(), "flags in order");
+        assert!(Level::parse("r0sxnf").is_err(), "flags in order");
+        for spec in ["r0sxnp", "r0sxfp", "r0sxp"] {
+            let e = Level::parse(spec).expect_err("`p` is gone");
+            assert!(e.contains("`p` (widened platforms) was removed: platforms are exact"), "{spec}: {e}");
+        }
     }
 
     /// `floor_player_window` is the cart's `floor.collide(player, 0, 0)` at
@@ -1131,18 +1145,9 @@ mod tests {
         assert!(doc[a..b] == want, "plans/abstractions.md does not list the widening table; regenerate with CELESTE_REGENERATE=1 (this test), then review:\n{want}");
     }
 
-    /// Every name in the table resolves, and a `SameAs` names an earlier
-    /// slot of its entry (the block side reads its widened value).
+    /// Every name in the table resolves.
     #[test]
     fn the_table_resolves() {
         assert_eq!(resolved().len(), TABLE.len());
-        for e in TABLE {
-            for (k, s) in e.slots.iter().enumerate() {
-                if let Stored::SameAs(other) = s.stored {
-                    let j = e.slots.iter().position(|t| t.field == [other]).expect("SameAs names a slot");
-                    assert!(j < k, "{}: SameAs({other}) must follow it", e.name);
-                }
-            }
-        }
     }
 }

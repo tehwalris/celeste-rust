@@ -9,7 +9,7 @@
 use anyhow::{anyhow, bail, Result};
 
 use celeste_engine::widening::{range, widen_level, Holds, Lit, Widener, TABLE};
-use celeste_engine::widening::{floor_player_window, Entry, Hook, Input, Level, Slot, Stored, Target, FLOOR_HITBOX, PLATFORM_PATH, PLAYER_HITBOX, REM};
+use celeste_engine::widening::{floor_player_window, Entry, Hook, Input, Level, Slot, Stored, Target, FLOOR_HITBOX, PLAYER_HITBOX};
 
 use super::domain::{Domain, Symbolic};
 use super::heap::Value;
@@ -103,7 +103,7 @@ pub fn stores_widened(s: &Slot) -> bool {
 /// boolean slot a lane may hold unknown), read as stored?
 pub fn interval_input(s: &Slot) -> bool {
     matches!(s.input, Input::Stored | Input::Literal | Input::Hook)
-        && matches!(s.stored, Stored::Range { .. } | Stored::Band { .. } | Stored::Phase { .. } | Stored::UnknownBool | Stored::SameAs(_))
+        && matches!(s.stored, Stored::Range { .. } | Stored::Band { .. } | Stored::Phase { .. } | Stored::UnknownBool)
 }
 
 /// A table RANGE `[lo, hi]` (raw 16.16) as one graph literal, as the block
@@ -162,7 +162,6 @@ impl<A: GraphArith> Widener for Out<'_, A> {
     type Instance = Path;
     type Place = Path;
     type Val = Value<Symbolic<A>>;
-    type Owed = NodeId;
     type N = A;
 
     fn instances(&mut self, ei: usize) -> Result<Vec<Path>> {
@@ -174,9 +173,6 @@ impl<A: GraphArith> Widener for Out<'_, A> {
     fn slot(&mut self, ei: usize, at: &Path, k: usize) -> Result<Option<Path>> {
         let p = field(at, TABLE[ei].slots[k].field);
         Ok(iface::get(self.st, &p).is_some().then_some(p))
-    }
-    fn read(&mut self, p: &Path) -> Value<Symbolic<A>> {
-        iface::get(self.st, p).expect("a present slot")
     }
     fn write(&mut self, p: &Path, v: Value<Symbolic<A>>) -> Result<()> {
         iface::set(self.st, p, v)
@@ -204,30 +200,29 @@ impl<A: GraphArith> Widener for Out<'_, A> {
         let m = self.d.num(m);
         Ok(Value::Num(self.d.fun2(super::domain::Fun2::Max, &v, &m)?))
     }
-    fn owe_inside(&mut self, ei: usize, p: &Path, lo: A, hi: A) -> Result<Option<NodeId>> {
+    fn owe_inside(&mut self, ei: usize, p: &Path, lo: A, hi: A) -> Result<()> {
         let v = self.num(ei, p)?;
-        let owed = contain(self.d, v, (lo, hi));
-        if let Some(h) = owed {
+        if let Some(h) = contain(self.d, v, (lo, hi)) {
             owe(&mut self.errs, self.d, p, h);
         }
-        Ok(owed)
+        Ok(())
     }
     /// The centre a shape's constant: the band a literal.
-    fn band(&mut self, ei: usize, k: usize, at: &Path, p: &Path, r: A) -> Result<(Option<NodeId>, Value<Symbolic<A>>)> {
+    fn band(&mut self, ei: usize, k: usize, at: &Path, p: &Path, r: A) -> Result<Value<Symbolic<A>>> {
         let Stored::Band { around, .. } = TABLE[ei].slots[k].stored else { bail!("widening {:?}: slot {k} is not a band", TABLE[ei].name) };
         let sp = field(at, &[around]);
         let Some(Value::Num(centre)) = iface::get(self.st, &sp) else { bail!("{}: not a number", iface::show(&sp)) };
         let Some(c) = self.d.as_const(&centre) else { bail!("{}: not a constant", iface::show(&sp)) };
         // As the block side: `s - radius`, `s + radius` in the arithmetic.
         let (Some(lo), Some(hi)) = (A::sub(c, r), A::add(c, r)) else { bail!("{}: the band {c:?} +- {r:?} leaves {}", iface::show(p), A::RANGE_NOTE) };
-        let owed = self.owe_inside(ei, p, lo, hi)?;
-        Ok((owed, self.value(Lit::Ival(lo, hi))))
+        self.owe_inside(ei, p, lo, hi)?;
+        Ok(self.value(Lit::Ival(lo, hi)))
     }
     fn exact(&mut self, ei: usize, p: &Path) -> Result<bool> {
         let v = self.num(ei, p)?;
         Ok(!self.d.is_interval(&v))
     }
-    fn owe_width(&mut self, ei: usize, p: &Path, period: A) -> Result<NodeId> {
+    fn owe_width(&mut self, ei: usize, p: &Path, period: A) -> Result<()> {
         let v = self.num(ei, p)?;
         let g = &mut self.d.graph;
         let (lo, hi) = (g.fold(Op::Lo, vec![v]), g.fold(Op::Hi, vec![v]));
@@ -236,21 +231,7 @@ impl<A: GraphArith> Widener for Out<'_, A> {
         let full_period = g.leaf(Op::Const(k, k));
         let full = g.fold(Op::Ge, vec![width, full_period]);
         owe(&mut self.errs, self.d, p, full);
-        Ok(full)
-    }
-    fn same(&mut self, ei: usize, p: &Path, twin: &Path) -> Result<()> {
-        anyhow::ensure!(
-            iface::get(self.st, p) == iface::get(self.st, twin),
-            "{}: not {} at the frame's end (widening {:?})",
-            iface::show(p),
-            iface::show(twin),
-            TABLE[ei].name
-        );
         Ok(())
-    }
-    /// The two being one node at every frame's end.
-    fn reowe(&mut self, p: &Path, h: NodeId) {
-        owe(&mut self.errs, self.d, p, h);
     }
     fn near_floors(&mut self, ei: usize) -> Result<()> {
         widen_near_floors(self.st, self.d, &TABLE[ei], &mut self.errs, self.mid)
@@ -276,11 +257,8 @@ fn contain<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, (lo, hi): (A, A)) -> O
 }
 
 /// The INPUT side: every entry of the tracer's level read as its slots'
-/// `Input` says, in table order, before the frame reads anything. Returned:
-/// what the platforms' hook owes per lane beyond its pins (the no-player
-/// speed), which the caller makes an error of the whole frame.
-pub fn read_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>) -> Result<Vec<NodeId>> {
-    let mut obligations = Vec::new();
+/// `Input` says, in table order, before the frame reads anything.
+pub fn read_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>) -> Result<()> {
     let mid = mid_frame(st);
     // A near level reads an absent countdown as the unknown number too: the
     // absent field is 0 (`Stored::AbsentAsZero`), which the unknown holds.
@@ -288,15 +266,9 @@ pub fn read_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<
     if d.level.floors_near && !mid {
         materialize_absent_fields(st, d)?;
     }
-    let mut platforms_read = false;
     for e in d.level.entries() {
         match e.hook {
             Some(Hook::NearFloor) => read_near_floors(st, d, e, mid)?,
-            Some(Hook::PlatformInputs) => {
-                if !std::mem::replace(&mut platforms_read, true) {
-                    obligations.extend(platform_inputs(st, d)?);
-                }
-            }
             None => {
                 for paths in entry_paths(st, e) {
                     for (s, p) in e.slots.iter().zip(&paths) {
@@ -306,11 +278,11 @@ pub fn read_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<
             }
         }
     }
-    Ok(obligations)
+    Ok(())
 }
 
-/// An input `v` READ AS the literal `[lo, hi]` (`Input::Literal`, a
-/// platform's `rem.x`): pinned to it (`Op::Pin`, the input disconnected, its
+/// An input `v` READ AS the literal `[lo, hi]` (`Input::Literal`, the fly
+/// fruit's `rem.y`): pinned to it (`Op::Pin`, the input disconnected, its
 /// check `v` inside the literal), unless the graph proves it inside.
 fn pin_literal<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, lo: i32, hi: i32) {
     let (l, h) = range::<A>(lo, hi);
@@ -399,8 +371,7 @@ pub const PLAYER_PROBE: [(i16, i16); 2] = [(-3, 3), (-1, 0)];
 /// floor stores the CART'S INVARIANT (hidden: `state` 2, `collideable`
 /// false, the player cannot be inside a solid floor), with the computed
 /// value owed (storing the computed value makes the split resolve every
-/// floor the player MIGHT overlap: 30x the outcomes); with the platforms
-/// unknown, the computed value (below). Mid split frame (`mid`),
+/// floor the player MIGHT overlap: 30x the outcomes). Mid split frame (`mid`),
 /// `collideable` also stays computed in the `PLAYER_PROBE` window: widening
 /// there would let the second step reach states the unsplit frame does not.
 /// `Rt2::widen_to` agrees.
@@ -474,18 +445,12 @@ fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symboli
         let apart = d.not(&overlap);
         let two = d.int(2);
         let range = ival(d, slo, shi);
-        // With the platforms unknown, the overlapped floor stores what the frame
-        // COMPUTED instead (exact, nothing owed): there the hidden invariant failed
-        // on every lane of the spawn's first player frame (room (2,1);
-        // plans/architecture.md "Open issues"). `Rt2::widen_to` agrees (it keeps
-        // an overlapped floor's values as they are).
-        let computed = d.level.platforms;
-        let state = d.sel_num(&overlap, if computed { &state } else { &two }, &range);
+        let state = d.sel_num(&overlap, &two, &range);
         iface::set(st, ps, Value::Num(state))?;
         let Some(Value::Bool(coll)) = iface::get(st, pc) else { bail!("{}: not a boolean", iface::show(pc)) };
         // Owed at the frame's END only: mid-frame the shaking floor's
         // `delay - 1 <= 0` is not split yet and would decline valid lanes.
-        if !mid && !computed {
+        if !mid {
             let passable = d.not(&coll);
             let held = d.or(&apart, &passable);
             owe(errs, d, pc, held);
@@ -493,103 +458,10 @@ fn widen_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symboli
         let (unknown, absent) = (d.unknown_bool_output(), d.boolean(false));
         // Mid-frame, in the probe window: the computed `collideable`, kept.
         let unread = if mid { d.sel_bool(&probe, &coll, &unknown) } else { unknown };
-        let coll = d.sel_bool(&overlap, if computed { &coll } else { &absent }, &unread);
+        let coll = d.sel_bool(&overlap, &absent, &unread);
         iface::set(st, pc, Value::Bool(coll))?;
     }
     Ok(())
-}
-
-/// `Hook::PlatformInputs`: the platforms' INPUT side at a platforms-unknown
-/// level. Which world platform each is, by constant `y` and `dir`; `x` an
-/// input cell restricted to the path (`Op::Restrict`) and recorded as the
-/// world's cell, so the split decides player-vs-platform comparisons per
-/// PLATFORM WORLD, keeping platforms mutually consistent; `last` read as `x`
-/// (checked at the output, `Stored::SameAs`); `rem.x` the literal whole
-/// remainder (`Input::Literal`: a literal's floor rejoins as fragments, at a
-/// pixel of slack); each unpinned `spd.x` through its range over the worlds,
-/// with no player as the literal of its one moving speed. Not table slots:
-/// all of it is per WORLD, which a slot cannot say. Returned: the per-lane
-/// obligation of each no-player speed (`0` or its one moving speed: a
-/// two-point set no single `Pin` states).
-pub fn platform_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>) -> Result<Vec<NodeId>> {
-    let table = d.worlds.clone().ok_or_else(|| anyhow::anyhow!("the platforms are unknown but there is no world table"))?;
-    let worlds = &table.0;
-    let platforms = objects_of_type(st, "platform");
-    let first = worlds.first().ok_or_else(|| anyhow::anyhow!("no platform world"))?;
-    anyhow::ensure!(first.len() == platforms.len(), "a platform world has {} platforms, the state {}", first.len(), platforms.len());
-    fn konst<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, p: &Path) -> Result<A> {
-        match iface::get(st, p) {
-            Some(Value::Num(n)) => match d.graph.point(n) {
-                Some(v) => Ok(v),
-                None => bail!("{}: a platform's {} is not a known constant ({:?})", iface::show(p), iface::show(p), d.graph.get(n).op),
-            },
-            _ => bail!("{}: not a number", iface::show(p)),
-        }
-    }
-    let mut taken = vec![false; platforms.len()];
-    let mut cells: Vec<Option<NodeId>> = vec![None; platforms.len()];
-    let mut obligations = Vec::new();
-    for obj in &platforms {
-        let (y, dir) = (konst(st, d, &field(obj, &["y"]))?, konst(st, d, &field(obj, &["dir"]))?);
-        let j = (0..first.len())
-            .find(|&j| !taken[j] && first[j][4] == y && first[j][5] == dir)
-            .ok_or_else(|| anyhow::anyhow!("no platform world entry at y {} dir {} left for {}", A::show(y), A::show(dir), iface::show(obj)))?;
-        taken[j] = true;
-        let spd = field(obj, &["spd", "x"]);
-        // Its distinct moving speeds (by bits; a double's `-0` would not
-        // be moving either).
-        let zero = A::from_i16(0);
-        let moving: Vec<A> = {
-            let mut v: Vec<A> = Vec::new();
-            for s in worlds.iter().map(|w| w[j][3]).filter(|s| !A::num_eq(*s, zero)) {
-                if !v.contains(&s) {
-                    v.push(s);
-                }
-            }
-            v
-        };
-        if let (Some(Value::Num(sv)), None, [v]) = (iface::get(st, &spd), super::shapes::player_path(st), moving.as_slice()) {
-            // NO PLAYER: a platform's move is unobservable, so read the speed
-            // as the literal (fragments, not a fork per platform); asserted
-            // per lane that the speed is 0 or that one.
-            if matches!(d.graph.get(sv).op, Op::Cell(_)) {
-                let (z, k) = (A::lit(zero), A::lit(*v));
-                let (k0, kv) = (d.graph.leaf(Op::Const(z, z)), d.graph.leaf(Op::Const(k, k)));
-                let (a, b) = (d.graph.fold(Op::Eq, vec![sv, k0]), d.graph.fold(Op::Eq, vec![sv, kv]));
-                obligations.push(d.graph.fold(Op::Or, vec![a, b]));
-                iface::set(st, &spd, Value::Num(kv))?;
-            }
-        } else if let Some(Value::Num(sv)) = iface::get(st, &spd) {
-            if matches!(d.graph.get(sv).op, Op::Cell(_)) {
-                // The hull in the total order (`-0` below `0`), as an
-                // interval's ends are.
-                let speeds = || worlds.iter().map(|w| w[j][3]);
-                let order = |a: &A, b: &A| a.to_f64().total_cmp(&b.to_f64());
-                let lo = speeds().min_by(order).expect("a world");
-                let hi = speeds().max_by(order).expect("a world");
-                let r = d.restrict(sv, A::lit(lo), A::lit(hi));
-                iface::set(st, &spd, Value::Num(r))?;
-            }
-        }
-        let (x, last, rem) = (field(obj, &["x"]), field(obj, &["last"]), field(obj, &[super::game::REM, "x"]));
-        let Some(Value::Num(xv)) = iface::get(st, &x) else { bail!("{}: not a number", iface::show(&x)) };
-        anyhow::ensure!(matches!(d.graph.get(xv).op, Op::Cell(_)), "a platform's `x` must be an input cell");
-        let (plo, phi) = (A::from_i16(PLATFORM_PATH.0), A::from_i16(PLATFORM_PATH.1));
-        let xr = d.restrict(xv, A::lit(plo), A::lit(phi));
-        // An integer in every world (checked where the worlds are made).
-        d.frame.integral_inputs.insert(xr);
-        iface::set(st, &x, Value::Num(xr))?;
-        iface::set(st, &last, Value::Num(xr))?;
-        // `rem.x` is replaced by the literal whole remainder: sound for a
-        // lane whose own lies inside, which is owed.
-        let Some(Value::Num(rv)) = iface::get(st, &rem) else { bail!("{}: not a number", iface::show(&rem)) };
-        pin_literal(d, rv, REM.0, REM.1);
-        let r = ival(d, REM.0, REM.1);
-        iface::set(st, &rem, Value::Num(r))?;
-        cells[j] = Some(xv);
-    }
-    d.frame.platform_cells = cells.into_iter().map(|c| c.expect("every world platform matched")).collect();
-    Ok(obligations)
 }
 
 #[cfg(test)]
