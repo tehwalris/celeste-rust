@@ -5,7 +5,7 @@
 //! A function of the frame (pushes merge order-free).
 
 use crate::search::hull::{AccOf, HullOf};
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use celeste_engine::runtime2::Rt2;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -301,6 +301,9 @@ pub(crate) struct WaveCtx<'a, N: Rem = P8> {
     pub(crate) edges: Option<&'a super::edges::EdgeFiles>,
     /// The forward's skeletons, registered by the emissions: the next layer's.
     pub(crate) skeletons: &'a Skeletons<N>,
+    /// A tool's observer of the frame's rows (`frame::RowCheck`; none in
+    /// production).
+    pub(crate) check: Option<&'a dyn crate::frame::RowCheck<N>>,
 }
 
 #[derive(Default)]
@@ -514,7 +517,7 @@ fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, cx: &WaveCtx<N>, front: &Frontier
     // frame's end; the gather numbers the workers' new pairs (`Gather::fresh`).
     let xtabs: Vec<std::sync::RwLock<Vec<Pair<N>>>> = (0..workers).map(|_| Default::default()).collect();
     let xfers_before = base.pairs.len();
-    let mut sinks: Vec<UnitSink<N>> = (0..workers).map(|w| UnitSink::new(visited, &routes, cx.skeletons, prov, cx.filters, cx.frame, w as u32, base, &xtabs[w], s)).collect();
+    let mut sinks: Vec<UnitSink<N>> = (0..workers).map(|w| UnitSink::new(visited, &routes, cx.skeletons, prov, cx.filters, cx.frame, w as u32, base, &xtabs[w], s).observed_by(cx.check)).collect();
     let mut scratch: Vec<super::route::JobScratch> = (0..workers).map(|_| super::route::JobScratch::default()).collect();
     let pipe: Pipe<N> = Pipe {
         xtabs: &xtabs,
@@ -556,7 +559,7 @@ fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, cx: &WaveCtx<N>, front: &Frontier
         }
     })?;
     collect_freed();
-    if s.diag.phases {
+    if s.phases {
         // The wave's anonymous peak (sampled) apart from the frame end's.
         crate::metrics::mem_phase(&format!("f{} units and region jobs", cx.frame));
     }
@@ -737,7 +740,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     // What the last frame's end and checkpoint freed back to the OS before
     // the wave's threads (new heaps) allocate: kept, it adds to the peak.
     collect_freed();
-    let mut st = Stats::new(s.diag.phases);
+    let mut st = Stats::new(s.phases);
     let workers = s.threads();
     st.set(S::EntriesIn, front.new.entries() as u64);
     st.set(S::LanesIn, front.new.states());
@@ -753,12 +756,12 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     };
     let plan = Plan::of(&front, cx.edges);
     let prov = Provisional::default();
-    if s.diag.phases {
+    if s.phases {
         crate::metrics::mem_phase(&format!("f{frame} start"));
     }
     let t_pipeline = Instant::now();
     let Piped { mut states, fresh, stats } = pipeline(engine, &cx, &front, &plan, &prov, spool.as_deref())?;
-    let WaveCtx { visited, xfers, filters, edges_dir, skeletons, .. } = cx;
+    let WaveCtx { visited, xfers, filters, edges_dir, skeletons, check, .. } = cx;
     st.add_time(S::Wave, t_pipeline.elapsed());
     st.merge(&stats);
     st.set_idle(workers);
@@ -789,7 +792,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     let mut new = seal(&mut states, &regions, &finals, visited, frame, workers)?;
     // The routes' touched tables, freed off their (exited) threads: back now.
     collect_freed();
-    if s.diag.phases {
+    if s.phases {
         crate::metrics::mem_phase(&format!("f{frame} the routes sealed (keys final, new and grown states)"));
     }
     for sl in &new {
@@ -841,9 +844,9 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     }
     ensure!(next.new.states() == next.hulls.len() as u64, "frame {frame}: the next layer holds {} states, {} hulls", next.new.states(), next.hulls.len());
     st.lap(S::EndLayer, &mut lap);
-    let wins = layer_wins(visited, &next.new, frame, s)?;
+    let wins = layer_wins(visited, &next.new, frame, s, check)?;
     st.lap(S::EndWins, &mut lap);
-    if s.diag.phases {
+    if s.phases {
         crate::metrics::mem_phase(&format!("f{frame} the next layer's wins decoded"));
     }
     st.set(S::Kept, next.new.states());
@@ -855,7 +858,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     }
     st.tick(S::PhEnd, tl);
     collect_freed();
-    if s.diag.phases {
+    if s.phases {
         crate::metrics::mem_phase(&format!("f{frame} the frame's end"));
     }
     st.add_time(S::Layer, t.elapsed());
@@ -1079,9 +1082,9 @@ fn collect_freed() {
 /// States decoded at a time at the frame's end (a chunk of a region's).
 const WIN_CHUNK: u32 = 1 << 12;
 
-/// The new layer's WINS: per entry of `next` (ascending) its win cells.
-/// `--key-check`: each decoded row's key is the boundary's, position its cell.
-fn layer_wins<N: Rem>(visited: &VisitedSet<N>, next: &Layer<N>, frame: u32, s: &crate::settings::Settings) -> Result<Vec<(u32, u64)>> {
+/// The new layer's WINS: per entry of `next` (ascending) its win cells;
+/// each decoded piece shown to `check` (`RowCheck::stored`).
+fn layer_wins<N: Rem>(visited: &VisitedSet<N>, next: &Layer<N>, frame: u32, s: &crate::settings::Settings, check: Option<&dyn crate::frame::RowCheck<N>>) -> Result<Vec<(u32, u64)>> {
     let tables = next.set.tables();
     let starts = next.set.entry_starts();
     // Chunks of a table's entries: (table, entries).
@@ -1114,11 +1117,9 @@ fn layer_wins<N: Rem>(visited: &VisitedSet<N>, next: &Layer<N>, frame: u32, s: &
             }
         }
         let rt2 = super::decode::decode_rows(&visited.keys, skel, &rows)?;
-        if s.diag.key_check {
-            crate::compiled::asm_kernel::key_check_block(&rt2, &visited.keys);
-            for (c, r) in crate::storage::cells::block_cells(&rt2)?.into_iter().zip(rows.iter()) {
-                ensure!(c == r.1, "frame {frame}: a state of r{region} decoded at cell {c}, not its own {}", r.1);
-            }
+        if let Some(c) = check {
+            let cells: Vec<u32> = rows.iter().map(|r| r.1).collect();
+            c.stored(&rt2, &cells, &visited.keys).with_context(|| format!("frame {frame}: a piece of r{region}"))?;
         }
         let mut wins: Vec<(u32, u64)> = Vec::new();
         for (w, &(e, local)) in crate::frame::wins_of(&rt2, s)?.into_iter().zip(&at) {
@@ -1379,7 +1380,7 @@ pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Rt2<N>>, frame: u3
     let s = &*engine.run().settings;
     let start = seed(&mut visited, &rows, HullOf::<N>::full(), &s)?.frontier;
     visited.forget_states();
-    let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, filters: Filters::default(), frame, edges_dir: None, edges: None, skeletons: &skeletons };
+    let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, filters: Filters::default(), frame, edges_dir: None, edges: None, skeletons: &skeletons, check: None };
     let wave = run_wave(engine, start, cx)?;
     let rows = super::layer::decode_states(&wave.frontier.new, &visited.keys, visited.shapes(), usize::MAX, &|_| true)?.into_iter().map(|(_, rt2)| rt2).collect();
     Ok((rows, wave.stats))

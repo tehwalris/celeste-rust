@@ -7,11 +7,32 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// The record's format; a reader refuses another.
-pub(crate) const FORMAT: u32 = 1;
+/// The record's format; a reader refuses another (2: the witness's path
+/// and the marks record).
+pub(crate) const FORMAT: u32 = 2;
 
 pub(crate) fn path(checkpoint_dir: &Path) -> PathBuf {
     checkpoint_dir.join("result.json")
+}
+
+/// THE MARKS RECORD of a search in `dir`, written by its final level's arc
+/// phase (`SearchResult::marks`) and read by `export-ui` (and `l1 probe
+/// --marks`): `support` W's support, each node with its last frame in W;
+/// `arc` the nodes reached inside W from the start (`reach::inside_w`), each
+/// with the last frame it is reached - marks files (`frame::save_marks`) in
+/// that tree's key space and arithmetic.
+pub fn marks_path(dir: &Path, which: Marks) -> PathBuf {
+    dir.join(match which {
+        Marks::Support => "support.marks.bin",
+        Marks::Arc => "arc.marks.bin",
+    })
+}
+
+/// The two files of the marks record (`marks_path`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Marks {
+    Support,
+    Arc,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +87,13 @@ pub struct SearchResult {
     /// Its inputs (`witness_file` holds them too).
     pub(crate) witness: Option<Vec<u8>>,
     pub witness_file: Option<String>,
+    /// Its path: per frame from the start the player's cell
+    /// (`storage::cells`; a dual witness's in the float half).
+    pub(crate) witness_path: Option<Vec<u32>>,
+    /// THE MARKS RECORD (`marks_path`): the tree its rows key into (a level's
+    /// `dir`, its final level's: the last, or the one that refuted the
+    /// horizon; a dual search's float half), when the search wrote it.
+    pub(crate) marks: Option<String>,
     /// The search's wall time and peak resident set (`VmHWM`, GB).
     pub wall_s: f64,
     pub(crate) peak_gb: f64,
@@ -109,7 +137,7 @@ mod tests {
     use super::*;
 
     /// The record round-trips through its file; the verdicts are snake case
-    /// (the runner reads them by name).
+    /// (the runner reads them by name); another format is refused.
     #[test]
     fn a_result_round_trips() {
         let dir = crate::testutil::TestDir::new("result");
@@ -126,6 +154,8 @@ mod tests {
             optimal: None,
             witness: None,
             witness_file: None,
+            witness_path: Some(vec![3, 4, 5]),
+            marks: Some("level00".into()),
             wall_s: 2.0,
             peak_gb: 0.5,
             error: Some("x".into()),
@@ -135,8 +165,12 @@ mod tests {
         assert_eq!(SearchResult::read(&dir).unwrap(), r);
         assert!(std::fs::read_to_string(path(&dir)).unwrap().contains("\"level_minus_one_refused\""));
         assert!(!std::fs::read_to_string(path(&dir)).unwrap().contains("dual"), "a single search's record is as before");
-        let d = SearchResult { dual: Some(DualResult { float: "float-celia".into(), float_loading_jank: Some(1), fixed_exit: Some(115) }), ..r };
+        let d = SearchResult { dual: Some(DualResult { float: "float-celia".into(), float_loading_jank: Some(1), fixed_exit: Some(115) }), ..r.clone() };
         d.write(&dir).unwrap();
         assert_eq!(SearchResult::read(&dir).unwrap(), d);
+        // A record of another format (1: no witness path, no marks record)
+        // is refused.
+        SearchResult { format: 1, ..r }.write(&dir).unwrap();
+        assert!(SearchResult::read(&dir).unwrap_err().to_string().contains("format 1"));
     }
 }

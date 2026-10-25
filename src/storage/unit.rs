@@ -445,14 +445,15 @@ impl<N: Rem> Verdicts<'_, N> {
 
 /// THE GUARDS at emission: the shapes this worker noted (`note_shape`),
 /// registered (`Skeletons`) and checked this frame (the DECODE GUARD), and
-/// `--key-check`'s rows, checked in batches.
-struct Guards<N: Rem> {
-    key_check: bool,
-    check: Vec<RowBuf<N>>,
+/// a tool's observer (`frame::RowCheck`) with the rows it is shown in
+/// batches, per shape.
+struct Guards<'a, N: Rem> {
+    observer: Option<&'a dyn crate::frame::RowCheck<N>>,
+    observed: Vec<RowBuf<N>>,
     noted: FxHashSet<u64>,
     registered: FxHashSet<u64>,
     guarded: FxHashSet<u64>,
-    /// Inside `emit_row` (reference rows: no guard, no key check).
+    /// Inside `emit_row` (reference rows: no guard, no observer).
     reference: bool,
     /// The last emission's shape, once registered and guarded (0: none).
     last_shape: u64,
@@ -579,7 +580,7 @@ pub struct UnitSink<'a, N: Rem = P8> {
     pusher: Pusher<N>,
     drops: Drops,
     verdicts: Verdicts<'a, N>,
-    guards: Guards<N>,
+    guards: Guards<'a, N>,
     /// The unit's bundles by route, and its (route, source region) pairs
     /// (`src_seen`: the ones met, direct mapped, `pair + 1`).
     bundles: UnitBundles,
@@ -617,13 +618,19 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             pusher: Pusher::default(),
             drops: Drops { l1: filters.l1, last: None },
             verdicts: Verdicts { marks: filters.marks, of: Default::default(), bufs: Vec::new(), at: Vec::new(), disallowed: false },
-            guards: Guards { key_check: s.diag.key_check, check: Vec::new(), noted: Default::default(), registered: Default::default(), guarded: Default::default(), reference: false, last_shape: 0 },
+            guards: Guards { observer: None, observed: Vec::new(), noted: Default::default(), registered: Default::default(), guarded: Default::default(), reference: false, last_shape: 0 },
             bundles: UnitBundles::default(),
             src_regions: Vec::new(),
             src_seen: Vec::new(),
             outbox: Vec::new(),
-            stats: super::stats::Stats::new(s.diag.phases),
+            stats: super::stats::Stats::new(s.phases),
         }
+    }
+
+    /// The sink with its emitted rows shown to `check` (`frame::RowCheck`).
+    pub(crate) fn observed_by(mut self, check: Option<&'a dyn crate::frame::RowCheck<N>>) -> Self {
+        self.guards.observer = check;
+        self
     }
 
     /// The tree's key space (read-only during the wave).
@@ -783,12 +790,12 @@ impl<'a, N: Rem> UnitSink<'a, N> {
                 g.last_shape = shape;
             }
         }
-        if g.key_check && !g.reference {
-            let b = Self::buf_of(&mut g.check, shape, &init);
+        if g.observer.is_some() && !g.reference {
+            let b = Self::buf_of(&mut g.observed, shape, &init);
             for i in lanes_of(take) {
-                push(&mut self.guards.check[b], i);
-                if self.guards.check[b].rows() >= 256 {
-                    self.check_rows(b)?;
+                push(&mut self.guards.observed[b], i);
+                if self.guards.observed[b].rows() >= 256 {
+                    self.show_rows(b)?;
                 }
             }
         }
@@ -847,20 +854,11 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         Ok(())
     }
 
-    /// `--key-check` of the rows in `check[i]`: each one's key is the
-    /// boundary's, and its key and cell decode to it.
-    fn check_rows(&mut self, i: usize) -> Result<()> {
-        let b = &self.guards.check[i];
-        crate::compiled::asm_kernel::key_check(b, self.keys, self.prov);
-        let rows = b.to_rt2();
-        let keep: Vec<u32> = (0..rows.width as u32).filter(|&r| !is_provisional(rows.row_keys[r as usize])).collect();
-        if !keep.is_empty() {
-            let mut r = rows.clone_block();
-            r.retain_lanes(&keep);
-            let cells: Vec<u32> = keep.iter().map(|&k| b.cells[k as usize]).collect();
-            self.skeletons.check_decodes(self.keys, &r, &cells)?;
-        }
-        self.guards.check[i].clear();
+    /// The rows in `observed[i]` shown to the observer, then dropped.
+    fn show_rows(&mut self, i: usize) -> Result<()> {
+        let g = &mut self.guards;
+        g.observer.expect("rows are observed only for an observer").emitted(&g.observed[i], self.keys, self.prov, self.skeletons)?;
+        g.observed[i].clear();
         Ok(())
     }
 
@@ -936,9 +934,9 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     /// targets' records go), its buckets the chunks of their routes.
     pub(crate) fn end(&mut self) -> Result<()> {
         let t = self.stats.tick_start();
-        for i in 0..self.guards.check.len() {
-            if self.guards.check[i].rows() > 0 {
-                self.check_rows(i)?;
+        for i in 0..self.guards.observed.len() {
+            if self.guards.observed[i].rows() > 0 {
+                self.show_rows(i)?;
             }
         }
         self.verdicts.decide(self.frame)?;

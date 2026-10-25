@@ -386,6 +386,18 @@ impl TreeL1 {
 
 }
 
+/// AN OBSERVER of the rows a forward step makes: the one seam a tool that
+/// checks them asks of the wave (`check::keys`); none in production
+/// (`ForwardState::step_with`). The wave calls it where the rows are:
+/// `emitted`, a batch of one shape's rows as the kernels emitted them, keyed
+/// (provisional keys `prov`'s), before level -1 and the filters drop any;
+/// `stored`, a piece of the new layer decoded at the frame's end, its rows'
+/// cells as the states hold them. An error fails the step.
+pub(crate) trait RowCheck<N: Rem>: Sync {
+    fn emitted(&self, rows: &crate::storage::unit::RowBuf<N>, keys: &celeste_engine::exact::KeySpace<N>, prov: &celeste_engine::exact::Provisional<N>, skeletons: &crate::storage::decode::Skeletons<N>) -> Result<()>;
+    fn stored(&self, rows: &Rt2<N>, cells: &[u32], keys: &celeste_engine::exact::KeySpace<N>) -> Result<()>;
+}
+
 /// What a forward filters by.
 pub(crate) struct Filters<'a, N: Arithmetic = P8> {
     /// The coarser level's arc marks (the objects ladder).
@@ -654,6 +666,32 @@ impl<N: Rem> ForwardState<N> {
     /// tree directory. The state advances to the frame (a bench's rep runs
     /// on a copy); the frame's stats.
     pub fn step(&mut self, engine: &dyn FrameStep<N>, edges_dir: Option<&std::path::Path>, ckpt: Option<&std::path::Path>, marks: Option<&MarkFilter<N>>) -> Result<Stats> {
+        self.step_with(engine, edges_dir, ckpt, marks, None)
+    }
+
+    /// THE STEP'S LINES, as `ckhash` prints them, of the frame it last made
+    /// (`frames`): `f` (its new states), `h` (the frontier's hulls), with
+    /// `edges` (a directory whose `edges/` holds the frame's edge file
+    /// alone) `e`, with `files` `b` over the bytes of every file under it.
+    pub fn lines(&self, edges: Option<&std::path::Path>, files: Option<&std::path::Path>, threads: usize) -> Result<String> {
+        let (frame, visited, front) = (self.frames, &self.visited, &self.frontier);
+        let (n, acc) = front.new.content_fingerprint(&visited.keys, visited.shapes())?;
+        let mut out = format!("f{frame:03} {n} {acc:016x}\n");
+        let (nh, ah) = crate::storage::hulls::fingerprint(front.states(frame), &visited.keys, visited.shapes())?;
+        out += &format!("h{frame:03} {nh} {ah:016x}\n");
+        if let Some(dir) = edges {
+            let (n, acc) = crate::storage::bench::edge_fingerprint(dir, frame, &self.xfers, visited, threads)?;
+            out += &format!("e{frame:03} {n} {acc:016x}\n");
+        }
+        if let Some(dir) = files {
+            let (files, bytes, acc) = crate::storage::bench::dir_fingerprint(dir)?;
+            out += &format!("b{frame:03} {files} {bytes} {acc:016x}\n");
+        }
+        Ok(out)
+    }
+
+    /// `step` with its rows shown to `check` (a tool's, `RowCheck`).
+    pub(crate) fn step_with(&mut self, engine: &dyn FrameStep<N>, edges_dir: Option<&std::path::Path>, ckpt: Option<&std::path::Path>, marks: Option<&MarkFilter<N>>, check: Option<&dyn RowCheck<N>>) -> Result<Stats> {
         let (s, t) = (&*engine.run().settings, std::time::Instant::now());
         let frame = self.frames + 1;
         let cx = crate::storage::wave::WaveCtx {
@@ -664,6 +702,7 @@ impl<N: Rem> ForwardState<N> {
             edges_dir,
             edges: Some(&self.edges),
             skeletons: &self.skeletons,
+            check,
         };
         // The frontier is spent by the wave (dropped before its end).
         let wave = crate::storage::wave::run_wave(engine, std::mem::take(&mut self.frontier), cx)?;

@@ -2,9 +2,13 @@
 //! trees and marks -> the compact static data the web UI (`ui/`) renders.
 //!
 //! Per (level, frame) the states and wins per player cell; per marked set
-//! (`search --save-marks`: W's support, arc-marked nodes) the marked states
-//! per cell by distance to the win. All from the frame files' region blocks
-//! and the marks files: no row is decoded, no engine built.
+//! (the search's MARKS RECORD, `search::result::marks_path`: W's support,
+//! arc-marked nodes) the marked states per cell by distance to the win; the
+//! witness and its path from the record. All from the frame files' region
+//! blocks and the marks files: no row is decoded, no engine built (the
+//! record is the search's: rerunning the backward over a big tree costs
+//! what its arc phase did, e.g. 1,828 s and 25-83 GB over a 421 GB edge
+//! store).
 //!
 //! STREAMED region by region (`read_tree`): a marks file is mapped, never
 //! loaded; sorted by state, so a region's marked states are a merge of its
@@ -12,8 +16,8 @@
 //! reads (frame by frame would map the whole file). An 82 GB tree with 431M
 //! marks peaks at 1.6 GB of heap, where loading it all took 96 GB.
 //!
-//! One horizon whose levels are the search's, plus with `--arc` a level for
-//! the arc backward over the last tree (`forward_of`). JSON fields `bwd`,
+//! One horizon whose levels are the search's, plus with a marks record a
+//! level for the arc backward over the last tree (`forward_of`). JSON fields `bwd`,
 //! `reruns` and the horizons list are kept only because the UI reads them.
 //!
 //! Output layout (`--out DIR`):
@@ -101,7 +105,7 @@ pub(crate) struct LevelRun {
     pub(crate) marks_by_dist: Vec<u64>,
     pub(crate) mlayers_file: Option<String>,
     pub(crate) marks_by_layer: Vec<u64>,
-    /// A backward over ANOTHER level's forward (`--arc`): that level's
+    /// A backward over ANOTHER level's forward (the marks record): that level's
     /// index, whose frames it shares; no forward pass of its own.
     pub(crate) forward_of: Option<usize>,
 }
@@ -111,7 +115,8 @@ pub(crate) struct HorizonRun {
     pub(crate) h: u32,
     pub(crate) levels: Vec<LevelRun>,
     pub(crate) refuted_at: Option<usize>,
-    /// No backward (exported without `--arc`): frames up to `h`, no verdict.
+    /// No backward (a search without its marks record): frames up to `h`,
+    /// no verdict.
     pub(crate) partial: bool,
 }
 
@@ -141,7 +146,8 @@ pub(crate) struct Run {
     pub(crate) prebuild_s: Option<f64>,
     pub(crate) optimal: Option<u32>,
     pub(crate) horizons: Vec<HorizonRun>,
-    /// Drawn over the room: `--arc`'s `witness.txt`, or `--witness FILE`.
+    /// Drawn over the room: the search's witness (`result.json`), or
+    /// `--witness FILE`.
     pub(crate) witness: Option<Witness>,
     /// `--reference FILE`: e.g. the community TAS in the original cart.
     pub(crate) reference: Option<Witness>,
@@ -703,9 +709,9 @@ fn room_tiles(room: (i16, i16)) -> Result<Tiles> {
     Ok(Tiles { w, h, ids, solid })
 }
 
-/// `witness.txt` (`search --save-marks`): `inputs a,b,..`, then `f x y`
-/// per frame from 0 (`f - -` without a player). A `--witness` /
-/// `--reference` file (`rewrite pico8 align`) may also carry `label TEXT` and
+/// A path file: `inputs a,b,..`, then `f x y` per frame from 0 (`f - -`
+/// without a player). A `--witness` / `--reference` file (`rewrite pico8
+/// align`) may also carry `label TEXT` and
 /// `dashes F:DIR ...` before the frames, and end early (at the exit).
 fn read_witness(path: &Path) -> Result<Witness> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -746,29 +752,30 @@ fn read_witness(path: &Path) -> Result<Witness> {
 
 /// A level's name in the UI: its spec, under its half's name in a dual
 /// search's record (`fixed/level00`, `float/level00`).
-fn level_label(l: &super::result::LevelResult) -> String {
+fn level_label(l: &crate::search::result::LevelResult) -> String {
     match l.dir.split_once('/') {
         Some((half, _)) => format!("{half}: {}", l.spec),
         None => l.spec.clone(),
     }
 }
 
-/// `--arc DIR` (`search --save-marks DIR`): the last forward level gets W's
-/// support, a level after it the ARC backward over the same tree; the
+/// THE MARKS RECORD of the search in `dir` (`result::marks_path`, over
+/// `last`'s tree, in its arithmetic `arith`): the last forward level gets
+/// W's support, a level after it the ARC backward over the same tree; the
 /// optimum is `last`'s arc bound unless `keep_optimal` (a dual search's is
-/// the pair's); the marks files are in `last`'s tree's arithmetic `arith`.
-/// Returns the witness if present.
-fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path, last: &super::result::LevelResult, arith: crate::settings::Arith, keep_optimal: bool) -> Result<Option<Witness>> {
-    let rows = |name: &str| -> Result<u64> { Ok(MarksMap::open(&dir.join(name), arith)?.rows as u64) };
+/// the pair's).
+fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path, last: &crate::search::result::LevelResult, arith: crate::settings::Arith, keep_optimal: bool) -> Result<()> {
+    use crate::search::result::{marks_path, Marks};
+    let rows = |m: Marks| -> Result<u64> { Ok(MarksMap::open(&marks_path(dir, m), arith)?.rows as u64) };
     let found = last.arc_bound;
     hr.partial = false;
     let li = hr.levels.len() - 1;
     let lr = &mut hr.levels[li];
     lr.precision = format!("{}, rem free", level_label(last));
     lr.refuted = lr.first_win.is_none();
-    lr.marked = Some(rows("level0.marks.bin")?);
+    lr.marked = Some(rows(Marks::Support)?);
     let mut arc = level_run(li + 1, format!("arc: {}, rem exact", level_label(last)), Vec::new(), found);
-    arc.marked = found.map(|_| rows("arc.marks.bin")).transpose()?;
+    arc.marked = found.map(|_| rows(Marks::Arc)).transpose()?;
     arc.refuted = found.is_none();
     arc.forward_of = Some(li);
     hr.levels.push(arc);
@@ -776,22 +783,33 @@ fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path, last: 
     if !keep_optimal {
         *optimal = if hr.refuted_at.is_none() { found } else { None };
     }
-    let w = dir.join("witness.txt");
-    w.exists().then(|| read_witness(&w)).transpose()
+    Ok(())
+}
+
+/// The search's witness as the UI draws it: its inputs and path from the
+/// record (`result.json`), labelled as the search found it.
+fn record_witness(res: &crate::search::result::SearchResult) -> Option<Witness> {
+    let (inputs, cells) = (res.witness.clone()?, res.witness_path.as_ref()?);
+    let label = match &res.dual {
+        Some(d) => format!("dual witness, valid in both arithmetics: {} exits on frame {}, real play on frame {} (the float half's path)", d.float, inputs.len(), d.fixed_exit.map_or("-".to_string(), |x| x.to_string())),
+        None => format!("concrete witness inside the winning sets, a win at f{}", inputs.len()),
+    };
+    let path = cells.iter().map(|&c| cell_xy(c)).collect();
+    Some(Witness { label, inputs, path, dashes: Vec::new() })
 }
 
 /// The concrete runs drawn over the room (`read_witness`'s format;
-/// `witness` replaces the arc directory's) and the download.
+/// `witness` replaces the search's) and the download.
 pub struct Paths<'a> {
     pub witness: Option<&'a Path>,
     pub reference: Option<&'a Path>,
     pub download: Option<&'a Path>,
 }
 
-/// The export of a search's `checkpoint_dir` (`result.json`, `levelNN/`;
-/// the room is the record's); `arc` its `search --save-marks` directory.
-pub fn export(checkpoint_dir: &Path, out: &Path, threads: usize, arc: Option<&Path>, paths: Paths) -> Result<()> {
-    let res = super::result::SearchResult::read(checkpoint_dir)?;
+/// The export of a search's `checkpoint_dir` (`result.json`, `levelNN/`,
+/// the marks record; the room is the record's).
+pub fn export(checkpoint_dir: &Path, out: &Path, threads: usize, paths: Paths) -> Result<()> {
+    let res = crate::search::result::SearchResult::read(checkpoint_dir)?;
     let room = res.room;
     let last = res.levels.last().with_context(|| format!("{}: the search recorded no level ({:?})", checkpoint_dir.display(), res.verdict))?;
     // `h` counts search steps (the trees' frames).
@@ -804,15 +822,19 @@ pub fn export(checkpoint_dir: &Path, out: &Path, threads: usize, arc: Option<&Pa
     let nforward = levels.len();
     let (wall_s, mut optimal) = (Some(res.wall_s), res.optimal);
     let mut hr = HorizonRun { h, levels, refuted_at: None, partial: true };
-    // The marks are the last tree's, in its arithmetic.
+    // The marks record: the last tree's, in its arithmetic.
     let marks_arith = crate::settings::recorded_arith(&tree_dir(nforward - 1))?;
-    let witness = match arc {
-        Some(dir) => attach_arc(&mut hr, &mut optimal, dir, last, marks_arith, res.dual.is_some())?,
+    let arc = match &res.marks {
+        Some(t) => {
+            anyhow::ensure!(*t == last.dir, "{}: the marks record is {t}'s, not the last level's ({})", checkpoint_dir.display(), last.dir);
+            attach_arc(&mut hr, &mut optimal, checkpoint_dir, last, marks_arith, res.dual.is_some())?;
+            Some(checkpoint_dir)
+        }
         None => None,
     };
     let witness = match paths.witness {
         Some(p) => Some(read_witness(p)?),
-        None => witness,
+        None => record_witness(&res),
     };
     let reference = paths.reference.map(read_witness).transpose()?;
     let download = match paths.download {
@@ -841,9 +863,10 @@ pub fn export(checkpoint_dir: &Path, out: &Path, threads: usize, arc: Option<&Pa
         let dir = tree_dir(level);
         let (mut set_levels, mut maps, mut by_cell_dist) = (Vec::new(), Vec::new(), Vec::new());
         if let Some(a) = arc.filter(|_| level == nforward - 1) {
-            for (l, name) in [(level, "level0.marks.bin"), (level + 1, "arc.marks.bin")] {
+            use crate::search::result::{marks_path, Marks};
+            for (l, m) in [(level, Marks::Support), (level + 1, Marks::Arc)] {
                 if !hr.levels[l].refuted {
-                    let path = a.join(name);
+                    let path = marks_path(a, m);
                     let (m, by) = scan_marks(MarksMap::open(&path, marks_arith)?, &path, threads)?;
                     by_cell_dist.push(by);
                     set_levels.push(l);
@@ -1077,8 +1100,8 @@ mod tests {
         assert_eq!((t.emit_ms, t.emit_idle, t.ckpt_ms, t.total_ms, got[0].visited, t.rss_gb), (7, 94, 1, 11, 4, 1.28));
     }
 
-    /// The search's `witness.txt` and a labelled path file with dashes that
-    /// ends at the exit both read; a skipped frame does not.
+    /// A path file and a labelled path file with dashes that ends at the
+    /// exit both read; a skipped frame does not.
     #[test]
     fn witness_and_reference_files_read() {
         let dir = crate::testutil::TestDir::new("ui-witness");

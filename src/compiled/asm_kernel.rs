@@ -2,7 +2,7 @@
 //! assemble each (shape, region)'s fused fork-free graph, and dispatch
 //! chunks to it. The APPEND step emits each `live & !error` lane at the
 //! boundary: canonical structure, its row key exactly as
-//! `Rt2::boundary_finish` (`--key-check`), its cell and transfer.
+//! `Rt2::boundary_finish` (`check keys`), its cell and transfer.
 
 use std::collections::HashMap;
 use std::os::raw::c_void;
@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 
 use celeste_core::arith::Arithmetic;
 use celeste_core::pico8_num::Pico8Num as P8;
-use celeste_engine::exact::{Code, KeySpace, Provisional};
+use celeste_engine::exact::Code;
 use celeste_engine::shape::{KeyRole, Layout};
 use celeste_engine::runtime2::{Col, Rt2, AV};
 use celeste_engine::slots::reshape;
@@ -632,69 +632,6 @@ impl<'c, N: Arithmetic> InputView<'c, N> {
             (ty, other) => InputView::Any(other, ty),
         })
     }
-}
-
-/// `--key-check`: the boundary over a copy of an emitted block changes
-/// nothing (structure, shape hash), and every row's key is what the key
-/// space makes of the boundary's row (packed, or provisional of equal content).
-pub(crate) fn key_check<N: crate::search::rem::Rem>(slot: &crate::storage::unit::RowBuf<N>, keys: &KeySpace<N>, prov: &Provisional<N>) {
-    use celeste_engine::exact::{is_provisional, RowKey};
-    let acc = slot.to_rt2();
-    let mut b = acc.clone_block();
-    b.boundary_canonicalize();
-    let want = keys.row_keys(&b);
-    let bad: Vec<usize> = (0..acc.width)
-        .filter(|&i| match &want[i] {
-            RowKey::Hit(k) => acc.row_keys[i] != *k,
-            RowKey::Miss(m) => !is_provisional(acc.row_keys[i]) || prov.content(acc.row_keys[i]) != *m,
-        })
-        .collect();
-    if b.shape_hash == acc.shape_hash && b.structure == acc.structure && bad.is_empty() {
-        return;
-    }
-    // Say WHICH rows and cells differ.
-    let varying: Vec<usize> = (0..acc.cols.len())
-        .filter(|&c| matches!(acc.structure.get(c), Some(celeste_engine::runtime2::Cell2::Val)))
-        .filter(|&c| (1..acc.width).any(|i| acc.cols[c].at(i) != acc.cols[c].at(0)))
-        .collect();
-    let rows: Vec<String> = bad
-        .iter()
-        .take(8)
-        .map(|&i| {
-            let cells: Vec<String> = varying.iter().map(|&c| format!("{c}={:?}", acc.cols[c].at(i))).collect();
-            format!("    row {i} append key {:?}, boundary {:?}: {}", acc.row_keys[i], want[i], cells.join(" "))
-        })
-        .collect();
-    panic!(
-        "KERNEL KEY CHECK: shape {:#x}: the boundary disagrees with the append step \
-         (width {}, shape {:#x} vs {:#x}, structure {}, {} keys differ)\n{}",
-        acc.shape_hash,
-        acc.width,
-        b.shape_hash,
-        acc.shape_hash,
-        if b.structure == acc.structure { "same" } else { "DIFFERENT" },
-        bad.len(),
-        rows.join("\n"),
-    );
-}
-
-/// `--key-check` on a block the forward STORES (a layer's rows, decoded at
-/// the frame's end): the boundary over a copy keeps its shape and
-/// structure, and the key space keys its rows as stored.
-pub(crate) fn key_check_block<N: celeste_core::arith::Arithmetic>(blk: &Rt2<N>, keys: &KeySpace<N>) {
-    let mut b = blk.clone_block();
-    b.boundary_canonicalize();
-    let got: Vec<Option<(u64, u64)>> = keys.lookup_keys(&b);
-    let same = got.iter().zip(&blk.row_keys).all(|(g, w)| *g == Some(*w));
-    assert!(
-        b.shape_hash == blk.shape_hash && b.structure == blk.structure && same,
-        "KERNEL KEY CHECK: a stored piece of shape {:#x} ({} rows) is not what the boundary keys it as (shape {:#x}, structure {}, keys {})",
-        blk.shape_hash,
-        blk.width,
-        b.shape_hash,
-        if b.structure == blk.structure { "same" } else { "DIFFERENT" },
-        if same { "same" } else { "DIFFERENT" },
-    );
 }
 
 fn num_raw<N: Arithmetic>(av: AV<N>) -> N::Raw {

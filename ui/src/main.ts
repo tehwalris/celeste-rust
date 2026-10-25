@@ -187,7 +187,7 @@ async function main() {
         main.append(
           errorCard(
             `Could not load ${label}`,
-            `${(e as Error).message}\n\nRegenerate it with:\n  rewrite export-ui --search-dir <search dir> --arc <marks dir> --out <data dir>/${runId}`,
+            `${(e as Error).message}\n\nRegenerate it with:\n  rewrite export-ui --search-dir <search dir> --out <data dir>/${runId}`,
             () => {
               current = null;
               void apply(runId, t, params);

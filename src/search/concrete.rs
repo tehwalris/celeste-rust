@@ -412,20 +412,6 @@ pub(crate) fn inputs_text(inputs: &[u8]) -> String {
     inputs.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
 }
 
-impl Witness {
-    /// `witness.txt`: `inputs ...`, then `f x y` per frame (frame 0 the start).
-    pub(crate) fn save(&self, path: &std::path::Path) -> Result<()> {
-        let mut text = format!("inputs {}\n", inputs_text(&self.inputs));
-        for (f, &c) in self.cells.iter().enumerate() {
-            match crate::storage::cells::cell_xy(c) {
-                Some((x, y)) => text += &format!("{f} {x} {y}\n"),
-                None => text += &format!("{f} - -\n"),
-            }
-        }
-        Ok(std::fs::write(path, text)?)
-    }
-}
-
 /// THE CONCRETE SEARCH of one level (`search` over `Single`): `horizon` in
 /// search steps (W's index), `bound` the arc optimum in frames.
 pub(super) fn concrete_search<N: Rem>(side: &Side<'_, N>, horizon: u32, bound: u32, prefer: Option<&[u8]>) -> Result<Option<Witness>> {

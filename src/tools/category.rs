@@ -321,7 +321,7 @@ pub fn run(job: &Job, cx: &Ctx) -> Result<Row> {
         if to.is_none() {
             cmd.arg("--ceiling");
         }
-        cmd.args(["--level", job.str("levels")?]).arg("--prefer").arg(&prefer).arg("--save-marks").arg(jd.join("marks")).arg("--search-dir").arg(&tree).args(&flags);
+        cmd.args(["--level", job.str("levels")?]).arg("--prefer").arg(&prefer).arg("--search-dir").arg(&tree).args(&flags);
         let log = std::fs::File::create(jd.join("search.log"))?;
         cmd.current_dir(env!("CARGO_MANIFEST_DIR")).stdout(log.try_clone()?).stderr(log);
         let t = std::time::Instant::now();
@@ -537,7 +537,7 @@ fn ui(cx: &Ctx, jd: &Path, entry: &tasdb::Entry, res: &Row, cat: Category, room_
     std::fs::write(jd.join("align.txt"), align(&cx.runner, room, cat, name, prologue, &crate::concrete::read_inputs(&jd.join("witness.txt").to_string_lossy())?, Some(&paths), seeds, jank)?)?;
     let rid = format!("room{}{cat}", room_s.replace(',', ""));
     let mut cmd = std::process::Command::new(safe_run());
-    cmd.arg("--").arg(cx.binary).args(["export-ui", "--search-dir"]).arg(jd.join("tree")).arg("--out").arg(Path::new(UI).join(&rid)).arg("--arc").arg(jd.join("marks")).arg("--witness").arg(paths.join("ours.txt")).arg("--reference").arg(paths.join("reference.txt"));
+    cmd.arg("--").arg(cx.binary).args(["export-ui", "--search-dir"]).arg(jd.join("tree")).arg("--out").arg(Path::new(UI).join(&rid)).arg("--witness").arg(paths.join("ours.txt")).arg("--reference").arg(paths.join("reference.txt"));
     // The UI's download IS the upload file.
     if let Some(up) = res.get("upload").and_then(Value::as_str) {
         cmd.args(["--download", up]);

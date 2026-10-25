@@ -226,8 +226,10 @@ and level -1, `src/trace/` the tracer, `src/engines/` the reference
 engine, `src/transpile/` graph IR and assembler, `src/compiled/` the kernel
 registry, `src/settings.rs`, the `rewrite` binary in `src/bin/rewrite/`).
 The checks and diagnostics are TOOLS, not core: `src/check/` (the
-differential harness, check arcs, check replay, the census, explain); the
-core names none of it (a conventions test).
+differential harness, check arcs, check replay, check keys through the one
+observer seam `frame::RowCheck`, the gate's fingerprints, the census,
+explain) and `src/ui_export.rs` (the UI export); the core names none of
+them (a conventions test).
 Details: plans/architecture.md.
 
 There is NO checked-in kernel artifact: the registry retraces the start
@@ -272,6 +274,12 @@ frame under `--split-frame`: `settings::Clock`). The most common:
 # tree takes its settings from the tree's records: no --room, --level, ...).
 ./safe-run.sh -- ./target/release/rewrite forward --steps 44 --room 1,0 --tree DIR
 ./safe-run.sh -- ./target/quick/rewrite ckhash --tree DIR --steps 44
+# The arc gate's `[gate]` fingerprints of a finished search (the search
+# prints none); the kernels' keys against the boundary, row by row, for one
+# step; a declined lane's kernel rebuilt and explained.
+./safe-run.sh -- ./target/quick/rewrite gate --search-dir DIR
+./safe-run.sh -- ./target/quick/rewrite check keys --tree DIR --step F
+./safe-run.sh -- ./target/quick/rewrite explain --tree DIR --step F --state S
 # A float witness against a nudged libm `sin`.
 ./safe-run.sh -- ./target/quick/rewrite robust --arith float --room X,Y [category] --inputs FILE
 # On a real PICO-8, headless (--original: the game as released, celeste_ocaml's celeste.lua).
@@ -280,10 +288,10 @@ frame under `--split-frame`: `settings::Clock`). The most common:
 
 ### The UI (`ui/`)
 
-A phone-first web view of one finished search (`search --save-marks DIR`,
-in either arithmetic, or `dual --save-marks DIR`: the float half's arc pass
-and the dual witness; then `rewrite export-ui --help`, which reads each tree
-in its recorded arithmetic); building and serving: `ui/README.md` and
+A phone-first web view of one finished `search` or `dual` (its `result.json`
+and the marks record every search writes, the float half's for a dual:
+`rewrite export-ui --search-dir DIR --out OUT`, each tree in its recorded
+arithmetic); building and serving: `ui/README.md` and
 UI-HOSTING.md. Served under `/celeste/` on port 3011 only, never uncapped
 (`systemd-run --user --scope -p MemoryMax=2G`); nothing generated is
 committed.

@@ -1,7 +1,8 @@
 //! THE CHECKS of a finished tree (`rewrite check ...`), each against
 //! something independent: the kernels against the reference engine row by
 //! row (`ref`), the recorded transfers against it (`arcs`), the widening
-//! table's two sides (`widen`), a known route against the search's pruning
+//! table's two sides (`widen`), the emitted and stored keys against the
+//! boundary (`keys`), a known route against the search's pruning
 //! (`known`), the tree against its own recorded graph (`replay`), and the
 //! kernels' tree against the reference engine's (`reference`). The
 //! sampled ones run on one harness (`differential`).
@@ -61,6 +62,19 @@ pub enum Command {
     /// keeps a floor's computed `collideable` in the player's probe window,
     /// which a frame boundary's widening does not.
     Widen(WidenArgs),
+    /// THE KEYS AGAINST THE BOUNDARY (`check::keys`): one forward step,
+    /// `--step` F -> F+1, as the forward runs it (its edges recorded into a
+    /// scratch directory).
+    ///
+    /// Every row the kernels emit is keyed as the boundary keys it (the
+    /// boundary over a copy changes nothing, the key is the key space's of
+    /// the boundary's row, packed or provisional) and decodes back from its
+    /// key and cell; every piece of the new layer is what the boundary keys
+    /// it as, each state at its own cell. The first bad row panics with what
+    /// differs; a step that checked no row fails. Prints the step's `f`, `h`
+    /// and `e` lines (`bench frame`'s), compared with `--expect`'s lines of
+    /// those kinds.
+    Keys(KeysArgs),
     /// A KNOWN solution against the pruning of a finished search (`search::known`).
     ///
     /// Stepped through the reference engine, at every step it must pass
@@ -159,6 +173,19 @@ pub struct WidenArgs {
 }
 
 #[derive(clap::Args)]
+pub struct KeysArgs {
+    #[command(flatten)]
+    tree: crate::TreeArg,
+    /// The step F to run F -> F+1 from (default: the tree's last).
+    #[arg(long)]
+    step: Option<u32>,
+    /// The printed lines must be this pinned file's lines of their kinds
+    /// (`bench frame --expect`'s pins).
+    #[arg(long)]
+    expect: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
 pub struct KnownArgs {
     /// The search's directory (its `result.json` and `level{i:02}` trees;
     /// a dual search's half: `DIR/fixed` or `DIR/float`).
@@ -207,6 +234,18 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
             let t = a.tree.open(run)?;
             let frame = t.frame(a.step)?;
             celeste_rust::with_arith!(t.run.settings.arith, N => widen_check::<N>(&t, frame, a.emitted))
+        }
+        Command::Keys(a) => {
+            let t = a.tree.open(run)?;
+            let frame = t.frame(a.step)?;
+            let tm = std::time::Instant::now();
+            let (lines, rows) = celeste_rust::with_arith!(t.run.settings.arith, N => celeste_rust::check::keys::check::<N>(&t, frame)?);
+            print!("{lines}");
+            if let Some(path) = &a.expect {
+                crate::bench::pinned(path, &lines, false, crate::bench::line_moves)?;
+            }
+            eprintln!("[check keys] {}: step {frame} -> {}: {rows} rows' keys as the boundary keys them ({:.1} s)", t.dir.display(), frame + 1, tm.elapsed().as_secs_f64());
+            Ok(())
         }
         Command::Known(a) => {
             let inputs = celeste_rust::concrete::read_inputs(&a.inputs)?;

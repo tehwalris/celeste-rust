@@ -11,7 +11,7 @@
 //!     the skeleton keeps each value column's `Repr`.
 //!
 //! A row its key does not determine is FATAL, never stored lossy: checked
-//! on a shape's first emission per worker and wave (`--key-check`: every
+//! on a shape's first emission per worker and wave (`check keys`: every
 //! one; `Skeletons::check_decodes`) and on the start (`check_piece`).
 
 use anyhow::{anyhow, ensure, Context, Result};

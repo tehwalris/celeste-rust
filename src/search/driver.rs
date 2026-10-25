@@ -11,11 +11,11 @@ use celeste_core::lua_f64::LuaF64;
 use celeste_engine::runtime2::Rt2;
 use celeste_core::pico8_num::Pico8Num as P8;
 
-use super::backward::{backward, gate_w_hash, optimum, Seeds, Winning, BLOCK};
+use super::backward::{backward, optimum, Seeds, Winning, BLOCK};
 use super::concrete::{concrete_search, inputs_text, NodeKeys, Side, Witness};
 use super::reach::{inside_w, ReachEdges};
 use super::rem::{start_point, Rem};
-use super::result::{DualResult, LevelResult, SearchResult, Verdict};
+use super::result::{DualResult, LevelResult, Marks, SearchResult, Verdict};
 use crate::abstraction::Level;
 use crate::compiled::KernelLanes;
 use crate::frame::{MarkFilter, Visited};
@@ -35,8 +35,6 @@ pub struct SearchSpec<'a> {
     pub dir: &'a Path,
     /// Stop at the arc bound (`--no-witness`).
     pub bound_only: bool,
-    /// The UI's arc pass (`--save-marks`; dual: the float half's).
-    pub save_marks: Option<&'a Path>,
     /// A known route (`--prefer`): tried first, checked against every
     /// pruning step (`search::known`).
     pub prefer: Option<&'a [u8]>,
@@ -49,11 +47,14 @@ pub struct SearchSpec<'a> {
 pub fn run(spec: &SearchSpec) -> Result<SearchResult> {
     let levels: Vec<Level> = spec.level.split(',').map(Level::parse).collect::<std::result::Result<_, _>>().map_err(|e| anyhow::anyhow!(e))?;
     let t0 = std::time::Instant::now();
-    // The record of THIS run: none until it decides.
+    // The record of THIS run: none until it decides, and its marks record
+    // none until its final level's arc phase writes it.
     std::fs::create_dir_all(spec.dir)?;
-    match std::fs::remove_file(super::result::path(spec.dir)) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-        _ => {}
+    for p in [super::result::path(spec.dir), super::result::marks_path(spec.dir, Marks::Support), super::result::marks_path(spec.dir, Marks::Arc)] {
+        match std::fs::remove_file(p) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
     }
     let s = spec.settings;
     let mut res = SearchResult {
@@ -68,6 +69,8 @@ pub fn run(spec: &SearchSpec) -> Result<SearchResult> {
         optimal: None,
         witness: None,
         witness_file: None,
+        witness_path: None,
+        marks: None,
         wall_s: 0.0,
         peak_gb: 0.0,
         error: None,
@@ -107,7 +110,7 @@ fn single<N: KernelLanes>(spec: &SearchSpec, levels: &[Level], res: &mut SearchR
         return Ok(Verdict::LevelMinusOneRefused);
     }
     let finish = if spec.bound_only { Finish::Bound } else { Finish::Concrete };
-    let solved = match run_levels::<N>(s, s.clock().steps(spec.horizon), levels, spec.dir, "", finish, spec.save_marks, spec.prefer, res)? {
+    let solved = match run_levels::<N>(s, s.clock().steps(spec.horizon), levels, spec.dir, "", finish, Some(spec.dir), spec.prefer, res)? {
         None => return Ok(Verdict::Refuted),
         Some(solved) => solved,
     };
@@ -130,13 +133,15 @@ fn single<N: KernelLanes>(spec: &SearchSpec, levels: &[Level], res: &mut SearchR
     Ok(Verdict::Optimal)
 }
 
-/// The witness file `witness_frame_F.txt` (`header`, the inputs), recorded.
+/// The witness file `witness_frame_F.txt` (`header`, the inputs), recorded
+/// with its path.
 fn witness(dir: &Path, res: &mut SearchResult, w: &Witness, header: &str) -> Result<()> {
     let f = w.inputs.len();
     let path = dir.join(format!("witness_frame_{f}.txt"));
     std::fs::write(&path, format!("{header}{}\n", inputs_text(&w.inputs)))?;
     res.optimal = Some(f as u32);
     res.witness = Some(w.inputs.clone());
+    res.witness_path = Some(w.cells.clone());
     res.witness_file = Some(path.file_name().expect("a file").to_string_lossy().into_owned());
     Ok(())
 }
@@ -153,7 +158,8 @@ fn dual(spec: &SearchSpec, float: &Settings, levels: &[Level], res: &mut SearchR
         return Ok(Verdict::LevelMinusOneRefused);
     }
     let Some(sx) = run_levels::<P8>(cfg, steps, levels, &spec.dir.join("fixed"), "fixed/", Finish::Arcs, None, spec.prefer, res)? else { return Ok(Verdict::Refuted) };
-    let Some(sf) = run_levels::<LuaF64>(float, steps, levels, &spec.dir.join("float"), "float/", Finish::Arcs, spec.save_marks, spec.prefer, res)? else { return Ok(Verdict::Refuted) };
+    // The marks record: the float half's (the count's).
+    let Some(sf) = run_levels::<LuaF64>(float, steps, levels, &spec.dir.join("float"), "float/", Finish::Arcs, Some(spec.dir), spec.prefer, res)? else { return Ok(Verdict::Refuted) };
     let (bx, bf) = (sx.arc, sf.arc);
     let bound = bx.max(bf);
     println!("DUAL BOUND: no dual win before f{bound} (the fixed half's arc bound f{bx}, the float half's f{bf})");
@@ -170,20 +176,12 @@ fn dual(spec: &SearchSpec, float: &Settings, levels: &[Level], res: &mut SearchR
          # A balloon room's real-play exit may hold for some `rnd` draws only.\n",
         spec.level, float.arith, w.fixed_exit
     );
-    let wit = Witness { inputs: w.inputs.clone(), cells: Vec::new() };
-    witness(spec.dir, res, &wit, &header)?;
+    // Its path: the float half's cells along it.
+    let cells = super::replay::Replay::<LuaF64>::of(&w.inputs, None, float)?.win_cells(float.clock())?;
+    witness(spec.dir, res, &Witness { inputs: w.inputs.clone(), cells }, &header)?;
     if let Some(d) = &mut res.dual {
         d.fixed_exit = Some(w.fixed_exit);
     }
-    // The UI's path: the float half's cells along the witness.
-    if let Some(out) = spec.save_marks {
-        let cells = super::replay::Replay::<LuaF64>::of(&w.inputs, None, float)?.win_cells(float.clock())?;
-        let path = out.join("witness.txt");
-        Witness { inputs: w.inputs.clone(), cells }.save(&path)?;
-        let label = format!("label dual witness, valid in both arithmetics: {} exits on frame {f}, real play on frame {} (the float half's path)\n", float.arith, w.fixed_exit);
-        std::fs::write(&path, label + &std::fs::read_to_string(&path)?)?;
-    }
-    println!("[gate] h{horizon} dual optimum {f} fixed exit {} inputs {}", w.fixed_exit, inputs_text(&w.inputs));
     Ok(Verdict::Optimal)
 }
 
@@ -216,7 +214,9 @@ fn for_levels<N: Rem>(levels: &[(Level, crate::settings::Clock)], mut step: impl
 
 /// The LEVELS of a search under `base`, each a forward and its arc phase,
 /// recorded in `res.levels` (dirs under `prefix`); the last ends as `finish`
-/// says. `None`: a level's arc phase REFUTED the horizon.
+/// says; with `record` the final level's marks go to that directory
+/// (`result::marks_path`, `res.marks`). `None`: a level's arc phase REFUTED
+/// the horizon.
 #[allow(clippy::too_many_arguments)]
 fn run_levels<N: KernelLanes>(
     cfg: &Settings,
@@ -225,7 +225,7 @@ fn run_levels<N: KernelLanes>(
     base: &Path,
     prefix: &str,
     finish: Finish,
-    save_marks: Option<&Path>,
+    record: Option<&Path>,
     prefer: Option<&[u8]>,
     res: &mut SearchResult,
 ) -> Result<Option<Solved<N>>> {
@@ -260,18 +260,22 @@ fn run_levels<N: KernelLanes>(
         // `f` counts search steps.
         eprintln!("[search] level {li} ({lvl}): forward to f{steps} in {forward_s:.1} s; first win {first_win:?}");
         crate::metrics::mem_phase("forward");
-        // THE ARC PHASE (every level saves its marks: the next overwrites),
-        // and the concrete search at the LAST level only: a coarser level's
-        // bound is loose wherever its objects are (a try at it can cost most
-        // of a search), and the finer level decides anyway.
+        // THE ARC PHASE (the final level's marks recorded), and the concrete
+        // search at the LAST level only: a coarser level's bound is loose
+        // wherever its objects are (a try at it can cost most of a search),
+        // and the finer level decides anyway.
         let known = prefer.map(|inputs| super::known::Route { inputs, filter, hulls: false });
-        let (arcs, marks, _) = arc_level::<N>(&dir, &run, steps, !last, save_marks, known.as_ref())?;
+        let (arcs, marks, _) = arc_level::<N>(&dir, &run, steps, !last, record, known.as_ref())?;
         let bound = arcs.bound(cfg.clock());
         let concrete = match bound {
-            Some(b) if last && finish == Finish::Concrete => concrete_level(&arcs, b, prefer, save_marks)?,
+            Some(b) if last && finish == Finish::Concrete => concrete_level(&arcs, b, prefer)?,
             _ => None,
         };
-        res.levels.push(LevelResult { spec: lvl.to_string(), dir: format!("{prefix}level{li:02}"), forward_s, first_win, arc_bound: bound });
+        let tree = format!("{prefix}level{li:02}");
+        if record.is_some() && (last || bound.is_none()) {
+            res.marks = Some(tree.clone());
+        }
+        res.levels.push(LevelResult { spec: lvl.to_string(), dir: tree, forward_s, first_win, arc_bound: bound });
         let Some(arc) = bound else { return Ok(None) };
         println!("ARC BOUND: no win before f{arc} (level {li}, {lvl}: remainder-exact, the level's objects over-approximated)");
         if last {
@@ -307,7 +311,7 @@ pub(crate) struct Arcs<N: Rem = P8> {
     /// by its projection: the tree holds the start unwidened), and the
     /// optimum in search steps (`None`: the horizon is REFUTED).
     pub(crate) start: Option<u32>,
-    steps: Option<u32>,
+    pub(crate) steps: Option<u32>,
 }
 
 impl<N: Rem> Arcs<N> {
@@ -318,7 +322,7 @@ impl<N: Rem> Arcs<N> {
         self.steps.map(|k| clock.frame_of(k))
     }
 
-    /// The level's states as the concrete searches admit them under `s`.
+    /// The level's states as the concrete searches admit them.
     pub(super) fn side(&self) -> Result<Side<'_, N>> {
         Ok(Side { w: &self.w, node: NodeKeys::new(&self.w, &self.shapes)?, keys: &self.space, run: &self.run, seeded: self.run.settings.concrete().1 })
     }
@@ -326,82 +330,38 @@ impl<N: Rem> Arcs<N> {
 
 /// THE ARC PHASE over a finished tree, before the edge files close: the
 /// backward from its wins and the optimum, the edges kept for the reach.
-struct ArcPhase<N: Rem> {
-    seeds: Seeds<N>,
-    arcs: Arcs<N>,
+/// Its readers: the search, `check known`, `check::gate`.
+pub(crate) struct ArcPhase<N: Rem> {
+    pub(crate) seeds: Seeds<N>,
+    pub(crate) arcs: Arcs<N>,
 }
 
 impl<N: Rem> ArcPhase<N> {
     /// `backward` and `optimum` over the tree in `dir` (of `run`) to step
-    /// `horizon`; its `[gate]` fingerprints printed (W's support, W per
-    /// frame, the optimum; over content, independent of scheduling).
-    fn of(dir: &Path, run: &Run, horizon: u32) -> Result<Self> {
+    /// `horizon`, its closed spans and W's nodes in files under `scratch`
+    /// (mapped, unlinked; the directory replaced).
+    pub(crate) fn of(dir: &Path, run: &Run, horizon: u32, scratch: &Path) -> Result<Self> {
         run.check(dir)?;
         let s = &*run.settings;
         crate::metrics::mem_phase("arc: start");
         let seeds = Seeds::<N>::load(dir, horizon)?;
         crate::metrics::mem_phase("arc: edge files opened");
         let tb = std::time::Instant::now();
-        // The closed spans and W's nodes go to scratch files beside the tree
-        // (mapped, unlinked).
-        let scratch = dir.join("arc-scratch");
         if scratch.exists() {
-            std::fs::remove_dir_all(&scratch)?;
+            std::fs::remove_dir_all(scratch)?;
         }
-        let w = backward(&seeds.store, &seeds.pairs, &seeds.wins, horizon, s.threads(), Some(&scratch))?;
+        let w = backward(&seeds.store, &seeds.pairs, &seeds.wins, horizon, s.threads(), Some(scratch))?;
         crate::metrics::mem_phase("arc: backward");
         let tb = tb.elapsed().as_secs_f64();
         let start = w.index(seeds.start);
         let steps = optimum(&w, start, start_point::<N>(), horizon);
         eprintln!("[arc] backward {tb:.2} s; optimum {steps:?} (steps)");
         let arcs = Arcs { w, shapes: seeds.shapes.clone(), space: seeds.space.clone(), run: run.clone(), horizon, start, steps };
-        let ap = ArcPhase { seeds, arcs };
-        ap.gate_lines(s.threads())?;
-        crate::metrics::mem_phase("arc: fingerprints");
-        Ok(ap)
-    }
-
-    /// THE `[gate]` LINES: W's support (its nodes, a content hash over
-    /// them: `Visited::fingerprint`'s), per frame the nodes with a set and
-    /// the sum of their (node, set) hashes, the optimum. Each span is added
-    /// at its first frame and taken off past its last (the sums commute, so
-    /// the nodes go in parallel).
-    fn gate_lines(&self, threads: usize) -> Result<()> {
-        let (w, horizon) = (&self.arcs.w, self.arcs.horizon);
-        let content = self.arcs.space.content_hash();
-        let parts = crate::par::Pool::new(threads).chunks(w.len().div_ceil(BLOCK), 4096, |lo, hi| {
-            let (mut fp, mut delta) = (0u64, vec![(0i64, 0u64); horizon as usize + 2]);
-            for x in w.nodes_from(lo * BLOCK, hi * BLOCK) {
-                let (shape, key, cell) = self.seeds.state(x.id);
-                let h = content.state(shape, key, cell);
-                fp = fp.wrapping_add(h);
-                for (lo, hi, r) in x.spans() {
-                    let g = gate_w_hash(h, r);
-                    delta[lo as usize] = (delta[lo as usize].0 + 1, delta[lo as usize].1.wrapping_add(g));
-                    delta[hi as usize + 1] = (delta[hi as usize + 1].0 - 1, delta[hi as usize + 1].1.wrapping_sub(g));
-                }
-            }
-            (fp, delta)
-        });
-        let (mut fp, mut delta) = (0u64, vec![(0i64, 0u64); horizon as usize + 2]);
-        for (f, d) in parts {
-            fp = fp.wrapping_add(f);
-            for (a, b) in delta.iter_mut().zip(d) {
-                *a = (a.0 + b.0, a.1.wrapping_add(b.1));
-            }
-        }
-        println!("[gate] h{horizon} support {} {fp:016x}", w.len());
-        let (mut n, mut acc) = (0i64, 0u64);
-        for (t, d) in delta[..=horizon as usize].iter().enumerate() {
-            (n, acc) = (n + d.0, acc.wrapping_add(d.1));
-            println!("[gate] h{horizon} W f{t:03} {n} {acc:016x}");
-        }
-        println!("[gate] h{horizon} arc optimum {}", self.arcs.steps.map_or("none".to_string(), |f| f.to_string()));
-        Ok(())
+        Ok(ArcPhase { seeds, arcs })
     }
 
     /// W's support as marks rows, each node's deadline its last frame
-    /// with a set (the UI's `level0.marks.bin`).
+    /// with a set (the marks record's support, `result::marks_path`).
     fn support_rows(&self, threads: usize) -> Vec<crate::frame::MarkRow> {
         let (w, horizon) = (&self.arcs.w, self.arcs.horizon);
         let parts = crate::par::Pool::new(threads).chunks(w.len().div_ceil(BLOCK), 4096, |lo, hi| {
@@ -439,23 +399,28 @@ impl<N: Rem> ArcPhase<N> {
 }
 
 /// A level's ARC PHASE and what follows it on every path: with `next` its
-/// reach marks (the next level's filter), with `save` the UI's
-/// `level0.marks.bin` (W's support) and `arc.marks.bin` (what
-/// `reach::inside_w` reaches), with `known` a known route checked against
-/// every pruning step (an error if one drops it; `Some(f)`: it exits in
-/// frame `f` and survives). The edge files closed.
+/// reach marks (the next level's filter); with `record` at the search's
+/// FINAL level (the last, `!next`, or the one that refutes the horizon) THE
+/// MARKS RECORD into that directory (`result::marks_path`: W's support, and
+/// unless refuted what `reach::inside_w` reaches); with `known` a known
+/// route checked against every pruning step (an error if one drops it;
+/// `Some(f)`: it exits in frame `f` and survives). The edge files closed.
 #[allow(clippy::type_complexity)]
-fn arc_level<N: KernelLanes>(dir: &Path, run: &Run, horizon: u32, next: bool, save: Option<&Path>, known: Option<&super::known::Route<N>>) -> Result<(Arcs<N>, Option<Visited<N>>, Option<u32>)> {
+fn arc_level<N: KernelLanes>(dir: &Path, run: &Run, horizon: u32, next: bool, record: Option<&Path>, known: Option<&super::known::Route<N>>) -> Result<(Arcs<N>, Option<Visited<N>>, Option<u32>)> {
+    use super::result::marks_path;
     use crate::frame::{mark_row, save_marks};
     let s = &*run.settings;
-    let ap = ArcPhase::<N>::of(dir, run, horizon)?;
+    // The scratch beside the tree (the search's own).
+    let ap = ArcPhase::<N>::of(dir, run, horizon, &dir.join("arc-scratch"))?;
     let space = &ap.seeds.space;
-    if let Some(out) = save {
-        std::fs::create_dir_all(out)?;
-        save_marks(&out.join("level0.marks.bin"), ap.support_rows(s.threads()), horizon, space)?;
+    let refuted = ap.arcs.steps.is_none();
+    let record = record.filter(|_| !next || refuted);
+    if let Some(out) = record {
+        save_marks(&marks_path(out, Marks::Support), ap.support_rows(s.threads()), horizon, space)?;
     }
+    let reached = record.filter(|_| !refuted);
     let mut marks = None;
-    if next || save.is_some() {
+    if next || reached.is_some() {
         let last = ap.reach(s.threads())?;
         if next {
             let mut m = Visited::new(space.clone());
@@ -464,8 +429,8 @@ fn arc_level<N: KernelLanes>(dir: &Path, run: &Run, horizon: u32, next: bool, sa
             }
             marks = Some(m);
         }
-        if let Some(out) = save {
-            save_marks(&out.join("arc.marks.bin"), ap.reached(&last).map(|(shape, key, cell, d)| mark_row(shape, key, cell, d, horizon)).collect(), horizon, space)?;
+        if let Some(out) = reached {
+            save_marks(&marks_path(out, Marks::Arc), ap.reached(&last).map(|(shape, key, cell, d)| mark_row(shape, key, cell, d, horizon)).collect(), horizon, space)?;
         }
     }
     // The concrete searches read W and the node keys, not the edge files.
@@ -480,37 +445,42 @@ fn arc_level<N: KernelLanes>(dir: &Path, run: &Run, horizon: u32, next: bool, sa
 }
 
 /// THE CONCRETE SEARCH of a search's last level (inside its W, from the arc
-/// bound `bound`): its witness, its `[gate]` line printed and, with `save`,
-/// the UI's `witness.txt`.
-fn concrete_level<N: KernelLanes>(arcs: &Arcs<N>, bound: u32, prefer: Option<&[u8]>, save: Option<&Path>) -> Result<Option<Witness>> {
-    let found = concrete_search(&arcs.side()?, arcs.horizon, bound, prefer)?;
-    if let Some(wt) = &found {
-        println!("[gate] h{} concrete optimum {} inputs {}", arcs.horizon, wt.inputs.len(), inputs_text(&wt.inputs));
-        if let Some(out) = save {
-            wt.save(&out.join("witness.txt"))?;
-        }
+/// bound `bound`): its witness.
+fn concrete_level<N: KernelLanes>(arcs: &Arcs<N>, bound: u32, prefer: Option<&[u8]>) -> Result<Option<Witness>> {
+    concrete_search(&arcs.side()?, arcs.horizon, bound, prefer)
+}
+
+/// A finished search's record (`result.json` in `search_dir`) and the trees
+/// of the levels it ran, in its order (a dual search's halves, fixed
+/// first): each one's directory and run (its record's, with the run's own
+/// settings from `run`), its level checked against the record's.
+pub(crate) fn levels_of(search_dir: &Path, run: &Settings) -> Result<(SearchResult, Vec<(std::path::PathBuf, Run)>)> {
+    let res = SearchResult::read(search_dir)?;
+    let mut trees = Vec::new();
+    for l in &res.levels {
+        let d = search_dir.join(&l.dir);
+        let tree = Run::of_tree(&d, run)?;
+        anyhow::ensure!(tree.level.to_string() == Level::parse(&l.spec).map_err(|e| anyhow::anyhow!(e))?.to_string(), "{}: level {}, the search's record says {}", d.display(), tree.level, l.spec);
+        trees.push((d, tree));
     }
-    Ok(found)
+    Ok((res, trees))
 }
 
 /// `rewrite check known`: a KNOWN route against the finished search in
 /// `dir`: per level the arc phase rerun, the route checked at every pruning
 /// step (the hull forward's claim too). Levels and horizon from
-/// `result.json` (a dual half: its parent's) unless `horizon`, settings from
-/// each tree's record. An error at the first check that drops the route.
+/// `result.json` (`levels_of`; a dual half: its parent's, the half's levels)
+/// unless `horizon`. An error at the first check that drops the route.
 pub fn check_known(dir: &Path, inputs: &[u8], horizon: Option<u32>, run: &Settings) -> Result<()> {
-    let res = SearchResult::read(dir).or_else(|e| match dir.parent() {
-        Some(p) if super::result::path(p).exists() => SearchResult::read(p),
-        _ => Err(e),
-    })?;
+    let (res, trees) = match dir.parent() {
+        Some(p) if !super::result::path(dir).exists() && super::result::path(p).exists() => {
+            let (res, trees) = levels_of(p, run)?;
+            (res, trees.into_iter().filter(|(d, ..)| d.starts_with(dir)).collect())
+        }
+        _ => levels_of(dir, run)?,
+    };
+    anyhow::ensure!(!trees.is_empty(), "{}: the search ran no level here", dir.display());
     let horizon = horizon.unwrap_or(res.horizon);
-    let mut trees = Vec::new();
-    for (li, spec) in res.level.split(',').enumerate() {
-        let d = dir.join(format!("level{li:02}"));
-        let tree = Run::of_tree(&d, run)?;
-        anyhow::ensure!(tree.level.to_string() == Level::parse(spec).map_err(|e| anyhow::anyhow!(e))?.to_string(), "{}: level {}, the search's record says {spec}", d.display(), tree.level);
-        trees.push((d, tree));
-    }
     crate::with_arith!(trees[0].1.settings.arith, N => check_known_in::<N>(&trees, inputs, horizon))
 }
 
@@ -553,7 +523,7 @@ mod tests {
             let mut lines = Vec::new();
             for (name, s, half) in [("search fixed", &fixed, None), ("search float", &float, None), ("dual", &fixed, Some(&dual))] {
                 let dir = base.join(format!("{name}-{threads}").replace(' ', "-"));
-                let spec = SearchSpec { settings: s, level: "r0sx", horizon: 35, ceiling: false, dir: &dir, bound_only: false, save_marks: None, prefer: None, dual: half };
+                let spec = SearchSpec { settings: s, level: "r0sx", horizon: 35, ceiling: false, dir: &dir, bound_only: false, prefer: None, dual: half };
                 let r = run(&spec).expect("the search");
                 assert_eq!(r.verdict, Verdict::Optimal, "{name} at {threads} threads");
                 let inputs = r.witness.expect("a witness").iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",");
