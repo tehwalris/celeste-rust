@@ -76,7 +76,51 @@ pub fn to_rt2<D: Domain, N: Arithmetic>(
     }
     rt2.strings = strings;
     rt2.shape_hash = rt2.shape_hash_of();
+    the_topology_is_the_shapes(&rt2);
     Ok(rt2)
+}
+
+/// A shape's POINTER TOPOLOGY: each value cell's target (`NONE`: no
+/// pointer) and each closure capture's, as `(cell, target)` in cell order.
+type Topology = Box<[(u32, u32)]>;
+
+/// THE POINTER TOPOLOGY IS THE SHAPE'S, process-wide: every block made
+/// under one shape hash has one signature and one `Topology`. The signature
+/// names neither a value cell's target nor a capture's
+/// (`Rt2::shape_words`), and a kernel is bound by path against one
+/// representative of its shape (`trace::bind`): a block whose pointers
+/// differ under the hash would run a kernel bound to the other's cells.
+/// FATAL (`exact`'s `pointer_violation` is the key space's side).
+fn the_topology_is_the_shapes<N: Arithmetic>(rt2: &Rt2<N>) {
+    type Seen = celeste_engine::FxHashMap<u64, Arc<(Vec<u32>, Topology)>>;
+    static SEEN: std::sync::OnceLock<std::sync::RwLock<Seen>> = std::sync::OnceLock::new();
+    let target = |c: &Col<N>| match c {
+        Col::U(AV::Ptr(t)) => *t,
+        _ => NONE,
+    };
+    let mut topology = Vec::new();
+    for (cell, (kind, col)) in rt2.structure.iter().zip(&rt2.cols).enumerate() {
+        match kind {
+            Cell2::Val => topology.push((cell as u32, target(col))),
+            Cell2::Clo(_, caps) => topology.extend(caps.iter().map(|c| (cell as u32, target(c)))),
+            _ => {}
+        }
+    }
+    let seen = SEEN.get_or_init(Default::default);
+    let had = seen.read().expect("the shapes' topologies").get(&rt2.shape_hash).cloned();
+    let had = had.unwrap_or_else(|| {
+        let first = || Arc::new((celeste_engine::exact::shape_sig(rt2), topology.clone().into_boxed_slice()));
+        seen.write().expect("the shapes' topologies").entry(rt2.shape_hash).or_insert_with(first).clone()
+    });
+    assert!(had.0 == celeste_engine::exact::shape_sig(rt2), "block: two shapes under the hash {:#x} (a shape-hash collision)", rt2.shape_hash);
+    if let Some((a, b)) = had.1.iter().zip(&topology).find(|(a, b)| a != b) {
+        panic!(
+            "block: shape {:#x}: cell {} points at {} where an earlier block of the shape's cell {} points at {} (u32::MAX: no pointer): \
+             the POINTER TOPOLOGY, which a kernel binds by path against one representative, varies under one shape hash",
+            rt2.shape_hash, b.0, b.1, a.0, a.1
+        );
+    }
+    assert!(had.1.len() == topology.len(), "block: shape {:#x}: {} pointers where an earlier block of the shape has {}", rt2.shape_hash, topology.len(), had.1.len());
 }
 
 /// The tracer's block of `st`: its shape, every number and boolean `Nil`
@@ -399,6 +443,56 @@ impl<N: Arithmetic, D: Domain<A = N>> FromBlock<'_, N, D> {
 
 #[cfg(test)]
 mod tests {
+    /// THE SIGNATURE READS BACK ITS BLOCK: on the start blocks of rooms of
+    /// every kind of object (the platforms', a 100% room's), `sig::kinds`
+    /// of what `shape_words` writes is the block's cells' kinds, and every
+    /// kind occurs (a reader whose cases the blocks skip is unchecked).
+    #[test]
+    fn the_signature_reads_back_the_blocks_kinds() {
+        use crate::settings::{Category, Settings};
+        use celeste_engine::shape::{sig, Kind};
+        let mut seen = std::collections::BTreeSet::new();
+        for s in [
+            Settings::default(),
+            Settings { room: (6, 0), ..Default::default() },
+            Settings { room: (4, 2), ..Default::default() },
+            Settings { room: (6, 2), category: Category::Hundred, loading_jank: Some(2), ..Default::default() },
+        ] {
+            let eng = crate::engines::reference::RefEngine::new(&s).expect("ref engine");
+            let b = eng.initial().expect("the start converts");
+            let mut words = Vec::new();
+            b.shape_words(|w| words.push(w));
+            let want: Vec<Kind> = b.structure.iter().map(|c| c.kind()).collect();
+            assert_eq!(sig::kinds(&words).as_deref(), Ok(&want[..]), "room {:?}", s.room);
+            seen.extend(want.iter().map(|k| format!("{k:?}")));
+        }
+        assert_eq!(seen.len(), 6, "the kinds the start blocks hold: {seen:?}");
+    }
+
+    /// THE POINTER TOPOLOGY IS THE SHAPE'S: room (1,0)'s start with its
+    /// `player_spawn`'s `type` pointed at the `player` type table has the
+    /// start's signature and hash (the signature names a value cell, not
+    /// its target), so its block is FATAL once the start's is made.
+    #[test]
+    fn a_block_whose_pointers_differ_under_its_shape_hash_is_fatal() {
+        use crate::trace::heap::Value;
+        let eng = crate::engines::reference::RefEngine::new(&Default::default()).expect("ref engine");
+        let start = eng.start_state();
+        let b = crate::engines::reference::to_block(start, (1, 0)).expect("the start converts");
+        let mut st = start.clone();
+        let global = |name: &str| match st.heap.tables[&st.globals].hash.get(name) {
+            Some(Value::Table(t)) => *t,
+            other => panic!("the global {name} holds {other:?}"),
+        };
+        let (objects, spawn, player) = (global("objects"), global("player_spawn"), global("player"));
+        let items: Vec<_> = st.heap.tables[&objects].arr.iter().filter_map(|v| if let Value::Table(t) = v { Some(*t) } else { None }).collect();
+        let obj = *items.iter().find(|o| st.heap.tables[o].hash.get("type") == Some(&Value::Table(spawn))).expect("the start holds a player_spawn");
+        st.heap.tables.get_mut(&obj).expect("the spawn").hash.insert("type".into(), Value::Table(player));
+        let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::engines::reference::to_block(&st, (1, 0)))) else { panic!("a retargeted pointer converted") };
+        let msg = e.downcast_ref::<String>().map_or("(not a formatted panic)", |m| m.as_str()).to_string();
+        assert!(msg.contains("POINTER TOPOLOGY") && msg.contains(&format!("{:#x}", b.shape_hash)), "{msg}");
+    }
+
     /// A CLOSURE'S CAPTURE IS ITS OWNER, or the block refuses it, naming the
     /// closure (plans/correctness.md C6): room (1,0)'s start converts; with
     /// every captured name rebound to the globals table, the conversion

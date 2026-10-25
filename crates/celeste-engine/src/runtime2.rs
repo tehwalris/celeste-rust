@@ -11,6 +11,8 @@ use celeste_core::collision_cache::CollisionCache;
 use celeste_core::pico8_num::Pico8Num;
 use serde::{Deserialize, Serialize};
 
+use crate::shape::{sig, Kind};
+
 pub type P8 = Pico8Num;
 
 /// The hash mixer: slot functions and fingerprints only (a state's
@@ -89,15 +91,27 @@ pub enum Cell2<N = P8> {
 }
 
 impl<N> Cell2<N> {
+    /// The cell's kind, as its shape's signature names it.
+    pub fn kind(&self) -> Kind {
+        match self {
+            Cell2::Val => Kind::Val,
+            Cell2::Obj(_) => Kind::Obj,
+            Cell2::Arr(_) => Kind::Arr,
+            Cell2::Unk => Kind::Unk,
+            Cell2::Clo(..) => Kind::Clo,
+            Cell2::Bi(_) => Kind::Bi,
+        }
+    }
+
     /// What the cell is, for messages.
     pub fn kind_name(&self) -> &'static str {
-        match self {
-            Cell2::Val => "value",
-            Cell2::Obj(_) => "object",
-            Cell2::Arr(_) => "array",
-            Cell2::Unk => "unknown table",
-            Cell2::Clo(..) => "closure",
-            Cell2::Bi(_) => "builtin",
+        match self.kind() {
+            Kind::Val => "value",
+            Kind::Obj => "object",
+            Kind::Arr => "array",
+            Kind::Unk => "unknown table",
+            Kind::Clo => "closure",
+            Kind::Bi => "builtin",
         }
     }
 }
@@ -343,8 +357,9 @@ impl<N: Arithmetic> Rt2<N> {
         }
     }
 
-    /// THE SHAPE'S SIGNATURE, word by word (`exact::shape_sig` collects it,
-    /// `shape_hash_of` hashes it): every cell in canonical order by kind, a
+    /// THE SHAPE'S SIGNATURE, word by word (`shape::sig`'s format;
+    /// `exact::shape_sig` collects it, `shape_hash_of` hashes it, `sig::kinds`
+    /// reads it): every cell in canonical order by kind, a
     /// field, function or builtin by its NAME's code (`NameCodes`); then the
     /// globals PRESENT, each by its name's code and its cell. A shape's
     /// identity is the names it holds, so appending a name to a table moves
@@ -353,9 +368,9 @@ impl<N: Arithmetic> Rt2<N> {
         let c = name_codes();
         for cell in &self.structure {
             match cell {
-                Cell2::Val => w(1),
+                Cell2::Val => w(sig::VAL),
                 Cell2::Obj(fields) => {
-                    w(2);
+                    w(sig::OBJ);
                     w(fields.len() as u32);
                     for (k, t) in fields {
                         w(c.fields[*k as usize]);
@@ -363,23 +378,23 @@ impl<N: Arithmetic> Rt2<N> {
                     }
                 }
                 Cell2::Arr(items) => {
-                    w(3);
+                    w(sig::ARR);
                     w(items.len() as u32);
                     items.iter().for_each(|t| w(*t));
                 }
-                Cell2::Unk => w(4),
+                Cell2::Unk => w(sig::UNK),
                 Cell2::Clo(f, caps) => {
-                    w(5);
+                    w(sig::CLO);
                     w(c.fns[*f as usize]);
                     w(caps.len() as u32);
                 }
                 Cell2::Bi(b) => {
-                    w(6);
+                    w(sig::BI);
                     w(c.builtins[*b as usize]);
                 }
             }
         }
-        w(u32::MAX);
+        w(sig::END);
         for (g, &cell) in self.globals.iter().enumerate() {
             if cell != NONE {
                 w(c.globals[g]);
