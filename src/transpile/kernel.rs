@@ -91,7 +91,7 @@ impl AxisRoots {
     }
 }
 
-/// THE TRANSFER ROOTS of an outcome (`search::arc_edges`): per axis, and
+/// THE TRANSFER ROOTS of an outcome (`search::rem::decode`): per axis, and
 /// whether its `fin` roots are real (the outcome ends with a player).
 /// Computed per body, stored in no row.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

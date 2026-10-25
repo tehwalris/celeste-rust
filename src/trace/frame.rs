@@ -41,7 +41,7 @@ pub struct FrameOut<A: GraphArith = Fixed> {
     pub ubool_cells: Vec<u32>,
     /// The state itself, so a shape walk can step forward from it.
     pub st: State<Symbolic<A>>,
-    /// THE TRANSFER ROOTS (`search::arc_edges`, level-0 traces only).
+    /// THE TRANSFER ROOTS (`search::rem::decode`, level-0 traces only).
     /// Never stored in the row.
     pub arc: Option<ArcRoots>,
 }

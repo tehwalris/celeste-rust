@@ -282,8 +282,8 @@ impl ArcSlots {
         m
     }
 
-    /// The record's pair of the transfer `words` (`Rem::transfer`: 16.16's
-    /// is `arc_edges::decode_axis`). An undecided `took` is FATAL: the
+    /// The record's pair of the transfer `words` (`Rem::transfer`:
+    /// `rem::decode`). An undecided `took` is FATAL: the
     /// record would be an unchecked claim about the remainder; so is a
     /// refused transfer.
     fn decode<N: KernelLanes>(&self, words: &RawWords<N>, chunk: &Rt2<N>, lane: usize, outcome: usize) -> N::Pair {

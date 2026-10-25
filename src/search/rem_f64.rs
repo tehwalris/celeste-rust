@@ -6,30 +6,16 @@
 //!
 //! `move` is `rem += ox; amount = flr(rem + 0.5); rem -= amount`, forked by
 //! `__split_by_round(rem)` at the exact cuts over the node's whole
-//! `[-1/2, 1/2)`; `decode_axis` turns a capture (`rem::Capture`) into:
-//! * the GUARD: the `r` with `fl(r + ox)` in `frag`, an order-interval
-//!   (`fl(r + ox)` is monotone) found EXACTLY by bisection with the
-//!   operation itself;
-//! * the ACTION `Mono(ox, k)`, `r -> fl(fl(r + ox) - k)` (monotone, not
-//!   injective), where `fin` is the fragment's image `fl(frag - k)` or no
-//!   player ends the frame (a death: any action is exact, as in
-//!   `arc_edges`); `Const(fin)` where a blocked step reset the remainder;
-//! * no split (a freeze, the spawn): the whole guard, the identity
-//!   `Mono(0, 0)` (`fin` the whole input, or no player) or `Const(fin)` (a
-//!   player made this frame);
-//! * a split of ONE point (`set_before_the_move`): the whole guard,
-//!   `Const(fin)` (no player at the end: the identity).
-//! Anything else is REFUSED (fatal in the forward).
+//! `[-1/2, 1/2)`; `rem::decode` turns a capture into a transfer, `Axis`
+//! records it.
 //!
 //! THE TOP SLIVER: at an integer speed the doubles `{1/2 - 2^-54,
 //! 1/2 - 2^-53}` round onto the cut (`fl(r - 2) = -3/2`), a piece no 16.16
 //! remainder takes; the hull forward pushes it only where a hull reaches it.
 
-use celeste_core::lua_f64::LuaF64;
 use celeste_engine::runtime2::mix64;
 
 use super::arcs::{Act, Circle, Seg, Transfer};
-use super::rem::Capture;
 
 /// The index of `0` (and the count of doubles in `[-1/2, 0)`): `1/2`'s bits.
 pub(crate) const ZERO: u64 = 0x3FE0_0000_0000_0000;
@@ -80,20 +66,6 @@ pub(crate) type Pair = (Axis, Axis);
 pub(crate) const PAIR_BYTES: usize = 2 * 29;
 
 impl Axis {
-    /// The identity over the whole circle.
-    pub(crate) fn identity() -> Axis {
-        Axis::mono(0, POINTS, 0.0, 0)
-    }
-
-    fn mono(lo: u64, hi: u64, ox: f64, k: i32) -> Axis {
-        Axis { lo, hi, tag: MONO, a: ox.to_bits(), k }
-    }
-
-    fn konst(lo: u64, hi: u64, rem: f64) -> Result<Axis, String> {
-        let p = index(rem).ok_or_else(|| format!("a constant remainder {rem:?} outside [-1/2, 1/2)"))?;
-        Ok(Axis { lo, hi, tag: CONST, a: p, k: 0 })
-    }
-
     /// The image of point `i` (inside the guard).
     #[cfg(test)]
     pub(crate) fn apply(&self, i: u64) -> u64 {
@@ -142,16 +114,6 @@ pub struct Shift {
 #[inline]
 fn mono(r: f64, ox: f64, k: f64) -> f64 {
     (r + ox) - k
-}
-
-/// `amount`: `flr(fl(x + 1/2))`.
-fn round(x: f64) -> f64 {
-    (x + 0.5).floor()
-}
-
-/// The first point from which `p` (false, then true) holds, by bisection.
-fn first(p: impl Fn(u64) -> bool) -> u64 {
-    first_in(0, POINTS, p)
 }
 
 /// The first point of `lo..hi` from which `p` (false, then true) holds
@@ -225,80 +187,116 @@ impl Circle for Doubles {
     }
 }
 
-/// Decode one axis (the module doc's rules). `Err` is a refusal.
-pub(crate) fn decode_axis(c: &Capture<LuaF64>) -> Result<Axis, String> {
-    let v = |p: (LuaF64, LuaF64)| (p.0.value(), p.1.value());
-    let top = value(POINTS - 1);
-    let whole = (-0.5, top);
-    if !c.took {
-        return match c.fin.map(v) {
-            None => Ok(Axis::identity()),
-            Some(f) if f == whole => Ok(Axis::identity()),
-            Some((a, b)) if a == b => Axis::konst(0, POINTS, a),
-            Some(f) => Err(format!("no player split, but the final remainder {f:?} is neither the input domain nor a point")),
-        };
-    }
-    let (ox, oh) = v(c.ox);
-    if ox != oh {
-        return Err(format!("the applied speed {:?} is not exact", c.ox));
-    }
-    let pre = v(c.pre);
-    let shifted = (-0.5 + ox, top + ox);
-    let frag = v(c.frag);
-    if pre.0 == pre.1 {
-        if shifted.0 == shifted.1 {
-            return Err(format!("the speed {ox:?} maps every remainder to one point: a reset and a move cannot be told apart"));
-        }
-        return set_before_the_move(pre.0, frag, c.fin.map(v));
-    }
-    if pre != shifted {
-        return Err(format!("the split's argument {pre:?} is not the remainders shifted by the speed {ox:?}, {shifted:?} (the remainder at the move was not [-1/2, 1/2))"));
-    }
-    if !(pre.0 <= frag.0 && frag.0 <= frag.1 && frag.1 <= pre.1) {
-        return Err(format!("the fragment {frag:?} is not inside the split's argument {pre:?}"));
-    }
-    let k = round(frag.0);
-    if round(frag.1) != k {
-        return Err(format!("the fragment {frag:?} spans two amounts"));
-    }
-    let lo = first(|i| value(i) + ox >= frag.0);
-    let hi = first(|i| value(i) + ox > frag.1);
-    if lo >= hi {
-        return Err(format!("no remainder lands in the fragment {frag:?} at the speed {ox:?}"));
-    }
-    let image = (frag.0 - k, frag.1 - k);
-    if index(image.0).is_none() || index(image.1).is_none() {
-        return Err(format!("the fragment {frag:?}'s image {image:?} is not in [-1/2, 1/2)"));
-    }
-    let ki = k as i32;
-    if ki as f64 != k {
-        return Err(format!("the amount {k:?} is not an i32"));
-    }
-    match c.fin.map(v) {
-        None => Ok(Axis::mono(lo, hi, ox, ki)),
-        Some(fin) if fin == image => Ok(Axis::mono(lo, hi, ox, ki)),
-        Some((a, b)) if a == b => Axis::konst(lo, hi, a),
-        Some(fin) => Err(format!("the final remainder {fin:?} is neither the image {image:?} nor a point")),
-    }
-}
+/// The doubles' decoder before `rem::decode` (one rule for both
+/// arithmetics), kept to check that one against (`rem`'s differential
+/// test).
+#[cfg(test)]
+pub(crate) mod legacy {
+    use super::{first_in, index, value, Axis, CONST, MONO, POINTS};
+    use crate::search::rem::Capture;
+    use celeste_core::lua_f64::LuaF64;
 
-/// A split of ONE point (as `arc_edges::set_before_the_move`): every input
-/// remainder takes the edge, to the constant `fin`.
-fn set_before_the_move(pre: f64, frag: (f64, f64), fin: Option<(f64, f64)>) -> Result<Axis, String> {
-    if frag != (pre, pre) {
-        return Err(format!("the fragment {frag:?} is not the split's one-point argument {pre:?}"));
+    /// The identity over the whole circle.
+    pub(crate) fn identity() -> Axis {
+        mono(0, POINTS, 0.0, 0)
     }
-    match fin {
-        None => Ok(Axis::identity()),
-        Some((a, b)) if a == b => Axis::konst(0, POINTS, a),
-        Some(f) => Err(format!("the remainder was set before the move, but the final remainder {f:?} is not a point")),
+
+    fn mono(lo: u64, hi: u64, ox: f64, k: i32) -> Axis {
+        Axis { lo, hi, tag: MONO, a: ox.to_bits(), k }
+    }
+
+    fn konst(lo: u64, hi: u64, rem: f64) -> Result<Axis, String> {
+        let p = index(rem).ok_or_else(|| format!("a constant remainder {rem:?} outside [-1/2, 1/2)"))?;
+        Ok(Axis { lo, hi, tag: CONST, a: p, k: 0 })
+    }
+
+    /// `amount`: `flr(fl(x + 1/2))`.
+    pub(crate) fn round(x: f64) -> f64 {
+        (x + 0.5).floor()
+    }
+
+    /// The first point from which `p` (false, then true) holds, by bisection.
+    fn first(p: impl Fn(u64) -> bool) -> u64 {
+        first_in(0, POINTS, p)
+    }
+
+    /// Decode one axis (the module doc's rules). `Err` is a refusal.
+    pub(crate) fn decode_axis(c: &Capture<LuaF64>) -> Result<Axis, String> {
+        let v = |p: (LuaF64, LuaF64)| (p.0.value(), p.1.value());
+        let top = value(POINTS - 1);
+        let whole = (-0.5, top);
+        if !c.took {
+            return match c.fin.map(v) {
+                None => Ok(identity()),
+                Some(f) if f == whole => Ok(identity()),
+                Some((a, b)) if a == b => konst(0, POINTS, a),
+                Some(f) => Err(format!("no player split, but the final remainder {f:?} is neither the input domain nor a point")),
+            };
+        }
+        let (ox, oh) = v(c.ox);
+        if ox != oh {
+            return Err(format!("the applied speed {:?} is not exact", c.ox));
+        }
+        let pre = v(c.pre);
+        let shifted = (-0.5 + ox, top + ox);
+        let frag = v(c.frag);
+        if pre.0 == pre.1 {
+            if shifted.0 == shifted.1 {
+                return Err(format!("the speed {ox:?} maps every remainder to one point: a reset and a move cannot be told apart"));
+            }
+            return set_before_the_move(pre.0, frag, c.fin.map(v));
+        }
+        if pre != shifted {
+            return Err(format!("the split's argument {pre:?} is not the remainders shifted by the speed {ox:?}, {shifted:?} (the remainder at the move was not [-1/2, 1/2))"));
+        }
+        if !(pre.0 <= frag.0 && frag.0 <= frag.1 && frag.1 <= pre.1) {
+            return Err(format!("the fragment {frag:?} is not inside the split's argument {pre:?}"));
+        }
+        let k = round(frag.0);
+        if round(frag.1) != k {
+            return Err(format!("the fragment {frag:?} spans two amounts"));
+        }
+        let lo = first(|i| value(i) + ox >= frag.0);
+        let hi = first(|i| value(i) + ox > frag.1);
+        if lo >= hi {
+            return Err(format!("no remainder lands in the fragment {frag:?} at the speed {ox:?}"));
+        }
+        let image = (frag.0 - k, frag.1 - k);
+        if index(image.0).is_none() || index(image.1).is_none() {
+            return Err(format!("the fragment {frag:?}'s image {image:?} is not in [-1/2, 1/2)"));
+        }
+        let ki = k as i32;
+        if ki as f64 != k {
+            return Err(format!("the amount {k:?} is not an i32"));
+        }
+        match c.fin.map(v) {
+            None => Ok(mono(lo, hi, ox, ki)),
+            Some(fin) if fin == image => Ok(mono(lo, hi, ox, ki)),
+            Some((a, b)) if a == b => konst(lo, hi, a),
+            Some(fin) => Err(format!("the final remainder {fin:?} is neither the image {image:?} nor a point")),
+        }
+    }
+
+    /// A split of ONE point (as `arc_edges::set_before_the_move`): every input
+    /// remainder takes the edge, to the constant `fin`.
+    fn set_before_the_move(pre: f64, frag: (f64, f64), fin: Option<(f64, f64)>) -> Result<Axis, String> {
+        if frag != (pre, pre) {
+            return Err(format!("the fragment {frag:?} is not the split's one-point argument {pre:?}"));
+        }
+        match fin {
+            None => Ok(identity()),
+            Some((a, b)) if a == b => konst(0, POINTS, a),
+            Some(f) => Err(format!("the remainder was set before the move, but the final remainder {f:?} is not a point")),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::legacy::{decode_axis, identity, round};
     use super::*;
-    use celeste_core::lua_f64::LuaF64Interval as FI;
+    use crate::search::rem::Capture;
+    use celeste_core::lua_f64::{LuaF64, LuaF64Interval as FI};
 
     type Arc = crate::search::hull::Arc<Doubles>;
     type Hull = crate::search::hull::Hull<Doubles>;
@@ -419,7 +417,7 @@ mod tests {
         assert_eq!((pieces[1].apply(POINTS - 2), pieces[1].apply(POINTS - 1)), (0, 0));
         assert_eq!(fixed_points(pieces[0].lo, pieces[0].hi), 65536);
         // A point hull at the top reaches only the sliver; one below it, only the rest.
-        let t = |a: &Axis| (a.transfer(), Axis::identity().transfer());
+        let t = |a: &Axis| (a.transfer(), identity().transfer());
         let mut acc = HullAcc::default();
         assert!(!Hull::point(POINTS - 3, ZERO).push(&t(&pieces[1]), &mut acc));
         assert!(Hull::point(POINTS - 2, ZERO).push(&t(&pieces[1]), &mut acc));
@@ -440,7 +438,7 @@ mod tests {
         assert_eq!(decode_axis(&Capture { fin: None, ..c }).unwrap().tag, MONO);
         // No split: the identity, a new player, or refused.
         let none = Capture { took: false, fin: Some((n(-0.5), n(value(POINTS - 1)))), ..c };
-        assert_eq!(decode_axis(&none).unwrap(), Axis::identity());
+        assert_eq!(decode_axis(&none).unwrap(), identity());
         assert_eq!(decode_axis(&Capture { fin: Some((n(0.0), n(0.0))), ..none }).unwrap(), Axis { lo: 0, hi: POINTS, tag: CONST, a: ZERO, k: 0 });
         assert!(decode_axis(&Capture { fin: Some((n(0.0), n(0.25))), ..none }).is_err());
         // Set before the move: the whole guard, the constant.
