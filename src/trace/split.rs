@@ -217,7 +217,6 @@ pub(super) fn three_valued_evaluated<A: GraphArith>(d: &mut Symbolic<A>, outs: &
 pub(super) fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: Vec<FrameOut<A>>) -> Result<Vec<FrameOut<A>>> {
     use crate::transpile::graph::Op;
     const MAX_OUTCOMES: usize = 4096;
-    let n_in = outs.len();
     // Templates of one shape share a class: their outcomes dedupe together.
     let class: Vec<usize> = (0..outs.len()).map(|i| (0..=i).find(|&j| outs[j].shape == outs[i].shape).expect("itself")).collect();
     // LARGEST CONE FIRST: a split only shrinks a cone, so every path into a
@@ -236,7 +235,6 @@ pub(super) fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: 
         let size = d.graph.cone(&lite.row()).len();
         work.push(d, &class, lite, size);
     }
-    let (mut n_splits, mut n_rest) = (0usize, 0usize);
     let mut done: Vec<Lite> = Vec::new();
     while let Some(o) = work.pop(&class) {
         anyhow::ensure!(work.len() + done.len() < MAX_OUTCOMES, "more than {MAX_OUTCOMES} outcomes splitting undecided selects");
@@ -258,7 +256,6 @@ pub(super) fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: 
             continue;
         };
         let atom = split_atom(d, c);
-        n_splits += 1;
         let (may_true, may_false) = d.may_answers(atom);
         // The equal side of `x == k` reads `k` for `x` (exact; a near floor
         // must store the `state` it narrowed to). The other side learns nothing.
@@ -332,7 +329,6 @@ pub(super) fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: 
             let made_elsewhere = |k: &RowKey| rows.iter().enumerate().any(|(j, r)| j != si && r == k) || work.index.contains_key(k) || done.iter().any(|p| Waiting::key(&class, p) == *k);
             match absorbed(d, &class, &side, &fresh, made_elsewhere) {
                 Some(halves) => {
-                    n_rest += 1;
                     for h in halves {
                         let size = d.graph.cone(&h.row()).len();
                         work.push(d, &class, h, size);
@@ -345,19 +341,15 @@ pub(super) fn split_undecided_selects<A: GraphArith>(d: &mut Symbolic<A>, outs: 
             }
         }
     }
-    n_rest += absorb_again(d, &class, &mut done);
-    if d.build_trace {
-        eprintln!("[build] split_undecided_selects: {n_in} outcomes, {n_splits} splits, {n_rest} absorbed by a case split, {} out", done.len());
-    }
+    absorb_again(d, &class, &mut done);
     Ok(reassemble(d, &outs, done))
 }
 
 /// ABSORPTION AGAIN once all outcomes exist (`split_undecided_selects`): an
 /// outcome that is two others under a decided case split is them. One is
 /// retried only when a merge gives it new candidates; rows never change, so
-/// the keys are kept. Returns how many were absorbed.
-fn absorb_again<A: GraphArith>(d: &mut Symbolic<A>, class: &[usize], done: &mut Vec<Lite>) -> usize {
-    let mut absorbed_n = 0;
+/// the keys are kept.
+fn absorb_again<A: GraphArith>(d: &mut Symbolic<A>, class: &[usize], done: &mut Vec<Lite>) {
     let mut keys: Vec<_> = done.iter().map(|p| Waiting::key(class, p)).collect();
     let mut dirty = vec![true; done.len()];
     while let Some(i) = dirty.iter().position(|x| *x) {
@@ -377,9 +369,7 @@ fn absorb_again<A: GraphArith>(d: &mut Symbolic<A>, class: &[usize], done: &mut 
             p.merge(d, h.guard, h.error, &h.rests);
             dirty[at] |= p.rests.len() > had;
         }
-        absorbed_n += 1;
     }
-    absorbed_n
 }
 
 /// Each outcome WHOLE again (`split_undecided_selects`): its error settled
@@ -498,16 +488,9 @@ fn three_valued<A: GraphArith>(d: &mut Symbolic<A>, root: NodeId) -> NodeId {
                     hull_of(d, &vals)
                 }
                 None if boolean_op => {
-                    let u = d.unknown_bool_atom();
-                    if d.build_trace {
-                        eprintln!("[build] three_valued: {op:?} past {ARMS} arms, unknown {:?}", d.graph.get(u).op);
-                    }
-                    u
+                    d.unknown_bool_atom()
                 }
                 None => {
-                    if d.build_trace {
-                        eprintln!("[build] three_valued: {op:?} past {ARMS} arms, the whole range");
-                    }
                     let (lo, hi) = A::bounds(A::unknown());
                     d.graph.leaf(Op::Const(A::lit(lo), A::lit(hi)))
                 }

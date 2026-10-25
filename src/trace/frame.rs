@@ -287,13 +287,6 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     for (o, e) in outs.iter_mut().zip(derived) {
         o.error = it.d.graph.fold(crate::transpile::graph::Op::Or, vec![o.error, e]);
     }
-    if it.d.build_trace {
-        let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
-        for (_, o) in &it.d.frame.fork_origins {
-            *by.entry(o.as_str()).or_default() += 1;
-        }
-        eprintln!("[build] trace_frame (widen {widen}): {} outcomes, {} pins, {} forks by origin {by:?}", outs.len(), pin.len(), it.d.frame.forks);
-    }
     let fork_ways: Vec<u8> = (0..it.d.frame.forks).map(|d| it.d.graph.fork_ways(d)).collect();
     let raise = {
         use super::domain::Domain;

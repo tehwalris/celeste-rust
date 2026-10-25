@@ -2248,7 +2248,6 @@ fn compile_with<A: LaneArith>(
     };
     // A small batch keeps live temporaries well under the 26 homes.
     let batch = 4;
-    let t_lower = std::time::Instant::now();
     let order = schedule(g, &live, roots, batch);
     let mix = opts.mix;
     let mut prov_node: Vec<NodeId> = Vec::new();
@@ -2258,7 +2257,6 @@ fn compile_with<A: LaneArith>(
             prov_node.resize(lo.insts.len(), id);
         }
     }
-    let t_lower = t_lower.elapsed();
 
     // Roots -> a PACKED output buffer, booleans first (not a line each).
     let root_kinds: Vec<Ty> = roots
@@ -2278,7 +2276,6 @@ fn compile_with<A: LaneArith>(
             prov_node.resize(lo.insts.len(), *r);
         }
     }
-    let t = std::time::Instant::now();
     let (insts, order) = reschedule(std::mem::take(&mut lo.insts), lo.next_vreg);
     lo.insts = insts;
     let prov: Vec<(NodeId, &'static str)> = if mix {
@@ -2286,9 +2283,6 @@ fn compile_with<A: LaneArith>(
     } else {
         Vec::new()
     };
-    if opts.trace {
-        eprintln!("[build]   {sym}: {} insts, {} vregs: lower {:.1}s, reschedule {:.1}s", lo.insts.len(), lo.next_vreg, t_lower.as_secs_f64(), t.elapsed().as_secs_f64());
-    }
 
     // Rematerializable vregs (spilled for free) and each vreg's def.
     let mut remat = vec![false; lo.next_vreg as usize];
@@ -2301,11 +2295,7 @@ fn compile_with<A: LaneArith>(
         }
     }
 
-    let t_alloc = std::time::Instant::now();
     let (home, spill_slots) = allocate(&lo.insts, lo.next_vreg, &remat);
-    if opts.trace {
-        eprintln!("[build]   {sym}: allocate {:.1}s ({spill_slots} spill slots)", t_alloc.elapsed().as_secs_f64());
-    }
 
     let has_calls = lo.insts.iter().any(|i| matches!(i, Inst::Call { .. }));
     let spill_bytes = spill_slots as u32 * 64;

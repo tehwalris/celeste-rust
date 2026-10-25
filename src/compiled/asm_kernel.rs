@@ -933,9 +933,9 @@ impl<N: KernelLanes> Registry<N> {
             Some(g) => eprintln!("[region] kernels keyed on a {} px grid, player speed asserted within [-{}, {}] px", g.px, g.speed, g.speed),
             None => eprintln!("[region] no region key (--region off)"),
         }
-        // The kernel cache, but for the diagnostics that keep or print the
-        // build (`--kernel-explain`, `--build-trace`).
-        let store = (!s.diag.kernel_explain && !s.diag.build_trace).then(super::cache::Store::default);
+        // The kernel cache, but for the diagnostic that keeps the build
+        // (`--kernel-explain`).
+        let store = (!s.diag.kernel_explain).then(super::cache::Store::default);
         Registry::build_with(opts, s, store.as_ref())
     }
 
@@ -958,7 +958,7 @@ impl<N: KernelLanes> Registry<N> {
             }
         }
         let build = BuildOptions {
-            asm: crate::transpile::asm::AsmOptions { trace: s.diag.build_trace, mix: s.diag.kernel_metrics },
+            asm: crate::transpile::asm::AsmOptions { mix: s.diag.kernel_metrics },
             keep_graphs: s.diag.kernel_explain,
         };
         let build = &build;
@@ -971,18 +971,15 @@ impl<N: KernelLanes> Registry<N> {
         let n_workers = pool.workers(refs.len());
         let built = pool.map(refs.len(), |si| {
             let (region, r) = &refs[si];
-            let mut times = r.lowered.times;
-            let (recipe, loaded, graphs) = build_one_shape::<N>(r, (r.frame.in_rt2.shape_hash_of(), *region), si, build, &mut times)?;
+            let (recipe, loaded, graphs) = build_one_shape::<N>(r, (r.frame.in_rt2.shape_hash_of(), *region), si, build)?;
             let stored = store.is_some().then(|| Ok::<_, anyhow::Error>((recipe.clone(), loaded.bytes()?))).transpose()?;
             let key = (recipe.shape, recipe.region);
-            Ok((key, AsmKernel::of(recipe, loaded, r.cache.clone(), graphs)?, times, stored))
+            Ok((key, AsmKernel::of(recipe, loaded, r.cache.clone(), graphs)?, stored))
         })?;
         let mut kernels = HashMap::new();
         let mut first: HashMap<(u64, Option<Region>), usize> = HashMap::new();
-        let mut times = crate::transpile::lower::BuildTimes::default();
         let mut entry: Vec<(Recipe<N>, Vec<u8>)> = Vec::new();
-        for (si, ((shape, key), kernel, t, stored)) in built.into_iter().enumerate() {
-            times.add(&t);
+        for (si, ((shape, key), kernel, stored)) in built.into_iter().enumerate() {
             entry.extend(stored);
             if kernels.insert((shape, key), kernel).is_some() {
                 let slots = |i: usize| refs[i].1.frame.iface.slots.iter().map(crate::trace::iface::show).filter(|p| p.starts_with("__")).collect::<Vec<_>>();
@@ -1011,7 +1008,6 @@ impl<N: KernelLanes> Registry<N> {
             n_workers,
             text_digest(&kernels),
         );
-        eprintln!("[asm build]   phases, summed over workers: {}", times.show());
         Ok(Registry { kernels, grid: s.region_grid() })
     }
 }
@@ -1257,30 +1253,23 @@ fn build_one_shape<N: KernelLanes>(
     key: (u64, Option<Region>),
     si: usize,
     build: &BuildOptions,
-    times: &mut crate::transpile::lower::BuildTimes,
 ) -> Result<(Recipe<N>, Loaded, Graphs<N>)> {
     use crate::transpile::graph::NodeId;
-    use crate::transpile::lower::Phase;
     let shape = key.0;
     let (fused, bodies) = (&r.lowered.fused, &r.lowered.bodies);
     // One output SLOT per DISTINCT root node, numbered by first appearance
     // in the bodies' roots in the kernel's order (`Roots::flat`).
-    let (flat_roots, slot_of) = times.time(Phase::Fuse, || {
-        let mut flat_roots: Vec<NodeId> = Vec::new();
-        let mut slot_of: HashMap<NodeId, u32> = HashMap::new();
-        for n in bodies.iter().flat_map(|b| b.roots.flat()) {
-            slot_of.entry(n).or_insert_with(|| {
-                flat_roots.push(n);
-                flat_roots.len() as u32 - 1
-            });
-        }
-        (flat_roots, slot_of)
-    });
+    let mut flat_roots: Vec<NodeId> = Vec::new();
+    let mut slot_of: HashMap<NodeId, u32> = HashMap::new();
+    for n in bodies.iter().flat_map(|b| b.roots.flat()) {
+        slot_of.entry(n).or_insert_with(|| {
+            flat_roots.push(n);
+            flat_roots.len() as u32 - 1
+        });
+    }
     let slot = |n: NodeId| slot_of[&n];
     let tag = format!("_{si}");
-    let (mut compiled, loaded) = times
-        .time(Phase::Assemble, || crate::transpile::asm::compile_and_load(fused, &flat_roots, &format!("k{shape:016x}{tag}"), build.asm))
-        .with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
+    let (mut compiled, loaded) = crate::transpile::asm::compile_and_load(fused, &flat_roots, &format!("k{shape:016x}{tag}"), build.asm).with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
     // Which fused nodes read the canonical output unknown (`may_unknown`).
     let reads_unknown_output: Vec<bool> = {
         let mut out = vec![false; fused.len()];

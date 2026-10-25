@@ -19,8 +19,7 @@
 //! mismatch is a loud miss and a rebuild, never a use). Written to a
 //! process's own directory and renamed into place: of two processes storing
 //! one key, whichever rename wins is the entry. Past `CAP_BYTES` the least
-//! recently used entries go. `--kernel-explain` and `--build-trace` build
-//! without it.
+//! recently used entries go. `--kernel-explain` builds without it.
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};

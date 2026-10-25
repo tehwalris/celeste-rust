@@ -326,8 +326,6 @@ fn fold_compare<A: Arithmetic>(op: Cmp, a: A, b: A) -> bool {
 #[derive(Default, Clone)]
 pub struct Symbolic<A: GraphArith = Fixed> {
     pub graph: Graph<A>,
-    /// `--build-trace`: the tracer's progress lines.
-    pub build_trace: bool,
     /// `split_ways` takes a static range's full width (level -1, whose speed
     /// is a range at every node).
     pub uncapped_ways: bool,
@@ -357,7 +355,8 @@ pub struct Symbolic<A: GraphArith = Fixed> {
 pub struct FrameScratch<A: GraphArith = Fixed> {
     /// FORK choices handed out this frame (the fork ids), buttons included.
     pub forks: u8,
-    /// What each `both_values` fork was made for (`--build-trace`).
+    /// What each `both_values` fork was made for (the buttons':
+    /// `UNKNOWN_BOOL_ORIGIN`, which `at_buttons` resolves).
     pub fork_origins: Vec<(u8, String)>,
     /// Fork choices by `(value, kind)`: a second fork of one value reuses the
     /// first's choice instead of an empty dimension.

@@ -5,56 +5,9 @@
 
 use std::collections::BTreeMap;
 
-
 use super::garith::GraphArith;
-use super::graph::{Eval, Graph, NodeId, Op};
+use super::graph::{Graph, NodeId, Op};
 use super::kernel::{Body, OutField, Roots};
-
-/// A kernel build's phases.
-#[derive(Clone, Copy)]
-pub(crate) enum Phase {
-    Specialize,
-    IntervalFold,
-    Boolean,
-    IntervalFold2,
-    Fuse,
-    Assemble,
-}
-
-const PHASE_NAMES: [&str; 6] = [
-    "specialize",
-    "decide: interval fold",
-    "decide: boolean simplification",
-    "decide: interval fold 2",
-    "fuse + key chains",
-    "assemble (gcc + load)",
-];
-
-/// A kernel build's time by `Phase`, summed over what it is gathered from
-/// (a frame's lowering, its assembly, every frame of a set).
-#[derive(Clone, Copy, Default)]
-pub(crate) struct BuildTimes([std::time::Duration; 6]);
-
-impl BuildTimes {
-    /// `f` run as phase `p`.
-    pub(crate) fn time<T>(&mut self, p: Phase, f: impl FnOnce() -> T) -> T {
-        let t = std::time::Instant::now();
-        let out = f();
-        self.0[p as usize] += t.elapsed();
-        out
-    }
-
-    pub(crate) fn add(&mut self, o: &BuildTimes) {
-        for (a, b) in self.0.iter_mut().zip(&o.0) {
-            *a += *b;
-        }
-    }
-
-    /// `name 1.2 s, ...`.
-    pub(crate) fn show(&self) -> String {
-        PHASE_NAMES.iter().zip(&self.0).map(|(name, d)| format!("{name} {:.1} s", d.as_secs_f64())).collect::<Vec<_>>().join(", ")
-    }
-}
 
 /// `want`'s images under the configuration `cfg`, specialized into `out`.
 fn roots_under<A: GraphArith>(graph: &Graph<A>, cfg: &[u8], need: &[bool], want: &[NodeId], out: &mut Graph<A>) -> Vec<NodeId> {
@@ -93,23 +46,14 @@ pub(crate) fn specialize_frame<A: GraphArith>(
     outs: &[Roots],
     forks: u8,
     room: Option<&crate::transpile::graph::Room>,
-    trace: bool,
-    times: &mut BuildTimes,
 ) -> (Graph<A>, Vec<Body>) {
     let mut sp = graph.like();
-    let mut cands = times.time(Phase::Specialize, || {
-        let mut cands = Vec::new();
-        for (oi, out) in outs.iter().enumerate() {
-            cands.extend(configurations(graph, oi, out, forks, room, trace, &mut sp));
-        }
-        cands
-    });
-    let n_cands = cands.len();
-    let sp = decide(&sp, &mut cands, room, trace, times);
-    if trace {
-        eprintln!("[build] specialize {n_cands} candidates; decide: {} nodes after", sp.len());
+    let mut cands = Vec::new();
+    for (oi, out) in outs.iter().enumerate() {
+        cands.extend(configurations(graph, oi, out, forks, room, &mut sp));
     }
-    times.time(Phase::Fuse, || fuse(sp, cands))
+    let sp = decide(&sp, &mut cands, room);
+    fuse(sp, cands)
 }
 
 /// THE CONFIGURATIONS of outcome `oi`, each specialized into `sp` as a
@@ -131,7 +75,6 @@ fn configurations<A: GraphArith>(
     out: &Roots,
     forks: u8,
     room: Option<&crate::transpile::graph::Room>,
-    trace: bool,
     sp: &mut Graph<A>,
 ) -> Vec<Body> {
     let mut cands = Vec::new();
@@ -179,7 +122,6 @@ fn configurations<A: GraphArith>(
         }
         classes = next;
     }
-    let n_classes = classes.len();
     // A DEAD fork (every fragment gives the same fields and error, and the
     // same `live` once its own validity is set aside) is taken once, validity
     // true (`graph::ANY_VALID`): the OR of its fragments' validities is the lane
@@ -205,17 +147,11 @@ fn configurations<A: GraphArith>(
             }
         })
         .collect();
-    let mut total_cfgs = 0u64;
-    // The most fragments one class enumerates per partitioning fork (trace).
-    let mut ways_max = vec![0u8; parts.len()];
     for m in classes {
         // A class's own arena (one shared across classes grew with each).
         let mut probe = graph.like();
         // Move forks keep their traced arity, which their `ForkOk` premise checks.
         let valid: Vec<u8> = parts.iter().map(|&d| graph.fork_ways(d)).collect();
-        for (i, n) in valid.iter().enumerate() {
-            ways_max[i] = ways_max[i].max(*n);
-        }
         let this = (need.as_slice(), want.as_slice());
         let values: Vec<Vec<u8>> = parts
             .iter()
@@ -246,7 +182,6 @@ fn configurations<A: GraphArith>(
             })
             .collect();
         let total: u64 = values.iter().map(|v| v.len() as u64).product();
-        total_cfgs += total;
         for k in 0..total {
             let mut cfg = m.clone();
             let mut r = k;
@@ -259,63 +194,20 @@ fn configurations<A: GraphArith>(
             cands.push(Body { outcome: oi, splits: cfg, roots: out.map(|n| map[n as usize]) });
         }
     }
-    if trace {
-        let ways: Vec<u8> = parts.iter().map(|&d| graph.fork_ways(d)).collect();
-        eprintln!(
-            "[build]   outcome {oi}: {} forks taken both ways -> {n_classes} classes; partitioning forks {parts:?} traced ways {ways:?}, at most {ways_max:?} in one class -> {total_cfgs} configurations",
-            takes_both.len()
-        );
-    }
     cands
 }
 
 /// DECIDE the boolean layer of the candidates, on the RESOLVED graph: the
 /// interval fold, the local BDD (`bdd::simplify_local`), the interval fold
 /// again; the candidates' roots follow into the result.
-fn decide<A: GraphArith>(sp: &Graph<A>, cands: &mut [Body], room: Option<&crate::transpile::graph::Room>, trace: bool, times: &mut BuildTimes) -> Graph<A> {
+fn decide<A: GraphArith>(sp: &Graph<A>, cands: &mut [Body], room: Option<&crate::transpile::graph::Room>) -> Graph<A> {
     let all: Vec<NodeId> = cands.iter().flat_map(|c| c.roots.flat()).collect();
-    let (g1, m1, _) = times.time(Phase::IntervalFold, || crate::transpile::ival::fold(sp, &all, room).expect("interval fold"));
+    let (g1, m1, _) = crate::transpile::ival::fold(sp, &all, room).expect("interval fold");
     let r1: Vec<NodeId> = all.iter().map(|x| m1[*x as usize]).collect();
-    // DIAGNOSTIC (--build-trace): a body whose `error` folded to true while
-    // live somewhere declines every lane it takes: the leaves of its `error`
-    // Or-tree the interval evaluator decided true.
-    if trace {
-        let vals = sp.eval(&crate::transpile::ival::seed_cells(sp), Eval::Fold, room).expect("the fold's eval");
-        let why = crate::transpile::why::Explain { g: sp, vals: Some(&vals) };
-        let (top_lo, top_hi) = A::bounds(A::unknown());
-        let is_top = |n: &NodeId| matches!(vals[*n as usize], crate::transpile::graph::Val::Num(iv) if A::bounds(iv).0 == top_lo || A::bounds(iv).1 == top_hi);
-        let declines = |c: &&Body| matches!(g1.get(m1[c.roots.error as usize]).op, Op::ConstBool(true)) && !matches!(g1.get(m1[c.roots.live as usize]).op, Op::ConstBool(false));
-        for c in cands.iter().filter(declines).take(3) {
-            let mut leaves = Vec::new();
-            for n in why.disjuncts(c.roots.error).into_iter().filter(|n| vals[*n as usize] == crate::transpile::graph::Val::Bool(Some(true))) {
-                leaves.push(why.with_args(n));
-                // Where an unbounded value came from: down the first full-range
-                // operand to the node that made it.
-                for &a in &sp.get(n).args {
-                    let chain = why.chain(a, 40, |cur| sp.get(cur).args.iter().copied().find(is_top));
-                    leaves.push(format!("top source: {} <- {}", why.show_chain(&chain), why.with_args(chain[chain.len() - 1])));
-                }
-            }
-            eprintln!("[build]   outcome {} cfg {:?}: error folds TRUE while live; true disjuncts: {}", c.outcome, c.splits, leaves.join(" | "));
-        }
-    }
     // The boolean layer, simplified locally (`bdd::simplify_local`).
-    let (g2, m2, bst) = times.time(Phase::Boolean, || crate::transpile::bdd::simplify_local(&g1, &r1, crate::transpile::bdd::LOCAL_CAP, crate::transpile::bdd::LOCAL_EXPAND));
-    if trace {
-        eprintln!(
-            "[build]   boolean simplification: {} -> {} nodes, {} constants, {} to atoms, {} merged ({} simple complements), {} duplicate leaves dropped, {} unanalysed (local table full)",
-            bst.before,
-            bst.after,
-            bst.constants,
-            bst.to_atom,
-            bst.merged,
-            bst.merged_simple,
-            bst.deduped,
-            bst.unanalysed
-        );
-    }
+    let (g2, m2, _) = crate::transpile::bdd::simplify_local(&g1, &r1, crate::transpile::bdd::LOCAL_CAP, crate::transpile::bdd::LOCAL_EXPAND);
     let r2: Vec<NodeId> = r1.iter().map(|x| m2[*x as usize]).collect();
-    let (g3, m3, _) = times.time(Phase::IntervalFold2, || crate::transpile::ival::fold(&g2, &r2, room).expect("interval fold 2"));
+    let (g3, m3, _) = crate::transpile::ival::fold(&g2, &r2, room).expect("interval fold 2");
     for c in cands.iter_mut() {
         c.roots = c.roots.map(|r| m3[m2[m1[r as usize] as usize] as usize]);
     }
