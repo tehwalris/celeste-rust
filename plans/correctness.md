@@ -224,22 +224,36 @@ settled here. Evidence is file:line at develop 19869c5d.
   return the frames it covers and guard on THAT. Then re-run (6,0)'s two
   results.
 
-## C14. Checks that can pass with nothing compared
-- `check ref` and `check arcs` pass when every sample was skipped over the
-  path cap (check.rs:335): a green check that compared nothing. Make "no
-  comparison" a failure (or a loud SKIPPED that fails the tier).
-- Identities as `Debug` strings: walk.rs:266/:666, driver.rs:230.
-- `l1 check` looks the table up by the UNWIDENED shape
-  (level_minus_one.rs:1961); likely agrees with the forward, unproven.
-- `rewrite l1 check` under `--split-frame` compares steps with a frame
-  horizon (level_minus_one.rs:1971, l1.rs:94): a valid route on (6,0)/(6,1)
-  is reported UNSOUND past mid-route (loud; fix `clock.steps(a.frames)`).
-- `l1 probe` reads a tree with the command line's settings instead of the
-  tree's record: a wrong `--room` silently probes the wrong room.
-- The `= P8` type defaults let fixed-only code run on float trees by
-  omission: `Visited::load` exists only for 16.16 (frame.rs:1037-1051) and
-  `l1 probe --marks` calls it on any tree (level_minus_one.rs:2089), decoding a
-  float key space as 16.16. Remove the defaults so the arithmetic is explicit.
-- `--override-settings` exists only for `--region`, but `--region off` also
-  turns off the no-player exploration (walk.rs:526-529): either the grid does
-  not change a tree (then don't record it) or overriding it is unsound.
+## C14. Checks that can pass with nothing compared (FIXED but (f), branch correctness-batch)
+- FIXED 99fd23ad: `differential::verdict` FAILS a check that compared
+  nothing (every sample SKIPPED over the path cap); the fence constant is
+  gone. `check arcs`/`check ref --path-cap 1` on the r10 fixture exited 0
+  before, 1 now. No tier step relied on it (t1's harness steps compare 32
+  of 32). check.sh's local tier, whose tests pass and print SKIPPED without
+  the store or PICO-8, now fails the run.
+- FIXED 9d68fb1b: the no-player exploration's identities (walk.rs) are
+  `state_id`: the shape and each constant's path and bits, not `Debug`
+  text; room (0,3)'s walk and kernel text identical. driver.rs's was
+  `MinusOne::text` since d47ae948.
+- SETTLED 24cf016e: `l1 check` by the UNWIDENED shape agrees with the
+  forward: the replay's states are canonical and the block side's widening
+  writes number and boolean columns only, never what `shape_words` hashes
+  or the renumbering follows. The known-route check (which looks level -1
+  up by the widened shape) asserts the two are equal at every step.
+- FIXED 24cf016e: `l1 check` under `--split-frame` judges the steps against
+  `clock.steps(frames)`; room (1,0) split's any% 99 route was UNSOUND from
+  step 57 before, passes now (a slow test).
+- FIXED ef53c2bb: `l1 probe` takes the tree's recorded settings and refuses
+  settings flags (a wrong `--room` is refused); `--marks` on a float tree is
+  refused (marks load as 16.16 only).
+- SETTLED ff553440: the region grid does not change a tree (ckhash with
+  edges and hulls identical under 16,6 and `--region off` in five forwards,
+  fixed, float, objects, fruit, split; level -1 tables identical in three
+  rooms; a grid the kernels cannot be built on fails at the build). It is
+  no longer recorded and `--override-settings` is deleted; settings
+  VERSION 4.
+- OPEN (f): the `= P8` type defaults let fixed-only code run on float trees
+  by omission (`Visited::load` exists only for 16.16); remove the defaults
+  so the arithmetic is explicit. Deferred: a wide mechanical change across
+  the engine and storage, which the `p` deletion (platforms-exact) is
+  rewriting now.
