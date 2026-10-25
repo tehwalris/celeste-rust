@@ -14,7 +14,7 @@ use super::decode::Skeletons;
 use super::route::{Chunk, Routes, UnitBundles};
 use super::visited::{Key, VisitedSet};
 use crate::frame::Filters;
-use crate::search::rem::Rem;
+use crate::search::rem::{Pair, Rem};
 use celeste_engine::exact::{is_provisional, KeySpace, Provisional, RowKey};
 
 /// A typed varying column of buffered rows: raw words, (low, high) pairs,
@@ -307,24 +307,24 @@ impl<N: Rem> Sources<N> {
 struct Xfers<'a, N: Rem> {
     base: &'a super::edges::XferTable<N>,
     first_new: u32,
-    ids: FxHashMap<N::Pair, u32>,
+    ids: FxHashMap<Pair<N>, u32>,
     /// Per local id its decoded transfers (the pushes').
     pairs: Vec<crate::search::rem::Xfer<N>>,
     cache: Vec<(crate::compiled::asm_kernel::RawWords<N>, u32)>,
     /// The worker's table of local transfers (the gather reads it), its length.
-    tab: &'a std::sync::RwLock<Vec<N::Pair>>,
+    tab: &'a std::sync::RwLock<Vec<Pair<N>>>,
     len: u32,
 }
 
 impl<'a, N: Rem> Xfers<'a, N> {
-    fn new(base: &'a super::edges::XferTable<N>, tab: &'a std::sync::RwLock<Vec<N::Pair>>) -> Self {
+    fn new(base: &'a super::edges::XferTable<N>, tab: &'a std::sync::RwLock<Vec<Pair<N>>>) -> Self {
         Xfers { base, first_new: u32::try_from(base.pairs.len()).expect("transfers past u32"), ids: Default::default(), pairs: Vec::new(), cache: Vec::new(), tab, len: 0 }
     }
 
     /// `id` through a direct-mapped raw -> id cache: few distinct transfers
     /// a frame, one lookup an emitted lane.
     #[inline]
-    fn id_raw(&mut self, worker: u32, words: &crate::compiled::asm_kernel::RawWords<N>, decode: impl FnOnce(&crate::compiled::asm_kernel::RawWords<N>) -> N::Pair) -> u32 {
+    fn id_raw(&mut self, worker: u32, words: &crate::compiled::asm_kernel::RawWords<N>, decode: impl FnOnce(&crate::compiled::asm_kernel::RawWords<N>) -> Pair<N>) -> u32 {
         let mut h = 0u64;
         for pair in words.chunks_exact(2) {
             // 16.16's word is `lo << 32 | hi` (`Arithmetic::word`, `fold`).
@@ -345,7 +345,7 @@ impl<'a, N: Rem> Xfers<'a, N> {
 
     /// The pair `t`'s id: its global one if the tree's table holds it, else
     /// this worker's local one (interned on first use).
-    fn id(&mut self, worker: u32, t: N::Pair) -> u32 {
+    fn id(&mut self, worker: u32, t: Pair<N>) -> u32 {
         if let Some(g) = self.base.find(&t) {
             return g;
         }
@@ -604,7 +604,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         level: crate::abstraction::Level,
         worker: u32,
         base: &'a super::edges::XferTable<N>,
-        xfer_tab: &'a std::sync::RwLock<Vec<N::Pair>>,
+        xfer_tab: &'a std::sync::RwLock<Vec<Pair<N>>>,
         s: &crate::settings::Settings,
     ) -> Self {
         UnitSink {
@@ -704,7 +704,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
 
     /// A transfer's id through a direct-mapped raw -> id cache (`Xfers`).
     #[inline]
-    pub(crate) fn xfer_id_raw(&mut self, words: &crate::compiled::asm_kernel::RawWords<N>, decode: impl FnOnce(&crate::compiled::asm_kernel::RawWords<N>) -> N::Pair) -> u32 {
+    pub(crate) fn xfer_id_raw(&mut self, words: &crate::compiled::asm_kernel::RawWords<N>, decode: impl FnOnce(&crate::compiled::asm_kernel::RawWords<N>) -> Pair<N>) -> u32 {
         self.xfers.id_raw(self.worker, words, decode)
     }
 
@@ -879,7 +879,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     /// (stored widened: `row_key`) by transfer `pair`.
     /// Its skeleton is `decode::reference_skeleton`: a reference row's
     /// columns follow its values, not a kernel's template.
-    pub(crate) fn emit_row(&mut self, row: &Rt2<N>, lane: usize, cell: u32, pair: N::Pair) -> Result<()> {
+    pub(crate) fn emit_row(&mut self, row: &Rt2<N>, lane: usize, cell: u32, pair: Pair<N>) -> Result<()> {
         debug_assert_eq!(row.width, 1);
         if self.minus_one_drop(row.shape_hash, cell) {
             return Ok(());

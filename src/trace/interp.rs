@@ -70,7 +70,7 @@ pub struct Interp<'a, D: Domain> {
     room_flags: std::collections::HashMap<(i16, i16, i16), bool>,
     /// Literal splits handed out: the ids in `State::frag`.
     next_split: usize,
-    /// THE ARC CAPTURE (`search::arc_edges`), set per level-0 trace: every
+    /// THE ARC CAPTURE (`search::rem::decode`), set per level-0 trace: every
     /// split of a remainder (`__split_by_round`, `__split_by_flr`) must name
     /// its site and the player's record what they did (`State::arc`).
     pub arc_capture: bool,
