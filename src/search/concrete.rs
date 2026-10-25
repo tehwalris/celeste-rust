@@ -503,7 +503,8 @@ pub(super) fn lookup_view<N: Arithmetic>(row: &Rt2<N>, seeded: bool) -> Result<R
 pub(crate) fn rem_raw<N: Rem>(rt2: &Rt2<N>) -> Result<Option<(N, N)>> {
     use celeste_engine::runtime2::AV;
     let ids = crate::compiled::ids();
-    let Some((cx, cy)) = rt2.player_xy_cells(ids.f_rem) else { return Ok(None) };
+    let Some((cx, cy)) = celeste_engine::shape::Anchors::of(rt2).player_xy(rt2, ids.f_rem) else { return Ok(None) };
+    let (cx, cy) = (cx as usize, cy as usize);
     let num = |c: usize| match rt2.cols[c].at(0) {
         AV::Num(n) => Ok(n),
         other => Err(anyhow::anyhow!("a concrete remainder expected, got {other:?}")),

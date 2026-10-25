@@ -639,9 +639,9 @@ impl<'a, N: Rem> UnitSink<'a, N> {
 
     /// A shape the key space lacks, emitted (`Provisional::note_shape`,
     /// once a worker).
-    pub(crate) fn note_shape(&mut self, r: &celeste_engine::exact::ShapeRecord) {
-        if self.guards.noted.insert(r.hash) {
-            self.prov.note_shape(r);
+    pub(crate) fn note_shape(&mut self, l: &std::sync::Arc<celeste_engine::shape::Layout>) {
+        if self.guards.noted.insert(l.hash()) {
+            self.prov.note_shape(l);
         }
     }
 
@@ -874,7 +874,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         w.widen_to(crate::abstraction::Level::EXACT);
         w.canonical();
         if self.keys.shape(w.shape_hash).is_none() {
-            self.note_shape(&celeste_engine::exact::ShapeRecord::of(&w));
+            self.note_shape(&std::sync::Arc::new(celeste_engine::shape::Layout::of(&w)));
         }
         let key = match self.keys.row_keys(&w).swap_remove(0) {
             RowKey::Hit(k) => k,

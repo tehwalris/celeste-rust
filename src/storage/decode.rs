@@ -19,6 +19,7 @@ use celeste_core::arith::Arithmetic;
 use celeste_core::pico8_num::Pico8Num as P8;
 
 use celeste_engine::exact::{Code, FieldDict, Key, KeySpace};
+use celeste_engine::shape::KeyRole;
 use celeste_engine::runtime2::{Cell2, Col, Rt2, AV};
 
 use crate::storage::cells::{cell_xy, room_offset, NO_CELL};
@@ -30,8 +31,8 @@ pub(crate) fn decode_rows<N: Arithmetic>(keys: &KeySpace<N>, skel: &Rt2<N>, rows
     let s = keys.shape(skel.shape_hash).ok_or_else(|| anyhow!("decode: shape {:016x} is not in the key space", skel.shape_hash))?;
     let n = rows.len();
     ensure!(n > 0, "decode: no rows");
-    let pos = s.record.pos;
-    let is_pos = |c: u32| pos.is_some_and(|(x, y)| c == x || c == y);
+    let layout = s.layout();
+    ensure!(layout.cells() == skel.structure.len(), "decode: shape {:016x}: a skeleton of {} cells, a layout of {}", skel.shape_hash, skel.structure.len(), layout.cells());
     let mut runs: Vec<(Key, usize, usize)> = Vec::new();
     for (i, r) in rows.iter().enumerate() {
         match runs.last_mut() {
@@ -55,32 +56,36 @@ pub(crate) fn decode_rows<N: Arithmetic>(keys: &KeySpace<N>, skel: &Rt2<N>, rows
         shape_hash: skel.shape_hash,
         row_keys: rows.iter().map(|r| r.0).collect(),
     };
-    // Every value cell but the position's, from the key.
-    for (c, cell) in skel.structure.iter().enumerate() {
-        if !matches!(cell, Cell2::Val) {
-            out.cols.push(skel.cols[c].clone());
-            continue;
-        }
-        let Some(f) = s.field(c) else {
-            // A FOLLOWER: the code its leader's index recorded.
-            let mut b = Builder::new(Repr::of(&skel.cols[c]), n);
-            let (g, slot) = s.follower(c as u32).ok_or_else(|| anyhow!("decode: shape {shape:016x} cell {c} is not a key field"))?;
-            let fl = &s.follows()[g];
-            let lead = s.field(fl.leader() as usize).ok_or_else(|| anyhow!("decode: shape {shape:016x}: the leader is not keyed"))?;
-            runs.iter()
-                .try_for_each(|&(k, lo, hi)| {
-                    let i = lead.index_in(k);
-                    ensure!((i as usize) < lead.len(), "decode: shape {shape:016x} leader cell {}: index {i} past the dictionary's {}", fl.leader(), lead.len());
-                    b.push(fl.code(slot, i), hi - lo)
-                })
-                .with_context(|| format!("decode: shape {shape:016x} follower cell {c}"))?;
-            out.cols.push(b.finish());
-            continue;
+    // Every value cell but the position's, from the key, by its role.
+    for c in 0..skel.structure.len() {
+        let f = match layout.role(c as u32) {
+            KeyRole::Structure => {
+                out.cols.push(skel.cols[c].clone());
+                continue;
+            }
+            // Below, from the row's cell.
+            KeyRole::Position => {
+                out.cols.push(Col::U(AV::Nil));
+                continue;
+            }
+            KeyRole::Value | KeyRole::Leader(_) => s.field(c).ok_or_else(|| anyhow!("decode: shape {shape:016x} cell {c} has no dictionary"))?,
+            KeyRole::Follower { dep, slot } => {
+                // The code its leader's index recorded.
+                let (g, slot) = (dep as usize, slot as usize);
+                let mut b = Builder::new(Repr::of(&skel.cols[c]), n);
+                let fl = &s.follows()[g];
+                let lead = s.field(fl.leader() as usize).ok_or_else(|| anyhow!("decode: shape {shape:016x}: the leader is not keyed"))?;
+                runs.iter()
+                    .try_for_each(|&(k, lo, hi)| {
+                        let i = lead.index_in(k);
+                        ensure!((i as usize) < lead.len(), "decode: shape {shape:016x} leader cell {}: index {i} past the dictionary's {}", fl.leader(), lead.len());
+                        b.push(fl.code(slot, i), hi - lo)
+                    })
+                    .with_context(|| format!("decode: shape {shape:016x} follower cell {c}"))?;
+                out.cols.push(b.finish());
+                continue;
+            }
         };
-        if is_pos(c as u32) {
-            out.cols.push(Col::U(AV::Nil));
-            continue;
-        }
         let mut b = Builder::new(Repr::of(&skel.cols[c]), n);
         // A field without bits holds its one code in every row.
         if f.bits() == 0 {
@@ -92,19 +97,18 @@ pub(crate) fn decode_rows<N: Arithmetic>(keys: &KeySpace<N>, skel: &Rt2<N>, rows
         .with_context(|| format!("decode: shape {shape:016x} cell {c}"))?;
         out.cols.push(b.finish());
     }
-    let Some((px, py)) = pos else {
+    let Some((px, py)) = layout.pos() else {
         ensure!(rows.iter().all(|r| r.1 == NO_CELL), "decode: shape {shape:016x} has no position object, a row has a cell");
         return Ok(out);
     };
     // Position: the cell's pixels less the room offset, plus the fraction.
-    let ids = crate::compiled::ids();
     let start = (skel.room.x, skel.room.y);
-    let room = out.global_target(ids.g_room).ok_or_else(|| anyhow!("decode: no `room` global"))?;
-    let room_field = |fid: u32| -> Result<(usize, &FieldDict<N>)> {
-        let c = out.obj_field_cell(room, fid).ok_or_else(|| anyhow!("decode: no room field {fid}"))? as usize;
+    let [rx, ry] = celeste_engine::shape::Anchors::room_of(&out).ok_or_else(|| anyhow!("decode: no `room` global with `x` and `y`"))?;
+    let room_field = |c: u32| -> Result<(usize, &FieldDict<N>)> {
+        let c = c as usize;
         Ok((c, s.field(c).ok_or_else(|| anyhow!("decode: shape {shape:016x} room cell {c} is not a key field"))?))
     };
-    let ((rxc, rxf), (ryc, ryf)) = (room_field(ids.f_x)?, room_field(ids.f_y)?);
+    let ((rxc, rxf), (ryc, ryf)) = (room_field(rx)?, room_field(ry)?);
     let whole = |code: Code<N>| -> Result<i16> {
         ensure!(code.kind == 0, "decode: room coordinate {:?}", code.value());
         N::from_raw(code.a).and_then(|v| v.whole_i16()).ok_or_else(|| anyhow!("decode: room coordinate {:?}", code.value()))

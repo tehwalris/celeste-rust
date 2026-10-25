@@ -174,7 +174,7 @@ fn berry_left_behind<A: GraphArith>(st: &State<Symbolic<A>>, d: &Symbolic<A>, ro
     }
 }
 
-/// The player, else the player spawn (`Rt2::position_object`'s rule).
+/// The player, else the player spawn (`shape::Anchors`' position rule).
 fn located_object<A: GraphArith>(st: &State<Symbolic<A>>) -> Option<Path> {
     crate::trace::shapes::player_path(st).or_else(|| crate::trace::widen::objects_of_type(st, "player_spawn").into_iter().next())
 }
@@ -2201,6 +2201,33 @@ mod tests {
         assert!(tree_table(&dir, t.fingerprint() ^ 1).is_err(), "another fingerprint than the record's");
         let back = tree_table(&dir, t.fingerprint()).expect("the tree's table");
         assert_eq!((&back.d, back.start_d), (&t.d, t.start_d));
+    }
+
+    /// THE POSITION OBJECT IS ONE RULE: on every representative of the
+    /// lattice walks of room (1,0) and room (4,2), the object level -1
+    /// locates (a path in the tracer's state) is the one `shape::Anchors`
+    /// names in its block - the player where one is, else the spawn, both
+    /// met.
+    #[test]
+    #[ignore = "slow, ./check.sh t2 runs it: two rooms' lattice walks, ~20 CPU-s"]
+    fn the_located_object_is_the_anchors_position() {
+        use celeste_engine::shape::Anchors;
+        let (mut players, mut spawns) = (0, 0);
+        for s in [crate::settings::Settings::default(), crate::settings::Settings { room: (4, 2), ..Default::default() }] {
+            let run = crate::settings::Run::new(&s, crate::abstraction::Level::EXACT);
+            let lw = crate::trace::walk::room_constant_lattice::<celeste_core::arith::Fixed>(&crate::trace::walk::Walk { run: &run, only: None }).expect("the walk");
+            for st in lw.reps.values() {
+                let b: celeste_engine::Rt2 = crate::trace::block::skeleton(st, lw.room).expect("a block");
+                let located = located_object(st).map(|p| celeste_engine::slots::deref(&b, crate::trace::bind::resolve(&b, &p).expect("the path resolves")).expect("an object"));
+                let anchors = Anchors::of(&b);
+                assert_eq!(located, anchors.position.map(|p| p.obj), "room {:?}: level -1 locates another object than the anchors' position", s.room);
+                match anchors.player {
+                    Some(_) => players += 1,
+                    None => spawns += located.is_some() as usize,
+                }
+            }
+        }
+        assert!(players > 0 && spawns > 0, "{players} representatives with a player, {spawns} with only a spawn");
     }
 
     fn num(lo: i32, hi: i32) -> Val {

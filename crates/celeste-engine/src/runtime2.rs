@@ -9,7 +9,7 @@ use celeste_core::room::Room;
 use celeste_core::pico8_num::Pico8Num;
 use serde::{Deserialize, Serialize};
 
-use crate::shape::{sig, Kind};
+use crate::shape::Kind;
 
 pub type P8 = Pico8Num;
 
@@ -43,7 +43,6 @@ pub enum AV<N = P8> {
     Str(u32),
     Nil,
     Ptr(u32),
-    NilPtr,
 }
 
 /// A column: one value per lane, or one value for every lane (`U`, which
@@ -115,12 +114,14 @@ impl<N> Cell2<N> {
 }
 
 /// The names the engine reads itself, as their ids (`celeste_names`): the
-/// POSITION OBJECT (the player, else the player spawn, in `objects` by its
-/// `type`) and its fields. The game's other names are its caller's.
+/// anchors' (`shape::Anchors`: the position object, the player, else the
+/// player spawn, in `objects` by its `type`; the `room`) and their fields.
+/// The game's other names are its caller's.
 pub struct Names {
     pub objects: u32,
     pub player: u32,
     pub player_spawn: u32,
+    pub room: u32,
     pub type_: u32,
     pub x: u32,
     pub y: u32,
@@ -131,7 +132,7 @@ pub fn names() -> &'static Names {
     static N: std::sync::OnceLock<Names> = std::sync::OnceLock::new();
     N.get_or_init(|| {
         let (g, f) = (celeste_names::global, celeste_names::field);
-        Names { objects: g("objects"), player: g("player"), player_spawn: g("player_spawn"), type_: f("type"), x: f("x"), y: f("y") }
+        Names { objects: g("objects"), player: g("player"), player_spawn: g("player_spawn"), room: g("room"), type_: f("type"), x: f("x"), y: f("y") }
     })
 }
 
@@ -204,36 +205,6 @@ pub fn collapse_uniform<N: Copy + PartialEq>(c: Col<N>) -> Col<N> {
         Col::V(vs) => Col::U(vs[0]),
         Col::U(_) => unreachable!(),
     }
-}
-
-/// Each name table's names as a shape's signature spells them: a name's
-/// FNV-1a hash, distinct within its table (checked once), so a signature
-/// is as exact as the names themselves and independent of where a name
-/// sits in its table.
-struct NameCodes {
-    fields: Vec<u32>,
-    globals: Vec<u32>,
-    fns: Vec<u32>,
-    builtins: Vec<u32>,
-}
-
-fn name_codes() -> &'static NameCodes {
-    static C: std::sync::OnceLock<NameCodes> = std::sync::OnceLock::new();
-    C.get_or_init(|| {
-        let codes = |what: &str, names: &[&str]| -> Vec<u32> {
-            let fnv = |n: &str| n.bytes().fold(0x811c_9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193));
-            let out: Vec<u32> = names.iter().map(|n| fnv(n)).collect();
-            let distinct: std::collections::HashSet<u32> = out.iter().copied().collect();
-            assert!(distinct.len() == out.len(), "two {what} names share a signature code");
-            out
-        };
-        NameCodes {
-            fields: codes("field", celeste_names::FIELD_NAMES),
-            globals: codes("global", celeste_names::GLOBAL_NAMES),
-            fns: codes("function", celeste_names::gen::FN_NAMES),
-            builtins: codes("builtin", &celeste_core::builtins::BUILTIN_NAMES),
-        }
-    })
 }
 
 impl<N: Arithmetic> Rt2<N> {
@@ -320,94 +291,17 @@ impl<N: Arithmetic> Rt2<N> {
         found
     }
 
-    /// The `x`/`y` cells of the table at `obj`'s field `f`.
-    fn xy_cells_of(&self, obj: u32, f: u32) -> Vec<u32> {
-        let mut out = Vec::new();
-        if let Some(ptr_cell) = self.obj_field_cell(obj, f) {
-            if let Col::U(AV::Ptr(sub)) = self.cols[ptr_cell as usize] {
-                for g in [names().x, names().y] {
-                    if let Some(c) = self.obj_field_cell(sub, g) {
-                        out.push(c);
-                    }
-                }
-            }
-        }
-        out
+    /// The `x`/`y` cells of the table at `obj`'s field `f` (`rem`, `spd`).
+    pub fn xy_cells(&self, obj: u32, f: u32) -> Option<(u32, u32)> {
+        let Col::U(AV::Ptr(sub)) = self.cols[self.obj_field_cell(obj, f)? as usize] else { return None };
+        Some((self.obj_field_cell(sub, names().x)?, self.obj_field_cell(sub, names().y)?))
     }
 
-    /// The POSITION object: the first player instance, else the first
-    /// `player_spawn` (`storage::cells::block_cells`' rule: its
-    /// whole-pixel `x`/`y` make the row's cell).
-    pub fn position_object(&self) -> Option<u32> {
-        self.player_objects().first().copied().or_else(|| self.objects_of_type(names().player_spawn).first().copied())
-    }
-
-    pub fn position_cells(&self) -> Option<(u32, u32)> {
-        let obj = self.position_object()?;
-        Some((self.obj_field_cell(obj, names().x)?, self.obj_field_cell(obj, names().y)?))
-    }
-
-    /// The first player INSTANCE's `x`/`y` cells of its table field `f`
-    /// (`rem`, `spd`) - not `player_spawn`'s, whose remainder is real state.
-    pub fn player_xy_cells(&self, f: u32) -> Option<(usize, usize)> {
-        let obj = *self.player_objects().first()?;
-        match self.xy_cells_of(obj, f)[..] {
-            [x, y] => Some((x as usize, y as usize)),
-            _ => None,
-        }
-    }
-
-    /// THE SHAPE'S SIGNATURE, word by word (`shape::sig`'s format;
-    /// `exact::shape_sig` collects it, `shape_hash_of` hashes it, `sig::kinds`
-    /// reads it): every cell in canonical order by kind, a
-    /// field, function or builtin by its NAME's code (`NameCodes`); then the
-    /// globals PRESENT, each by its name's code and its cell. A shape's
-    /// identity is the names it holds, so appending a name to a table moves
-    /// no shape (an absent global is not in it).
-    pub fn shape_words(&self, mut w: impl FnMut(u32)) {
-        let c = name_codes();
-        for cell in &self.structure {
-            match cell {
-                Cell2::Val => w(sig::VAL),
-                Cell2::Obj(fields) => {
-                    w(sig::OBJ);
-                    w(fields.len() as u32);
-                    for (k, t) in fields {
-                        w(c.fields[*k as usize]);
-                        w(*t);
-                    }
-                }
-                Cell2::Arr(items) => {
-                    w(sig::ARR);
-                    w(items.len() as u32);
-                    items.iter().for_each(|t| w(*t));
-                }
-                Cell2::Unk => w(sig::UNK),
-                Cell2::Clo(f, caps) => {
-                    w(sig::CLO);
-                    w(c.fns[*f as usize]);
-                    w(caps.len() as u32);
-                }
-                Cell2::Bi(b) => {
-                    w(sig::BI);
-                    w(c.builtins[*b as usize]);
-                }
-            }
-        }
-        w(sig::END);
-        for (g, &cell) in self.globals.iter().enumerate() {
-            if cell != NONE {
-                w(c.globals[g]);
-                w(cell);
-            }
-        }
-    }
-
-    /// The shape key: a hash of the signature (`shape_words`).
+    /// The shape key: a hash of the signature (`shape::sig`).
     pub fn shape_hash_of(&self) -> u64 {
         use std::hash::Hasher;
         let mut h = rustc_hash::FxHasher::default();
-        self.shape_words(|x| h.write_u32(x));
+        crate::shape::sig::write(&self.structure, &self.globals, |x| h.write_u32(x));
         h.finish()
     }
 

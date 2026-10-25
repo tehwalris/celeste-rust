@@ -85,14 +85,14 @@ pub fn to_rt2<D: Domain, N: Arithmetic>(
 type Topology = Box<[(u32, u32)]>;
 
 /// THE POINTER TOPOLOGY IS THE SHAPE'S, process-wide: every block made
-/// under one shape hash has one signature and one `Topology`. The signature
-/// names neither a value cell's target nor a capture's
-/// (`Rt2::shape_words`), and a kernel is bound by path against one
-/// representative of its shape (`trace::bind`): a block whose pointers
-/// differ under the hash would run a kernel bound to the other's cells.
-/// FATAL (`exact`'s `pointer_violation` is the key space's side).
+/// under one shape hash has one signature (`shape::sig::intern_of`) and one
+/// `Topology`. The signature names neither a value cell's target nor a
+/// capture's, and a kernel is bound by path against one representative of
+/// its shape (`trace::bind`): a block whose pointers differ under the hash
+/// would run a kernel bound to the other's cells. FATAL (`exact`'s
+/// `pointer_violation` is the key space's side).
 fn the_topology_is_the_shapes<N: Arithmetic>(rt2: &Rt2<N>) {
-    type Seen = celeste_engine::FxHashMap<u64, Arc<(Vec<u32>, Topology)>>;
+    type Seen = celeste_engine::FxHashMap<u64, Arc<Topology>>;
     static SEEN: std::sync::OnceLock<std::sync::RwLock<Seen>> = std::sync::OnceLock::new();
     let target = |c: &Col<N>| match c {
         Col::U(AV::Ptr(t)) => *t,
@@ -106,21 +106,18 @@ fn the_topology_is_the_shapes<N: Arithmetic>(rt2: &Rt2<N>) {
             _ => {}
         }
     }
+    celeste_engine::shape::sig::intern_of(rt2);
     let seen = SEEN.get_or_init(Default::default);
     let had = seen.read().expect("the shapes' topologies").get(&rt2.shape_hash).cloned();
-    let had = had.unwrap_or_else(|| {
-        let first = || Arc::new((celeste_engine::exact::shape_sig(rt2), topology.clone().into_boxed_slice()));
-        seen.write().expect("the shapes' topologies").entry(rt2.shape_hash).or_insert_with(first).clone()
-    });
-    assert!(had.0 == celeste_engine::exact::shape_sig(rt2), "block: two shapes under the hash {:#x} (a shape-hash collision)", rt2.shape_hash);
-    if let Some((a, b)) = had.1.iter().zip(&topology).find(|(a, b)| a != b) {
+    let had = had.unwrap_or_else(|| seen.write().expect("the shapes' topologies").entry(rt2.shape_hash).or_insert_with(|| Arc::new(topology.clone().into_boxed_slice())).clone());
+    if let Some((a, b)) = had.iter().zip(&topology).find(|(a, b)| a != b) {
         panic!(
             "block: shape {:#x}: cell {} points at {} where an earlier block of the shape's cell {} points at {} (u32::MAX: no pointer): \
              the POINTER TOPOLOGY, which a kernel binds by path against one representative, varies under one shape hash",
             rt2.shape_hash, b.0, b.1, a.0, a.1
         );
     }
-    assert!(had.1.len() == topology.len(), "block: shape {:#x}: {} pointers where an earlier block of the shape has {}", rt2.shape_hash, topology.len(), had.1.len());
+    assert!(had.len() == topology.len(), "block: shape {:#x}: {} pointers where an earlier block of the shape has {}", rt2.shape_hash, topology.len(), had.len());
 }
 
 /// The tracer's block of `st`: its shape, every number and boolean `Nil`
@@ -379,7 +376,7 @@ impl<N: Arithmetic, D: Domain<A = N>> FromBlock<'_, N, D> {
             AV::Bool(b) => Value::Bool(self.d.boolean(b)),
             AV::UBool => Value::Bool(self.d.boolean(false)),
             AV::Str(s) => Value::Str(Arc::from(self.rt2.strings[s as usize].as_str())),
-            AV::Nil | AV::NilPtr => Value::Nil,
+            AV::Nil => Value::Nil,
             AV::Ptr(p) => self.target(p)?,
         })
     }
@@ -445,7 +442,7 @@ impl<N: Arithmetic, D: Domain<A = N>> FromBlock<'_, N, D> {
 mod tests {
     /// THE SIGNATURE READS BACK ITS BLOCK: on the start blocks of rooms of
     /// every kind of object (the platforms', a 100% room's), `sig::kinds`
-    /// of what `shape_words` writes is the block's cells' kinds, and every
+    /// of what `sig::write` writes is the block's cells' kinds, and every
     /// kind occurs (a reader whose cases the blocks skip is unchecked).
     #[test]
     fn the_signature_reads_back_the_blocks_kinds() {
@@ -460,10 +457,8 @@ mod tests {
         ] {
             let eng = crate::engines::reference::RefEngine::new(&s).expect("ref engine");
             let b = eng.initial().expect("the start converts");
-            let mut words = Vec::new();
-            b.shape_words(|w| words.push(w));
             let want: Vec<Kind> = b.structure.iter().map(|c| c.kind()).collect();
-            assert_eq!(sig::kinds(&words).as_deref(), Ok(&want[..]), "room {:?}", s.room);
+            assert_eq!(sig::kinds(&sig::of(&b)).as_deref(), Ok(&want[..]), "room {:?}", s.room);
             seen.extend(want.iter().map(|k| format!("{k:?}")));
         }
         assert_eq!(seen.len(), 6, "the kinds the start blocks hold: {seen:?}");

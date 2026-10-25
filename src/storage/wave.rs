@@ -1269,8 +1269,8 @@ fn finalize_keys<N: Rem>(visited: &mut VisitedSet<N>, states: &[RouteState<N>], 
     new_shapes.sort_unstable();
     new_shapes.dedup();
     for s in new_shapes {
-        let r = prov.shape_record(s).unwrap_or_else(|| panic!("exact keys: the new shape {s:#x} was not noted"));
-        visited.keys.add_shape(&r, adds);
+        let l = prov.shape_layout(s).unwrap_or_else(|| panic!("exact keys: the new shape {s:#x} was not noted"));
+        visited.keys.add_shape(&l, adds);
     }
     visited.keys.add_misses(&contents, adds);
     keys.iter().zip(&contents).map(|(&k, m)| (k, visited.keys.complete(m))).collect()

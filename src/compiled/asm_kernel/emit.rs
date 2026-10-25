@@ -20,6 +20,7 @@ use anyhow::Result;
 
 use celeste_core::arith::Arithmetic;
 use celeste_engine::exact::{follower_violation, Code, FieldDict, Follow, MissKey, ShapeKeys};
+use celeste_engine::shape::KeyRole;
 use celeste_engine::runtime2::{Rt2, P8};
 
 use super::{AsmKernel, KernelLanes};
@@ -29,8 +30,7 @@ use crate::search::rem::Capture;
 use crate::storage::unit::lanes_of;
 
 /// One per-row field of a key: its cell (the shape's dictionary), output
-/// slot, its type and whether it is a position coordinate (its code
-/// `exact::Code::of_pos`).
+/// slot, and how the slot reads as its code (its type and `KeyRole`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct KeyField {
     pub cell: u32,
@@ -105,10 +105,10 @@ fn bool_same(v: u16, k: u16, r: usize, of: u16) -> u16 {
 }
 
 impl KeyField {
-    /// `pos`: the cell is a position coordinate (`Rt2::position_cells`),
-    /// which keys without its whole pixels.
-    pub(super) fn new(cell: u32, root: usize, ty: Ty, pos: bool) -> Result<KeyField> {
-        let read = match (ty, pos) {
+    /// The field of `cell` in `role` (a position coordinate keys without its
+    /// whole pixels: `KeyRole::code`).
+    pub(super) fn new(cell: u32, root: usize, ty: Ty, role: KeyRole) -> Result<KeyField> {
+        let read = match (ty, role == KeyRole::Position) {
             (Ty::Num, false) => Read::Num,
             (Ty::Ival, false) => Read::Ival,
             (Ty::Bool | Ty::UBool, false) => Read::Bool,
@@ -386,13 +386,14 @@ impl<N: Arithmetic> Default for PartKey<N> {
 
 impl<N: Arithmetic> PartKey<N> {
     /// `t`'s uniform fields in `sk` (`None`: a shape the key space lacks),
-    /// the template's record (signature and key layout) checked against the
-    /// key space's.
+    /// the template's layout (signature and key dependencies) checked
+    /// against the key space's.
     pub(super) fn of(t: &super::AccTemplate<N>, sk: Option<&ShapeKeys<N>>) -> PartKey<N> {
         use celeste_engine::exact::NONE;
         let Some(sk) = sk else { return PartKey { missing: t.uniform.clone(), leader_missing: u32::MAX, ..PartKey::default() } };
-        assert!(sk.record.deps == t.record.deps || sk.record.sig != t.record.sig, "exact keys: shape {:#x} under two key layouts", t.shape_hash);
-        assert!(sk.record == t.record, "exact keys: two shapes under the hash {:#x} (a shape-hash collision)", t.shape_hash);
+        let (have, want) = (sk.layout(), &t.layout);
+        assert!(have.deps() == want.deps() || have.sig() != want.sig(), "exact keys: shape {:#x} under two key layouts", t.shape_hash);
+        assert!(**have == **want, "exact keys: two shapes under the hash {:#x} (a shape-hash collision)", t.shape_hash);
         let mut p = PartKey::default();
         for &(c, code) in &t.uniform {
             let d = sk.field(c as usize).unwrap_or_else(|| panic!("uniform cell {c} is not a value cell of shape {:#x}", t.shape_hash));
@@ -665,7 +666,7 @@ impl<N: KernelLanes> AsmKernel<N> {
             }
             c.read_miss[r] = match sks[shape as usize] {
                 Some(sk) => {
-                    let d = sk.field(f.cell as usize).unwrap_or_else(|| panic!("key field cell {} is not a value cell of shape {:#x}", f.cell, sk.record.hash));
+                    let d = sk.field(f.cell as usize).unwrap_or_else(|| panic!("key field cell {} is not a value cell of shape {:#x}", f.cell, sk.layout().hash()));
                     f.eval::<N>(buf, half, d, need, &mut c.read_placed[r])
                 }
                 // A shape the key space lacks: every lane new, its partial
@@ -702,7 +703,7 @@ impl<N: KernelLanes> AsmKernel<N> {
             let template = &self.acc_templates[body.outcome];
             let (shape, sk) = (plan.shapes[b.shape as usize], sks[b.shape as usize]);
             if sk.is_none() {
-                sink.note_shape(&template.record);
+                sink.note_shape(&template.layout);
             }
             if parts[body.outcome].0 != generation {
                 parts[body.outcome] = (generation, PartKey::of(template, sk));
@@ -817,12 +818,12 @@ impl<N: KernelLanes> AsmKernel<N> {
             }
             left &= !same;
             let idx = ld.index_in((packed.0[1][r], packed.0[0][r]));
-            assert!((idx as usize) < ld.len(), "exact keys: shape {:#x}: a leader index {idx} past its {} codes", sk.record.hash, ld.len());
+            assert!((idx as usize) < ld.len(), "exact keys: shape {:#x}: a leader index {idx} past its {} codes", sk.layout().hash(), ld.len());
             let at = |lane: usize| format!("the kernels' emission, body {bi} lane {lane}");
             if part.checked[g] != idx {
                 for &(_, slot, cell, code) in uniform.iter().filter(|u| u.0 as usize == g) {
                     if fl.code(slot as usize, idx) != code {
-                        follower_violation(sk.record.hash, fl.leader(), ld.code(idx), idx, cell, code, fl.code(slot as usize, idx), &at(r));
+                        follower_violation(sk.layout().hash(), fl.leader(), ld.code(idx), idx, cell, code, fl.code(slot as usize, idx), &at(r));
                     }
                 }
                 part.checked[g] = idx;
@@ -832,7 +833,7 @@ impl<N: KernelLanes> AsmKernel<N> {
                 let eq = f.eq_code::<N>(buf, half, want) & same;
                 if eq != same {
                     let lane = (same & !eq).trailing_zeros() as usize;
-                    follower_violation(sk.record.hash, fl.leader(), ld.code(idx), idx, f.cell, f.code::<N>(buf, half, lane), want, &at(lane));
+                    follower_violation(sk.layout().hash(), fl.leader(), ld.code(idx), idx, f.cell, f.code::<N>(buf, half, lane), want, &at(lane));
                 }
             }
         }

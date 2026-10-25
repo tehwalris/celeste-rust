@@ -115,20 +115,18 @@ pub(crate) fn whole_range_col<N: Arithmetic>(rt2: &Rt2<N>, cell: u32) -> Option<
 /// Per-lane cell of a block (`room.x`/`room.y` must be numbers; no player or
 /// a non-numeric position: `NO_CELL`); the start room is its `room`.
 pub fn block_cells<N: Arithmetic>(rt2: &Rt2<N>) -> Result<Vec<u32>> {
-    let ids = crate::compiled::ids();
+    let anchors = celeste_engine::shape::Anchors::of(rt2);
     let start = (rt2.room.x, rt2.room.y);
     let lanes = rt2.width;
-    let axis = |obj: u32, f: u32| rt2.obj_field_cell(obj, f).and_then(|c| whole_i16_col(rt2, c));
-    let room = rt2
-        .global_target(ids.g_room)
-        .ok_or_else(|| anyhow!("block_cells: no readable `room` global"))?;
-    let (Some(rx), Some(ry)) = (axis(room, ids.f_x), axis(room, ids.f_y)) else {
+    let axis = |c: u32| whole_i16_col(rt2, c);
+    let [rxc, ryc] = anchors.room.ok_or_else(|| anyhow!("block_cells: no readable `room` global with `x` and `y`"))?;
+    let (Some(rx), Some(ry)) = (axis(rxc), axis(ryc)) else {
         return Err(anyhow!("block_cells: room.x/room.y are not numbers"));
     };
-    let Some(obj) = rt2.position_object() else {
+    let Some(p) = anchors.position else {
         return Ok(vec![NO_CELL; lanes]);
     };
-    let (Some(px), Some(py)) = (axis(obj, ids.f_x), axis(obj, ids.f_y)) else {
+    let (Some(px), Some(py)) = (axis(p.x), axis(p.y)) else {
         return Ok(vec![NO_CELL; lanes]);
     };
     (0..lanes)

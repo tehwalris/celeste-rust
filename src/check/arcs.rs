@@ -122,7 +122,7 @@ where
     o.run.check(dir)?;
     let ids = crate::compiled::ids();
     let graph = EdgeStore::<N>::open(&dir, to)?;
-    let rem_cells = |rt2: &Rt2<N>| rt2.player_xy_cells(ids.f_rem);
+    let rem_cells = |rt2: &Rt2<N>| celeste_engine::shape::Anchors::of(rt2).player_xy(rt2, ids.f_rem).map(|(x, y)| (x as usize, y as usize));
     // One stored state's row, as a one-lane block.
     let tree = Tree::<N>::open(dir, to)?;
     let row_of = |s: Sk| -> Result<Rt2<N>> {

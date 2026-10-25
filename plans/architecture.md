@@ -223,8 +223,8 @@ the key PROVISIONAL until the frame's end appends the new codes sorted.
 The key holds NO POSITION: the position object's x/y contribute only their
 part past the cell's whole pixel (`Code::pos`). States sharing all but the
 position share a key, which is what a storage entry is. A shape's hash is
-its name, and its signature (`Rt2::shape_words`) is stored and compared:
-every cell by kind, a field, function or builtin by its NAME, then the
+its name, and its signature (`shape::sig`, interned process-wide: a
+second one under a hash is FATAL) is stored and compared: every cell by kind, a field, function or builtin by its NAME, then the
 globals PRESENT, so appending a name to a table moves nothing.
 GLOBAL_NAMES' order is the cell numbering (the walk from the globals): a
 reordering is a different search. The signature names a value cell, never
@@ -233,7 +233,12 @@ by path against one representative of its shape: THE POINTER TOPOLOGY IS
 THE SHAPE'S, a premise guarded twice, FATAL - a key field holding a
 pointer holds exactly one code (`exact::check_pointer`), and every block
 `block::to_rt2` makes under one hash has one signature and one topology,
-process-wide. `shape::sig::kinds` is the signature's one reader.
+process-wide. `shape::sig::kinds` is the signature's one reader. A shape's
+key LAYOUT (`shape::Layout`, recorded as an `exact::ShapeRecord`) gives
+every cell its `KeyRole` - structure, a keyed value, a position coordinate
+(keyed by its fraction), a dependency's leader or follower - and
+`KeyRole::code` is the code rule's one site; the position object's, the
+`room`'s and the first player's cells are `shape::Anchors::of`'s one rule.
 The concrete search compares whole states, never keys.
 
 **Key dependencies** (`exact::Deps`): a shape may declare FOLLOWER cells

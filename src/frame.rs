@@ -57,18 +57,14 @@ fn summit_flag((rx, ry): (i16, i16)) -> Option<(i16, i16, i16, i16)> {
 
 /// Per lane: has it left the start room, or met the `win_rect`?
 pub(crate) fn exits_of<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
-    let ids = crate::compiled::ids();
     let lanes = rt2.width;
     if let Some((txl, txh, tyl, tyh)) = win_rect(s) {
-        let Some(obj) = rt2.position_object() else {
+        let Some(p) = celeste_engine::shape::Anchors::of(rt2).position else {
             return Ok(vec![false; lanes]);
         };
         // An interval position wins where it meets the target.
-        let axis = |f: u32| {
-            rt2.obj_field_cell(obj, f)
-                .and_then(|c| crate::storage::cells::whole_range_col(rt2, c))
-        };
-        return Ok(match (axis(ids.f_x), axis(ids.f_y)) {
+        let axis = |c: u32| crate::storage::cells::whole_range_col(rt2, c);
+        return Ok(match (axis(p.x), axis(p.y)) {
             (Some(xs), Some(ys)) => xs
                 .iter()
                 .zip(&ys)
@@ -84,14 +80,10 @@ pub(crate) fn exits_of<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Setting
 /// Per lane: is the `room` global (`room.x`, `room.y`) = `(wx, wy)`?
 fn room_is<N: Arithmetic>(rt2: &Rt2<N>, (wx, wy): (i16, i16)) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{Col, AV};
-    let ids = crate::compiled::ids();
     let lanes = rt2.width;
-    let room = rt2
-        .global_target(ids.g_room)
-        .ok_or_else(|| anyhow::anyhow!("wins: no `room` global"))?;
-    let is = |f: u32, name: &str, want: i16| -> Result<Vec<bool>> {
+    let [rx, ry] = celeste_engine::shape::Anchors::room_of(rt2).ok_or_else(|| anyhow::anyhow!("wins: no `room` global with `x` and `y`"))?;
+    let is = |c: u32, name: &str, want: i16| -> Result<Vec<bool>> {
         let want = N::from_i16(want);
-        let c = rt2.obj_field_cell(room, f).ok_or_else(|| anyhow::anyhow!("wins: room table has no {name} field"))?;
         Ok(match &rt2.cols[c as usize] {
             Col::U(AV::Num(n)) => vec![*n == want; lanes],
             Col::N(vs) => vs.iter().map(|n| *n == want).collect(),
@@ -99,7 +91,7 @@ fn room_is<N: Arithmetic>(rt2: &Rt2<N>, (wx, wy): (i16, i16)) -> Result<Vec<bool
             other => anyhow::bail!("wins: room.{name} is not a number column: {:?}", other),
         })
     };
-    let (xs, ys) = (is(ids.f_x, "x", wx)?, is(ids.f_y, "y", wy)?);
+    let (xs, ys) = (is(rx, "x", wx)?, is(ry, "y", wy)?);
     Ok(xs.iter().zip(&ys).map(|(a, b)| *a && *b).collect())
 }
 
@@ -1345,7 +1337,8 @@ mod tests {
         let mut space = celeste_engine::exact::KeySpace::<P8>::new();
         let mut adds = Default::default();
         for shape in [1, 9] {
-            space.add_shape(&celeste_engine::exact::ShapeRecord { hash: shape, sig: vec![1, u32::MAX], pos: None, deps: Vec::new() }, &mut adds);
+            let rec = celeste_engine::exact::ShapeRecord { hash: shape, sig: vec![1, u32::MAX], pos: None, deps: Vec::new() };
+            space.add_shape(&std::sync::Arc::new(celeste_engine::shape::Layout::from_record(&rec).expect("a layout")), &mut adds);
             space.add_codes(shape, 0, &[celeste_engine::exact::Code::num(0, 0), celeste_engine::exact::Code::num(1, 1)], &mut adds);
         }
         let mut v = Visited::new(space);
@@ -1372,7 +1365,8 @@ mod tests {
         let path = std::env::temp_dir().join(format!("celeste-marks-arith-{}.bin", std::process::id()));
         let mut space = KeySpace::<Float>::new();
         let mut adds = Default::default();
-        space.add_shape(&ShapeRecord { hash: 1, sig: vec![1, u32::MAX], pos: None, deps: Vec::new() }, &mut adds);
+        let rec = ShapeRecord { hash: 1, sig: vec![1, u32::MAX], pos: None, deps: Vec::new() };
+        space.add_shape(&std::sync::Arc::new(celeste_engine::shape::Layout::from_record(&rec).expect("a layout")), &mut adds);
         space.add_codes(1, 0, &[Code::<Float>::num(0, 0), Code::<Float>::num(1.5f64.to_bits(), 2.5f64.to_bits())], &mut adds);
         let mut v = Visited::<Float>::new(space);
         v.insert_until(1, (0, 1), 4, 7);
@@ -1641,8 +1635,8 @@ mod tests {
                 b.cols[c as usize] = num(v);
             }
             for (f, (vx, vy)) in [(ids.f_spd, (0, -2)), (ids.f_rem, (0, 0))] {
-                let (cx, cy) = b.player_xy_cells(f).expect("a vector field");
-                (b.cols[cx], b.cols[cy]) = (num(vx), num(vy));
+                let (cx, cy) = b.xy_cells(p, f).expect("a vector field");
+                (b.cols[cx as usize], b.cols[cy as usize]) = (num(vx), num(vy));
             }
             reference.step_one(&b, 0).expect("one concrete successor")
         };

@@ -23,20 +23,16 @@ pub(crate) fn av_show<N: Arithmetic>(v: AV<N>) -> String {
 /// then the globals'.
 pub fn cell_names<N: Arithmetic>(rt2: &Rt2<N>, ids: &BoundaryIds) -> HashMap<usize, String> {
     let mut names = HashMap::new();
-    if let Some(obj) = rt2.position_object() {
+    if let Some(obj) = celeste_engine::shape::Anchors::of(rt2).position.map(|p| p.obj) {
         for (nm, f) in [("player.x", ids.f_x), ("player.y", ids.f_y), ("dash_effect_time", ids.f_dash_effect_time)] {
             if let Some(c) = rt2.obj_field_cell(obj, f) {
                 names.insert(c as usize, nm.to_string());
             }
         }
         for (nm, f) in [("spd", ids.f_spd), ("rem", ids.f_rem)] {
-            if let Some(pc) = rt2.obj_field_cell(obj, f) {
-                if let Col::U(AV::Ptr(sub)) = rt2.cols[pc as usize] {
-                    for (ax, g) in [("x", ids.f_x), ("y", ids.f_y)] {
-                        if let Some(c) = rt2.obj_field_cell(sub, g) {
-                            names.insert(c as usize, format!("{nm}.{ax}"));
-                        }
-                    }
+            if let Some((cx, cy)) = rt2.xy_cells(obj, f) {
+                for (ax, c) in [("x", cx), ("y", cy)] {
+                    names.insert(c as usize, format!("{nm}.{ax}"));
                 }
             }
         }
