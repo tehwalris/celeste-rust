@@ -57,7 +57,7 @@ settled here. Evidence is file:line at develop 19869c5d.
   it (a legitimate projection difference, or a bug). Blocks any further split-
   frame refactor (audit M6).
 
-## C4. The minimal cart's move guard: UNREACHABLE (proven); pick a form
+## C4. The minimal cart's move guard: UNREACHABLE (proven); the player unguarded (DECIDED, branch jump-buffer)
 - Original: `obj.move(obj.spd.x,obj.spd.y)` unconditionally (celeste.lua:1195);
   minimal cart, split-frame.lua and trace/cart.rs:264 guard it on nonzero
   speed. `move_x(amount,0)` AND `move_y` start their loops at 0 (orig 1042),
@@ -74,6 +74,15 @@ settled here. Evidence is file:line at develop 19869c5d.
   exploration steps in 16 rooms. The loading frame is identical too (rem 0).
 - To decide: (1) document the proof plus a loud check outside the cart, or
   (2) unguard the player only (identical hashes on all routes; gates must hold).
+- DECIDED (2026-10-25): (2), `24188cfc`. The player moves unconditionally
+  (the minimal cart, split-frame.lua, `trace::cart::apply_loading_frame`);
+  every other object keeps the guard (fully unguarded, the balloon rooms
+  fail kernel assembly on fractional object coordinates). Measured: every
+  16.16 tree byte-identical (r10 r42x r42n r10arc r60s, the room (1,0)
+  gates, (6,2) 100% without level -1 to f45); level -1 builds another
+  (6,2) table (the r62h tree -9.6% states; the 100% witness's `l1 check`
+  clean); in doubles +0.01 to +2.8% states (the original turns a `-0`
+  remainder `+0`).
 - Evidence: /var/tmp/c4-quick/cart-differences.md; probe worktree
   /var/tmp/c4-wt (branch c4-probe, uncommitted), /var/tmp/c4-probe-scripts/.
 - Still to do: a standing DIFFERENTIAL CHECK running the original cart's Lua
@@ -108,7 +117,7 @@ settled here. Evidence is file:line at develop 19869c5d.
   globals table it is refused); the whole ladder converts every block of the
   real cart through the assert.
 
-## C7. HIGH: the jump buffer is removed, so the search MISSES real states
+## C7. HIGH: the jump buffer is removed, so the search MISSES real states (FIXED, branch jump-buffer; re-proofs below)
 - The original buffers a jump press for 4 updates (orig 136-142, 211-212);
   the minimal cart jumps only on a fresh press (min 109-110, 169-170). Its
   argument "a buffered jump executes identically to an exactly-timed press"
@@ -123,6 +132,17 @@ settled here. Evidence is file:line at develop 19869c5d.
   TAS (made WITH the buffer): weak evidence, not proof.
 - Fix: restore `jbuffer` in the minimal cart (one 0..4 field) and re-run
   every room (results can only stay or improve).
+- FIXED (2026-10-25, branch jump-buffer): the cart has the original's
+  buttons exactly (`p_jump`, `p_dash`, `jbuffer`, `02076e4f`); every level
+  widens the buttons' memory (the former `h`, plus `jbuffer` the unknown
+  countdown; a spec with `h` is refused at parse); the concrete search runs
+  them exactly. The sets are the former `h`'s (every fixture's per-frame
+  counts identical); the buffered example reproduced on PICO-8 in both
+  carts and pinned (`concrete::tests::a_buffered_jump_then_a_fresh_one_as_pico8_runs_them`);
+  the re-timing is deleted (`02fe9d5c`: the goldens are the raw files, the
+  float oracle replays all 336 bit for bit). The buffer's duplicate
+  emissions are dropped by a kernel-build proof (`47c17fae`): the release
+  budget +0.9..+1.5% against develop.
 
 - Scope, refined (2026-10-21): the `h` level widens `p_jump`/`p_dash` (read
   both ways), so at `h` a jump at u needs only the input at u: the tree, W

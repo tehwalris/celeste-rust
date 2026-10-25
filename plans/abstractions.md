@@ -176,7 +176,12 @@ input, never a stored value); the concrete search's seeded-balloon view
   fixture's per-frame counts identical), and `h` in a spec is refused.
 - **Measured**: room (1,0) level 0 3.8x fewer states at f70 than with the
   buttons exact, first win unchanged. Room (2,0) f68: 50.7M -> 13.3M
-  states. A constant factor.
+  states. A constant factor. With `jbuffer` exact instead, +224% to +344%
+  states (the cart-fidelity prototype). The countdown splits a frame's
+  bodies (+47%); its successors repeat across the jump button's classes,
+  dropped at the kernel build (`asm_kernel::dup_refs`, alike outcomes
+  from the same slots): the release budget +0.9..+1.5% against the cart
+  without the buffer.
 
 ## f: the fly fruit unknown (fruit rooms)
 
