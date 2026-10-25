@@ -32,7 +32,6 @@ pub const NATIVE: &[&str] = &[
     "rnd",
     "mget",
     "fget",
-    "_hint_normalize",
     "printh",
 ];
 

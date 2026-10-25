@@ -136,13 +136,12 @@ pub const DUMP_GLOBALS: &[&str] = &["max_djump", "deaths", "freeze", "shake", "h
 
 /// THE TRACER'S HOOKS AS PICO-8 STUBS: every function the tracer provides
 /// that PICO-8 does not (`trace::cart::NATIVE`, `lua/builtin_level_*.lua`)
-/// and the cart may call, the splitters the identity on a concrete value,
-/// the normalization hint a no-op. A hook the cart calls without a stub
+/// and the cart may call, the splitter the identity on a concrete value. A
+/// hook the cart calls without a stub
 /// here crashes every replay (C12), and a stub of a hook it no longer calls
 /// is dead: `tests::every_hook_the_cart_calls_has_a_stub`.
 const HOOK_STUBS: &[(&str, &str)] = &[
     ("__split_by_round", "function __split_by_round(x) return x end"),
-    ("_hint_normalize", "function _hint_normalize() end"),
 ];
 
 /// The cart text (`.p8`) of `spec`.
@@ -682,7 +681,7 @@ mod tests {
     fn every_hook_the_cart_calls_has_a_stub() {
         use full_moon::visitors::Visitor;
         // What PICO-8 itself provides, of what the tracer provides.
-        const PICO8: &[&str] = &["add", "foreach", "btn", "count", "del", "print", "music", "sfx", "pal", "rectfill", "map", "spr", "circfill", "min", "max", "abs", "flr", "sin", "rnd", "mget", "fget", "printh"];
+        const PICO8: &[&str] = &["add", "foreach", "btn", "count", "del", "print", "music", "sfx", "pal", "rectfill", "map", "spr", "camera", "circfill", "min", "max", "abs", "flr", "sin", "rnd", "mget", "fget", "printh"];
         #[derive(Default)]
         struct Names {
             called: std::collections::BTreeSet<String>,

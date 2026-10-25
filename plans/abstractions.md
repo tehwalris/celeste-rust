@@ -73,6 +73,10 @@ checks that they agree. The table below is GENERATED
 |  |  |  | `deaths` | 0 (dead) | as stored |  |
 | key sprite | every | `key` | `spr` | 8 (dead) | as stored | exact |
 |  |  |  | `flip.x` | false (dead) | as stored |  |
+| sound timers | every | globals | `sfx_timer` | 0 (dead) | as stored | exact |
+|  |  |  | `music_timer` | 0 (dead) | as stored |  |
+| fly fruit sound delay | every | `fly_fruit` | `sfx_delay` | 0 (dead) | as stored | exact |
+| screen shake | every | globals | `shake` | 0 (dead) | as stored | exact |
 | fly fruit | `f` | `fly_fruit` | `step` | the unknown number | the unknown number | over |
 |  |  |  | `y` | the unknown number | the unknown number |  |
 |  |  |  | `spd.y` | [-3.5, 0.5]; owed: inside | the literal; owed: inside |  |
@@ -100,8 +104,11 @@ checks that they agree. The table below is GENERATED
 - **player remainder** (over-approximation). The sub-pixel remainder, to the whole [-0.5, 0.5) at the boundary (the region's `Restrict` bounds the input too). Refuted by the ARCS: every recorded edge carries the frame's exact transfer of the remainder, and the backward over them is exact in it.
 - **dash effect** (EXACT). `dash_effect_time` decrements every frame; the traced cart reads it only to decrement it (and the original cart only as `dash_effect_time > 0`), so every value <= 0 behaves alike and `max(v, 0)` keeps every read.
 - **strawberry bob** (over-approximation). A live strawberry's bob forgotten, `off` and `y` TOGETHER (one without the other is a row no level has). `off` is a nonnegative integer read only as `sin(off / 40)`, periodic in it with period 40 bit-exactly (`pico8_num::test_pico8_sin_period_40_bit_exact`), so one period [0, 39] covers every phase (in doubles `sin` is not bit-periodic, but `off` feeds only `y`, and [0, 39] makes every `y` of the band); `y` is the band `start +- 2.5` the bob stays in, owed. The fruit's collision reads `y`, so a collect becomes possible at any phase: refuted by the CONCRETE SEARCH.
-- **timers** (EXACT). DEAD fields: the cart reads `frames`, `seconds`, `minutes` and `deaths` only to update each other and the key's sprite (below), never in anything a state's successors or the search's tests depend on, so every value of them behaves alike. Checked: traced as free input cells along room (4,0)'s 100% route, no other stored field, guard, error or raise reads them, but for an error's overflow check of their own arithmetic (`minutes + 1`), which holds at the stored 0 (`trace::widen::tests::dead_fields_are_unread`).
+- **timers** (EXACT). DEAD fields: the cart reads `frames`, `seconds`, `minutes` and `deaths` only to update each other and the key's sprite (below), never in anything a state's successors or the search's tests depend on, so every value of them behaves alike. Checked: traced as free input cells along room (4,0)'s and (6,2)'s 100% routes and room (5,2)'s (the orb), no other stored field, guard, error or raise reads them, but for an error's overflow check of their own arithmetic (`minutes + 1`), which holds at the stored 0 (`trace::widen::tests::dead_fields_are_unread`).
 - **key sprite** (EXACT). DEAD fields: the key's `spr` (from `frames`) and `flip.x` (from `spr`) are read only by each other and the draw, so every value behaves alike. Checked with the timers.
+- **sound timers** (EXACT). DEAD fields: each read only to count itself down and to decide a call of the no-op `sfx`/`music`, so every value behaves alike. Checked with the timers.
+- **fly fruit sound delay** (EXACT). DEAD field: read only to count itself down, then to call the no-op `sfx` and set the dead `sfx_timer`, so every value behaves alike. Checked with the timers.
+- **screen shake** (EXACT). DEAD field: read only to count itself down and to call the no-op `camera` (with `rnd` offsets, unread), so every value behaves alike. Checked with the timers.
 - **fly fruit** (over-approximation). While waiting the fly fruit's `step += 0.05` and bob mean no fruit state recurs across frames; once flying, rows split by the frame of the dash. `step`/`y` the unknown number, `spd.y`/`rem.y` their ranges (read as the literals, owed per lane on the raw input), `fly` an unknown boolean. Refuted by the objects ladder and the CONCRETE SEARCH.
 - **fall floor countdown** (over-approximation). The countdown, the unknown number (never the interval [MIN, MAX]: `delay - 1` of it would overflow, `Op::NoWrap`). The cart only decrements it and compares it with 0. Refuted by the CONCRETE SEARCH (or the ladder's exact level).
 - **balloon countdown** (over-approximation). As the fall floor's countdown.

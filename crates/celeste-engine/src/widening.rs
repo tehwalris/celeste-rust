@@ -375,8 +375,8 @@ pub static TABLE: &[Entry] = &[
         why: "DEAD fields: the cart reads `frames`, `seconds`, `minutes` and `deaths` only to update \
               each other and the key's sprite (below), never in anything a state's successors or the \
               search's tests depend on, so every value of them behaves alike. Checked: traced as free \
-              input cells along room (4,0)'s 100% route, no other stored field, guard, error or raise \
-              reads them, but for an error's overflow check of their own arithmetic (`minutes + 1`), \
+              input cells along room (4,0)'s and (6,2)'s 100% routes and room (5,2)'s (the orb), no \
+              other stored field, guard, error or raise reads them, but for an error's overflow check of their own arithmetic (`minutes + 1`), \
               which holds at the stored 0 (`trace::widen::tests::dead_fields_are_unread`).",
     },
     Entry {
@@ -388,6 +388,36 @@ pub static TABLE: &[Entry] = &[
         hook: None,
         why: "DEAD fields: the key's `spr` (from `frames`) and `flip.x` (from `spr`) are read only by \
               each other and the draw, so every value behaves alike. Checked with the timers.",
+    },
+    Entry {
+        name: "sound timers",
+        flag: Flag::Always,
+        target: Target::Globals,
+        slots: &[slot(&["sfx_timer"], Stored::Num(0), Input::Stored), slot(&["music_timer"], Stored::Num(0), Input::Stored)],
+        kind: Kind::Exact,
+        hook: None,
+        why: "DEAD fields: each read only to count itself down and to decide a call of the no-op \
+              `sfx`/`music`, so every value behaves alike. Checked with the timers.",
+    },
+    Entry {
+        name: "fly fruit sound delay",
+        flag: Flag::Always,
+        target: Target::Objects("fly_fruit"),
+        slots: &[slot(&["sfx_delay"], Stored::Num(0), Input::Stored)],
+        kind: Kind::Exact,
+        hook: None,
+        why: "DEAD field: read only to count itself down, then to call the no-op `sfx` and set the \
+              dead `sfx_timer`, so every value behaves alike. Checked with the timers.",
+    },
+    Entry {
+        name: "screen shake",
+        flag: Flag::Always,
+        target: Target::Globals,
+        slots: &[slot(&["shake"], Stored::Num(0), Input::Stored)],
+        kind: Kind::Exact,
+        hook: None,
+        why: "DEAD field: read only to count itself down and to call the no-op `camera` (with `rnd` \
+              offsets, unread), so every value behaves alike. Checked with the timers.",
     },
     Entry {
         name: "fly fruit",

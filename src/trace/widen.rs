@@ -618,88 +618,114 @@ mod tests {
     }
 
     /// THE DEAD FIELDS are unread: the slots the table stores as a constant
-    /// (`Stored::Num`/`Bool`: the timers, the key's sprite) traced as free input
-    /// cells, every other slot concrete, are read by no stored field outside
-    /// them, no guard, error or raise - so the stored constant loses nothing (an
-    /// EXACT canonicalization). The one read is an error's OVERFLOW check of
-    /// their own arithmetic (`minutes + 1`), which holds at the stored
-    /// constants. Every frame of room (4,0)'s 100% route (the player runs,
-    /// dashes, takes the key and opens the chest with it).
+    /// (`Stored::Num`/`Bool`: the timers, the key's sprite, the sound timers,
+    /// the screen shake) traced as free input cells, every other slot
+    /// concrete, are read by no stored field outside them, no guard, error
+    /// or raise - so the stored constant loses nothing (an EXACT
+    /// canonicalization). The one read is an error's OVERFLOW check of their
+    /// own arithmetic (`minutes + 1`), which holds at the stored constants.
+    /// Every frame of three routes, which between them set every dead slot:
+    /// room (4,0)'s 100% route (the player runs, dashes, takes the key and
+    /// opens the chest with it), room (6,2)'s (the fly fruit takes off at
+    /// the dash and counts its sound delay down) and room (5,2)'s (the big
+    /// chest shakes the screen, the orb sets the music timer).
     #[test]
     fn dead_fields_are_unread() {
-        let s = crate::settings::Settings { room: (4, 0), ..Default::default() };
-        let chunks = cart::Chunks::parse(&s).expect("chunks");
-        let frame = &chunks.frame;
-        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-        let mut st = cart::boot(&mut it, &chunks, s.room).expect("boot");
         let dead = |s: &Slot| matches!(s.stored, Stored::Num(_) | Stored::Bool(_));
-        let route = crate::concrete::read_inputs("tas/room_4_0_hundred_frame_152.txt").expect("the route");
-        let (mut traced, mut with_key, mut with_player, mut has_key) = (0, 0, 0, false);
+        // Per dead slot (its entry and field), the frames traced with it.
+        let mut seen: std::collections::BTreeMap<String, usize> = Default::default();
         let mut overflow_checks = 0;
-        for &byte in &route {
-            let roots = slots_where(&st, Level::EXACT, dead);
-            with_key += roots.iter().any(|p| p.last() == Some(&iface::key("spr"))) as usize;
-            with_player += !objects_of_type(&st, crate::trace::game::PLAYER).is_empty() as usize;
-            let f = trace_frame(&mut it, &chunks, st.clone(), &crate::trace::frame::TraceSpec { roots: &roots, concrete: true, ..Default::default() }).expect("trace");
-            // Everything a successor depends on, its booleans decided as far as a
-            // BDD over independent atoms can (a guard re-merged after a branch on
-            // `frames` is `c or not c`, true).
-            let mut roots_in = vec![f.raise];
-            let mut what = vec!["the raise".to_string()];
-            for (k, o) in f.outs.iter().enumerate() {
-                roots_in.extend([o.guard, o.error]);
-                what.extend([format!("outcome {k}'s guard"), format!("outcome {k}'s error")]);
-                // The dead slots as the outcome names them (objects move in
-                // `objects` when one before them is destroyed).
-                let dead_out = slots_where(&o.st, Level::EXACT, dead);
-                for (p, n, _) in &o.fields {
-                    if !dead_out.contains(p) {
-                        roots_in.push(*n);
-                        what.push(iface::show(p));
-                    }
-                }
-            }
-            let (g, map, _) = crate::transpile::bdd::simplify_local(&it.d.graph, &roots_in, crate::transpile::bdd::LOCAL_CAP, crate::transpile::bdd::LOCAL_EXPAND);
-            // Every input cell is a dead slot's; at its stored constant.
-            let stored: HashMap<u32, Val> = f
-                .iface
-                .slots
-                .iter()
-                .enumerate()
-                .map(|(i, p)| (i as u32, canonical(&st, p).unwrap_or_else(|| panic!("{} is no dead slot", iface::show(p)))))
-                .collect();
-            let at_stored = g.eval(&stored, Eval::Lenient, None).expect("eval");
-            for (r, w) in roots_in.iter().zip(&what) {
-                // Down to the cells, but not through an overflow check, which
-                // must hold at the stored constants instead.
-                let mut seen = vec![false; g.len()];
-                let mut stack = vec![map[*r as usize]];
-                while let Some(n) = stack.pop() {
-                    if std::mem::replace(&mut seen[n as usize], true) {
-                        continue;
-                    }
-                    match g.get(n).op {
-                        Op::Cell(_) => panic!("{w} reads a dead field"),
-                        Op::NoWrap => {
-                            assert_eq!(at_stored[n as usize], Val::Bool(Some(true)), "{w}: an overflow check fails at the stored constants");
-                            overflow_checks += 1;
+        let routes: [((i16, i16), &str, &dyn Fn(&State<Symbolic>, &Symbolic) -> bool); 3] = [
+            ((4, 0), "tas/room_4_0_hundred_frame_152.txt", &|st, d| matches!(iface::get(st, &[iface::key("has_key")]), Some(Value::Bool(b)) if d.decide(&b) == Some(true))),
+            ((6, 2), "tas/room_6_2_hundred_frame_93.txt", &|st, d| objects_of_type(st, "fly_fruit").iter().any(|f| matches!(iface::get(st, &field(f, &["fly"])), Some(Value::Bool(b)) if d.decide(&b) == Some(true)))),
+            ((5, 2), "tas/room_5_2_exit_frame_150.txt", &|st, d| matches!(iface::get(st, &[iface::key("music_timer")]), Some(Value::Num(n)) if d.as_const(&n).is_some_and(|v| v > P8::from_i16(0)))),
+        ];
+        for (room, file, happened) in routes {
+            let s = crate::settings::Settings { room, ..Default::default() };
+            let chunks = cart::Chunks::parse(&s).expect("chunks");
+            let frame = &chunks.frame;
+            let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+            let mut st = cart::boot(&mut it, &chunks, s.room).expect("boot");
+            let route = crate::concrete::read_inputs(file).expect("the route");
+            let mut event = false;
+            for &byte in &route {
+                let roots = slots_where(&st, Level::EXACT, dead);
+                for e in Level::EXACT.entries() {
+                    for paths in entry_paths(&st, e) {
+                        for (sl, p) in e.slots.iter().zip(paths) {
+                            if dead(sl) && roots.contains(&p) {
+                                *seen.entry(format!("{}: {}", e.name, sl.field.join("."))).or_default() += 1;
+                            }
                         }
-                        _ => stack.extend(g.get(n).args.iter().copied()),
                     }
                 }
+                let f = trace_frame(&mut it, &chunks, st.clone(), &crate::trace::frame::TraceSpec { roots: &roots, concrete: true, ..Default::default() }).expect("trace");
+                // Everything a successor depends on, its booleans decided as far as a
+                // BDD over independent atoms can (a guard re-merged after a branch on
+                // `frames` is `c or not c`, true).
+                let mut roots_in = vec![f.raise];
+                let mut what = vec!["the raise".to_string()];
+                for (k, o) in f.outs.iter().enumerate() {
+                    roots_in.extend([o.guard, o.error]);
+                    what.extend([format!("outcome {k}'s guard"), format!("outcome {k}'s error")]);
+                    // The dead slots as the outcome names them (objects move in
+                    // `objects` when one before them is destroyed).
+                    let dead_out = slots_where(&o.st, Level::EXACT, dead);
+                    for (p, n, _) in &o.fields {
+                        if !dead_out.contains(p) {
+                            roots_in.push(*n);
+                            what.push(iface::show(p));
+                        }
+                    }
+                }
+                let (g, map, _) = crate::transpile::bdd::simplify_local(&it.d.graph, &roots_in, crate::transpile::bdd::LOCAL_CAP, crate::transpile::bdd::LOCAL_EXPAND);
+                // Every input cell is a dead slot's; at its stored constant.
+                let stored: HashMap<u32, Val> = f
+                    .iface
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (i as u32, canonical(&st, p).unwrap_or_else(|| panic!("{} is no dead slot", iface::show(p)))))
+                    .collect();
+                let at_stored = g.eval(&stored, Eval::Lenient, None).expect("eval");
+                for (r, w) in roots_in.iter().zip(&what) {
+                    // Down to the cells, but not through an overflow check, which
+                    // must hold at the stored constants instead.
+                    let mut seen_node = vec![false; g.len()];
+                    let mut stack = vec![map[*r as usize]];
+                    while let Some(n) = stack.pop() {
+                        if std::mem::replace(&mut seen_node[n as usize], true) {
+                            continue;
+                        }
+                        match g.get(n).op {
+                            Op::Cell(_) => panic!("room {room:?}: {w} reads a dead field"),
+                            Op::NoWrap => {
+                                assert_eq!(at_stored[n as usize], Val::Bool(Some(true)), "room {room:?}: {w}: an overflow check fails at the stored constants");
+                                overflow_checks += 1;
+                            }
+                            _ => stack.extend(g.get(n).args.iter().copied()),
+                        }
+                    }
+                }
+                for b in 0..6 {
+                    let v = it.d.boolean(byte >> b & 1 == 1);
+                    iface::set(&mut st, &[iface::key(crate::trace::game::BUTTONS), Step::Idx(b)], Value::Bool(v)).expect("a button");
+                }
+                // Until an `rnd` makes the concrete frame two (room (4,0): the
+                // chest's, once the key is taken and the chest opened).
+                let Ok(next) = cart::run_one(&mut it, frame, st) else { break };
+                st = next;
+                event |= happened(&st, &it.d);
             }
-            traced += 1;
-            for b in 0..6 {
-                let v = it.d.boolean(byte >> b & 1 == 1);
-                iface::set(&mut st, &[iface::key(crate::trace::game::BUTTONS), Step::Idx(b)], Value::Bool(v)).expect("a button");
-            }
-            // Until the chest's `rnd` makes the concrete frame two (the key
-            // is taken and the chest opened by then).
-            let Ok(next) = cart::run_one(&mut it, frame, st) else { break };
-            st = next;
-            has_key |= matches!(iface::get(&st, &[iface::key("has_key")]), Some(Value::Bool(b)) if it.d.decide(&b) == Some(true));
+            assert!(event, "room {room:?}: the route never did what it is here for");
         }
-        assert!(has_key && with_key > 60 && with_player > 60, "{traced} frames traced: {with_key} with the key, {with_player} with the player, the key taken: {has_key}");
+        // Every dead slot of the table, traced on many frames.
+        for e in TABLE.iter() {
+            for sl in e.slots.iter().filter(|sl| dead(sl)) {
+                let name = format!("{}: {}", e.name, sl.field.join("."));
+                assert!(seen.get(&name).is_some_and(|&n| n > 40), "{name}: traced on {:?} frames", seen.get(&name));
+            }
+        }
         assert!(overflow_checks > 0, "the timers' own arithmetic is checked");
     }
 }

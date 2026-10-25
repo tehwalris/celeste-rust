@@ -16,8 +16,28 @@ function _update()
 			end
 		end
 
+		if music_timer>0 then
+		 music_timer = music_timer - (1)
+		 if music_timer<=0 then
+		  music(10,0,7)
+		 end
+		end
+
+		if sfx_timer>0 then
+		 sfx_timer = sfx_timer - (1)
+		end
+
 		-- cancel if freeze
 		if freeze>0 then freeze = freeze - 1 __phase = {} __frozen = {} return end
+
+		-- screenshake
+		if shake>0 then
+			shake = shake - (1)
+			camera()
+			if shake>0 then
+				camera(-2+rnd(5),-2+rnd(5))
+			end
+		end
 
 		-- restart (soon)
 		if will_restart and delay_restart>0 then
@@ -36,7 +56,6 @@ function _update()
 			end
 			if obj.type == player then __phase = {} return end
 			if obj.type.update~=nil then
-				_hint_normalize()
 				obj.type.update(obj)
 			end
 		end)
@@ -53,7 +72,6 @@ function _update()
 			if obj.type == player then
 				past = true
 				if obj.type.update~=nil then
-					_hint_normalize()
 					obj.type.update(obj)
 				end
 			end
@@ -63,14 +81,9 @@ function _update()
 			obj.move(obj.spd.x,obj.spd.y)
 		end
 		if obj.type.update~=nil then
-			_hint_normalize()
 			obj.type.update(obj)
 		end
 	end)
-
-	if true then
-    	_hint_normalize()
-    end
 
 	-- start game
 	if is_title() then

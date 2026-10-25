@@ -105,6 +105,14 @@ pub static GLOBAL_NAMES: &[&str] = &[
     // The split frame's phase marker (lua/split-frame.lua).
     "__phase",
     "__frozen",
+    // The original's sound, music, screen shake and background.
+    "flash_bg",
+    "new_bg",
+    "sfx_timer",
+    "psfx",
+    "music_timer",
+    "shake",
+    "camera",
 ];
 pub static FIELD_NAMES: &[&str] = &[
     "type",
@@ -155,6 +163,8 @@ pub static FIELD_NAMES: &[&str] = &[
     "hide_for",
     // The jump buffer (plans/correctness.md C7).
     "jbuffer",
+    // The fly fruit's sound delay.
+    "sfx_delay",
 ];
 pub static FN_NAMES: &[&str] = &[
     "__init",
@@ -234,6 +244,14 @@ pub static FN_NAMES: &[&str] = &[
     "__assert_2",
     "foreach_1",
     "add_0",
+    // The original's draws (but the balloon's) and sound.
+    "player_spawn.draw_100",
+    "fall_floor.draw_102",
+    "fly_fruit.draw_103",
+    "fake_wall.draw_104",
+    "platform.draw_105",
+    "psfx_106",
+    "camera_107",
 ];
 pub fn global_id(name: &str) -> Option<u32> {
     GLOBAL_NAMES.iter().position(|n| *n == name).map(|i| i as u32)
