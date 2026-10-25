@@ -1,6 +1,6 @@
 function _update()
-	-- SPLIT FRAME (prototype, plans/room60-overnight-2026-09-28.md): one
-	-- frame is two steps. Part a (`__phase` nil): the timers, freeze,
+	-- SPLIT FRAME (plans/architecture.md "The split frame"): one frame is
+	-- two steps. Part a (`__phase` nil): the timers, freeze,
 	-- restart, and every object up to and including the PLAYER'S MOVE;
 	-- part b: the player's update (the buttons), the objects after it, the
 	-- tail, and `_draw`. `__phase` marks a state between the parts, `__frozen`

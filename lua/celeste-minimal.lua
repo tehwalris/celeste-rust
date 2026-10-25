@@ -1,6 +1,47 @@
 -- ~celeste~
 -- matt thorson + noel berry
 
+-- THE TRACED CART: the original (celeste_ocaml's celeste.lua) less what
+-- the tracer cannot or need not run. What differs from the original:
+-- - syntax: PICO-8's `+=`, `-=`, `*=`, `!=` and one-line `if (c) stmt`
+--   written as Lua 5.1 (the parser, full_moon, reads 5.1);
+-- - `_init` loads the search's start room, not the title screen (and
+--   `got_fruit` stays `{}`);
+-- - not here: smoke, hair, clouds, particles, dead particles, the lifeup,
+--   room title, message and flag objects (`rnd` draws, `..`, `#` of a
+--   string, `cos`), the player's animation (`spr_off`, `was_on_ground`),
+--   `balloon.draw` (`%` of an interval), the big chest's particles and the
+--   orb's ring; `maybe()` (the smoke's) and the wall slide's `rnd(10)`
+--   with them;
+-- - `move`'s `__split_by_round(rem)` hint, and `--@unroll N` on loops over
+--   symbolic bounds (tracer hooks: below);
+-- - `_update` moves an object only at a nonzero speed, but the player
+--   always, as the original moves every object (plans/correctness.md C4);
+-- - under `--split-frame` `_update` is lua/split-frame.lua's.
+-- Kept exactly: the buttons (`p_jump`, `p_dash`, the jump buffer
+-- `jbuffer`), sound, music, screen shake and the draws that only draw;
+-- their dead fields are the widening table's EXACT entries.
+--
+-- THE ANCHORS, each patched where its text is found exactly once (so
+-- this header names them, never quotes them):
+-- - `_init`'s `load_room` call: the start room (`game_runner::
+--   apply_start_room`; `max_djump=2` past the orb), its loading frame
+--   (`trace::cart::apply_loading_frame`, `--loading-jank`) and the PICO-8
+--   replay's start (`tools::pico8::cart`);
+-- - the definitions of `_update` and `_draw`: `trace::cart::split_frame`;
+-- - the balloon's phase (`offset`) at its init: its seed
+--   (`trace::cart::fix_balloon_seeds`, `tools::pico8::cart`); the chest's
+--   timer at its init and its shake (`x`): its seed (`trace::cart::
+--   tool_seeds`, `tools::pico8::cart`);
+-- - the dash's arms: `trace::cart::forbid_diagonal_dashes` (nodiag),
+--   `forbid_straight_dashes` (onlydiag); its `v_input` line: the PICO-8
+--   replay's dash report.
+-- TOOL HOOKS: `__split_by_round` (the integer fragments of a remainder;
+-- the identity on a number, a stub on PICO-8: `tools::pico8::HOOK_STUBS`);
+-- `--@unroll N` (a loop's bound for the tracer, a comment to Lua);
+-- `tile_flag_at`, replaced after the toplevel by the native
+-- (`trace::cart::inject_tile_flag_at`).
+
 -- globals --
 -------------
 
