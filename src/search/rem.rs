@@ -1,20 +1,21 @@
 //! THE REMAINDER MODEL of an arithmetic (plans/float.md "The remainder
 //! model and the round fork"): the CIRCLE its remainders are points of
-//! (`Rem::C`) and an edge's transfer PAIR as the tree's table stores it. The
-//! forward and the storage are generic over it.
+//! (`Rem::C`, `search::arcs`), THE DECODE of a frame's captures into an
+//! edge's transfer (`decode`: one rule for both arithmetics), and the
+//! transfer's RECORD as the tree's table stores it (`Rem::Axis`: 16.16's
+//! `AxisXfer`, the doubles' `AxisF64`; a pair `Pair`). The forward and the
+//! storage are generic over it.
 
 use std::fmt::Debug;
 use std::hash::Hash;
 
-use anyhow::Result;
 use celeste_core::arith::Arithmetic;
 use celeste_core::lua_f64::LuaF64;
 use celeste_core::pico8_num::Pico8Num as P8;
+use celeste_engine::runtime2::mix64;
 
-use super::arc_edges::{self, Pair};
-use super::arcs::{Circle, Fixed16, Seg, Transfer};
+use super::arcs::{self, Act, Circle, Doubles, Fixed16, Seg, Shift, Transfer, CIRCLE};
 use super::hull::{Hull, HullOf};
-use super::rem_f64;
 
 /// A CIRCLE'S STORED WORD (`Circle::W`: arena words, hull bounds; a
 /// point or a count): 16.16's `u16`, the doubles' `u64`.
@@ -107,19 +108,21 @@ pub struct Capture<N> {
 }
 
 pub trait Rem: Arithmetic {
-    /// An edge's transfer pair as the tree's table records it.
-    type Pair: Copy + Debug + PartialEq + Eq + Hash + PartialOrd + Ord + Send + Sync + 'static;
-    /// One axis of a pair (`record`).
-    type Axis: Copy + Debug + Eq + Hash + Ord + Send + Sync + 'static;
     /// The circle the remainders are points of (hulls, the arcs' sets).
     type C: Circle;
-    /// Bytes a pair takes on disk.
-    const PAIR_BYTES: usize;
+    /// One axis's transfer as the tree's table (`edges/xfer.bin`) holds it.
+    /// Its `Ord` orders a slice's new pairs (`XferTable::merge`: the
+    /// transfer ids), so it is FROZEN, as its bytes are.
+    type Axis: Copy + Debug + Eq + Hash + Ord + Send + Sync + 'static;
+    /// Bytes a record takes on disk; a pair, two.
+    const AXIS_BYTES: usize;
+    const PAIR_BYTES: usize = 2 * Self::AXIS_BYTES;
 
-    /// THE DECODE of a frame's captures (x, y): `decode`'s, recorded; `Err`
-    /// is a refusal (fatal in the forward).
-    fn transfer(x: &Capture<Self>, y: &Capture<Self>) -> Result<Self::Pair, String>;
-    /// One axis's guard and action as its record holds them.
+    /// A remainder as a point of the circle (`None`: not in `[-1/2, 1/2)`).
+    fn rem_point(v: Self) -> Option<Point<Self>>;
+    /// The remainder at point `p` (`rem_point`'s inverse).
+    fn at_point(p: Point<Self>) -> Self;
+    /// One axis's guard and action (`decode`'s) as its record.
     fn record(guard: Seg<Point<Self>>, act: Action<Self>) -> Self::Axis;
     /// `decode`'s guard: the points (as numbers, `[lo, hi)`) whose
     /// `fl(r + ox)` is in the round split's fragment `frag`, the circle's
@@ -129,17 +132,36 @@ pub trait Rem: Arithmetic {
     fn guard(frag: (Self, Self), ox: Self) -> (u64, u64) {
         guard(frag, ox)
     }
-    fn xfer(p: &Self::Pair) -> Xfer<Self>;
-    /// A remainder as a point of the circle (`None`: not in `[-1/2, 1/2)`).
-    fn rem_point(v: Self) -> Option<Point<Self>>;
-    /// The remainder at point `p` (`point`'s inverse).
-    fn at_point(p: Point<Self>) -> Self;
-    /// Append `p`'s `PAIR_BYTES`.
-    fn encode_pair(out: &mut Vec<u8>, p: &Self::Pair);
-    fn decode_pair(b: &[u8]) -> Self::Pair;
-    /// A hash of a pair (the transfer table's index).
-    fn pair_hash(p: &Self::Pair) -> u64;
+    /// A record as the pushes and pulls read it.
+    fn transfer(a: &Self::Axis) -> Transfer<Self::C>;
+    /// Append `a`'s `AXIS_BYTES`; and back.
+    fn encode(out: &mut Vec<u8>, a: &Self::Axis);
+    fn decode(b: &[u8]) -> Self::Axis;
+    /// A record's hash (`pair_hash`'s part).
+    fn axis_hash(a: &Self::Axis) -> u64;
+
+    /// A pair as the pushes and pulls read it.
+    #[inline]
+    fn xfer(p: &Pair<Self>) -> Xfer<Self> {
+        (Self::transfer(&p.0), Self::transfer(&p.1))
+    }
+    /// Append `p`'s `PAIR_BYTES`; and back.
+    fn encode_pair(out: &mut Vec<u8>, p: &Pair<Self>) {
+        Self::encode(out, &p.0);
+        Self::encode(out, &p.1);
+    }
+    fn decode_pair(b: &[u8]) -> Pair<Self> {
+        (Self::decode(&b[..Self::AXIS_BYTES]), Self::decode(&b[Self::AXIS_BYTES..Self::PAIR_BYTES]))
+    }
+    /// A pair's hash (the transfer table's index).
+    #[inline]
+    fn pair_hash(p: &Pair<Self>) -> u64 {
+        mix64(Self::axis_hash(&p.0) ^ Self::axis_hash(&p.1).rotate_left(31))
+    }
 }
+
+/// An edge's transfer pair (x, y) as one edge record's id refers to it.
+pub type Pair<N> = (<N as Rem>::Axis, <N as Rem>::Axis);
 
 /// What a frame does to one axis's remainder on its guard (`decode`):
 /// `r -> fl(fl(r + ox) - k)` (`move` after the round split; 16.16's a
@@ -181,7 +203,7 @@ pub enum Action<N: Rem> {
 /// its captures shifted back by 1/2 first (exact). Anything else is
 /// REFUSED, FATAL in the forward: the record would be an unchecked claim
 /// about the remainder.
-pub(crate) fn decode<N: Rem>(x: &Capture<N>, y: &Capture<N>) -> Result<(N::Axis, N::Axis), String> {
+pub(crate) fn decode<N: Rem>(x: &Capture<N>, y: &Capture<N>) -> Result<Pair<N>, String> {
     let axis = |c: &Capture<N>, name: &str| decode_axis(c).map(|(g, a)| N::record(g, a)).map_err(|e| format!("axis {name} ({c:?}): {e}"));
     Ok((axis(x, "x")?, axis(y, "y")?))
 }
@@ -370,7 +392,7 @@ pub(crate) fn holds<N: Rem>(h: &HullOf<N>, x: N, y: N) -> bool {
 
 /// Does an edge of transfer `p` take the remainder `from` and end at `to`
 /// (`None`: no player at the frame's end; any action)?
-pub(crate) fn maps<N: Rem>(p: &N::Pair, from: (N, N), to: Option<(N, N)>) -> bool {
+pub(crate) fn maps<N: Rem>(p: &Pair<N>, from: (N, N), to: Option<(N, N)>) -> bool {
     let axis = |a: &Transfer<N::C>, f: N, t: Option<N>| {
         let Some(f) = N::rem_point(f) else { return false };
         if !a.takes(f) {
@@ -383,23 +405,23 @@ pub(crate) fn maps<N: Rem>(p: &N::Pair, from: (N, N), to: Option<(N, N)>) -> boo
     axis(&tx, from.0, to.map(|t| t.0)) && axis(&ty, from.1, to.map(|t| t.1))
 }
 
-impl Rem for P8 {
-    type Pair = Pair;
-    type Axis = arc_edges::AxisXfer;
-    type C = Fixed16;
-    const PAIR_BYTES: usize = arc_edges::PAIR_BYTES;
+/// 16.16's transfer record (`Rem::Axis`, 13 bytes): the guard `[lo, hi)`
+/// and the action (`tag` 0: the rotation by `val`, in `0..CIRCLE`; 1: the
+/// constant point `val`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AxisXfer {
+    pub(crate) lo: u32,
+    pub(crate) hi: u32,
+    pub(crate) tag: u8,
+    pub(crate) val: i32,
+}
 
-    fn transfer(x: &Capture<P8>, y: &Capture<P8>) -> Result<Pair, String> {
-        decode(x, y)
-    }
-    /// A `Mono` as the rotation it is, `ox - k` mod 1 (raw).
-    fn record(guard: Seg, act: Action<P8>) -> arc_edges::AxisXfer {
-        let (tag, val) = match act {
-            Action::Mono { ox, k } => (0, (ox.as_raw_u32() as i32 as i64 - ((k as i64) << 16)).rem_euclid(1 << 16) as i32),
-            Action::Const(p) => (1, p as i32),
-        };
-        arc_edges::AxisXfer { lo: guard.lo, hi: guard.hi, tag, val }
-    }
+impl Rem for P8 {
+    type C = Fixed16;
+    type Axis = AxisXfer;
+    /// `lo`, `hi` (u32), `tag` (u8), `val` (i32).
+    const AXIS_BYTES: usize = 13;
+
     /// Exactly `[frag.lo - ox, frag.hi - ox + 1)` as points (`r + 1/2`).
     #[inline]
     fn guard(frag: (P8, P8), ox: P8) -> (u64, u64) {
@@ -407,159 +429,154 @@ impl Rem for P8 {
         let at = |v: i64| v.clamp(0, 1 << 16) as u64;
         (at(raw(frag.0) - raw(ox) + 32768), at(raw(frag.1) - raw(ox) + 32769))
     }
-    #[inline]
-    fn xfer(p: &Pair) -> (Transfer, Transfer) {
-        (p.0.transfer(), p.1.transfer())
-    }
+
     fn rem_point(v: P8) -> Option<u32> {
         let r = v.as_raw_u32() as i32;
-        (-32768..32768).contains(&r).then(|| super::arcs::point(r))
+        (-32768..32768).contains(&r).then(|| arcs::point(r))
     }
     fn at_point(p: u32) -> P8 {
         P8::from_raw(p as i32 - 32768)
     }
-    fn encode_pair(out: &mut Vec<u8>, p: &Pair) {
-        arc_edges::encode_pair(out, p)
+    /// A `Mono` as the rotation it is, `ox - k` mod 1 (raw).
+    fn record(guard: Seg, act: Action<P8>) -> AxisXfer {
+        let (tag, val) = match act {
+            Action::Mono { ox, k } => (0, (ox.as_raw_u32() as i32 as i64 - ((k as i64) << 16)).rem_euclid(1 << 16) as i32),
+            Action::Const(p) => (1, p as i32),
+        };
+        AxisXfer { lo: guard.lo, hi: guard.hi, tag, val }
     }
-    fn decode_pair(b: &[u8]) -> Pair {
-        arc_edges::decode_pair(b)
+    /// A ROTATION by `val` as the translation it is on the guard (the guard
+    /// is one floor's: its image never wraps - checked, FATAL otherwise), or
+    /// the constant point.
+    #[inline]
+    fn transfer(a: &AxisXfer) -> Transfer {
+        let guard = Seg { lo: a.lo, hi: a.hi };
+        let act = match a.tag {
+            0 => {
+                let d = if a.lo as i64 + a.val as i64 >= CIRCLE as i64 { a.val - CIRCLE as i32 } else { a.val };
+                assert!(a.lo as i64 + d as i64 >= 0 && a.hi as i64 + d as i64 <= CIRCLE as i64, "a transfer whose image wraps: {a:?}");
+                Act::Mono(d)
+            }
+            _ => Act::Const(a.val as u32),
+        };
+        Transfer { guard, act }
+    }
+    fn encode(out: &mut Vec<u8>, a: &AxisXfer) {
+        out.extend_from_slice(&a.lo.to_le_bytes());
+        out.extend_from_slice(&a.hi.to_le_bytes());
+        out.push(a.tag);
+        out.extend_from_slice(&a.val.to_le_bytes());
+    }
+    fn decode(b: &[u8]) -> AxisXfer {
+        let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().expect("4 bytes"));
+        AxisXfer { lo: u32_at(0), hi: u32_at(4), tag: b[8], val: u32_at(9) as i32 }
     }
     #[inline]
-    fn pair_hash(p: &Pair) -> u64 {
-        use celeste_engine::runtime2::mix64;
-        let w = |a: &arc_edges::AxisXfer| mix64((a.lo as u64) << 32 | a.hi as u64) ^ ((a.val as u32 as u64) << 8 | a.tag as u64);
-        mix64(w(&p.0) ^ w(&p.1).rotate_left(31))
+    fn axis_hash(a: &AxisXfer) -> u64 {
+        mix64((a.lo as u64) << 32 | a.hi as u64) ^ ((a.val as u32 as u64) << 8 | a.tag as u64)
     }
 }
 
-impl Rem for LuaF64 {
-    type Pair = rem_f64::Pair;
-    type Axis = rem_f64::Axis;
-    type C = rem_f64::Doubles;
-    const PAIR_BYTES: usize = rem_f64::PAIR_BYTES;
+/// `AxisF64::tag` of `r -> fl(fl(r + ox) - k)` (`a` the bits of `ox`).
+pub(crate) const MONO: u8 = 0;
+/// `AxisF64::tag` of the constant point `a`.
+pub(crate) const CONST: u8 = 1;
 
-    fn transfer(x: &Capture<LuaF64>, y: &Capture<LuaF64>) -> Result<rem_f64::Pair, String> {
-        decode(x, y)
-    }
-    /// A `Mono` by the bits of its speed.
-    fn record(guard: Seg<u64>, act: Action<LuaF64>) -> rem_f64::Axis {
-        let (tag, a, k) = match act {
-            Action::Mono { ox, k } => (rem_f64::MONO, ox.to_bits(), k),
-            Action::Const(p) => (rem_f64::CONST, p, 0),
-        };
-        rem_f64::Axis { lo: guard.lo, hi: guard.hi, tag, a, k }
-    }
-    #[inline]
-    fn xfer(p: &rem_f64::Pair) -> Xfer<LuaF64> {
-        (p.0.transfer(), p.1.transfer())
-    }
+/// The doubles' transfer record (`Rem::Axis`, 29 bytes): the guard `[lo,
+/// hi)` of the points (`arcs::index`) and the action (`tag`, `a`, `k`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AxisF64 {
+    pub(crate) lo: u64,
+    pub(crate) hi: u64,
+    pub(crate) tag: u8,
+    pub(crate) a: u64,
+    pub(crate) k: i32,
+}
+
+impl Rem for LuaF64 {
+    type C = Doubles;
+    type Axis = AxisF64;
+    /// `lo`, `hi`, `a` (u64), `tag` (u8), `k` (i32).
+    const AXIS_BYTES: usize = 29;
+
     fn rem_point(v: LuaF64) -> Option<u64> {
-        rem_f64::index(v.value())
+        arcs::index(v.value())
     }
     fn at_point(p: u64) -> LuaF64 {
-        LuaF64::new(rem_f64::value(p)).expect("a remainder is finite")
+        LuaF64::new(arcs::value(p)).expect("a remainder is finite")
     }
-    fn encode_pair(out: &mut Vec<u8>, p: &rem_f64::Pair) {
-        p.0.encode(out);
-        p.1.encode(out);
-    }
-    fn decode_pair(b: &[u8]) -> rem_f64::Pair {
-        (rem_f64::Axis::decode(&b[..29]), rem_f64::Axis::decode(&b[29..58]))
+    /// A `Mono` by the bits of its speed.
+    fn record(guard: Seg<u64>, act: Action<LuaF64>) -> AxisF64 {
+        let (tag, a, k) = match act {
+            Action::Mono { ox, k } => (MONO, ox.to_bits(), k),
+            Action::Const(p) => (CONST, p, 0),
+        };
+        AxisF64 { lo: guard.lo, hi: guard.hi, tag, a, k }
     }
     #[inline]
-    fn pair_hash(p: &rem_f64::Pair) -> u64 {
-        celeste_engine::runtime2::mix64(p.0.mixed() ^ p.1.mixed().rotate_left(31))
+    fn transfer(a: &AxisF64) -> Transfer<Doubles> {
+        let act = match a.tag {
+            MONO => Act::Mono(Shift { ox: a.a, k: a.k }),
+            _ => Act::Const(a.a),
+        };
+        Transfer { guard: Seg { lo: a.lo, hi: a.hi }, act }
+    }
+    fn encode(out: &mut Vec<u8>, a: &AxisF64) {
+        out.extend_from_slice(&a.lo.to_le_bytes());
+        out.extend_from_slice(&a.hi.to_le_bytes());
+        out.extend_from_slice(&a.a.to_le_bytes());
+        out.push(a.tag);
+        out.extend_from_slice(&a.k.to_le_bytes());
+    }
+    fn decode(b: &[u8]) -> AxisF64 {
+        let u = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().expect("8 bytes"));
+        AxisF64 { lo: u(0), hi: u(8), a: u(16), tag: b[24], k: i32::from_le_bytes(b[25..29].try_into().expect("4 bytes")) }
+    }
+    #[inline]
+    fn axis_hash(a: &AxisF64) -> u64 {
+        mix64(a.lo ^ a.hi.rotate_left(21) ^ mix64(a.a ^ ((a.k as u32 as u64) << 8 | a.tag as u64)))
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::search::arc_edges::legacy::{self as fixed_legacy, RawAxis};
-    use crate::search::rem_f64::{legacy as float_legacy, value, POINTS, ZERO};
-    use celeste_core::lua_f64::LuaF64Interval as FI;
+    use crate::search::arcs::{Piece, Region, POINTS, ZERO};
 
-    /// One axis through `decode`, recorded.
-    fn generic<N: Rem>(c: &Capture<N>) -> Result<N::Axis, String> {
-        decode_axis(c).map(|(g, a)| N::record(g, a)).map_err(String::from)
+    pub(crate) fn lcg(s: &mut u64) -> u64 {
+        crate::testutil::lcg(s) >> 1
     }
 
-    /// The two decoders on one capture: the same record, or both refuse.
-    /// Whether it decoded.
-    fn agree<A: PartialEq + Debug>(what: &dyn Debug, legacy: Result<A, String>, generic: Result<A, String>) -> bool {
-        match (&legacy, &generic) {
-            (Ok(a), Ok(b)) => assert_eq!(a, b, "{what:?}"),
-            (Err(_), Err(_)) => {}
-            _ => panic!("{what:?}: legacy {legacy:?}, generic {generic:?}"),
-        }
-        legacy.is_ok()
+    /// An arithmetic's speeds for the decoder suites (the old suites'
+    /// corpora and random ones).
+    pub(crate) trait Speeds: Rem {
+        fn speeds() -> Vec<Self>;
     }
 
-    fn agree16(r: &RawAxis) -> bool {
-        let n = |v: (i32, i32)| (P8::from_raw(v.0), P8::from_raw(v.1));
-        let c = Capture { took: r.took, pre: n(r.pre), frag: n(r.frag), ox: n(r.ox), fin: r.fin.map(n) };
-        agree(r, fixed_legacy::decode_axis(r), generic(&c))
+    impl Speeds for P8 {
+        /// Raw: whole pixels and their neighbours, a point piece (`65537`:
+        /// the upper piece is the one point `1/2 - 2^-16`), random in [-9, 9] px.
+        fn speeds() -> Vec<P8> {
+            let mut s = 5u64;
+            let mut v = vec![0i32, 1, -1, 39322, 65535, 65536, 65537, -39322, -65536 * 3 + 7, 32768, -32768, 2 * 65536, -5 * 65536 + 13107];
+            v.extend((0..40).map(|_| (lcg(&mut s) % (18 * 65536 + 1)) as i32 - 9 * 65536));
+            v.into_iter().map(P8::from_raw).collect()
+        }
     }
 
-    /// THE ONE DECODER IS 16.16'S OLD ONE: every raw speed in [-9, 9] px,
-    /// each fragment of its floor split with the final remainder its image,
-    /// none, the point 0, another point, or neither; fragments cut short;
-    /// no split; a remainder set before the move; what neither covers.
-    #[test]
-    fn the_decoder_is_the_legacy_one_in_16_16() {
-        let (mut ok, mut all) = (0u64, 0u64);
-        let mut count = |d: bool| {
-            all += 1;
-            ok += d as u64;
-        };
-        for ox in -9 * 65536..=9 * 65536i32 {
-            let pre = (ox, ox + 65535);
-            let cut = (ox.div_euclid(65536) + 1) * 65536;
-            let mut frags = vec![(ox, pre.1.min(cut - 1))];
-            if pre.1 >= cut {
-                frags.push((cut, pre.1));
+    impl Speeds for LuaF64 {
+        /// Whole and half pixels and their neighbours (the top sliver), the
+        /// zeros, random.
+        fn speeds() -> Vec<LuaF64> {
+            let mut s = 99u64;
+            let mut v = vec![0.0, -0.0, 0.6, -0.6, 0.35, 2.9999999999999996, -5.0 + 1e-15, 0.1 + 0.2, 3.0000000000000004];
+            for i in -5..=5 {
+                let w = i as f64;
+                v.extend([w, w.next_up(), w.next_down(), w + 0.5, (w + 0.5).next_down()]);
             }
-            let split = |frag, fin| RawAxis { took: true, pre, frag, ox: (ox, ox), fin };
-            for frag in frags {
-                let f = frag.0.div_euclid(65536);
-                let image = (frag.0 - 32768 - f * 65536, frag.1 - 32768 - f * 65536);
-                for fin in [Some(image), None, Some((0, 0)), Some((-32768, -32768)), Some((image.0, image.0 + 1)), Some((40000, 40000))] {
-                    count(agree16(&split(frag, fin)));
-                }
-                if ox % 97 == 0 {
-                    // Cut short at either end, or inside: no whole piece.
-                    for short in [(frag.0 + 1, frag.1), (frag.0, frag.1 - 1), (frag.0 + 1, frag.1 - 1)] {
-                        if short.0 <= short.1 {
-                            assert!(!agree16(&split(short, Some((short.0 - 32768 - f * 65536, short.1 - 32768 - f * 65536)))), "{short:?} decoded");
-                        }
-                    }
-                }
-            }
-            if ox % 13 == 0 {
-                // Set before the move: the remainder in range or not, the
-                // fragment the point or not, the final remainder.
-                for set in [-32768, 0, 32767, 32768, -32769, 70000] {
-                    let p = set + ox + 32768;
-                    for (frag, fin) in [((p, p), Some((0, 0))), ((p, p), None), ((p, p), Some((0, 9))), ((p, p), Some((-32768, 32767))), ((p - 1, p), Some((0, 0)))] {
-                        count(agree16(&RawAxis { took: true, pre: (p, p), frag, ox: (ox, ox), fin }));
-                    }
-                }
-                // Inexact speeds, an argument narrower than the circle, a fragment over two floors or outside.
-                for r in [
-                    RawAxis { took: true, pre: (ox, ox + 65535 + 10), frag: (ox, ox + 10), ox: (ox, ox + 10), fin: None },
-                    RawAxis { took: true, pre: (ox, ox + 100), frag: (ox, ox + 100), ox: (ox, ox), fin: None },
-                    RawAxis { took: true, pre, frag: (ox, ox + 65535), ox: (ox, ox), fin: None },
-                    RawAxis { took: true, pre, frag: (ox - 5, ox), ox: (ox, ox), fin: None },
-                ] {
-                    count(agree16(&r));
-                }
-            }
+            v.extend((0..40).map(|_| (lcg(&mut s) % 1_000_000) as f64 / 99_991.0 - 5.0));
+            v.into_iter().map(n).collect()
         }
-        // No split: the whole circle, none, points, neither.
-        for fin in [Some((-32768, 32767)), None, Some((0, 0)), Some((-32768, -32768)), Some((32767, 32767)), Some((32768, 32768)), Some((0, 5))] {
-            count(agree16(&RawAxis { took: false, pre: (3, 9), frag: (3, 4), ox: (1, 2), fin }));
-        }
-        assert!(ok > 7_000_000 && ok < all, "{ok} of {all} decoded");
     }
 
     /// `first` finds a monotone predicate's first point (or the circle's
@@ -598,89 +615,274 @@ mod tests {
         first_from_any_estimate::<LuaF64>();
     }
 
-    fn n(v: f64) -> LuaF64 {
+    pub(crate) fn n(v: f64) -> LuaF64 {
         LuaF64::new(v).unwrap()
     }
 
-    /// The captures the reference engine makes of `move` at speed `ox` over
-    /// the whole domain: per fragment of its round split, `fin` the image.
-    fn captures(ox: f64) -> Vec<Capture<LuaF64>> {
-        let pre = FI::new(n(-0.5), n(value(POINTS - 1))).checked_add(FI::point(n(ox))).unwrap();
-        (0..pre.rounds().unwrap().unwrap())
-            .map(|w| {
-                let f = pre.round_fragment(w).unwrap();
-                let k = float_legacy::round(f.lo.value());
-                Capture { took: true, pre: (pre.lo, pre.hi), frag: (f.lo, f.hi), ox: (n(ox), n(ox)), fin: Some((n(f.lo.value() - k), n(f.hi.value() - k))) }
-            })
-            .collect()
+    fn half<N: Rem>() -> N {
+        N::from_fixed_raw(1 << 15)
     }
 
-    /// `v` with the other zero's sign (any other value as it is).
-    fn flip(v: LuaF64) -> LuaF64 {
-        if v.value() == 0.0 {
-            n(-v.value())
+    /// The whole circle's ends as remainders.
+    fn ends<N: Rem>() -> (N, N) {
+        (N::at_point(N::C::narrow(0)), N::at_point(N::C::prev(N::C::SIZE)))
+    }
+
+    /// What the tracer captures of a value of the round split's argument
+    /// (16.16's split is the floor fork of `rem + ox + 1/2`).
+    fn traced<N: Rem>(v: N) -> N {
+        if N::ROUND_BY_SHIFTED_FLOOR {
+            N::add(v, half::<N>()).unwrap()
         } else {
             v
         }
     }
 
-    /// THE ONE DECODER IS THE DOUBLES' OLD ONE where that one held the
-    /// rules 16.16's does: at the old tests' speeds, 1e5 random ones, every
-    /// integer in [-9, 9] and its neighbours (the top sliver), each piece
-    /// with `fin` its image (its zeros' signs flipped too), none, either
-    /// zero, another point or neither; no split. The old one did not check
-    /// that a fragment is its amount's whole piece, nor that a remainder set
-    /// before the move is a remainder: there, and only there, the new one
-    /// refuses what the old one took.
-    #[test]
-    fn the_decoder_is_the_legacy_one_in_doubles() {
-        let mut s = 99u64;
-        let rnd = |s: &mut u64| (crate::testutil::lcg(s) >> 11) as f64 / (1u64 << 53) as f64;
-        let mut speeds = vec![0.0, -0.0, 1.0, -1.0, 2.0, -2.0, 3.0, -4.0, 0.6, -0.6, 1.5, -1.5, 0.35, 0.5, -0.5, 2.9999999999999996, -5.0 + 1e-15, 0.1 + 0.2];
-        for i in -9..=9 {
-            let v = i as f64;
-            speeds.extend([v, v.next_up(), v.next_down(), v + 0.5, (v + 0.5).next_up(), (v + 0.5).next_down()]);
-        }
-        speeds.extend((0..100_000).map(|i| if i % 2 == 0 { 18.0 * rnd(&mut s) - 9.0 } else { (rnd(&mut s) - 0.5) * 2f64.powi(-(i % 40)) }));
-        let (mut ok, mut refused_new) = (0u64, 0u64);
-        for &ox in &speeds {
+    /// The captures the tracer makes of `move` at speed `ox` over the whole
+    /// circle: per fragment of its split, `fin` the fragment's image.
+    pub(crate) fn captures<N: Rem>(ox: N) -> Vec<Capture<N>> {
+        let (bottom, top) = ends::<N>();
+        let pre = N::ival(N::add(bottom, ox).unwrap(), N::add(top, ox).unwrap());
+        let t = |v: (N, N)| (traced(v.0), traced(v.1));
+        (0..N::rounds(pre).unwrap().unwrap())
+            .map(|w| {
+                let f = N::bounds(N::round_fragment(pre, w).unwrap());
+                let k = N::flr(N::add(f.0, half::<N>()).unwrap());
+                Capture { took: true, pre: t(N::bounds(pre)), frag: t(f), ox: (ox, ox), fin: Some((N::sub(f.0, k).unwrap(), N::sub(f.1, k).unwrap())) }
+            })
+            .collect()
+    }
+
+    /// The decoder's pieces at every speed of `N`'s corpus.
+    pub(crate) fn pieces<N: Speeds>() -> Vec<Transfer<N::C>> {
+        N::speeds()
+            .into_iter()
+            .flat_map(captures)
+            .map(|c| {
+                let (g, a) = decode_axis(&c).unwrap();
+                N::transfer(&N::record(g, a))
+            })
+            .collect()
+    }
+
+    /// THE DECODE AGAINST THE CART: at every speed the pieces partition the
+    /// circle, and at every probe of a piece (its ends, its middle, random
+    /// points) the cart's `move` lands in the fragment and ends where the
+    /// action says; just outside it does not land there. With a collision's
+    /// final remainder instead, the same guard, the constant. The number of
+    /// one-point pieces.
+    fn pieces_partition_the_circle_and_act_as_the_cart<N: Speeds>() -> usize {
+        let size = N::C::wide(N::C::SIZE);
+        let zero = N::from_i16(0);
+        let (mut s, mut one_point) = (17u64, 0);
+        for ox in N::speeds() {
+            let mut at = 0u64;
             for c in captures(ox) {
-                let image = c.fin.unwrap();
-                let other = n(value(ZERO + 12345));
-                for fin in [Some(image), Some((flip(image.0), flip(image.1))), None, Some((n(0.0), n(0.0))), Some((n(-0.0), n(-0.0))), Some((n(-0.0), n(0.0))), Some((other, other)), Some((n(0.0), n(0.25)))] {
-                    let c = Capture { fin, ..c };
-                    ok += agree(&c, float_legacy::decode_axis(&c), generic(&c)) as u64;
+                let (g, act) = decode_axis(&c).unwrap_or_else(|e| panic!("ox {ox:?}: {e}"));
+                assert!(matches!(act, Action::Mono { .. }), "ox {ox:?}: {act:?}");
+                let t = N::transfer(&N::record(g, act));
+                let (lo, hi) = (N::C::wide(g.lo), N::C::wide(g.hi));
+                assert_eq!(lo, at, "ox {ox:?}: the pieces are contiguous");
+                at = hi;
+                one_point += (hi - lo == 1) as usize;
+                let frag = if N::ROUND_BY_SHIFTED_FLOOR { (N::sub(c.frag.0, half::<N>()).unwrap(), N::sub(c.frag.1, half::<N>()).unwrap()) } else { c.frag };
+                let moved = |p: u64| N::add(N::at_point(N::C::narrow(p)), ox).unwrap();
+                let inside = |v: N| N::le(frag.0, v) && N::le(v, frag.1);
+                let mut probes = vec![lo, hi - 1, lo + (hi - lo) / 2];
+                probes.extend((0..8).map(|_| lo + lcg(&mut s) % (hi - lo)));
+                for p in probes {
+                    let r1 = moved(p);
+                    assert!(inside(r1), "ox {ox:?}: point {p} is in the guard, but {r1:?} not in the fragment {frag:?}");
+                    let k = N::flr(N::add(r1, half::<N>()).unwrap());
+                    let want = N::rem_point(N::sub(r1, k).unwrap()).expect("a remainder");
+                    let p = N::C::narrow(p);
+                    assert_eq!(t.image(Seg { lo: p, hi: N::C::next(p) }), Some(Seg { lo: want, hi: N::C::next(want) }), "ox {ox:?}: point {p:?}");
                 }
-                // Cut short: not the whole piece. Refused; the old one took
-                // what still holds a remainder.
-                let (lo, hi) = c.frag;
-                for short in [(lo.succ().unwrap(), hi), (lo, hi.pred().unwrap())] {
-                    if short.0.le(short.1) {
-                        let c = Capture { frag: short, fin: None, ..c };
-                        assert!(generic(&c).is_err(), "{c:?} decoded");
-                        refused_new += float_legacy::decode_axis(&c).is_ok() as u64;
-                    }
+                for p in [lo.wrapping_sub(1), hi].into_iter().filter(|&p| p < size) {
+                    assert!(!inside(moved(p)), "ox {ox:?}: point {p} outside the guard lands in the fragment");
+                }
+                let hit = decode_axis(&Capture { fin: Some((zero, zero)), ..c }).unwrap();
+                if !N::num_eq(c.fin.unwrap().0, zero) || !N::num_eq(c.fin.unwrap().1, zero) {
+                    assert_eq!(hit, (g, Action::Const(N::rem_point(zero).unwrap())), "ox {ox:?}: a collision");
                 }
             }
-            // Set before the move: the remainder 0 or -1/2 set, plus the
-            // speed; and a point no remainder reaches (the old one took it).
-            for set in [0.0, -0.5] {
-                let p = n(set + ox);
-                for (frag, fin) in [((p, p), Some((n(0.0), n(0.0)))), ((p, p), None), ((p, p), Some((n(0.0), n(0.1))))] {
-                    let c = Capture { took: true, pre: (p, p), frag, ox: (n(ox), n(ox)), fin };
-                    ok += agree(&c, float_legacy::decode_axis(&c), generic(&c)) as u64;
+            assert_eq!(at, size, "ox {ox:?}: the pieces cover the circle");
+        }
+        one_point
+    }
+
+    #[test]
+    fn the_pieces_partition_the_circle_and_act_as_the_cart() {
+        assert!(pieces_partition_the_circle_and_act_as_the_cart::<P8>() > 0, "16.16's corpus has a point piece");
+        pieces_partition_the_circle_and_act_as_the_cart::<LuaF64>();
+    }
+
+    /// No split (a freeze, the spawn): the whole circle, the identity, a new
+    /// player's constant, or refused; a remainder set before the move: the
+    /// whole circle to the constant it ends at, or refused.
+    fn no_split_and_set_before_the_move<N: Rem>() {
+        let raw = N::from_fixed_raw;
+        let whole = Seg { lo: N::C::narrow(0), hi: N::C::SIZE };
+        let identity = Action::Mono { ox: N::from_i16(0), k: 0 };
+        let at = |v: N| Action::Const(N::rem_point(v).unwrap());
+        let none = Capture { took: false, pre: (raw(0), raw(0)), frag: (raw(0), raw(0)), ox: (raw(0), raw(0)), fin: Some(ends::<N>()) };
+        assert_eq!(decode_axis(&none), Ok((whole, identity)));
+        assert_eq!(decode_axis(&Capture { fin: None, ..none }), Ok((whole, identity)));
+        assert_eq!(decode_axis(&Capture { fin: Some((raw(0), raw(0))), ..none }), Ok((whole, at(raw(0)))));
+        assert!(decode_axis(&Capture { fin: Some((raw(0), raw(5))), ..none }).is_err());
+        // A platform's carry blocked by a wall set the remainder to 0 (and
+        // the speed may move it after): the split's argument is the point
+        // 0 plus the speed, every input remainder takes the edge.
+        for ox in [raw(0), raw(13107), raw(-70000)] {
+            let p = traced(N::add(raw(0), ox).unwrap());
+            let set = Capture { took: true, pre: (p, p), frag: (p, p), ox: (ox, ox), fin: Some((raw(0), raw(0))) };
+            assert_eq!(decode_axis(&set), Ok((whole, at(raw(0)))), "ox {ox:?}");
+            assert_eq!(decode_axis(&Capture { fin: Some((raw(13107), raw(13107))), ..set }), Ok((whole, at(raw(13107)))));
+            // A death after it: the whole circle, into the dummy coordinate.
+            assert_eq!(decode_axis(&Capture { fin: None, ..set }), Ok((whole, identity)));
+            // A fragment off the point, a final remainder not a point, a
+            // point no remainder plus the speed is.
+            assert!(decode_axis(&Capture { frag: (N::below(p).unwrap(), p), ..set }).is_err());
+            assert!(decode_axis(&Capture { fin: Some((raw(0), raw(9))), ..set }).is_err());
+            let far = N::add(p, raw(2 << 16)).unwrap();
+            assert!(decode_axis(&Capture { pre: (far, far), frag: (far, far), ..set }).is_err(), "ox {ox:?}");
+        }
+    }
+
+    #[test]
+    fn no_split_and_a_remainder_set_before_the_move_are_the_whole_circle() {
+        no_split_and_set_before_the_move::<P8>();
+        no_split_and_set_before_the_move::<LuaF64>();
+    }
+
+    /// What the model does not cover is refused (FATAL in the forward).
+    fn refusals<N: Rem>() {
+        let raw = N::from_fixed_raw;
+        let c = captures(raw(39322))[0];
+        let bad = |c: Capture<N>| decode_axis(&c).is_err();
+        // An inexact speed; a remainder at the move narrower than the circle.
+        assert!(bad(Capture { ox: (c.ox.0, N::add(c.ox.0, raw(10)).unwrap()), ..c }));
+        assert!(bad(Capture { pre: (c.pre.0, N::sub(c.pre.1, raw(100)).unwrap()), ..c }));
+        // A fragment over two amounts, cut short (not its amount's whole
+        // piece), or outside the argument.
+        assert!(bad(Capture { frag: c.pre, fin: None, ..c }));
+        assert!(bad(Capture { frag: (c.frag.0, N::below(c.frag.1).unwrap()), fin: None, ..c }));
+        assert!(bad(Capture { frag: (N::below(c.pre.0).unwrap(), c.frag.1), fin: None, ..c }));
+        // A final remainder neither the image nor a point; a constant
+        // outside [-1/2, 1/2).
+        assert!(bad(Capture { fin: Some((raw(0), raw(16384))), ..c }));
+        assert!(bad(Capture { fin: Some((raw(49152), raw(49152))), ..c }));
+        // A collision's constant; a death.
+        assert!(matches!(decode_axis(&Capture { fin: Some((raw(0), raw(0))), ..c }), Ok((_, Action::Const(_)))));
+        assert!(matches!(decode_axis(&Capture { fin: None, ..c }), Ok((_, Action::Mono { .. }))));
+    }
+
+    #[test]
+    fn what_the_model_does_not_cover_is_refused() {
+        refusals::<P8>();
+        refusals::<LuaF64>();
+    }
+
+    /// Pairs and their records round-trip through their bytes.
+    fn pairs_round_trip<N: Speeds>() {
+        let ps: Vec<N::Axis> = N::speeds().into_iter().flat_map(captures).map(|c| decode_axis(&c).map(|(g, a)| N::record(g, a)).unwrap()).collect();
+        let mut b = Vec::new();
+        for w in ps.windows(2) {
+            N::encode_pair(&mut b, &(w[0], w[1]));
+        }
+        assert_eq!(b.len(), (ps.len() - 1) * N::PAIR_BYTES);
+        for (k, w) in ps.windows(2).enumerate() {
+            assert_eq!(N::decode_pair(&b[k * N::PAIR_BYTES..(k + 1) * N::PAIR_BYTES]), (w[0], w[1]));
+        }
+    }
+
+    #[test]
+    fn pairs_round_trip_through_their_bytes() {
+        pairs_round_trip::<P8>();
+        pairs_round_trip::<LuaF64>();
+    }
+
+    /// A point of `N`'s circle as a number, often near its ends or 0.
+    pub(crate) fn probe_point<N: Rem>(s: &mut u64) -> u64 {
+        let (size, zero) = (N::C::wide(N::C::SIZE), N::C::wide(N::rem_point(N::from_i16(0)).unwrap()));
+        match lcg(s) % 5 {
+            0 => lcg(s) % 64,
+            1 => size - 1 - lcg(s) % 64,
+            2 => zero - 32 + lcg(s) % 64,
+            _ => lcg(s) % size,
+        }
+    }
+
+    /// THE PULL IS THE PREIMAGE, EXACTLY: a region pulled through the
+    /// decoder's pieces of real speeds (and a constant), probed at the
+    /// result's boundaries and their neighbours, the guards' ends and random
+    /// points: a point is in the pull iff the guards take it and its image
+    /// is in the region.
+    fn a_region_pulls_to_its_exact_preimage<N: Speeds>() {
+        let (size, mut s) = (N::C::wide(N::C::SIZE), 17u64);
+        let pt = N::C::narrow;
+        let mut ts = pieces::<N>();
+        ts.push(Transfer { guard: Seg { lo: pt(0), hi: N::C::SIZE }, act: Act::Const(N::rem_point(N::from_i16(0)).unwrap()) });
+        let seg = |s: &mut u64| {
+            let (a, b) = (probe_point::<N>(s), probe_point::<N>(s));
+            Seg { lo: pt(a.min(b)), hi: pt(a.max(b) + 1) }
+        };
+        let image = |t: &Transfer<N::C>, p: Point<N>| t.image(Seg { lo: p, hi: N::C::next(p) }).expect("in the guard").lo;
+        for _ in 0..300 {
+            let mut ps: Vec<Piece<_>> = (0..1 + lcg(&mut s) % 6).map(|_| Piece { y: seg(&mut s), x: seg(&mut s) }).collect();
+            let r = Region::<N::C>::from_pieces(&mut ps, &mut Vec::new());
+            let (tx, ty) = (ts[(lcg(&mut s) % ts.len() as u64) as usize], ts[(lcg(&mut s) % ts.len() as u64) as usize]);
+            let mut out = Vec::new();
+            r.as_ref().pull(tx, ty, &mut out);
+            let pr = Region::<N::C>::from_pieces(&mut out, &mut Vec::new());
+            let w = N::C::wide;
+            let around = |v: u64| [v.wrapping_sub(1), v, v + 1].into_iter().filter(|&p| p < size);
+            let mut px: Vec<u64> = vec![w(tx.guard.lo), w(tx.guard.hi) - 1, probe_point::<N>(&mut s), probe_point::<N>(&mut s)];
+            let mut py: Vec<u64> = vec![w(ty.guard.lo), w(ty.guard.hi) - 1, probe_point::<N>(&mut s), probe_point::<N>(&mut s)];
+            for (y, xs) in pr.as_ref().slabs() {
+                py.extend(around(w(y.lo)).chain(around(w(y.hi))));
+                for x in xs {
+                    px.extend(around(w(x.lo)).chain(around(w(x.hi))));
                 }
             }
-            let far = n(ox + 3.0);
-            let c = Capture { took: true, pre: (far, far), frag: (far, far), ox: (n(ox), n(ox)), fin: None };
-            assert!(generic(&c).is_err(), "{c:?} decoded");
-            refused_new += float_legacy::decode_axis(&c).is_ok() as u64;
+            for &x in &px {
+                for &y in &py {
+                    let (x, y) = (pt(x), pt(y));
+                    let want = tx.takes(x) && ty.takes(y) && r.as_ref().contains(image(&tx, x), image(&ty, y));
+                    assert_eq!(pr.as_ref().contains(x, y), want, "pull at ({x:?}, {y:?}) through {tx:?} {ty:?}");
+                }
+            }
         }
-        let top = n(value(POINTS - 1));
-        for fin in [Some((n(-0.5), top)), None, Some((n(0.0), n(0.0))), Some((n(-0.0), n(0.0))), Some((n(0.0), n(0.25)))] {
-            let c = Capture { took: false, pre: (n(0.0), n(0.0)), frag: (n(0.0), n(0.0)), ox: (n(0.0), n(0.0)), fin };
-            ok += agree(&c, float_legacy::decode_axis(&c), generic(&c)) as u64;
-        }
-        assert!(ok > 1_000_000 && refused_new > 100_000, "{ok} decoded alike; {refused_new} refused only by the new one");
+    }
+
+    #[test]
+    fn a_region_pulls_to_its_exact_preimage_through_the_pieces() {
+        a_region_pulls_to_its_exact_preimage::<P8>();
+        a_region_pulls_to_its_exact_preimage::<LuaF64>();
+    }
+
+    /// The sliver at an integer speed: `fl(r - 2) = -3/2` for the top two
+    /// doubles, a piece of its own onto `-1/2` that no 16.16 remainder
+    /// takes; 16.16's one piece is the rest. A point hull at the top
+    /// reaches only the sliver; one below it, only the rest.
+    #[test]
+    fn an_integer_speed_has_the_top_sliver() {
+        // How many 16.16 remainders (multiples of `2^-16`) the points `[lo, hi)` hold.
+        let fixed_points = |lo: u64, hi: u64| {
+            let from = |i: u64| if i == POINTS { 32768 } else { (crate::search::arcs::value(i) * 65536.0).ceil() as i64 };
+            (from(hi) - from(lo)) as u64
+        };
+        assert_eq!((fixed_points(0, POINTS), fixed_points(0, 1)), (65536, 1));
+        let pieces: Vec<Transfer<Doubles>> = captures(n(-2.0)).iter().map(|c| decode_axis(c).unwrap()).map(|(g, a)| LuaF64::transfer(&LuaF64::record(g, a))).collect();
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(pieces[1].guard, Seg { lo: POINTS - 2, hi: POINTS });
+        assert_eq!(fixed_points(pieces[1].guard.lo, pieces[1].guard.hi), 0);
+        assert_eq!(pieces[1].image(pieces[1].guard), Some(Seg { lo: 0, hi: 1 }));
+        assert_eq!(fixed_points(pieces[0].guard.lo, pieces[0].guard.hi), 65536);
+        let identity = Transfer { guard: Seg { lo: 0, hi: POINTS }, act: Act::Mono(Shift { ox: 0, k: 0 }) };
+        let mut acc = crate::search::hull::HullAcc::default();
+        assert!(!Hull::point(POINTS - 3, ZERO).push(&(pieces[1], identity), &mut acc));
+        assert!(Hull::point(POINTS - 2, ZERO).push(&(pieces[1], identity), &mut acc));
+        assert_eq!(acc.hull(), Some(Hull::point(0, ZERO)));
     }
 }

@@ -49,8 +49,9 @@ celeste-rust (src/)
   search/               driver (the search's levels, each level's arc
                         phase), backward (W, the optimum), reach (inside W;
                         exact), concrete (the concrete search; dual: over
-                        pairs), known, arcs, hull, rem (+ rem_f64),
-                        arc_edges, arc_check, hull_replay, tree (a finished
+                        pairs), known, arcs (the sets; both circles),
+                        hull, rem (the decode, the transfer records),
+                        arc_check, hull_replay, tree (a finished
                         tree opened), result, ui_export, inspect, level_minus_one
                         (the cost-to-go table, its one builder), robust (a
                         float witness against the libm)
@@ -363,12 +364,14 @@ node and an input, the circle splits into two pieces; in each the frame
 does one discrete thing and TRANSLATES the remainder (the piece is one
 floor's: its image never wraps), or maps it to a constant on a collision.
 The transfer is captured where the tracer forks `__split_by_flr` on the
-player's own `rem` (`arc_edges`): guard = the piece, action = the
-translation or `Const(fin)`; identity on an axis without a split. One
-model for both arithmetics (`arcs::Transfer`): a guard and a MONOTONE
-action (16.16's translation, the doubles' `Mono(ox, k)`) or a constant;
-the tree's table keeps 16.16's as the rotation it is mod 1
-(`arc_edges::AxisXfer`, converted at load and checked not to wrap). A second player split on an axis in one path is refused (and cannot
+player's own `rem` and decoded by ONE rule for both arithmetics
+(`rem::decode`, in their own operations, every comparison by value):
+guard = the piece, action = the translation or `Const(fin)`; identity on
+an axis without a split. One model for both arithmetics
+(`arcs::Transfer`): a guard and a MONOTONE action (16.16's translation,
+the doubles' `Mono(ox, k)`) or a constant; the tree's table keeps 16.16's
+as the rotation it is mod 1 (`rem::AxisXfer`, converted at load and
+checked not to wrap). A second player split on an axis in one path is refused (and cannot
 happen: `move` is the only splitter). A platform carry blocked by a wall
 sets `rem.x = 0` before the move: a split of one point, decoded as a
 constant. A body without transfer roots is refused at the kernel build.

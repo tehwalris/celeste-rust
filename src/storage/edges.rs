@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use super::bundle::{self, Bundle};
 use super::file::{self, At, Mapped};
 use super::Sk;
-use crate::search::rem::Rem;
+use crate::search::rem::{Pair, Rem};
 use celeste_core::pico8_num::Pico8Num as P8;
 
 /// The global transfer table: every distinct pair the tree's edges carry,
@@ -24,7 +24,7 @@ use celeste_core::pico8_num::Pico8Num as P8;
 /// past it are a killed wave's).
 #[derive(Clone)]
 pub struct XferTable<N: Rem = P8> {
-    pub(crate) pairs: Vec<N::Pair>,
+    pub(crate) pairs: Vec<Pair<N>>,
     index: PairIndex,
     /// Pairs written to `xfer.bin`.
     flushed: usize,
@@ -47,7 +47,7 @@ struct PairIndex {
 
 impl PairIndex {
     #[inline]
-    fn find<N: Rem>(&self, pairs: &[N::Pair], p: &N::Pair) -> Option<u32> {
+    fn find<N: Rem>(&self, pairs: &[Pair<N>], p: &Pair<N>) -> Option<u32> {
         if self.slots.is_empty() {
             return None;
         }
@@ -63,7 +63,7 @@ impl PairIndex {
     }
 
     /// Pair `id` of `pairs` (absent) indexed.
-    fn insert<N: Rem>(&mut self, pairs: &[N::Pair], id: u32) {
+    fn insert<N: Rem>(&mut self, pairs: &[Pair<N>], id: u32) {
         if (self.n + 1) * 4 > self.slots.len() * 3 {
             let cap = ((self.n + 1) * 2).next_power_of_two().max(16);
             let old = std::mem::replace(&mut self.slots, vec![0; cap]);
@@ -76,7 +76,7 @@ impl PairIndex {
     }
 
     #[inline]
-    fn place<N: Rem>(&mut self, pairs: &[N::Pair], id: u32) {
+    fn place<N: Rem>(&mut self, pairs: &[Pair<N>], id: u32) {
         let m = self.slots.len() - 1;
         let mut i = N::pair_hash(&pairs[id as usize]) as usize & m;
         while self.slots[i] != 0 {
@@ -104,7 +104,7 @@ impl<N: Rem> XferTable<N> {
     }
 
     /// The pairs alone, as `load` reads them (no index: a big tree has ~4M).
-    pub(crate) fn load_pairs(dir: &Path) -> Result<Vec<N::Pair>> {
+    pub(crate) fn load_pairs(dir: &Path) -> Result<Vec<Pair<N>>> {
         let n = match super::record::done(dir)? {
             Some(d) => d.xfers,
             None => 0,
@@ -116,7 +116,7 @@ impl<N: Rem> XferTable<N> {
     }
 
     #[inline]
-    pub(crate) fn find(&self, p: &N::Pair) -> Option<u32> {
+    pub(crate) fn find(&self, p: &Pair<N>) -> Option<u32> {
         self.index.find::<N>(&self.pairs, p)
     }
 
@@ -137,8 +137,8 @@ impl<N: Rem> XferTable<N> {
     /// since its last merge: a slice's) merged in, in value order; per tail
     /// its pairs' ids. Final: the pairs first met in a slice are a function
     /// of the frame, so their ids are.
-    pub(crate) fn merge(&mut self, tails: &[&[N::Pair]]) -> Vec<Vec<u32>> {
-        let mut new: Vec<N::Pair> = tails.iter().flat_map(|t| t.iter()).filter(|p| self.index.find::<N>(&self.pairs, p).is_none()).copied().collect();
+    pub(crate) fn merge(&mut self, tails: &[&[Pair<N>]]) -> Vec<Vec<u32>> {
+        let mut new: Vec<Pair<N>> = tails.iter().flat_map(|t| t.iter()).filter(|p| self.index.find::<N>(&self.pairs, p).is_none()).copied().collect();
         new.sort_unstable();
         new.dedup();
         // Room by an eighth at least: doubling can hold a whole table spare.
@@ -402,7 +402,7 @@ impl EdgeFiles {
 /// global transfer table.
 pub struct EdgeStore<N: Rem = P8> {
     files: EdgeFiles,
-    xfers: Vec<N::Pair>,
+    xfers: Vec<Pair<N>>,
     pub edges: u64,
     pub(crate) bytes: u64,
 }
@@ -425,11 +425,11 @@ impl<N: Rem> EdgeStore<N> {
         self.files.file(frame)
     }
 
-    pub fn pair(&self, xfer: u32) -> Option<N::Pair> {
+    pub fn pair(&self, xfer: u32) -> Option<Pair<N>> {
         self.xfers.get(xfer as usize).copied()
     }
 
-    pub(crate) fn pairs(&self) -> &[N::Pair] {
+    pub(crate) fn pairs(&self) -> &[Pair<N>] {
         &self.xfers
     }
 
@@ -625,7 +625,7 @@ pub(crate) fn segments_of(edges: &[(Sk, Sk, u32)]) -> Result<(Vec<Segment>, Vec<
 /// frame and its transfer table `pairs`, under the level's tree `dir`, its
 /// record trusting them (the backward's tests).
 #[cfg(test)]
-pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(Sk, Sk, u32)>)], pairs: &[crate::search::arc_edges::Pair]) -> Result<()> {
+pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(Sk, Sk, u32)>)], pairs: &[Pair<P8>]) -> Result<()> {
     let edges = dir.join("edges");
     let mut xt = XferTable::<P8>::default();
     xt.merge(&[pairs]);
@@ -643,7 +643,6 @@ pub(crate) fn write_test_edges(dir: &Path, frames: &[(u32, Vec<(Sk, Sk, u32)>)],
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::arc_edges::Pair;
 
     /// A slice's new transfers get their final ids at its merge, in value
     /// order after every pair before; a pair held keeps its id; the ids
@@ -651,7 +650,7 @@ mod tests {
     #[test]
     fn a_slices_new_transfers_get_final_ids_in_value_order() {
         let pair = |v: i32| {
-            let ax = crate::search::arc_edges::AxisXfer { lo: 0, hi: 1 << 16, tag: 0, val: v };
+            let ax = crate::search::rem::AxisXfer { lo: 0, hi: 1 << 16, tag: 0, val: v };
             (ax, ax)
         };
         let mut t = XferTable::<P8>::default();
@@ -703,9 +702,9 @@ mod tests {
         let none = st(0, 7, crate::storage::cells::NO_CELL);
         let extra = (st(0, 6, cell(2, 4)), t1, 2);
         let edges = vec![(a, t1, 3), (b, t2, 3), (a, t2, 4), (a, far, 3), (none, t1, 0), (t1, none, 1), extra];
-        let pairs: Vec<Pair> = (0..5)
+        let pairs: Vec<Pair<P8>> = (0..5)
             .map(|i| {
-                let ax = crate::search::arc_edges::AxisXfer { lo: 0, hi: 1 << 16, tag: 0, val: i };
+                let ax = crate::search::rem::AxisXfer { lo: 0, hi: 1 << 16, tag: 0, val: i };
                 (ax, ax)
             })
             .collect();

@@ -22,7 +22,7 @@ pub(crate) struct EdgeHashes {
 }
 
 impl EdgeHashes {
-    pub(crate) fn new<N: crate::search::rem::Rem>(pairs: &[N::Pair]) -> Self {
+    pub(crate) fn new<N: crate::search::rem::Rem>(pairs: &[crate::search::rem::Pair<N>]) -> Self {
         let mix = celeste_engine::runtime2::mix64;
         EdgeHashes {
             pairs: pairs

@@ -1025,7 +1025,7 @@ pub fn gate_w_hash<C: Circle>(node: u64, r: RegionRef<C>) -> u64 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::search::arc_edges::AxisXfer;
+    use crate::search::rem::{AxisXfer, Pair};
     use crate::search::arcs::{point, Act, Seg, Transfer, CIRCLE};
 
     /// `seek` is the linear walk: from every start and for every key, over
@@ -1089,7 +1089,7 @@ pub(crate) mod tests {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SEQ: AtomicU32 = AtomicU32::new(0);
             let dir = crate::testutil::TestDir::new(&format!("arcdp-{name}-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
-            let mut pairs: Vec<crate::search::arc_edges::Pair> = edges.iter().map(|e| (axis(e.2), axis(e.3))).collect();
+            let mut pairs: Vec<Pair<celeste_core::pico8_num::Pico8Num>> = edges.iter().map(|e| (axis(e.2), axis(e.3))).collect();
             pairs.sort_unstable();
             pairs.dedup();
             let mut frames: std::collections::BTreeMap<u32, Vec<(Sk, Sk, u32)>> = Default::default();
@@ -1109,7 +1109,7 @@ pub(crate) mod tests {
         /// The store up to `horizon`, its transfers, and its win seeds.
         pub(crate) fn open(&self, horizon: u32) -> (EdgeStore, Vec<(Transfer, Transfer)>, Vec<(Sk, u32)>) {
             let store = EdgeStore::<celeste_core::pico8_num::Pico8Num>::open(&self.dir, horizon).expect("open");
-            let pairs = store.pairs().iter().map(|p| (p.0.transfer(), p.1.transfer())).collect();
+            let pairs = store.pairs().iter().map(<celeste_core::pico8_num::Pico8Num as Rem>::xfer).collect();
             let wins = self.wins.iter().map(|&k| (sid(k), self.layers[k as usize])).collect();
             (store, pairs, wins)
         }
