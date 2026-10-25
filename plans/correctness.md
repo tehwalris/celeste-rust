@@ -180,7 +180,15 @@ settled here. Evidence is file:line at develop 19869c5d.
   ref` 5 -> 19 GB. Re-proven under it: any% (0,0) 93, (1,0) 99, (4,0) 76,
   summit 55, gemskip summit 57, (5,3) 79. Still at risk: nodiag (6,0) 73
   (C13 since fixed), nodiag (6,1) 92, nodiag (1,2) 113, 100% (6,1) 114, 100% (4,3)
-  109. Decision pending (Philippe).
+  109. Decided (Philippe, 2026-10-25): the fix above.
+- RE-PROVEN under the real buttons (2026-10-25, branch jump-buffer on
+  develop d63f0056; plans/results.md "Under the real buttons"): every result
+  at risk, NONE moved - any% (0,0) 93, (1,0) 99, (4,0) 76, (5,3) 79, (1,2)
+  103 (develop's platform re-proof had bound 99 < 103: at risk too), summit
+  55, gemskip summit 57; nodiag (6,0) 73, (6,1) 92, (1,2) 113; 100% (6,1)
+  114, (4,3) 109. Every known route kept, every witness the stored one and
+  valid on PICO-8 in the original cart. The breadth-first proofs grow with
+  the buffer ((4,3) 100%: 31.2M steps, 26 GB).
 
 ## C8. Death and exit in the same update counts as a win (FIXED, branch correctness-batch)
 - The original cart: `kill_player` (orig 121-122 spikes, 125-126 the bottom)
