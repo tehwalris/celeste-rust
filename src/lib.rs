@@ -1,5 +1,6 @@
 
 pub mod abstraction;
+pub mod check;
 pub mod compiled;
 pub mod frame;
 pub mod game_runner;

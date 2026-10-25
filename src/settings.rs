@@ -224,9 +224,6 @@ pub struct Diagnostics {
     /// DIAGNOSTIC: kernels keep their graphs, so a decline names its premise.
     #[arg(long, global = true)]
     pub kernel_explain: bool,
-    /// The kernels' census and slice counters (`bench frame --metrics`).
-    #[arg(skip)]
-    pub kernel_metrics: bool,
     /// DIAGNOSTIC: the wave workers' phase timings.
     #[arg(long, global = true)]
     pub phases: bool,

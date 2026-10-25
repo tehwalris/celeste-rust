@@ -64,7 +64,10 @@ celeste-rust (src/)
                         over RefDomain as a frame step)
   transpile/            graph IR, garith, ival, bdd, lowering, asm (codegen,
                         float codegen, call-outs, jit)
-  compiled/             FrameEngine, the kernel registry, emission, mix
+  compiled/             FrameEngine, the kernel registry, emission, the
+                        kernel cache
+  check/                the tools outside the core, which names none of
+                        them: census (the kernel census, rebuilt)
   settings.rs           the run's settings (flags), the tree's record
   starts.rs             the feasible loading-jank J's and their classes
   par.rs, metrics.rs, concrete.rs, game_runner.rs

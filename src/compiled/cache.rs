@@ -9,7 +9,7 @@
 //!   src/, crates/, lua/, cart/, the manifests) and its profile;
 //! - the traced program's text (`trace::cart::sources`);
 //! - the run's settings (all of them but the thread count and the
-//!   diagnostics that change no kernel) and the level;
+//!   diagnostics, which change no kernel) and the level;
 //! - the assembler's and the C library's versions.
 //!
 //! Every commit misses: entries serve the processes of one build (a check
@@ -19,7 +19,9 @@
 //! mismatch is a loud miss and a rebuild, never a use). Written to a
 //! process's own directory and renamed into place: of two processes storing
 //! one key, whichever rename wins is the entry. Past `CAP_BYTES` the least
-//! recently used entries go. `--kernel-explain` builds without it.
+//! recently used entries go. `--kernel-explain` builds without it. A tool
+//! keeps what it derives from the set beside it, under the same key
+//! (`get`, `put`: the census's `<key>-census`).
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -30,7 +32,7 @@ use super::asm_kernel::Recipe;
 use super::KernelLanes;
 
 /// The entries' format: a change of `Recipe` or of this layout bumps it.
-pub(crate) const KERNEL_CACHE_FORMAT: u32 = 1;
+pub(crate) const KERNEL_CACHE_FORMAT: u32 = 2;
 
 /// The entries' total size past which the least recently used go.
 const CAP_BYTES: u64 = 4 << 30;
@@ -79,13 +81,9 @@ fn toolchain() -> &'static str {
 
 /// Level `level`'s kernel set under `s`, in `N`'s arithmetic: its key.
 pub(crate) fn key<N: KernelLanes>(level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Key> {
-    // The settings but those that change no kernel: the threads, and the
-    // diagnostics (but the census, which an entry holds).
-    let settings = crate::settings::Settings {
-        threads: None,
-        diag: crate::settings::Diagnostics { kernel_metrics: s.diag.kernel_metrics, ..Default::default() },
-        ..s.clone()
-    };
+    // The settings but those that change no kernel: the threads and the
+    // diagnostics.
+    let settings = crate::settings::Settings { threads: None, diag: Default::default(), ..s.clone() };
     let program = crate::trace::cart::sources(s)?;
     let text = format!(
         "kernel cache format {KERNEL_CACHE_FORMAT}\nsources {SOURCES}, debug assertions {}\n{}\narithmetic {}, level {level}\nsettings {settings:?}\nprogram {:016x} ({} bytes)\n",
@@ -108,53 +106,81 @@ impl Store {
         Store { dir: root.join(format!("k{KERNEL_CACHE_FORMAT}")) }
     }
 
-    /// The entry of `key`, if one is stored and whole. A damaged entry (a
-    /// file missing or not its manifest's) is said, removed, and a miss.
+    /// The kernel set of `key`, if one is stored and whole (`get`).
     pub(crate) fn load<N: KernelLanes>(&self, key: &Key) -> Result<Option<Entry<N>>> {
-        let dir = self.dir.join(&key.name);
-        if !dir.exists() {
-            return Ok(None);
-        }
-        match read_entry::<N>(&dir, key) {
-            Ok(entry) => {
-                // Recently used (the eviction's order).
-                let _ = std::fs::File::options().write(true).open(dir.join("used")).and_then(|f| f.set_modified(std::time::SystemTime::now()));
-                Ok(Some(entry))
-            }
+        let Some(mut files) = self.get(&key.name, key)? else { return Ok(None) };
+        let parsed = (|| -> Result<Entry<N>> {
+            let recipes: Vec<Recipe<N>> = bincode::deserialize(&files.remove("recipes.bin").context("no recipes.bin")?).context("the recipes")?;
+            let entry = recipes.into_iter().enumerate().map(|(i, r)| Ok((r, files.remove(&format!("k{i}.so")).with_context(|| format!("no k{i}.so"))?))).collect::<Result<Entry<N>>>()?;
+            ensure!(files.is_empty(), "files past the kernels: {:?}", files.keys().collect::<Vec<_>>());
+            Ok(entry)
+        })();
+        match parsed {
+            Ok(entry) => Ok(Some(entry)),
             Err(e) => {
-                eprintln!("[asm build] kernel cache entry {} is DAMAGED, rebuilt: {e:#}", dir.display());
-                let _ = std::fs::remove_dir_all(&dir);
+                self.damaged(&key.name, &e);
                 Ok(None)
             }
         }
     }
 
-    /// Store `entry` as `key`'s (unless another process just did), then
-    /// evict past the cap.
+    /// Store `entry` as `key`'s (`put`).
     pub(crate) fn store<N: KernelLanes>(&self, key: &Key, entry: &[(&Recipe<N>, &[u8])]) -> Result<()> {
+        let recipes: Vec<&Recipe<N>> = entry.iter().map(|(r, _)| *r).collect();
+        let mut files = vec![("recipes.bin".to_string(), bincode::serialize(&recipes)?)];
+        files.extend(entry.iter().enumerate().map(|(i, (_, so))| (format!("k{i}.so"), so.to_vec())));
+        self.put(&key.name, key, &files)
+    }
+
+    /// The files of the entry named `name`, stored under `key` (the set's,
+    /// or a tool's beside it: `check::census`), by name: `None` unless it
+    /// is stored and whole. A damaged entry (a file missing or not its
+    /// manifest's, another key) is said, removed, and a miss.
+    pub(crate) fn get(&self, name: &str, key: &Key) -> Result<Option<std::collections::BTreeMap<String, Vec<u8>>>> {
+        let dir = self.dir.join(name);
+        if !dir.exists() {
+            return Ok(None);
+        }
+        match read_entry(&dir, key) {
+            Ok(files) => {
+                // Recently used (the eviction's order).
+                let _ = std::fs::File::options().write(true).open(dir.join("used")).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+                Ok(Some(files))
+            }
+            Err(e) => {
+                self.damaged(name, &e);
+                Ok(None)
+            }
+        }
+    }
+
+    /// Store `files` as the entry `name` under `key` (unless another
+    /// process just did), then evict past the cap.
+    pub(crate) fn put(&self, name: &str, key: &Key, files: &[(String, Vec<u8>)]) -> Result<()> {
         std::fs::create_dir_all(&self.dir).with_context(|| format!("creating {}", self.dir.display()))?;
-        let tmp = self.dir.join(format!(".{}.{}", key.name, std::process::id()));
+        let tmp = self.dir.join(format!(".{name}.{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir(&tmp)?;
         let mut manifest = String::new();
-        let mut put = |name: &str, bytes: &[u8]| -> Result<()> {
-            std::fs::write(tmp.join(name), bytes)?;
-            manifest.push_str(&manifest_line(name, bytes));
-            Ok(())
-        };
-        put("key.txt", key.text.as_bytes())?;
-        let recipes: Vec<&Recipe<N>> = entry.iter().map(|(r, _)| *r).collect();
-        put("recipes.bin", &bincode::serialize(&recipes)?)?;
-        for (i, (_, so)) in entry.iter().enumerate() {
-            put(&format!("k{i}.so"), so)?;
+        for (f, bytes) in std::iter::once(("key.txt", key.text.as_bytes())).chain(files.iter().map(|(f, b)| (f.as_str(), b.as_slice()))) {
+            ensure!(!["manifest.txt", "used"].contains(&f), "a cache entry's file named {f}");
+            std::fs::write(tmp.join(f), bytes)?;
+            manifest.push_str(&manifest_line(f, bytes));
         }
         std::fs::write(tmp.join("manifest.txt"), manifest)?;
         std::fs::write(tmp.join("used"), b"")?;
         // Whichever process's rename wins is the entry.
-        if std::fs::rename(&tmp, self.dir.join(&key.name)).is_err() {
+        if std::fs::rename(&tmp, self.dir.join(name)).is_err() {
             std::fs::remove_dir_all(&tmp)?;
         }
-        self.evict(&key.name)
+        self.evict(name)
+    }
+
+    /// A damaged entry, said and removed.
+    fn damaged(&self, name: &str, e: &anyhow::Error) {
+        let dir = self.dir.join(name);
+        eprintln!("[asm build] kernel cache entry {} is DAMAGED, rebuilt: {e:#}", dir.display());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The least recently used entries removed until the rest fit the cap
@@ -185,20 +211,19 @@ impl Store {
     }
 }
 
-/// An entry's files, each checked against the manifest, its key against
-/// `key`'s.
-fn read_entry<N: KernelLanes>(dir: &Path, key: &Key) -> Result<Entry<N>> {
+/// An entry's files but its key, by name: every file its manifest lists,
+/// each checked against its line, the key against `key`'s.
+fn read_entry(dir: &Path, key: &Key) -> Result<std::collections::BTreeMap<String, Vec<u8>>> {
     let manifest = std::fs::read_to_string(dir.join("manifest.txt")).context("the manifest")?;
-    let read = |name: &str| -> Result<Vec<u8>> {
-        let bytes = std::fs::read(dir.join(name)).with_context(|| format!("{name}"))?;
-        let line = manifest_line(name, &bytes);
-        ensure!(manifest.lines().any(|l| format!("{l}\n") == line), "{name} is not the manifest's ({})", line.trim_end());
-        Ok(bytes)
-    };
-    ensure!(read("key.txt")? == key.text.as_bytes(), "the stored key is not this one");
-    let recipes: Vec<Recipe<N>> = bincode::deserialize(&read("recipes.bin")?).context("the recipes")?;
-    ensure!(manifest.lines().count() == recipes.len() + 2, "the manifest lists {} files for {} kernels", manifest.lines().count(), recipes.len());
-    recipes.into_iter().enumerate().map(|(i, r)| Ok((r, read(&format!("k{i}.so"))?))).collect::<Result<Entry<N>>>().map_err(|e: anyhow::Error| anyhow!("{e:#}"))
+    let mut files = std::collections::BTreeMap::new();
+    for l in manifest.lines() {
+        let name = l.split(' ').next().unwrap_or_default();
+        let bytes = std::fs::read(dir.join(name)).with_context(|| name.to_string())?;
+        ensure!(manifest_line(name, &bytes) == format!("{l}\n"), "{name} is not the manifest's ({l})");
+        ensure!(files.insert(name.to_string(), bytes).is_none(), "the manifest lists {name} twice");
+    }
+    ensure!(files.remove("key.txt").ok_or_else(|| anyhow!("no key.txt"))? == key.text.as_bytes(), "the stored key is not this one");
+    Ok(files)
 }
 
 #[cfg(test)]
@@ -211,8 +236,8 @@ mod tests {
 
     /// A MISS FOR EVERY INPUT CHANGED: the key moves with each setting that
     /// shapes a kernel set (and with the arithmetic and the level), not
-    /// with the thread count; it names the sources' fingerprint and the
-    /// toolchain.
+    /// with the thread count or a diagnostic; it names the sources'
+    /// fingerprint and the toolchain.
     #[test]
     fn a_kernel_cache_key_moves_with_every_input() {
         let level = Level::parse("r0sxh").expect("level");
@@ -220,6 +245,7 @@ mod tests {
         let k = |s: &Settings, l: Level| super::key::<Pico8Num>(l, s).expect("key").name;
         let at = k(&base, level);
         assert_eq!(at, k(&Settings { threads: Some(3), ..base.clone() }, level), "the threads change no kernel");
+        assert_eq!(at, k(&Settings { diag: crate::settings::Diagnostics { phases: true, ..Default::default() }, ..base.clone() }, level), "the diagnostics change no kernel");
         let changed: Vec<(&str, Settings)> = vec![
             ("room", Settings { room: (4, 2), ..base.clone() }),
             ("region", Settings { region: Some((8, 6)), ..base.clone() }),
@@ -228,7 +254,6 @@ mod tests {
             ("loading jank", Settings { loading_jank: Some(1), ..base.clone() }),
             ("balloon seeds", Settings { balloon_seeds: Some("0".to_string()), ..base.clone() }),
             ("win", Settings { win_at: Some((9, 9, 101, 101)), ..base.clone() }),
-            ("census", Settings { diag: crate::settings::Diagnostics { kernel_metrics: true, ..Default::default() }, ..base.clone() }),
         ];
         for (what, s) in &changed {
             assert_ne!(at, k(s, level), "{what}: the key did not move");
@@ -265,10 +290,10 @@ mod tests {
                 files.sort();
                 files
             };
-            let fresh: Vec<Registry<Pico8Num>> = stores.iter().map(|st| Registry::build_with(level, s, Some(st)).expect("a fresh build")).collect();
+            let fresh: Vec<Registry<Pico8Num>> = stores.iter().map(|st| Registry::build_with(level, s, Some(st), false).expect("a fresh build")).collect();
             assert_eq!(entry(0), entry(1), "room {:?}: two fresh builds store the same entry", s.room);
             assert!(entry(0).iter().filter(|(n, _)| n.ends_with(".so")).count() == fresh[0].len(), "an entry holds every kernel's code");
-            let cached = Registry::<Pico8Num>::build_with(level, s, Some(&stores[0])).expect("a cached build");
+            let cached = Registry::<Pico8Num>::build_with(level, s, Some(&stores[0]), false).expect("a cached build");
             assert_eq!(cached.text_digest(), fresh[0].text_digest(), "room {:?}: the cached kernels are the fresh ones", s.room);
             let layouts = cached.key_layouts();
             assert!(layouts == fresh[0].key_layouts(), "room {:?}: the cached kernels' key layouts are the fresh ones'", s.room);

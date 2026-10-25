@@ -16,32 +16,20 @@ pub use jit::{assemble, check_mxcsr, KernelFn, Loaded};
 use anyhow::Result;
 use std::path::PathBuf;
 
-/// What an assembly is built with: `mix` (`bench-frame --metrics`:
-/// instruction provenance kept, the assembly text kept for the kernel
-/// census).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct AsmOptions {
-    pub mix: bool,
-}
-
-/// Compile `roots` of `g` to assembly, assemble it, and load it. Returns
-/// the layout metadata (each input cell's by its type in `g`) and the
-/// loaded function.
+/// Compile `roots` of `g` to assembly as the function `sym`, assemble it,
+/// and load it. Returns the layout metadata (each input cell's by its type
+/// in `g`) and the loaded function; the text is dropped once loaded (it is
+/// GBs across a room's kernel sets; the census compiles its own,
+/// `check::census`).
 pub fn compile_and_load<A: crate::transpile::garith::GraphArith>(
     g: &crate::transpile::graph::Graph<A>,
     roots: &[crate::transpile::graph::NodeId],
-    tag: &str,
-    opts: AsmOptions,
+    sym: &str,
 ) -> Result<(Compiled, Loaded)> {
-    let sym = format!("kernel_{tag}");
-    let mut compiled = compile(g, roots, &sym, opts)?;
-    let so: PathBuf = assemble(&compiled.asm, tag)?;
-    let loaded = Loaded::open(&so, &sym)?;
-    // The assembly text is only the assembler's input: drop it once loaded
-    // (it is GBs across a room's kernel sets). The mix diagnostic reads it.
-    if !opts.mix {
-        compiled.asm = String::new();
-    }
+    let mut compiled = compile(g, roots, sym, false)?;
+    let so: PathBuf = assemble(&compiled.asm, sym)?;
+    let loaded = Loaded::open(&so, sym)?;
+    compiled.asm = String::new();
     Ok((compiled, loaded))
 }
 

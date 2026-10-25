@@ -56,8 +56,8 @@ pub struct FrameArgs {
     /// cleared per rep), as the search's forward does.
     #[arg(long)]
     edges: bool,
-    /// The first rep's exact metrics (`compiled::mix`) must be this pinned
-    /// file's (with `--pin`: written to it).
+    /// The first rep's exact metrics (the kernel census, `check::census`)
+    /// must be this pinned file's (with `--pin`: written to it).
     #[arg(long)]
     pub metrics: Option<PathBuf>,
     /// The printed lines must be this pinned file's lines of their kinds
@@ -119,7 +119,9 @@ fn bench_frame<N: Rem + celeste_rust::compiled::KernelLanes>(t: &TreeDir, a: &Fr
     anyhow::ensure!(!a.pin || (a.expect.is_some() || a.metrics.is_some()), "--pin writes --expect and --metrics: give one");
     anyhow::ensure!(!a.pin || a.expect.is_none() || checkpoint, "--pin --expect: a pin holds every line (--edges --checkpoint)");
     let frame = t.frame(a.step)?;
-    let engine = celeste_rust::compiled::Kernels::<N>::new(cfg, level)?;
+    // `--metrics`: the kernels count the slices they run (the census's
+    // dynamic instructions, `check::census`).
+    let engine = if a.metrics.is_some() { celeste_rust::compiled::Kernels::<N>::counting(cfg, level)? } else { celeste_rust::compiled::Kernels::<N>::new(cfg, level)? };
     let t = std::time::Instant::now();
     engine.warm();
     let t_kernels = t.elapsed().as_secs_f64();
@@ -187,13 +189,13 @@ fn bench_frame<N: Rem + celeste_rust::compiled::KernelLanes>(t: &TreeDir, a: &Fr
         if rep == 0 {
             celeste_rust::compiled::print_kernel_stats(&costs[0].stats);
             if let Some(path) = &a.metrics {
-                let kernels = celeste_rust::compiled::mix::kernel_metrics();
+                let kernels = celeste_rust::check::census::counted(&engine, level, cfg)?;
                 let slices: u64 = kernels.iter().map(|k| k.1).sum();
                 let insts: u64 = kernels.iter().map(|(_, n, c)| n * c.get("insts").copied().unwrap_or(0)).sum();
                 eprintln!("[bench] kernels: {insts} dynamic instructions over {slices} slices ({} a slice; call-outs' callees aside)", insts.checked_div(slices).unwrap_or(0));
-                pinned(path, &frame_metrics(cfg.room, level, frame, &costs[0].stats), a.pin, metrics_moves)?;
+                pinned(path, &frame_metrics(cfg.room, level, frame, &costs[0].stats, &kernels), a.pin, metrics_moves)?;
             }
-            celeste_rust::compiled::mix::reset_slices();
+            engine.reset_slices();
         }
         lines = Some(out);
     }
@@ -354,9 +356,11 @@ fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize)
 
 /// `bench frame --metrics`: one frame's EXACT metrics as `key value` lines
 /// (no timings: the same at every thread count): the frame's, the calls',
-/// every built kernel's census summed (`all.*`), the dynamic instructions
-/// (`dyn.*`: slices x static count) and per kernel that ran (`k.<sym>.*`).
-fn frame_metrics((rx, ry): (i16, i16), level: Level, frame: u32, w: &celeste_rust::storage::stats::Stats) -> String {
+/// every built kernel's census summed (`all.*`; `kernels`: per kernel its
+/// symbol, slices and census, `check::census::counted`), the dynamic
+/// instructions (`dyn.*`: slices x static count) and per kernel that ran
+/// (`k.<sym>.*`).
+fn frame_metrics((rx, ry): (i16, i16), level: Level, frame: u32, w: &celeste_rust::storage::stats::Stats, kernels: &[(String, u64, celeste_rust::check::census::Census)]) -> String {
     use celeste_rust::storage::stats::S;
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
@@ -380,10 +384,9 @@ fn frame_metrics((rx, ry): (i16, i16), level: Level, frame: u32, w: &celeste_rus
     put("calls.bodies", w.get(S::KernelBodies));
     put("calls.bodies_taken", w.get(S::KernelBodiesTaken));
     put("calls.lane_emits", w.get(S::KernelTakes));
-    let kernels = celeste_rust::compiled::mix::kernel_metrics();
     put("kernels.built", kernels.len() as u64);
     // Every kernel's census summed.
-    for (sym, slices, census) in &kernels {
+    for (sym, slices, census) in kernels {
         for (k, v) in census {
             put(&format!("all.{k}"), *v);
         }

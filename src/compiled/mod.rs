@@ -11,7 +11,6 @@ use celeste_names as gen;
 
 pub(crate) mod asm_kernel;
 pub(crate) mod cache;
-pub mod mix;
 
 pub use asm_kernel::{KernelLanes, Registry, Resident, Scratch};
 
@@ -113,6 +112,8 @@ pub fn collision_cache((room_x, room_y): (i16, i16)) -> Arc<CollisionCache> {
 pub struct Kernels<N: KernelLanes = celeste_core::pico8_num::Pico8Num> {
     level: crate::abstraction::Level,
     settings: Arc<crate::settings::Settings>,
+    /// Each kernel counts the slices it runs (`counting`).
+    counting: bool,
     registry: std::sync::OnceLock<Arc<asm_kernel::Registry<N>>>,
 }
 
@@ -122,11 +123,34 @@ pub type FrameEngine = Kernels<celeste_core::pico8_num::Pico8Num>;
 impl<N: KernelLanes> Kernels<N> {
     /// The engine for the start room of `settings`, its frames at `level`.
     pub fn new(settings: &crate::settings::Settings, level: crate::abstraction::Level) -> Result<Self> {
-        Ok(Kernels { level, settings: Arc::new(settings.clone()), registry: std::sync::OnceLock::new() })
+        Ok(Kernels { level, settings: Arc::new(settings.clone()), counting: false, registry: std::sync::OnceLock::new() })
+    }
+
+    /// The same kernels, each COUNTING the slices it runs (`slice_counts`:
+    /// the census's dynamic instructions, `check::census`). The same code
+    /// and cache entry as `new`'s; the counters are attached at load.
+    pub fn counting(settings: &crate::settings::Settings, level: crate::abstraction::Level) -> Result<Self> {
+        Ok(Kernels { counting: true, ..Kernels::new(settings, level)? })
     }
 
     fn registry(&self) -> &asm_kernel::Registry<N> {
-        self.registry.get_or_init(|| asm_kernel::registry::<N>(self.level, &self.settings))
+        self.registry.get_or_init(|| asm_kernel::registry::<N>(self.level, &self.settings, self.counting))
+    }
+
+    /// Per kernel its (shape, region), symbol and the slices it ran since
+    /// the last `reset_slices` (none unless `counting`), by key.
+    pub fn slice_counts(&self) -> Vec<((u64, Option<crate::trace::walk::Region>), String, u64)> {
+        self.registry().slice_counts()
+    }
+
+    /// Zero the slice counters (a bench's warm-up done).
+    pub fn reset_slices(&self) {
+        self.registry().reset_slices()
+    }
+
+    /// Kernel `k`'s text digest: a rebuilding tool's identity check.
+    pub(crate) fn digest_of(&self, k: (u64, Option<crate::trace::walk::Region>)) -> Option<u64> {
+        self.registry().digest_of(k)
     }
 
     /// One frame of one BUCKET (one shape's block), emitted into `sink`:

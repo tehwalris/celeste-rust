@@ -123,7 +123,7 @@ pub trait GraphArith: Arithmetic {
     fn alone_in_its_value(v: Self) -> bool;
     /// The kernel computing `roots` of `g`, as assembly (`transpile::asm`:
     /// the arithmetic's lowering of each node and its lane layout).
-    fn compile_kernel(g: &Graph<Self>, roots: &[NodeId], sym: &str, opts: super::asm::AsmOptions) -> anyhow::Result<super::asm::Compiled>;
+    fn compile_kernel(g: &Graph<Self>, roots: &[NodeId], sym: &str, provenance: bool) -> anyhow::Result<super::asm::Compiled>;
     /// Can `op` leave the arithmetic's range (`NoWrap`, its own error,
     /// `trace::error`)? 16.16: `+ - * /`, negation and `abs` wrap or
     /// saturate. Doubles: `+ - * /` and `%` can leave the finite doubles
@@ -563,8 +563,8 @@ impl GraphArith for Fixed {
     fn alone_in_its_value(_v: Pico8Num) -> bool {
         true
     }
-    fn compile_kernel(g: &Graph<Fixed>, roots: &[NodeId], sym: &str, opts: super::asm::AsmOptions) -> anyhow::Result<super::asm::Compiled> {
-        super::asm::compile_fixed(g, roots, sym, opts)
+    fn compile_kernel(g: &Graph<Fixed>, roots: &[NodeId], sym: &str, provenance: bool) -> anyhow::Result<super::asm::Compiled> {
+        super::asm::compile_fixed(g, roots, sym, provenance)
     }
     fn range_error(op: &Op<Fixed>) -> bool {
         matches!(op, Op::Add | Op::Sub | Op::Neg | Op::Abs | Op::Mul | Op::Div)
@@ -702,8 +702,8 @@ impl GraphArith for Float {
     fn alone_in_its_value(v: LuaF64) -> bool {
         v.value() != 0.0
     }
-    fn compile_kernel(g: &Graph<Float>, roots: &[NodeId], sym: &str, opts: super::asm::AsmOptions) -> anyhow::Result<super::asm::Compiled> {
-        super::asm::compile_float(g, roots, sym, opts)
+    fn compile_kernel(g: &Graph<Float>, roots: &[NodeId], sym: &str, provenance: bool) -> anyhow::Result<super::asm::Compiled> {
+        super::asm::compile_float(g, roots, sym, provenance)
     }
     fn range_error(op: &Op<Float>) -> bool {
         matches!(op, Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem)

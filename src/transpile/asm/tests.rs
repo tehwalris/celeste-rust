@@ -21,7 +21,7 @@ use celeste_core::lua_f64::LuaF64;
 use celeste_core::pico8_num::Pico8Num as P8;
 
 use crate::compiled::asm_kernel::KernelLanes;
-use crate::transpile::asm::{compile, compile_and_load, AsmCtx, AsmOptions, CollisionEnv, Compiled, Loaded};
+use crate::transpile::asm::{compile, compile_and_load, AsmCtx, CollisionEnv, Compiled, Loaded};
 use crate::transpile::graph::{one_operand, Cut, Graph, NodeId, Op, Ty, Unknown};
 
 /// A tiny deterministic PRNG (splitmix64), so the tests need no `rand`.
@@ -438,7 +438,7 @@ fn lane_value<A: TestArith>(g: &Graph<A>, out: &[Option<V<A>>], id: NodeId, row:
 }
 
 fn build<A: TestArith>(g: &Graph<A>, roots: &[NodeId], tag: &str) -> (Compiled, Loaded) {
-    compile_and_load(g, roots, tag, AsmOptions::default()).expect("compile and load")
+    compile_and_load(g, roots, &format!("kernel_{tag}")).expect("compile and load")
 }
 
 /// Run up to sixteen lanes (`rows[j]`: lane `j`'s cells; unused lanes repeat
@@ -935,7 +935,7 @@ fn scalar_overflow_is_at_most_two_compares() {
     let roots: Vec<NodeId> = ops.iter().chain(&oks).copied().collect();
     // One compare per distinct bound a literal form puts on `x`, and one
     // sign test per two-cell `+`/`-`; nothing else compares.
-    let text = compile(&g, &roots, "scalarovf", Default::default()).expect("compile").asm;
+    let text = compile(&g, &roots, "scalarovf", false).expect("compile").asm;
     let compares = text.lines().filter(|l| l.trim_start().starts_with("vpcmpd")).count();
     let mut bounds = std::collections::BTreeSet::new();
     for &o in &ops {
@@ -1041,7 +1041,7 @@ fn interval_scale_and_divide_overflow_is_one_compare_a_bound() {
     }
     let oks: Vec<NodeId> = ops.iter().map(|&x| g.add(Op::NoWrap, vec![x])).collect();
     let roots: Vec<NodeId> = ops.iter().chain(&oks).copied().collect();
-    let text = compile(&g, &roots, "ivalscale", Default::default()).expect("compile").asm;
+    let text = compile(&g, &roots, "ivalscale", false).expect("compile").asm;
     let compares = text.lines().filter(|l| l.trim_start().starts_with("vpcmpd")).count();
     // One per distinct bound a literal can cross (`*2` and `/0.5` share
     // theirs, `*1.00002` and `/0.99998` their low one), none for the rest.
@@ -1095,7 +1095,7 @@ fn inline_div_rem_by_a_power_of_two_is_pico8s() {
         let c = g.leaf(Op::Const(d, d));
         roots.push(g.add(Op::Rem, vec![x, c]));
     }
-    let text = compile(&g, &roots, "pow2", Default::default()).expect("compile").asm;
+    let text = compile(&g, &roots, "pow2", false).expect("compile").asm;
     assert!(!text.contains("call"), "a power-of-two divisor is inline");
     let mut edges: Vec<i32> = vec![i32::MIN, i32::MIN + 1, i32::MAX, i32::MAX - 1, 0, 1, -1];
     for k in 0..31 {
@@ -1147,7 +1147,7 @@ fn a_call_out_preserves_what_is_live_across_it() {
     let q = g.add(Op::Div, vec![before, three]); // a call-out, after `before`
     let n = g.add(Op::Neg, vec![q]); // reads ZERO after the call
     let roots = vec![g.add(Op::Add, vec![before, n]), before];
-    let text = compile(&g, &roots, "livecall", Default::default()).expect("compile").asm;
+    let text = compile(&g, &roots, "livecall", false).expect("compile").asm;
     // Stores to the stack: the call's two arguments and the saves.
     let stores = text.lines().filter(|l| l.contains("vmovdqu64 %zmm") && l.contains("(%rsp)")).count();
     assert!(text.contains("call") && (3..32).contains(&stores), "{stores} stack stores around the call");
@@ -1172,7 +1172,7 @@ fn values_held_across_a_run_of_calls_survive_it() {
         })
         .collect();
     let roots: Vec<NodeId> = held.iter().chain(&qs).copied().collect();
-    let text = compile(&g, &roots, "callrun", Default::default()).expect("compile").asm;
+    let text = compile(&g, &roots, "callrun", false).expect("compile").asm;
     assert_eq!(text.matches("call *%rax").count(), 8, "eight call-outs");
     let mut rng = Lcg(0x5a7e_0a11);
     let rows: Vec<Vec<In<Fixed>>> = (0..256).map(|_| (0..8).map(|_| In::N(Fixed::random(&mut rng, true))).collect()).collect();
@@ -1201,7 +1201,7 @@ fn rematerialized_constants_under_pressure_are_exact() {
         let ge = g.add(Op::Ge, vec![cs[i], min]);
         roots.push(g.add(Op::Sel, vec![ge, ks[(i + 5) % ks.len()], s]));
     }
-    let text = compile(&g, &roots, "remat", Default::default()).expect("compile").asm;
+    let text = compile(&g, &roots, "remat", false).expect("compile").asm;
     let consts = text.lines().filter(|l| l.contains("vpbroadcastd") || l.contains("vpternlogd $0xff") || l.trim_start().starts_with("vpxord")).count();
     assert!(text.contains("(%rsp)") && consts > ks.len(), "the test needs spilled constants: {consts} materializations");
     let mut rng = Lcg(0x4e3a_7a7e);

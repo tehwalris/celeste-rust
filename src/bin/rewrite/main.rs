@@ -474,11 +474,9 @@ fn main() -> Result<()> {
     // The commands that run in float (a tree's arithmetic is its record's).
     let float = cli.command.reads_trees() || matches!(cli.command, Command::Search(_) | Command::Forward(_) | Command::Robust(_) | Command::L1(_));
     let cfg = celeste_rust::settings::startup(&cli.settings, float, |s| {
-        // `bench frame` times the workers' phases; `--metrics` counts the
-        // kernels' census and slices (read when the kernels are built).
-        if let Command::Bench(bench::Command::Frame(a)) = &cli.command {
+        // `bench frame` times the workers' phases.
+        if let Command::Bench(bench::Command::Frame(_)) = &cli.command {
             s.diag.phases = true;
-            s.diag.kernel_metrics = a.metrics.is_some();
         }
     })?;
     match cli.command {

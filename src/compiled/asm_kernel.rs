@@ -202,8 +202,9 @@ struct AsmKernel<N: KernelLanes = P8> {
     fused_nodes: usize,
     /// Per input cell, its traced path (named by packing failures).
     input_names: Vec<String>,
-    /// `bench frame --metrics`: the slices this kernel ran (`compiled::mix`).
-    mix_slices: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// The slices this kernel ran, in a COUNTING set (`Kernels::counting`:
+    /// the census's dynamic instructions, `check::census`).
+    slices: Option<std::sync::atomic::AtomicU64>,
 }
 
 impl<N: KernelLanes> AsmKernel<N> {
@@ -238,7 +239,7 @@ impl<N: KernelLanes> AsmKernel<N> {
         let t_setup = sink.stats.tick_start();
         let n = lanes.len();
         debug_assert!((1..=16).contains(&n));
-        if let Some(c) = &self.mix_slices {
+        if let Some(c) = &self.slices {
             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let views = self.input_views(chunk);
@@ -826,7 +827,6 @@ pub struct Registry<N: KernelLanes = P8> {
 /// What a kernel set is built with besides its level and the settings that
 /// shape the cart: the build's diagnostics.
 struct BuildOptions {
-    asm: crate::transpile::asm::AsmOptions,
     /// `--kernel-explain`: kernels keep their fused graphs, so a decline
     /// names its premise.
     keep_graphs: bool,
@@ -837,6 +837,27 @@ use crate::trace::walk::Region;
 impl<N: KernelLanes> Registry<N> {
     pub fn len(&self) -> usize {
         self.kernels.len()
+    }
+
+    /// Per kernel of a COUNTING set (`registry`'s `counting`) its key,
+    /// symbol and the slices it ran; none in a set that is not counting.
+    pub(crate) fn slice_counts(&self) -> Vec<((u64, Option<Region>), String, u64)> {
+        let mut out: Vec<_> = self.kernels.iter().filter_map(|(k, v)| Some((*k, v.compiled.sym.clone(), v.slices.as_ref()?.load(std::sync::atomic::Ordering::Relaxed)))).collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Zero every kernel's slice counter (a bench's warm-up done).
+    pub(crate) fn reset_slices(&self) {
+        for c in self.kernels.values().filter_map(|v| v.slices.as_ref()) {
+            c.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Kernel `k`'s text digest (`Compiled::text_digest`): what a tool that
+    /// rebuilds it checks its own against.
+    pub(crate) fn digest_of(&self, k: (u64, Option<Region>)) -> Option<u64> {
+        self.kernels.get(&k).map(|v| v.compiled.text_digest)
     }
 
     /// Its kernels' text, fingerprinted (`text_digest`).
@@ -927,8 +948,9 @@ impl<N: KernelLanes> Registry<N> {
     }
 
     /// Retrace the start room and assemble every shape for level `opts`
-    /// under settings `s`.
-    pub fn build_for_start_room(opts: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Registry<N>> {
+    /// under settings `s` (`counting`: each kernel counts the slices it
+    /// runs).
+    pub fn build_for_start_room(opts: crate::abstraction::Level, s: &crate::settings::Settings, counting: bool) -> Result<Registry<N>> {
         match s.region_grid() {
             Some(g) => eprintln!("[region] kernels keyed on a {} px grid, player speed asserted within [-{}, {}] px", g.px, g.speed, g.speed),
             None => eprintln!("[region] no region key (--region off)"),
@@ -936,11 +958,11 @@ impl<N: KernelLanes> Registry<N> {
         // The kernel cache, but for the diagnostic that keeps the build
         // (`--kernel-explain`).
         let store = (!s.diag.kernel_explain).then(super::cache::Store::default);
-        Registry::build_with(opts, s, store.as_ref())
+        Registry::build_with(opts, s, store.as_ref(), counting)
     }
 
     /// `build_for_start_room` with the kernel cache `store` (none: build).
-    pub(crate) fn build_with(opts: crate::abstraction::Level, s: &crate::settings::Settings, store: Option<&super::cache::Store>) -> Result<Registry<N>> {
+    pub(crate) fn build_with(opts: crate::abstraction::Level, s: &crate::settings::Settings, store: Option<&super::cache::Store>, counting: bool) -> Result<Registry<N>> {
         let t0 = std::time::Instant::now();
         let key = store.map(|_| super::cache::key::<N>(opts, s)).transpose()?;
         if let (Some(store), Some(key)) = (store, &key) {
@@ -950,17 +972,14 @@ impl<N: KernelLanes> Registry<N> {
                 for (i, (recipe, so)) in entry.into_iter().enumerate() {
                     let loaded = Loaded::from_bytes(&so, &format!("cached_{i}"), &recipe.compiled.sym)?;
                     let k = (recipe.shape, recipe.region);
-                    anyhow::ensure!(kernels.insert(k, AsmKernel::of(recipe, loaded, cache.clone(), None)?).is_none(), "the kernel cache's entry {} holds kernel {k:?} twice", key.name);
+                    anyhow::ensure!(kernels.insert(k, AsmKernel::of(recipe, loaded, cache.clone(), None, counting)?).is_none(), "the kernel cache's entry {} holds kernel {k:?} twice", key.name);
                 }
                 unify(&mut kernels)?;
                 eprintln!("[asm build] {} kernels: kernel cache HIT {}, {:.2}s; kernel text {:016x}", kernels.len(), key.name, t0.elapsed().as_secs_f64(), text_digest(&kernels));
                 return Ok(Registry { kernels, grid: s.region_grid() });
             }
         }
-        let build = BuildOptions {
-            asm: crate::transpile::asm::AsmOptions { mix: s.diag.kernel_metrics },
-            keep_graphs: s.diag.kernel_explain,
-        };
+        let build = BuildOptions { keep_graphs: s.diag.kernel_explain };
         let build = &build;
         let refs = crate::trace::lower::lattice_kernel_refs::<N>(opts, s)
             .context("retracing the start room for ASM kernels")?;
@@ -974,7 +993,7 @@ impl<N: KernelLanes> Registry<N> {
             let (recipe, loaded, graphs) = build_one_shape::<N>(r, (r.frame.in_rt2.shape_hash_of(), *region), si, build)?;
             let stored = store.is_some().then(|| Ok::<_, anyhow::Error>((recipe.clone(), loaded.bytes()?))).transpose()?;
             let key = (recipe.shape, recipe.region);
-            Ok((key, AsmKernel::of(recipe, loaded, r.cache.clone(), graphs)?, stored))
+            Ok((key, AsmKernel::of(recipe, loaded, r.cache.clone(), graphs, counting)?, stored))
         })?;
         let mut kernels = HashMap::new();
         let mut first: HashMap<(u64, Option<Region>), usize> = HashMap::new();
@@ -1152,8 +1171,6 @@ pub(crate) struct Recipe<N: Arithmetic = P8> {
     pub(crate) outcomes: Vec<Skeleton<N>>,
     /// Per input cell, its traced path (named by packing failures).
     pub(crate) input_names: Vec<String>,
-    /// `--metrics`: the kernel census.
-    pub(crate) census: Option<crate::compiled::mix::Census>,
 }
 
 /// A fused body's roots as output slots (`Compiled::root_offsets`'
@@ -1245,9 +1262,30 @@ impl<N: Arithmetic> AccTemplate<N> {
 /// `--kernel-explain`'s fused graph and roots of a kernel.
 type Graphs<N> = Option<(crate::transpile::graph::Graph<N>, Vec<crate::transpile::graph::NodeId>)>;
 
-/// Assemble ONE lowered frame (gcc + dlopen) as kernel `key`'s recipe and
-/// its loaded code; `tag` distinguishes a shape's region kernels. With
-/// `keep_graphs` (`--kernel-explain`), also its fused graph and roots.
+/// A lowered frame's OUTPUT SLOTS: one per DISTINCT root node of its
+/// bodies, numbered by first appearance in their roots in the kernel's
+/// order (`Roots::flat`); and each root's slot.
+pub(crate) fn root_slots(bodies: &[crate::transpile::kernel::Body]) -> (Vec<crate::transpile::graph::NodeId>, HashMap<crate::transpile::graph::NodeId, u32>) {
+    let mut flat_roots = Vec::new();
+    let mut slot_of = HashMap::new();
+    for n in bodies.iter().flat_map(|b| b.roots.flat()) {
+        slot_of.entry(n).or_insert_with(|| {
+            flat_roots.push(n);
+            flat_roots.len() as u32 - 1
+        });
+    }
+    (flat_roots, slot_of)
+}
+
+/// The symbol of the kernel of shape `shape` built from the set's `si`-th
+/// lowered frame (a shape's region kernels are several frames).
+pub(crate) fn kernel_sym(shape: u64, si: usize) -> String {
+    format!("kernel_k{shape:016x}_{si}")
+}
+
+/// Assemble ONE lowered frame (the set's `si`-th; gcc + dlopen) as kernel
+/// `key`'s recipe and its loaded code. With `keep_graphs`
+/// (`--kernel-explain`), also its fused graph and roots.
 fn build_one_shape<N: KernelLanes>(
     r: &crate::trace::lower::LoweredFrame<N>,
     key: (u64, Option<Region>),
@@ -1257,19 +1295,9 @@ fn build_one_shape<N: KernelLanes>(
     use crate::transpile::graph::NodeId;
     let shape = key.0;
     let (fused, bodies) = (&r.lowered.fused, &r.lowered.bodies);
-    // One output SLOT per DISTINCT root node, numbered by first appearance
-    // in the bodies' roots in the kernel's order (`Roots::flat`).
-    let mut flat_roots: Vec<NodeId> = Vec::new();
-    let mut slot_of: HashMap<NodeId, u32> = HashMap::new();
-    for n in bodies.iter().flat_map(|b| b.roots.flat()) {
-        slot_of.entry(n).or_insert_with(|| {
-            flat_roots.push(n);
-            flat_roots.len() as u32 - 1
-        });
-    }
+    let (flat_roots, slot_of) = root_slots(bodies);
     let slot = |n: NodeId| slot_of[&n];
-    let tag = format!("_{si}");
-    let (mut compiled, loaded) = crate::transpile::asm::compile_and_load(fused, &flat_roots, &format!("k{shape:016x}{tag}"), build.asm).with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
+    let (compiled, loaded) = crate::transpile::asm::compile_and_load(fused, &flat_roots, &kernel_sym(shape, si)).with_context(|| format!("assembling shape {si} (hash {shape:#x})"))?;
     // Which fused nodes read the canonical output unknown (`may_unknown`).
     let reads_unknown_output: Vec<bool> = {
         let mut out = vec![false; fused.len()];
@@ -1312,27 +1340,6 @@ fn build_one_shape<N: KernelLanes>(
                 .unwrap_or_else(|| format!("cell {c}, not an input slot"))
         })
         .collect();
-    let census = if build.asm.mix {
-        use crate::compiled::mix::{ROLE_ARC, ROLE_ERROR, ROLE_FIELD, ROLE_LIVE};
-        let mut roles = vec![0u8; flat_roots.len()];
-        for b in bodies {
-            for &n in &b.roots.fields {
-                roles[slot(n) as usize] |= ROLE_FIELD;
-            }
-            roles[slot(b.roots.error) as usize] |= ROLE_ERROR;
-            roles[slot(b.roots.live) as usize] |= ROLE_LIVE;
-            for n in b.roots.arc.iter().flat_map(|a| a.nodes()) {
-                roles[slot(n) as usize] |= ROLE_ARC;
-            }
-        }
-        let guards: Vec<_> = bodies.iter().map(|b| (b.roots.error, b.roots.live)).collect();
-        let census = N::mix_report(&crate::compiled::mix::Input { traced: &r.bound.graph, fused, roots: &flat_roots, roles: &roles, bodies: &guards, compiled: &compiled })
-            .with_context(|| format!("the census of {}", compiled.sym))?;
-        compiled.asm = String::new();
-        Some(census)
-    } else {
-        None
-    };
     let recipe = Recipe {
         shape,
         region: key.1,
@@ -1343,7 +1350,6 @@ fn build_one_shape<N: KernelLanes>(
         bodies: slots,
         outcomes: (0..r.bound.outcomes.len()).map(|oi| Skeleton::<N>::of(r, oi)).collect(),
         input_names,
-        census,
     };
     let graphs = build.keep_graphs.then(|| (fused.clone(), flat_roots));
     Ok((recipe, loaded, graphs))
@@ -1351,16 +1357,18 @@ fn build_one_shape<N: KernelLanes>(
 
 impl<N: KernelLanes> AsmKernel<N> {
     /// The kernel of `recipe`, its code `loaded`, in `cache`'s room (`graphs`:
-    /// `--kernel-explain`'s fused graph and roots): its accumulator
-    /// templates, its bodies on their slots with what each reads at
-    /// emission (`emit::Plan`), the earlier bodies each repeats.
+    /// `--kernel-explain`'s fused graph and roots; `counting`: it counts its
+    /// slices): its accumulator templates, its bodies on their slots with
+    /// what each reads at emission (`emit::Plan`), the earlier bodies each
+    /// repeats.
     fn of(
         recipe: Recipe<N>,
         loaded: Loaded,
         cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
         graphs: Graphs<N>,
+        counting: bool,
     ) -> Result<AsmKernel<N>> {
-        let Recipe { shape: recipe_shape, compiled, forks, fused_nodes, may_unknown, bodies, outcomes, input_names, census, .. } = recipe;
+        let Recipe { shape: recipe_shape, compiled, forks, fused_nodes, may_unknown, bodies, outcomes, input_names, .. } = recipe;
         let acc_templates: Vec<AccTemplate<N>> = outcomes.iter().map(|sk| AccTemplate::of(sk.rt2(cache.clone()), sk.shape_hash)).collect::<Result<_>>()?;
         // Per outcome, its position coordinates' cells (keyed without their whole pixels).
         let pos_cells: Vec<Option<(u32, u32)>> = acc_templates.iter().map(|t| t.own.position_cells()).collect();
@@ -1409,7 +1417,6 @@ impl<N: KernelLanes> AsmKernel<N> {
         }
         let dup_pairs = dup_refs(&mut asm_bodies, &reads);
         let plan = emit::Plan::of(&reads);
-        let mix_slices = census.map(|c| crate::compiled::mix::counter(&compiled.sym, c));
         let (fused, flat_roots) = graphs.unwrap_or_default();
         Ok(AsmKernel {
             loaded,
@@ -1421,7 +1428,7 @@ impl<N: KernelLanes> AsmKernel<N> {
             forks,
             body_cols: Vec::new(),
             fused_nodes,
-            mix_slices,
+            slices: counting.then(|| std::sync::atomic::AtomicU64::new(0)),
             fused,
             flat_roots,
             room: Room { cache },
@@ -1530,20 +1537,22 @@ fn follower_of(r: &ShapeRecord, cell: u32) -> Option<(u32, u32)> {
     r.deps.iter().enumerate().find_map(|(g, d)| Some((g as u32, d.followers.binary_search(&cell).ok()? as u32)))
 }
 
-/// An arithmetic's resident kernel set and what it was built under.
-pub type Resident<N> = Option<(crate::abstraction::Level, crate::settings::Settings, std::sync::Arc<Registry<N>>)>;
+/// An arithmetic's resident kernel set and what it was built under (the
+/// level, the settings, whether it counts its slices).
+pub type Resident<N> = Option<(crate::abstraction::Level, crate::settings::Settings, bool, std::sync::Arc<Registry<N>>)>;
 
-/// `level`'s kernel set under settings `s`, built on first use. ONE set an
-/// arithmetic is resident (GBs), keyed on the level AND the settings it was
-/// built under: another key replaces it; callers hold theirs by `Arc`.
-pub(crate) fn registry<N: KernelLanes>(level: crate::abstraction::Level, s: &crate::settings::Settings) -> std::sync::Arc<Registry<N>> {
+/// `level`'s kernel set under settings `s` (`counting`: its kernels count
+/// their slices), built on first use. ONE set an arithmetic is resident
+/// (GBs), keyed on the level, the settings it was built under and whether
+/// it counts: another key replaces it; callers hold theirs by `Arc`.
+pub(crate) fn registry<N: KernelLanes>(level: crate::abstraction::Level, s: &crate::settings::Settings, counting: bool) -> std::sync::Arc<Registry<N>> {
     let mut set = N::resident().lock().unwrap();
     match &*set {
-        Some((l, k, r)) if *l == level && k == s => r.clone(),
+        Some((l, k, c, r)) if *l == level && k == s && *c == counting => r.clone(),
         _ => {
             *set = None;
-            let built = std::sync::Arc::new(build_registry_for_level::<N>(level, s));
-            *set = Some((level, s.clone(), built.clone()));
+            let built = std::sync::Arc::new(build_registry_for_level::<N>(level, s, counting));
+            *set = Some((level, s.clone(), counting, built.clone()));
             built
         }
     }
@@ -1584,12 +1593,12 @@ impl Drop for BuildPurgeDelay {
     }
 }
 
-fn build_registry_for_level<N: KernelLanes>(level: crate::abstraction::Level, s: &crate::settings::Settings) -> Registry<N> {
+fn build_registry_for_level<N: KernelLanes>(level: crate::abstraction::Level, s: &crate::settings::Settings, counting: bool) -> Registry<N> {
     let _purge = BuildPurgeDelay::start();
     let s = s.clone();
     let built = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
-        .spawn(move || Registry::<N>::build_for_start_room(level, &s))
+        .spawn(move || Registry::<N>::build_for_start_room(level, &s, counting))
         .expect("spawn asm-kernel builder")
         .join()
         .expect("asm-kernel builder panicked");

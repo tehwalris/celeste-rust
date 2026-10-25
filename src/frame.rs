@@ -1483,7 +1483,7 @@ mod tests {
         let s = Settings::default();
         let level = Level::parse("r0sxh").expect("level");
         let grid = s.region_grid().expect("the default region grid");
-        let registry = crate::compiled::asm_kernel::registry(level, &s);
+        let registry = crate::compiled::asm_kernel::registry(level, &s, false);
         let row = standing_row(&s, level);
         let ids = crate::compiled::ids();
         let player = row.player_objects()[0];
@@ -1529,7 +1529,7 @@ mod tests {
     fn the_kernels_emission_checks_the_followers() {
         let s = Settings { room: (6, 0), split_frame: true, ..Default::default() };
         let level = Level::parse("r0sxhf").expect("level");
-        let registry = crate::compiled::asm_kernel::registry(level, &s);
+        let registry = crate::compiled::asm_kernel::registry(level, &s, false);
         let mut reference = RefEngine::new(&s).expect("ref engine");
         let start = reference.initial().expect("start");
         let one = reference.step_one(&start, 0).expect("step 1");
