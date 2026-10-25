@@ -104,7 +104,8 @@ fn room_is<N: Arithmetic>(rt2: &Rt2<N>, (wx, wy): (i16, i16)) -> Result<Vec<bool
 }
 
 /// Per lane: on the win target? The exit, plus the orb in the orb room,
-/// and in a 100% run the room's berry taken.
+/// and in a 100% run the room's berry taken; never where the player DIED in
+/// the update (`died`).
 pub fn wins_of<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let mut wins = reaches_win(rt2, s)?;
     if s.category.hundred() {
@@ -112,7 +113,27 @@ pub fn wins_of<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Re
             *e &= b;
         }
     }
+    for (w, d) in wins.iter_mut().zip(died(rt2)?) {
+        *w &= !d;
+    }
     Ok(wins)
+}
+
+/// Per lane: is a room restart PENDING (`will_restart`)? Only `kill_player`
+/// sets it (`restart_room`), and it holds until the reload 15 updates later,
+/// during which no player exists to leave the room: so a row that left the
+/// room with it set left it in the update its player died. The cart runs
+/// the rest of the dead player's update on its table, and its `next_room()`
+/// loads the next room - which then restarts 15 updates in. A DYING EXIT is
+/// no win: by the category rules it is a death (`rewrite pico8 chain`
+/// reports one), and the per-room optima must chain in real play
+/// (plans/correctness.md C8). An unknown counts as alive (an abstract win
+/// over-approximates; the concrete search runs it exact).
+fn died<N: Arithmetic>(rt2: &Rt2<N>) -> Result<Vec<bool>> {
+    use celeste_engine::runtime2::{NONE, AV};
+    let c = rt2.globals[celeste_names::global("will_restart") as usize];
+    anyhow::ensure!(c != NONE, "wins: no `will_restart` global");
+    Ok((0..rt2.width).map(|l| rt2.cols[c as usize].at(l) == AV::Bool(true)).collect())
 }
 
 /// `wins_of` without its 100% condition.
@@ -1483,6 +1504,45 @@ mod tests {
         assert!(!runs(&with(x, add(path_lo, px(-1)), path_hi)), "x before the path declines");
         assert!(!runs(&with(rem, half.wrapping_neg(), half)), "a remainder reaching 0.5 declines");
         assert!(!runs(&with(spd, add(speed, px(1)), add(speed, px(1)))), "spd.x past its worlds' range declines");
+    }
+
+    /// A DYING EXIT IS NO WIN (plans/correctness.md C8). Room (2,2)'s top
+    /// row holds a right-facing spike (tile 59) at tile 8, beside the exit. A
+    /// player at x 64 rising from y -3 at 2 px a frame is in its kill zone
+    /// after its move (not moving left) and above y -4: the one update kills
+    /// it and, on its table, loads room (3,2) with the restart pending. The
+    /// same rise at x 40, clear of the spike, is the room's clean exit.
+    #[test]
+    fn a_dying_exit_is_no_win() {
+        let s = Settings { room: (2, 2), ..Default::default() };
+        let mut reference = RefEngine::new(&s).expect("ref engine");
+        let mut st = reference.initial().expect("initial state");
+        while st.player_objects().is_empty() {
+            st = reference.step_one(&st, 0).expect("the spawn");
+        }
+        let ids = crate::compiled::ids();
+        let num = |v: i16| Col::U(AV::Num(P8::from_i16(v)));
+        let mut rise = |x: i16| {
+            let mut b = st.clone_block();
+            let p = b.player_objects()[0];
+            for (f, v) in [(ids.f_x, x), (ids.f_y, -3)] {
+                let c = b.obj_field_cell(p, f).expect("a position field");
+                b.cols[c as usize] = num(v);
+            }
+            for (f, (vx, vy)) in [(ids.f_spd, (0, -2)), (ids.f_rem, (0, 0))] {
+                let (cx, cy) = b.player_xy_cells(f).expect("a vector field");
+                (b.cols[cx], b.cols[cy]) = (num(vx), num(vy));
+            }
+            reference.step_one(&b, 0).expect("one concrete successor")
+        };
+        let dying = rise(64);
+        assert_eq!(exits_of(&dying, &s).expect("exits"), [true], "it leaves the room");
+        assert_eq!(died(&dying).expect("died"), [true], "it died in that update");
+        assert_eq!(wins_of(&dying, &s).expect("wins"), [false], "a dying exit is no win");
+        assert_eq!(not_expanded(&dying, 1, None, &s).expect("not expanded"), [true], "nor is it expanded");
+        let clean = rise(40);
+        assert_eq!(died(&clean).expect("died"), [false]);
+        assert_eq!(wins_of(&clean, &s).expect("wins"), [true], "the clean exit wins");
     }
 
     /// The summit wins at the flag: the TAS31 reference wins at frame 55, not before.

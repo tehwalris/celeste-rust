@@ -135,13 +135,39 @@ settled here. Evidence is file:line at develop 19869c5d.
   (also C13), nodiag (6,1) 92, nodiag (1,2) 113, 100% (6,1) 114, 100% (4,3)
   109. Decision pending (Philippe).
 
-## C8. Death and exit in the same update counts as a win
-- `kill_player` (orig 121-122) then `next_room()` (orig 305) in one update:
-  the search's win test is the room alone (frame.rs:189-212), so a dying exit
-  is a win (FAKE by the category rules; `rewrite pico8 chain` reports a death), and the
-  next room's pending-reload start is never searched (MISSES).
-- Rooms with side spikes in row 0 next to the exit: (2,2), (6,2), (0,3),
-  (2,3), (3,3). Not reached by any actual route yet.
+## C8. Death and exit in the same update counts as a win (FIXED, branch correctness-batch)
+- The original cart: `kill_player` (orig 121-122 spikes, 125-126 the bottom)
+  destroys the player and `restart_room()` sets `will_restart=true`,
+  `delay_restart=15`; the REST of the same update runs on the dead player's
+  table, so line 305's `if this.y<-4 ... next_room()` loads the next room in
+  that update; `load_room` leaves `will_restart` alone, so 15 updates later
+  `_update`'s restart block (1186-1190) reloads the NEW room and its player
+  respawns there. The minimal cart is the same (min 93/97, 231, 709-720,
+  778-783). The search's win test was the room alone, so a dying exit won.
+- POLICY (Philippe, 2026-10-25): a dying exit is NOT a win: the per-room
+  optima must chain in real play, where the next room restarts 15 updates
+  in (and the category rules count a death). The cart's semantics, no knob:
+  `frame::wins_of` requires `will_restart` false (`died`). Only
+  `kill_player` sets it, and it holds until the reload, during which no
+  player exists to leave the room: a row that left with it set left in its
+  player's dying update. Such a row is not expanded either (it is in the
+  next room). The level -1 table, a bound on the frames to ANY exit, stays a
+  lower bound.
+- Test: `frame::tests::a_dying_exit_is_no_win`, room (2,2): a constructed
+  rise at x 64 under the top row's right-facing spike (tile 59 at tile 8)
+  dies and loads (3,2) in one update: no win (the test fails without the
+  fix); the same rise at x 40 is a clean exit and wins.
+- The MISSES half (the next room's pending-reload start is never searched)
+  needs no handling: that start restarts its room 15 updates after entry,
+  so a dying exit could pay off only if it beat the room's best clean exit
+  by more than about 15 frames (everything the next room's player does
+  before the restart is lost), and it fails the real-play validity check (a
+  death) besides.
+- No result changes: fewer wins only raise bounds, and every witness still
+  wins. The 15 witnesses of the five rooms with spikes beside the exit
+  ((2,2), (6,2), (0,3), (2,3), (3,3): any%, 100%, nodiag, gemskipnodiag
+  and the community references) replay to their named exit frames under the
+  new test with a living winner; no winning lineage holds a pending restart.
 
 ## C9. The category runner falls back to the IL start
 - `tools::chain::entry_jank` (used by `rewrite category`): when the previous
