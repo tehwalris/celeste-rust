@@ -1961,7 +1961,7 @@ pub fn check_route<N: crate::search::rem::Rem>(inputs: &[u8], horizon: u32, spd:
     for (f, layer) in run.layers.iter().enumerate() {
         let mut line = Vec::new();
         for ((_, b), &on) in layer.iter().zip(&on[f]) {
-            let shape = b.shape_hash_of();
+            let shape = b.shape_hash();
             for cell in block_cells(b)? {
                 let at = cell_xy(cell);
                 match table.d_of(shape, cell) {

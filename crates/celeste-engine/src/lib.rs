@@ -9,7 +9,8 @@ pub mod shape;
 pub mod slots;
 pub mod widening;
 
-pub use runtime2::{Cell2, Col, Rt2, AV, NONE};
+pub use runtime2::{Col, Rt2, AV, NONE};
+pub use shape::{Cell, Shape};
 
 /// The hasher the row machinery keys with. Part of this crate's ABI: maps
 /// passed into `runtime2` must use the same one (rustc-hash 1 and 2 differ).

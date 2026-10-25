@@ -69,12 +69,12 @@ fn emitted_keys<N: Arithmetic>(acc: &Rt2<N>, keys: &KeySpace<N>, prov: &Provisio
             RowKey::Miss(m) => !is_provisional(acc.row_keys[i]) || prov.content(acc.row_keys[i]) != *m,
         })
         .collect();
-    if b.shape_hash == acc.shape_hash && b.structure == acc.structure && bad.is_empty() {
+    if b.shape_hash() == acc.shape_hash() && b.cells() == acc.cells() && bad.is_empty() {
         return;
     }
     // Say WHICH rows and cells differ.
     let varying: Vec<usize> = (0..acc.cols.len())
-        .filter(|&c| matches!(acc.structure.get(c), Some(celeste_engine::runtime2::Cell2::Val)))
+        .filter(|&c| matches!(acc.cells().get(c), Some(celeste_engine::shape::Cell::Val)))
         .filter(|&c| (1..acc.width).any(|i| acc.cols[c].at(i) != acc.cols[c].at(0)))
         .collect();
     let rows: Vec<String> = bad
@@ -88,11 +88,11 @@ fn emitted_keys<N: Arithmetic>(acc: &Rt2<N>, keys: &KeySpace<N>, prov: &Provisio
     panic!(
         "KERNEL KEY CHECK: shape {:#x}: the boundary disagrees with the append step \
          (width {}, shape {:#x} vs {:#x}, structure {}, {} keys differ)\n{}",
-        acc.shape_hash,
+        acc.shape_hash(),
         acc.width,
-        b.shape_hash,
-        acc.shape_hash,
-        if b.structure == acc.structure { "same" } else { "DIFFERENT" },
+        b.shape_hash(),
+        acc.shape_hash(),
+        if b.cells() == acc.cells() { "same" } else { "DIFFERENT" },
         bad.len(),
         rows.join("\n"),
     );
@@ -107,12 +107,12 @@ fn stored_keys<N: Arithmetic>(blk: &Rt2<N>, keys: &KeySpace<N>) {
     let got: Vec<Option<(u64, u64)>> = keys.lookup_keys(&b);
     let same = got.iter().zip(&blk.row_keys).all(|(g, w)| *g == Some(*w));
     assert!(
-        b.shape_hash == blk.shape_hash && b.structure == blk.structure && same,
+        b.shape_hash() == blk.shape_hash() && b.cells() == blk.cells() && same,
         "KERNEL KEY CHECK: a stored piece of shape {:#x} ({} rows) is not what the boundary keys it as (shape {:#x}, structure {}, keys {})",
-        blk.shape_hash,
+        blk.shape_hash(),
         blk.width,
-        b.shape_hash,
-        if b.structure == blk.structure { "same" } else { "DIFFERENT" },
+        b.shape_hash(),
+        if b.cells() == blk.cells() { "same" } else { "DIFFERENT" },
         if same { "same" } else { "DIFFERENT" },
     );
 }

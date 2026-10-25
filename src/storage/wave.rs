@@ -1297,7 +1297,7 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start
         canon.push(r);
     }
     let keys_added = visited.keys.absorb(&canon.iter().collect::<Vec<_>>());
-    let mut shapes: Vec<u64> = canon.iter().map(|r| r.shape_hash).filter(|s| visited.shape_index(*s).is_none()).collect();
+    let mut shapes: Vec<u64> = canon.iter().map(|r| r.shape_hash()).filter(|s| visited.shape_index(*s).is_none()).collect();
     shapes.sort_unstable();
     shapes.dedup();
     let mut numbered = Vec::new();
@@ -1314,9 +1314,9 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start
         r.row_keys = keys.clone();
         super::decode::check_piece(&visited.keys, r, &cells).map_err(|e| e.context("frame 0"))?;
         let rec = super::layer::SkelRecord::of(r)?;
-        ensure!(skels.get(&r.shape_hash).is_none_or(|x| *x == rec), "two initial blocks of shape {:016x} with other skeletons", r.shape_hash);
-        skels.insert(r.shape_hash, rec);
-        let si = visited.shape_index(r.shape_hash).expect("numbered above");
+        ensure!(skels.get(&r.shape_hash()).is_none_or(|x| *x == rec), "two initial blocks of shape {:016x} with other skeletons", r.shape_hash());
+        skels.insert(r.shape_hash(), rec);
+        let si = visited.shape_index(r.shape_hash()).expect("numbered above");
         for ((&k, &c), w) in keys.iter().zip(&cells).zip(crate::frame::wins_of(r, s)?) {
             states.push((Sk::at(si, k, c), w));
         }
@@ -1359,7 +1359,7 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start
     drop(parts);
     ensure!(held == 0, "frame 0 into a visited set that held {held} of its states");
     for (h, rec) in skels {
-        next.skeletons.insert(h, std::sync::Arc::new(rec.rt2(canon[0].room)));
+        next.skeletons.insert(h, std::sync::Arc::new(rec.rt2(canon[0].room)?));
     }
     let n = next.states() as usize;
     let mut stats = Stats::default();
@@ -1467,7 +1467,7 @@ mod tests {
         assert!(rest.followers.len() >= 10 * 3, "every platform's `x`, `rem.x` and `last` at least: {rest:?}");
         let mut visited = VisitedSet::new();
         seed(&mut visited, std::slice::from_ref(&start), Hull::full(), &s).expect("frame 0 decodes with its followers");
-        let sk = visited.keys.shape(start.shape_hash).expect("the start's shape");
+        let sk = visited.keys.shape(start.shape_hash()).expect("the start's shape");
         assert_eq!(sk.follows().iter().map(|f| f.cells().to_vec()).collect::<Vec<_>>(), deps.iter().map(|d| d.followers.clone()).collect::<Vec<_>>());
         assert!(deps.iter().flat_map(|d| &d.followers).all(|&c| sk.field(c as usize).is_none()), "no follower is keyed");
         let s21 = Settings { room: (2, 1), ..Default::default() };

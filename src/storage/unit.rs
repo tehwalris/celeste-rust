@@ -49,7 +49,7 @@ impl<N: Arithmetic> RowBuf<N> {
                 Col::U(_) => None,
             })
             .collect::<Vec<_>>();
-        RowBuf { shape: skeleton.shape_hash, skeleton, cols, keys: Vec::new(), cells: Vec::new() }
+        RowBuf { shape: skeleton.shape_hash(), skeleton, cols, keys: Vec::new(), cells: Vec::new() }
     }
 
     pub(crate) fn rows(&self) -> usize {
@@ -82,7 +82,6 @@ impl<N: Arithmetic> RowBuf<N> {
                 u => u.clone(),
             })
             .collect();
-        b.shape_hash = self.shape;
         for (cell, col) in &self.cols {
             b.cols[*cell] = match col {
                 TCol::Num(v) => Col::N(v.iter().map(|&x| num::<N>(x)).collect()),
@@ -871,7 +870,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         let mut w = row.clone_block();
         w.widen_to(crate::abstraction::Level::EXACT);
         w.canonical();
-        if self.keys.shape(w.shape_hash).is_none() {
+        if self.keys.shape(w.shape_hash()).is_none() {
             self.note_shape(&std::sync::Arc::new(celeste_engine::shape::Layout::of(&w)));
         }
         let key = match self.keys.row_keys(&w).swap_remove(0) {
@@ -887,14 +886,14 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     /// columns follow its values, not a kernel's template.
     pub(crate) fn emit_row(&mut self, row: &Rt2<N>, lane: usize, cell: u32, pair: Pair<N>) -> Result<()> {
         debug_assert_eq!(row.width, 1);
-        if self.minus_one_drop(row.shape_hash, cell) {
+        if self.minus_one_drop(row.shape_hash(), cell) {
             return Ok(());
         }
         let (w, key) = self.row_key(row);
-        anyhow::ensure!(w.shape_hash == row.shape_hash, "a reference row's widening changed its shape ({:016x} -> {:016x})", row.shape_hash, w.shape_hash);
-        if !self.guards.registered.contains(&w.shape_hash) {
+        anyhow::ensure!(w.shape_hash() == row.shape_hash(), "a reference row's widening changed its shape ({:016x} -> {:016x})", row.shape_hash(), w.shape_hash());
+        if !self.guards.registered.contains(&w.shape_hash()) {
             self.skeletons.register(&super::decode::reference_skeleton(&w))?;
-            self.guards.registered.insert(w.shape_hash);
+            self.guards.registered.insert(w.shape_hash());
         }
         // Its buffers (verdicts, the key check) hold the row as it is.
         let init = || {
@@ -909,14 +908,13 @@ impl<'a, N: Rem> UnitSink<'a, N> {
                     v => Col::U(v),
                 })
                 .collect();
-            b.shape_hash = w.shape_hash;
             b
         };
         // One lane's `emit_body`: the state reached from unit lane `lane`.
         let xfer = self.xfers.id(self.worker, pair);
         let mut targets = Targets::default();
-        self.targets(w.shape_hash, &[cell; 16], 1, &[lane], &mut targets);
-        let e = BodyEmits { shape: w.shape_hash, take: 1, keys: &[key; 16], targets: &targets, xfers: &[xfer; 16] };
+        self.targets(w.shape_hash(), &[cell; 16], 1, &[lane], &mut targets);
+        let e = BodyEmits { shape: w.shape_hash(), take: 1, keys: &[key; 16], targets: &targets, xfers: &[xfer; 16] };
         self.guards.reference = true;
         let r = self.emit_body(&e, init, |b, _| b.push_row(&w, key, cell));
         self.guards.reference = false;

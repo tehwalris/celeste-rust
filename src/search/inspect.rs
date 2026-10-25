@@ -3,7 +3,8 @@
 
 use celeste_core::arith::Arithmetic;
 use crate::compiled::BoundaryIds;
-use celeste_engine::runtime2::{Cell2, Col, Rt2, AV};
+use celeste_engine::runtime2::{Col, Rt2, AV};
+use celeste_engine::shape::Cell;
 use std::collections::{BTreeMap, HashMap};
 
 /// A row's named value cells, each shown (`av_show`).
@@ -38,7 +39,7 @@ pub fn cell_names<N: Arithmetic>(rt2: &Rt2<N>, ids: &BoundaryIds) -> HashMap<usi
         }
     }
     if let Some(arr) = rt2.global_target(ids.g_objects) {
-        if let Cell2::Arr(items) = &rt2.structure[arr as usize] {
+        if let Cell::Arr(items) = &rt2.cells()[arr as usize] {
             let type_name = |t: u32| -> String {
                 (0..celeste_names::GLOBAL_NAMES.len() as u32)
                     .find(|&g| rt2.global_target(g) == Some(t))
@@ -48,7 +49,7 @@ pub fn cell_names<N: Arithmetic>(rt2: &Rt2<N>, ids: &BoundaryIds) -> HashMap<usi
             let field_name = |f: u32| celeste_names::FIELD_NAMES.get(f as usize).copied().unwrap_or("?");
             for (i, item) in items.iter().enumerate() {
                 let Col::U(AV::Ptr(obj)) = rt2.cols[*item as usize] else { continue };
-                let Cell2::Obj(fields) = &rt2.structure[obj as usize] else { continue };
+                let Cell::Obj(fields) = &rt2.cells()[obj as usize] else { continue };
                 let ty = rt2
                     .obj_field_cell(obj, ids.f_type)
                     .and_then(|c| match rt2.cols[c as usize] {
@@ -57,15 +58,15 @@ pub fn cell_names<N: Arithmetic>(rt2: &Rt2<N>, ids: &BoundaryIds) -> HashMap<usi
                     })
                     .unwrap_or_else(|| "?".to_string());
                 for &(f, c) in fields {
-                    match (&rt2.structure[c as usize], &rt2.cols[c as usize]) {
-                        (Cell2::Val, Col::U(AV::Ptr(sub))) => {
-                            if let Cell2::Obj(subs) = &rt2.structure[*sub as usize] {
+                    match (&rt2.cells()[c as usize], &rt2.cols[c as usize]) {
+                        (Cell::Val, Col::U(AV::Ptr(sub))) => {
+                            if let Cell::Obj(subs) = &rt2.cells()[*sub as usize] {
                                 for &(g, c2) in subs {
                                     names.entry(c2 as usize).or_insert_with(|| format!("{ty}[{i}].{}.{}", field_name(f), field_name(g)));
                                 }
                             }
                         }
-                        (Cell2::Val, _) => {
+                        (Cell::Val, _) => {
                             names.entry(c as usize).or_insert_with(|| format!("{ty}[{i}].{}", field_name(f)));
                         }
                         _ => {}
@@ -77,18 +78,18 @@ pub fn cell_names<N: Arithmetic>(rt2: &Rt2<N>, ids: &BoundaryIds) -> HashMap<usi
     // Globals: a value global by its name, a table global's entries as
     // `name[i]` (arrays, 1-based as in Lua) or `name.field`.
     for (g, gname) in celeste_names::GLOBAL_NAMES.iter().enumerate() {
-        let Some(&cell) = rt2.globals.get(g) else { continue };
-        if cell == celeste_engine::runtime2::NONE || cell as usize >= rt2.structure.len() {
+        let Some(&cell) = rt2.shape.globals().get(g) else { continue };
+        if cell == celeste_engine::runtime2::NONE || cell as usize >= rt2.cells().len() {
             continue;
         }
-        match (&rt2.structure[cell as usize], &rt2.cols[cell as usize]) {
-            (Cell2::Val, Col::U(AV::Ptr(t))) => match &rt2.structure[*t as usize] {
-                Cell2::Arr(items) => {
+        match (&rt2.cells()[cell as usize], &rt2.cols[cell as usize]) {
+            (Cell::Val, Col::U(AV::Ptr(t))) => match &rt2.cells()[*t as usize] {
+                Cell::Arr(items) => {
                     for (i, &c) in items.iter().enumerate() {
                         names.entry(c as usize).or_insert_with(|| format!("{gname}[{}]", i + 1));
                     }
                 }
-                Cell2::Obj(fields) => {
+                Cell::Obj(fields) => {
                     for &(f, c) in fields {
                         let field = celeste_names::FIELD_NAMES.get(f as usize).copied().unwrap_or("?");
                         names.entry(c as usize).or_insert_with(|| format!("{gname}.{field}"));
@@ -96,7 +97,7 @@ pub fn cell_names<N: Arithmetic>(rt2: &Rt2<N>, ids: &BoundaryIds) -> HashMap<usi
                 }
                 _ => {}
             },
-            (Cell2::Val, _) => {
+            (Cell::Val, _) => {
                 names.entry(cell as usize).or_insert_with(|| gname.to_string());
             }
             _ => {}
@@ -110,7 +111,7 @@ pub fn cell_names<N: Arithmetic>(rt2: &Rt2<N>, ids: &BoundaryIds) -> HashMap<usi
 pub fn project_row<N: Arithmetic>(rt2: &Rt2<N>, names: &HashMap<usize, String>, r: u32, erase: &[String]) -> Proj {
     names
         .iter()
-        .filter(|(c, n)| matches!(rt2.structure[**c], Cell2::Val) && !erase.iter().any(|e| n.starts_with(e.as_str())))
+        .filter(|(c, n)| matches!(rt2.cells()[**c], Cell::Val) && !erase.iter().any(|e| n.starts_with(e.as_str())))
         .map(|(c, n)| (n.clone(), av_show(rt2.cols[*c].at(r as usize))))
         .filter(|(_, v)| !v.starts_with("Ptr("))
         .collect()

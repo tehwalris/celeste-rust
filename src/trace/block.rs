@@ -25,7 +25,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, ensure, Result};
 use celeste_core::room::Room;
 use celeste_core::arith::Arithmetic;
-use celeste_engine::runtime2::{Cell2, Col, Rt2, AV, NONE};
+use celeste_engine::runtime2::{Col, Rt2, AV, NONE};
+use celeste_engine::shape::Cell;
 use celeste_names as gen;
 
 use crate::builtins::BUILTIN_NAMES;
@@ -48,76 +49,64 @@ pub fn to_rt2<D: Domain, N: Arithmetic>(
         Some(Value::Table(t)) => Some(*t),
         _ => None,
     };
-    let rt2 = Rt2::empty(1, gen::GLOBAL_NAMES.len(), gen::STRINGS, room);
-    let mut cx = ToRt2 { st, rt2, tables: HashMap::new(), closures: HashMap::new(), buttons, num, boolean };
+    let static_strings = gen::STRINGS.iter().map(|s| s.to_string()).collect();
+    let mut cx = ToRt2 { st, cells: Vec::new(), cols: Vec::new(), strings: static_strings, tables: HashMap::new(), closures: HashMap::new(), buttons, num, boolean };
+    let mut cell_of_global = vec![NONE; gen::GLOBAL_NAMES.len()];
     for (g, name) in gen::GLOBAL_NAMES.iter().enumerate() {
         if let Some(v) = globals.get(*name) {
-            cx.rt2.globals[g] = cx.slot(v, false, None)?;
+            cell_of_global[g] = cx.slot(v, false, None)?;
         }
     }
-    let mut rt2 = cx.rt2;
-    rt2.canonicalize_ids();
+    let (old, statics) = (cx.strings, gen::STRINGS.len());
+    let mut rt2 = Rt2::canonical_of(1, cx.cells, cx.cols, cell_of_global, Arc::from(&old[..statics]), room);
     // A string's id (part of the key) is its occurrence in canonical order
     // after the static ones.
-    let mut strings: Vec<String> = gen::STRINGS.iter().map(|s| s.to_string()).collect();
-    let old = std::mem::take(&mut rt2.strings);
-    let mut renumber = |col: &mut Col<N>| {
-        if let Col::U(AV::Str(s)) = col {
+    let mut strings: Vec<String> = old[..statics].to_vec();
+    for (cell, col) in rt2.shape.cells().iter().zip(rt2.cols.iter_mut()) {
+        if let (Cell::Val, Col::U(AV::Str(s))) = (cell, col) {
             strings.push(old[*s as usize].clone());
             *s = (strings.len() - 1) as u32;
         }
-    };
-    for (cell, col) in rt2.structure.iter_mut().zip(rt2.cols.iter_mut()) {
-        match cell {
-            Cell2::Val => renumber(col),
-            Cell2::Clo(_, caps) => caps.iter_mut().for_each(&mut renumber),
-            _ => {}
-        }
     }
-    rt2.strings = strings;
-    rt2.shape_hash = rt2.shape_hash_of();
+    rt2.strings = strings.into();
     the_topology_is_the_shapes(&rt2);
     Ok(rt2)
 }
 
-/// A shape's POINTER TOPOLOGY: each value cell's target (`NONE`: no
-/// pointer) and each closure capture's, as `(cell, target)` in cell order.
+/// A shape's POINTER TOPOLOGY in a block: each value cell's target
+/// (`NONE`: no pointer), as `(cell, target)` in cell order.
 type Topology = Box<[(u32, u32)]>;
 
 /// THE POINTER TOPOLOGY IS THE SHAPE'S, process-wide: every block made
-/// under one shape hash has one signature (`shape::sig::intern_of`) and one
-/// `Topology`. The signature names neither a value cell's target nor a
-/// capture's, and a kernel is bound by path against one representative of
-/// its shape (`trace::bind`): a block whose pointers differ under the hash
-/// would run a kernel bound to the other's cells. FATAL (`exact`'s
+/// under one shape has one `Topology` (its captures' targets are its
+/// shape's: `Shape::intern`). The signature names no value cell's target,
+/// and a kernel is bound by path against one representative of its shape
+/// (`trace::bind`): a block whose pointers differ under the hash would run
+/// a kernel bound to the other's cells. FATAL (`exact`'s
 /// `pointer_violation` is the key space's side).
 fn the_topology_is_the_shapes<N: Arithmetic>(rt2: &Rt2<N>) {
     type Seen = celeste_engine::FxHashMap<u64, Arc<Topology>>;
     static SEEN: std::sync::OnceLock<std::sync::RwLock<Seen>> = std::sync::OnceLock::new();
-    let target = |c: &Col<N>| match c {
-        Col::U(AV::Ptr(t)) => *t,
-        _ => NONE,
-    };
-    let mut topology = Vec::new();
-    for (cell, (kind, col)) in rt2.structure.iter().zip(&rt2.cols).enumerate() {
-        match kind {
-            Cell2::Val => topology.push((cell as u32, target(col))),
-            Cell2::Clo(_, caps) => topology.extend(caps.iter().map(|c| (cell as u32, target(c)))),
-            _ => {}
-        }
-    }
-    celeste_engine::shape::sig::intern_of(rt2);
+    let topology: Vec<(u32, u32)> = rt2
+        .cells()
+        .iter()
+        .zip(&rt2.cols)
+        .enumerate()
+        .filter(|(_, (cell, _))| **cell == Cell::Val)
+        .map(|(c, (_, col))| (c as u32, if let Col::U(AV::Ptr(t)) = col { *t } else { NONE }))
+        .collect();
     let seen = SEEN.get_or_init(Default::default);
-    let had = seen.read().expect("the shapes' topologies").get(&rt2.shape_hash).cloned();
-    let had = had.unwrap_or_else(|| seen.write().expect("the shapes' topologies").entry(rt2.shape_hash).or_insert_with(|| Arc::new(topology.clone().into_boxed_slice())).clone());
+    let hash = rt2.shape_hash();
+    let had = seen.read().expect("the shapes' topologies").get(&hash).cloned();
+    let had = had.unwrap_or_else(|| seen.write().expect("the shapes' topologies").entry(hash).or_insert_with(|| Arc::new(topology.clone().into_boxed_slice())).clone());
     if let Some((a, b)) = had.iter().zip(&topology).find(|(a, b)| a != b) {
         panic!(
             "block: shape {:#x}: cell {} points at {} where an earlier block of the shape's cell {} points at {} (u32::MAX: no pointer): \
              the POINTER TOPOLOGY, which a kernel binds by path against one representative, varies under one shape hash",
-            rt2.shape_hash, b.0, b.1, a.0, a.1
+            hash, b.0, b.1, a.0, a.1
         );
     }
-    assert!(had.len() == topology.len(), "block: shape {:#x}: {} pointers where an earlier block of the shape has {}", rt2.shape_hash, topology.len(), had.len());
+    assert!(had.len() == topology.len(), "block: shape {hash:#x}: {} pointers where an earlier block of the shape has {}", topology.len(), had.len());
 }
 
 /// The tracer's block of `st`: its shape, every number and boolean `Nil`
@@ -161,7 +150,11 @@ pub fn dense_ints<D: Domain>(st: &mut State<D>) -> Result<()> {
 
 struct ToRt2<'a, D: Domain, E: Arithmetic, N, B> {
     st: &'a State<D>,
-    rt2: Rt2<E>,
+    /// The block's cells and columns as made (`Rt2::canonical_of` numbers
+    /// them), the static strings then the state's.
+    cells: Vec<Cell>,
+    cols: Vec<Col<E>>,
+    strings: Vec<String>,
     tables: HashMap<TableId, u32>,
     /// Each closure's cell and the table holding it (`closure`).
     closures: HashMap<ClosureId, (u32, Option<TableId>)>,
@@ -176,10 +169,10 @@ where
     N: Fn(&D::Num) -> Result<AV<E>>,
     B: Fn(&D::Bool) -> Result<AV<E>>,
 {
-    fn cell(&mut self, cell: Cell2<E>, col: Col<E>) -> u32 {
-        self.rt2.structure.push(cell);
-        self.rt2.cols.push(col);
-        (self.rt2.structure.len() - 1) as u32
+    fn cell(&mut self, cell: Cell, col: Col<E>) -> u32 {
+        self.cells.push(cell);
+        self.cols.push(col);
+        (self.cells.len() - 1) as u32
     }
 
     /// A slot holding `v`: its own `Val` cell, or a builtin's `Bi` cell.
@@ -188,7 +181,7 @@ where
     fn slot(&mut self, v: &Value<D>, button: bool, holder: Option<TableId>) -> Result<u32> {
         if let Value::Builtin(name) = v {
             let i = BUILTIN_NAMES.iter().position(|n| n == name).ok_or_else(|| anyhow!("unknown builtin {name:?}"))?;
-            return Ok(self.cell(Cell2::Bi(i as u32), Col::U(AV::Nil)));
+            return Ok(self.cell(Cell::Bi(i as u32), Col::U(AV::Nil)));
         }
         let av = match v {
             Value::Nil => AV::Nil,
@@ -196,21 +189,21 @@ where
             Value::Bool(_) if button => AV::UBool,
             Value::Bool(b) => (self.boolean)(b)?,
             Value::Str(s) => {
-                self.rt2.strings.push(s.to_string());
-                AV::Str((self.rt2.strings.len() - 1) as u32)
+                self.strings.push(s.to_string());
+                AV::Str((self.strings.len() - 1) as u32)
             }
             Value::Table(t) => AV::Ptr(self.table(*t)?),
             Value::Func(c) => AV::Ptr(self.closure(*c, holder)?),
             Value::Builtin(_) => unreachable!("a builtin is its own cell"),
         };
-        Ok(self.cell(Cell2::Val, Col::U(av)))
+        Ok(self.cell(Cell::Val, Col::U(av)))
     }
 
     fn table(&mut self, t: TableId) -> Result<u32> {
         if let Some(&c) = self.tables.get(&t) {
             return Ok(c);
         }
-        let cell = self.cell(Cell2::Unk, Col::U(AV::Nil));
+        let cell = self.cell(Cell::Unk, Col::U(AV::Nil));
         self.tables.insert(t, cell);
         let st = self.st;
         let table = &st.heap.tables[&t];
@@ -227,28 +220,28 @@ where
                     fields.push((f, self.slot(v, button, Some(t))?));
                 }
             }
-            Cell2::Obj(fields)
+            Cell::Obj(fields.into_boxed_slice())
         } else if !arr.is_empty() {
             let mut items = Vec::with_capacity(arr.len());
             for v in &arr {
                 items.push(self.slot(v, button, Some(t))?);
             }
-            Cell2::Arr(items)
+            Cell::Arr(items.into_boxed_slice())
         } else {
-            Cell2::Unk
+            Cell::Unk
         };
-        self.rt2.structure[cell as usize] = shape;
+        self.cells[cell as usize] = shape;
         Ok(cell)
     }
 
-    /// Closure `c`'s cell, reached through a slot of `holder`. Its captures
-    /// are columns on the cell, but a state's EXACT identity reads none of
-    /// them (`exact::exact_rows` reads `Val` cells; the shape counts them):
-    /// the block is exact only because every capture IS the closure's
-    /// OWNER, the one table holding it (`obj.move` captures `obj`), which
-    /// the block's structure already says. Any other capture - another
-    /// table, a closure held by two tables or by a global - is refused,
-    /// naming the closure (plans/correctness.md C6).
+    /// Closure `c`'s cell, reached through a slot of `holder`. Its captures'
+    /// targets are the cell's (its shape's), but a state's EXACT identity
+    /// reads none of them (`exact::exact_rows` reads `Val` cells; the
+    /// signature counts them): the block is exact only because every
+    /// capture IS the closure's OWNER, the one table holding it (`obj.move`
+    /// captures `obj`), which the block's structure already says. Any other
+    /// capture - another table, a closure held by two tables or by a global
+    /// - is refused, naming the closure (plans/correctness.md C6).
     fn closure(&mut self, c: ClosureId, holder: Option<TableId>) -> Result<u32> {
         let st = self.st;
         let cl = &st.heap.closures[&c];
@@ -260,17 +253,17 @@ where
             ensure!(cl.captures.is_empty() || owner == holder, "closure {name} (#{c}) captures {:?} and is held by two tables, #{owner:?} and #{holder:?}: a capture is identity no key reads (plans/correctness.md C6)", cl.captures);
             return Ok(h);
         }
-        let cell = self.cell(Cell2::Unk, Col::U(AV::Nil));
+        let cell = self.cell(Cell::Unk, Col::U(AV::Nil));
         self.closures.insert(c, (cell, holder));
         let mut caps = Vec::with_capacity(cl.captures.len());
         for cap in &cl.captures {
             match st.heap.lookup(cl.env, cap) {
-                Some(Value::Table(t)) if Some(*t) == holder => caps.push(Col::U(AV::Ptr(self.table(*t)?))),
+                Some(Value::Table(t)) if Some(*t) == holder => caps.push(self.table(*t)?),
                 Some(Value::Table(t)) => bail!("closure {name} (#{c}): its capture {cap:?} is table #{t}, not its owner #{holder:?} (the table holding it): a capture is identity no key reads (plans/correctness.md C6)"),
                 other => bail!("closure {name} (#{c}): its capture {cap:?} holds {other:?}, not a table"),
             }
         }
-        self.rt2.structure[cell as usize] = Cell2::Clo(f, caps.into_boxed_slice());
+        self.cells[cell as usize] = Cell::Clo { f, caps: caps.into_boxed_slice() };
         Ok(cell)
     }
 }
@@ -308,7 +301,7 @@ pub fn from_block<N: Arithmetic, D: Domain<A = N>, E: Domain>(
     let globals = cx.heap.new_table();
     let scope = cx.heap.new_scope(None);
     let mut named: Vec<(&str, u32)> =
-        gen::GLOBAL_NAMES.iter().zip(&rt2.globals).filter(|(_, &c)| c != NONE).map(|(n, &c)| (*n, c)).collect();
+        gen::GLOBAL_NAMES.iter().zip(rt2.shape.globals()).filter(|(_, &c)| c != NONE).map(|(n, &c)| (*n, c)).collect();
     named.sort();
     for (name, c) in named {
         if cx.is_unknown(c) {
@@ -354,12 +347,12 @@ struct FromBlock<'a, N: Arithmetic, D: Domain> {
 
 impl<N: Arithmetic, D: Domain<A = N>> FromBlock<'_, N, D> {
     fn is_unknown(&self, cell: u32) -> bool {
-        matches!(self.rt2.structure[cell as usize], Cell2::Val) && self.rt2.cols[cell as usize].at(self.lane) == AV::UBool
+        matches!(self.rt2.cells()[cell as usize], Cell::Val) && self.rt2.cols[cell as usize].at(self.lane) == AV::UBool
     }
 
     fn slot(&mut self, cell: u32) -> Result<Value<D>> {
-        match self.rt2.structure[cell as usize] {
-            Cell2::Val => self.value(self.rt2.cols[cell as usize].at(self.lane)),
+        match self.rt2.cells()[cell as usize] {
+            Cell::Val => self.value(self.rt2.cols[cell as usize].at(self.lane)),
             _ => self.target(cell),
         }
     }
@@ -386,8 +379,8 @@ impl<N: Arithmetic, D: Domain<A = N>> FromBlock<'_, N, D> {
             return Ok(v.clone());
         }
         let rt2 = self.rt2;
-        Ok(match &rt2.structure[cell as usize] {
-            Cell2::Obj(fields) => {
+        Ok(match &rt2.cells()[cell as usize] {
+            Cell::Obj(fields) => {
                 let t = self.heap.new_table();
                 self.memo.insert(cell, Value::Table(t));
                 let mut named: Vec<(&str, u32)> = fields.iter().map(|&(f, c)| (gen::FIELD_NAMES[f as usize], c)).collect();
@@ -401,39 +394,39 @@ impl<N: Arithmetic, D: Domain<A = N>> FromBlock<'_, N, D> {
                 }
                 Value::Table(t)
             }
-            Cell2::Arr(items) => {
+            Cell::Arr(items) => {
                 let t = self.heap.new_table();
                 self.memo.insert(cell, Value::Table(t));
-                for &c in items {
+                for &c in items.iter() {
                     let v = self.slot(c)?;
                     self.heap.tables.get_mut(&t).expect("just made").arr.push(v);
                 }
                 Value::Table(t)
             }
             // A `{}` that never had a field stored.
-            Cell2::Unk => {
+            Cell::Unk => {
                 let t = self.heap.new_table();
                 self.memo.insert(cell, Value::Table(t));
                 Value::Table(t)
             }
-            Cell2::Clo(f, caps) => {
+            Cell::Clo { f, caps } => {
                 let (body, names) = self.fn_info.get(f).ok_or_else(|| anyhow!("no registered body for {}", gen::FN_NAMES[*f as usize]))?;
                 ensure!(names.len() == caps.len(), "{}: {} captures in the block, {} registered", gen::FN_NAMES[*f as usize], caps.len(), names.len());
                 let env = self.heap.new_scope(None);
-                for (name, cap) in names.iter().zip(caps.iter()) {
-                    let v = self.value(cap.at(self.lane))?;
+                for (name, &cap) in names.iter().zip(caps.iter()) {
+                    let v = self.target(cap)?;
                     self.heap.scopes.get_mut(&env).expect("just made").vars.insert(name.clone(), v);
                 }
                 let c = self.heap.new_closure(*body, env, Some(*f), names.clone());
                 self.memo.insert(cell, Value::Func(c));
                 Value::Func(c)
             }
-            Cell2::Bi(b) => {
+            Cell::Bi(b) => {
                 let v = Value::Builtin(BUILTIN_NAMES[*b as usize]);
                 self.memo.insert(cell, v.clone());
                 v
             }
-            Cell2::Val => self.value(rt2.cols[cell as usize].at(self.lane))?,
+            Cell::Val => self.value(rt2.cols[cell as usize].at(self.lane))?,
         })
     }
 }
@@ -457,8 +450,8 @@ mod tests {
         ] {
             let eng = crate::engines::reference::RefEngine::new(&s).expect("ref engine");
             let b = eng.initial().expect("the start converts");
-            let want: Vec<Kind> = b.structure.iter().map(|c| c.kind()).collect();
-            assert_eq!(sig::kinds(&sig::of(&b)).as_deref(), Ok(&want[..]), "room {:?}", s.room);
+            let want: Vec<Kind> = b.cells().iter().map(|c| c.kind()).collect();
+            assert_eq!(sig::kinds(b.shape.sig()).as_deref(), Ok(&want[..]), "room {:?}", s.room);
             seen.extend(want.iter().map(|k| format!("{k:?}")));
         }
         assert_eq!(seen.len(), 6, "the kinds the start blocks hold: {seen:?}");
@@ -485,7 +478,7 @@ mod tests {
         st.heap.tables.get_mut(&obj).expect("the spawn").hash.insert("type".into(), Value::Table(player));
         let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::engines::reference::to_block(&st, eng.room()))) else { panic!("a retargeted pointer converted") };
         let msg = e.downcast_ref::<String>().map_or("(not a formatted panic)", |m| m.as_str()).to_string();
-        assert!(msg.contains("POINTER TOPOLOGY") && msg.contains(&format!("{:#x}", b.shape_hash)), "{msg}");
+        assert!(msg.contains("POINTER TOPOLOGY") && msg.contains(&format!("{:#x}", b.shape_hash())), "{msg}");
     }
 
     /// A CLOSURE'S CAPTURE IS ITS OWNER, or the block refuses it, naming the

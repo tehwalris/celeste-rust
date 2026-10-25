@@ -83,7 +83,8 @@ pub fn ckhash(run: &Settings, a: CkhashArgs) -> Result<()> {
 
 pub fn census(run: &Settings, a: CensusArgs) -> Result<()> {
     use celeste_engine::exact::Code;
-    use celeste_engine::runtime2::{Cell2, Col, AV};
+    use celeste_engine::runtime2::{Col, AV};
+    use celeste_engine::shape::Cell;
     let t = a.tree.open(run)?;
     anyhow::ensure!(!t.float(), "census: a 16.16 tree only so far");
     let cfg = &*t.run.settings;
@@ -106,10 +107,10 @@ pub fn census(run: &Settings, a: CensusArgs) -> Result<()> {
     let mut by_shape: std::collections::BTreeMap<u64, S> = Default::default();
     for (_, rt2) in tree.rows(frame, cfg.room, 1 << 20, &keep, cfg.threads())? {
         let n = rt2.cols.len();
-        let st = by_shape.entry(rt2.shape_hash).or_insert_with(|| S { rows: 0, cols: vec![Default::default(); n], varying: vec![false; n], ivals: vec![0; n], ubools: vec![0; n], names: cell_names(&rt2, ids), spd: Default::default() });
+        let st = by_shape.entry(rt2.shape_hash()).or_insert_with(|| S { rows: 0, cols: vec![Default::default(); n], varying: vec![false; n], ivals: vec![0; n], ubools: vec![0; n], names: cell_names(&rt2, ids), spd: Default::default() });
         st.rows += rt2.width as u64;
         for (c, col) in rt2.cols.iter().enumerate() {
-            if !matches!(rt2.structure[c], Cell2::Val) {
+            if !matches!(rt2.cells()[c], Cell::Val) {
                 continue;
             }
             if let Col::U(v) = col {
@@ -171,7 +172,7 @@ pub fn census(run: &Settings, a: CensusArgs) -> Result<()> {
                 new += rt2.width as u64;
                 let names = cell_names(&rt2, ids);
                 let mut cells: Vec<(String, usize)> = (0..rt2.cols.len())
-                    .filter(|&c| matches!(rt2.structure[c], Cell2::Val))
+                    .filter(|&c| matches!(rt2.cells()[c], Cell::Val))
                     .map(|c| (names.get(&c).cloned().unwrap_or_else(|| format!("cell{c}")), c))
                     .filter(|(nm, _)| !erase.iter().any(|p| nm.starts_with(p.as_str())))
                     .collect();

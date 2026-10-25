@@ -20,7 +20,8 @@
 
 use celeste_core::arith::Arithmetic;
 
-use crate::runtime2::{collapse_uniform, names, Cell2, Col, Rt2, AV, NONE};
+use crate::runtime2::{collapse_uniform, names, Col, Rt2, AV, NONE};
+use crate::shape::Cell;
 
 /// A LEVEL: which objects the forward widens (plans/abstractions.md), on
 /// top of what every level widens (`Flag::Always`: the remainder, and the
@@ -602,16 +603,16 @@ impl<N: Arithmetic> Rt2<N> {
     /// An object's own value cells: its value fields and those of the
     /// tables they point to (`rem`, `spd`, `hitbox`, ...), not its `type`'s.
     fn own_value_cells(&self, obj: u32) -> Vec<u32> {
-        let val = |c: u32| matches!(self.structure[c as usize], Cell2::Val);
+        let val = |c: u32| matches!(self.cells()[c as usize], Cell::Val);
         let mut out = Vec::new();
-        let Cell2::Obj(fields) = &self.structure[obj as usize] else { return out };
+        let Cell::Obj(fields) = &self.cells()[obj as usize] else { return out };
         for &(name, cell) in fields.iter().filter(|f| val(f.1)) {
             out.push(cell);
             if name == names().type_ {
                 continue;
             }
             if let Col::U(AV::Ptr(sub)) = self.cols[cell as usize] {
-                if let Cell2::Obj(sub_fields) = &self.structure[sub as usize] {
+                if let Cell::Obj(sub_fields) = &self.cells()[sub as usize] {
                     out.extend(sub_fields.iter().map(|f| f.1).filter(|&c| val(c)));
                 }
             }
@@ -900,7 +901,7 @@ impl<N: Arithmetic> Rt2<N> {
         let (mut cell, rest) = match base {
             Some(obj) => (self.obj_field_cell(obj, field[0])?, &field[1..]),
             None => {
-                let c = self.globals[field[0] as usize];
+                let c = self.shape.globals()[field[0] as usize];
                 (c, &field[1..])
             }
         };

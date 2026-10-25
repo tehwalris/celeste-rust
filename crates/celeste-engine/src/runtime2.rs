@@ -1,15 +1,18 @@
 //! The columnar block, the kernels' input/output: heap structure shared by
-//! every lane (the shape premise), values in per-lane columns. Owns the lane
-//! primitives and the BOUNDARY: a level's widenings (`widen_to`, the
-//! `widening` table on blocks), canonical renumbering and the shape hash.
-//! Row keys are the storage's (`exact::KeySpace`).
+//! every lane (the shape premise: one `shape::Shape`, interned), values in
+//! per-lane columns. Owns the lane primitives and the BOUNDARY: a level's
+//! widenings (`widen_to`, the `widening` table on blocks) and the canonical
+//! renumbering into the block's shape. Row keys are the storage's
+//! (`exact::KeySpace`).
+
+use std::sync::Arc;
 
 use celeste_core::arith::Arithmetic;
 use celeste_core::room::Room;
 use celeste_core::pico8_num::Pico8Num;
 use serde::{Deserialize, Serialize};
 
-use crate::shape::Kind;
+use crate::shape::{Cell, Shape};
 
 pub type P8 = Pico8Num;
 
@@ -75,44 +78,6 @@ impl<N: Copy + PartialEq> Col<N> {
     }
 }
 
-/// Shared heap structure; a `Val` cell's contents are `Rt2::cols` at the same
-/// index, other kinds are uniform. Closure captures are value snapshots.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum Cell2<N = P8> {
-    Val,
-    Obj(Vec<(u32, u32)>),
-    Arr(Vec<u32>),
-    Unk,
-    Clo(u32, Box<[Col<N>]>),
-    Bi(u32),
-}
-
-impl<N> Cell2<N> {
-    /// The cell's kind, as its shape's signature names it.
-    pub fn kind(&self) -> Kind {
-        match self {
-            Cell2::Val => Kind::Val,
-            Cell2::Obj(_) => Kind::Obj,
-            Cell2::Arr(_) => Kind::Arr,
-            Cell2::Unk => Kind::Unk,
-            Cell2::Clo(..) => Kind::Clo,
-            Cell2::Bi(_) => Kind::Bi,
-        }
-    }
-
-    /// What the cell is, for messages.
-    pub fn kind_name(&self) -> &'static str {
-        match self.kind() {
-            Kind::Val => "value",
-            Kind::Obj => "object",
-            Kind::Arr => "array",
-            Kind::Unk => "unknown table",
-            Kind::Clo => "closure",
-            Kind::Bi => "builtin",
-        }
-    }
-}
-
 /// The names the engine reads itself, as their ids (`celeste_names`): the
 /// anchors' (`shape::Anchors`: the position object, the player, else the
 /// player spawn, in `objects` by its `type`; the `room`) and their fields.
@@ -138,16 +103,17 @@ pub fn names() -> &'static Names {
 
 pub struct Rt2<N = P8> {
     pub width: usize,
-    pub structure: Vec<Cell2<N>>,
-    /// Per-cell value columns, parallel to `structure`.
+    /// The structure every lane shares (its hash the block's shape key).
+    pub shape: Arc<Shape>,
+    /// Per-cell value columns, parallel to the shape's cells (a non-value
+    /// cell's uniform and unread).
     pub cols: Vec<Col<N>>,
-    pub globals: Vec<u32>,
-    pub strings: Vec<String>,
+    /// The strings a `Str` value names: `celeste_names::STRINGS`, then the
+    /// block's own.
+    pub strings: Arc<[String]>,
     /// The search's start room (the kernels read its tiles; a row's cell
     /// is relative to it).
     pub room: &'static Room,
-    /// Set by `boundary`: the canonical structure hash (the shape key).
-    pub shape_hash: u64,
     /// A stored piece's per-lane EXACT keys (its tree's `exact::KeySpace`);
     /// empty elsewhere (a boundary clears them).
     pub row_keys: Vec<(u64, u64)>,
@@ -207,36 +173,158 @@ pub fn collapse_uniform<N: Copy + PartialEq>(c: Col<N>) -> Col<N> {
     }
 }
 
+/// The static strings (`celeste_names::STRINGS`), shared.
+pub fn static_strings() -> Arc<[String]> {
+    static S: std::sync::OnceLock<Arc<[String]>> = std::sync::OnceLock::new();
+    S.get_or_init(|| celeste_names::STRINGS.iter().map(|s| s.to_string()).collect()).clone()
+}
+
 impl<N: Arithmetic> Rt2<N> {
-    pub fn empty(
-        width: usize,
-        globals_len: usize,
-        static_strings: &[&str],
-        room: &'static Room,
-    ) -> Rt2<N> {
-        Rt2 {
-            width,
-            structure: Vec::new(),
-            cols: Vec::new(),
-            globals: vec![NONE; globals_len],
-            strings: static_strings.iter().map(|s| s.to_string()).collect(),
-            room,
-            shape_hash: 0,
-            row_keys: Vec::new(),
+    /// A block of `shape` with `cols`, no row keys.
+    pub fn new(width: usize, shape: Arc<Shape>, cols: Vec<Col<N>>, strings: Arc<[String]>, room: &'static Room) -> Rt2<N> {
+        debug_assert_eq!(cols.len(), shape.cells().len(), "a block's columns are its shape's cells");
+        Rt2 { width, shape, cols, strings, room, row_keys: Vec::new() }
+    }
+
+    /// The block of `cells`, `cols` and `globals` in any numbering, made
+    /// CANONICAL (`canonicalize_ids`) and its shape interned.
+    pub fn canonical_of(width: usize, cells: Vec<Cell>, cols: Vec<Col<N>>, globals: Vec<u32>, strings: Arc<[String]>, room: &'static Room) -> Rt2<N> {
+        let (cells, cols, globals) = canonical_ids(&cells, &cols, &globals);
+        Rt2::new(width, Shape::intern(cells, globals), cols, strings, room)
+    }
+
+    /// The shape's cells.
+    #[inline]
+    pub fn cells(&self) -> &[Cell] {
+        self.shape.cells()
+    }
+
+    /// The shape's key, its hash.
+    #[inline]
+    pub fn shape_hash(&self) -> u64 {
+        self.shape.hash()
+    }
+}
+
+/// CANONICAL ORDER: every cell renumbered by BFS discovery from the globals
+/// (children in stored order, an object's fields by name) and the
+/// unreachable dropped, every pointer remapped - so isomorphic heaps are
+/// identical and row keys block-independent; a value column compressed
+/// (`N`/`I`) and collapsed where uniform (`collapse_uniform`), a non-value
+/// cell's column `Nil`.
+fn canonical_ids<N: Arithmetic>(cells: &[Cell], cols: &[Col<N>], globals: &[u32]) -> (Vec<Cell>, Vec<Col<N>>, Vec<u32>) {
+    // Fields sorted by name, or creation order changes the shape (most
+    // objects are already).
+    let by_name = |f: &(u32, u32)| celeste_names::FIELD_NAMES[f.0 as usize];
+    let resorted: Vec<(usize, Vec<(u32, u32)>)> = cells
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| match c {
+            Cell::Obj(fields) if !fields.is_sorted_by_key(by_name) => {
+                let mut v = fields.to_vec();
+                v.sort_by_key(by_name);
+                Some((i, v))
+            }
+            _ => None,
+        })
+        .collect();
+    fn pick<'a>(resorted: &'a [(usize, Vec<(u32, u32)>)], i: usize, fields: &'a [(u32, u32)]) -> &'a [(u32, u32)] {
+        resorted.iter().find(|r| r.0 == i).map_or(fields, |r| &r.1)
+    }
+    let fields_of = |i: usize, fields| pick(&resorted, i, fields);
+    let mut order: Vec<u32> = Vec::new();
+    let mut new_id = vec![u32::MAX; cells.len()];
+    let mut queue: std::collections::VecDeque<u32> = Default::default();
+    let mut enqueue = |t: u32, new_id: &mut [u32], queue: &mut std::collections::VecDeque<u32>| {
+        if new_id[t as usize] == u32::MAX {
+            new_id[t as usize] = order.len() as u32;
+            order.push(t);
+            queue.push_back(t);
+        }
+    };
+    for &cell in globals {
+        if cell != NONE {
+            enqueue(cell, &mut new_id, &mut queue);
         }
     }
+    while let Some(c) = queue.pop_front() {
+        match &cells[c as usize] {
+            Cell::Val => match &cols[c as usize] {
+                Col::U(AV::Ptr(t)) => enqueue(*t, &mut new_id, &mut queue),
+                Col::U(_) | Col::N(_) | Col::I(_) => {}
+                Col::V(vs) => {
+                    for v in vs {
+                        if let AV::Ptr(t) = v {
+                            enqueue(*t, &mut new_id, &mut queue);
+                        }
+                    }
+                }
+            },
+            Cell::Obj(fields) => {
+                for &(_, t) in fields_of(c as usize, fields) {
+                    enqueue(t, &mut new_id, &mut queue);
+                }
+            }
+            Cell::Arr(items) => {
+                for &t in items.iter() {
+                    enqueue(t, &mut new_id, &mut queue);
+                }
+            }
+            Cell::Clo { caps, .. } => {
+                for &t in caps.iter() {
+                    enqueue(t, &mut new_id, &mut queue);
+                }
+            }
+            Cell::Unk | Cell::Bi(_) => {}
+        }
+    }
+    // Compact over the live cells, remapping every pointer.
+    let remap_av = |v: AV<N>| -> AV<N> {
+        match v {
+            AV::Ptr(t) => AV::Ptr(new_id[t as usize]),
+            other => other,
+        }
+    };
+    let remap_col = |c: &Col<N>| -> Col<N> {
+        match c {
+            Col::U(v) => Col::U(remap_av(*v)),
+            Col::V(vs) => Col::V(vs.iter().map(|v| remap_av(*v)).collect()),
+            Col::N(vs) => Col::N(vs.clone()),
+            Col::I(vs) => Col::I(vs.clone()),
+        }
+    };
+    let ids = |ts: &[u32]| -> Box<[u32]> { ts.iter().map(|t| new_id[*t as usize]).collect() };
+    let mut new_cells: Vec<Cell> = Vec::with_capacity(order.len());
+    let mut new_cols: Vec<Col<N>> = Vec::with_capacity(order.len());
+    for &old in &order {
+        let cell = &cells[old as usize];
+        new_cells.push(match cell {
+            Cell::Val => Cell::Val,
+            Cell::Obj(fields) => Cell::Obj(fields_of(old as usize, fields).iter().map(|&(k, t)| (k, new_id[t as usize])).collect()),
+            Cell::Arr(items) => Cell::Arr(ids(items)),
+            Cell::Unk => Cell::Unk,
+            Cell::Clo { f, caps } => Cell::Clo { f: *f, caps: ids(caps) },
+            Cell::Bi(b) => Cell::Bi(*b),
+        });
+        new_cols.push(match cell {
+            Cell::Val => collapse_uniform(compress_num(remap_col(&cols[old as usize]))),
+            _ => Col::U(AV::Nil),
+        });
+    }
+    let new_globals = globals.iter().map(|&g| if g == NONE { NONE } else { new_id[g as usize] }).collect();
+    (new_cells, new_cols, new_globals)
 }
 
 impl<N: Arithmetic> Rt2<N> {
     /// The cell a table-valued global points at, if any.
     pub fn global_target(&self, g: u32) -> Option<u32> {
-        let cell = self.globals[g as usize];
+        let cell = self.shape.globals()[g as usize];
         if cell == NONE {
             return None;
         }
         // Globals hold Val(Ptr(target)) for tables.
-        match &self.structure[cell as usize] {
-            Cell2::Val => match self.cols[cell as usize] {
+        match &self.cells()[cell as usize] {
+            Cell::Val => match self.cols[cell as usize] {
                 Col::U(AV::Ptr(t)) => Some(t),
                 _ => None,
             },
@@ -246,8 +334,8 @@ impl<N: Arithmetic> Rt2<N> {
 
     /// The cell holding field `f` of object `obj`, if the object has it.
     pub fn obj_field_cell(&self, obj: u32, f: u32) -> Option<u32> {
-        match &self.structure[obj as usize] {
-            Cell2::Obj(fields) => fields.iter().find(|(k, _)| *k == f).map(|(_, c)| *c),
+        match &self.cells()[obj as usize] {
+            Cell::Obj(fields) => fields.iter().find(|(k, _)| *k == f).map(|(_, c)| *c),
             _ => None,
         }
     }
@@ -264,14 +352,14 @@ impl<N: Arithmetic> Rt2<N> {
         let Some(arr) = self.global_target(names().objects) else {
             return found;
         };
-        let Cell2::Arr(items) = &self.structure[arr as usize] else {
+        let Cell::Arr(items) = &self.cells()[arr as usize] else {
             return found;
         };
         let type_table = self.global_target(type_global);
         for item in items {
             // Array items are cells holding Ptr(obj).
-            let obj = match &self.structure[*item as usize] {
-                Cell2::Val => match self.cols[*item as usize] {
+            let obj = match &self.cells()[*item as usize] {
+                Cell::Val => match self.cols[*item as usize] {
                     Col::U(AV::Ptr(o)) => o,
                     _ => continue,
                 },
@@ -297,138 +385,12 @@ impl<N: Arithmetic> Rt2<N> {
         Some((self.obj_field_cell(sub, names().x)?, self.obj_field_cell(sub, names().y)?))
     }
 
-    /// The shape key: a hash of the signature (`shape::sig`).
-    pub fn shape_hash_of(&self) -> u64 {
-        use std::hash::Hasher;
-        let mut h = rustc_hash::FxHasher::default();
-        crate::shape::sig::write(&self.structure, &self.globals, |x| h.write_u32(x));
-        h.finish()
-    }
-
-    /// Renumber every cell into CANONICAL order (BFS discovery from the globals,
-    /// children in stored order) and compact, so isomorphic heaps are identical
-    /// and row keys block-independent.
+    /// Renumber every cell into CANONICAL order (`canonical_ids`), the
+    /// block's shape the canonical one's.
     pub fn canonicalize_ids(&mut self) {
-        // Fields sorted by name, or creation order changes the shape.
-        for cell in self.structure.iter_mut() {
-            if let Cell2::Obj(fields) = cell {
-                fields.sort_by_key(|(k, _)| celeste_names::FIELD_NAMES[*k as usize]);
-            }
-        }
-        let mut order: Vec<u32> = Vec::new();
-        let mut new_id = vec![u32::MAX; self.structure.len()];
-        {
-            let mut queue: std::collections::VecDeque<u32> = Default::default();
-            fn enqueue(
-                t: u32,
-                new_id: &mut [u32],
-                queue: &mut std::collections::VecDeque<u32>,
-                order: &mut Vec<u32>,
-            ) {
-                if new_id[t as usize] == u32::MAX {
-                    new_id[t as usize] = order.len() as u32;
-                    order.push(t);
-                    queue.push_back(t);
-                }
-            }
-            for &cell in self.globals.iter() {
-                if cell != NONE {
-                    enqueue(cell, &mut new_id, &mut queue, &mut order);
-                }
-            }
-            while let Some(c) = queue.pop_front() {
-                match &self.structure[c as usize] {
-                    Cell2::Val => match &self.cols[c as usize] {
-                        Col::U(AV::Ptr(t)) => enqueue(*t, &mut new_id, &mut queue, &mut order),
-                        Col::U(_) | Col::N(_) | Col::I(_) => {}
-                        Col::V(vs) => {
-                            for v in vs {
-                                if let AV::Ptr(t) = v {
-                                    enqueue(*t, &mut new_id, &mut queue, &mut order);
-                                }
-                            }
-                        }
-                    },
-                    Cell2::Obj(fields) => {
-                        for (_, t) in fields {
-                            enqueue(*t, &mut new_id, &mut queue, &mut order);
-                        }
-                    }
-                    Cell2::Arr(items) => {
-                        for t in items {
-                            enqueue(*t, &mut new_id, &mut queue, &mut order);
-                        }
-                    }
-                    Cell2::Clo(_, caps) => {
-                        for cap in caps.iter() {
-                            match cap {
-                                Col::U(AV::Ptr(t)) => {
-                                    enqueue(*t, &mut new_id, &mut queue, &mut order)
-                                }
-                                Col::V(vs) => {
-                                    for v in vs {
-                                        if let AV::Ptr(t) = v {
-                                            enqueue(*t, &mut new_id, &mut queue, &mut order);
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                    Cell2::Unk | Cell2::Bi(_) => {}
-                }
-            }
-        }
-
-        // Compact over the live cells, remapping every pointer.
-        let remap_av = |v: AV<N>, new_id: &[u32]| -> AV<N> {
-            match v {
-                AV::Ptr(t) => AV::Ptr(new_id[t as usize]),
-                other => other,
-            }
-        };
-        let remap_col = |c: &Col<N>, new_id: &[u32]| -> Col<N> {
-            match c {
-                Col::U(v) => Col::U(remap_av(*v, new_id)),
-                Col::V(vs) => Col::V(vs.iter().map(|v| remap_av(*v, new_id)).collect()),
-                Col::N(vs) => Col::N(vs.clone()),
-                Col::I(vs) => Col::I(vs.clone()),
-            }
-        };
-        let mut new_structure: Vec<Cell2<N>> = Vec::with_capacity(order.len());
-        let mut new_cols: Vec<Col<N>> = Vec::with_capacity(order.len());
-        for &old in &order {
-            let cell = match &self.structure[old as usize] {
-                Cell2::Val => Cell2::Val,
-                Cell2::Obj(fields) => Cell2::Obj(
-                    fields.iter().map(|(k, t)| (*k, new_id[*t as usize])).collect(),
-                ),
-                Cell2::Arr(items) => {
-                    Cell2::Arr(items.iter().map(|t| new_id[*t as usize]).collect())
-                }
-                Cell2::Unk => Cell2::Unk,
-                Cell2::Clo(f, caps) => Cell2::Clo(
-                    *f,
-                    caps.iter().map(|c| remap_col(c, &new_id)).collect(),
-                ),
-                Cell2::Bi(b) => Cell2::Bi(*b),
-            };
-            new_structure.push(cell);
-            new_cols.push(match &self.structure[old as usize] {
-                Cell2::Val => {
-                    collapse_uniform(compress_num(remap_col(&self.cols[old as usize], &new_id)))
-                }
-                _ => Col::U(AV::Nil),
-            });
-        }
-        for g in self.globals.iter_mut() {
-            if *g != NONE {
-                *g = new_id[*g as usize];
-            }
-        }
-        self.structure = new_structure;
-        self.cols = new_cols;
+        let (cells, cols, globals) = canonical_ids(self.cells(), &self.cols, self.shape.globals());
+        self.shape = Shape::intern(cells, globals);
+        self.cols = cols;
     }
 
     /// The block as it is, CANONICAL (ids, shape hash; no widening): what a
@@ -453,20 +415,12 @@ impl<N: Arithmetic> Rt2<N> {
             Col::I(v) => v.len() == self.width,
         };
         debug_assert!(self.cols.iter().all(full), "boundary: a column is not at block width");
-        debug_assert!(
-            self.structure.iter().all(|c| match c {
-                Cell2::Clo(_, caps) => caps.iter().all(full),
-                _ => true,
-            }),
-            "boundary: a closure capture is not at block width"
-        );
     }
 
-    /// Shared boundary tail: canonical ids and the shape hash; row keys
+    /// Shared boundary tail: canonical ids (the canonical shape); row keys
     /// cleared.
     fn boundary_finish(&mut self) {
         self.canonicalize_ids();
-        self.shape_hash = self.shape_hash_of();
         self.row_keys.clear();
     }
 
@@ -498,37 +452,21 @@ impl<N: Arithmetic> Rt2<N> {
         for col in self.cols.iter_mut() {
             retain_col(col);
         }
-        for cell in self.structure.iter_mut() {
-            if let Cell2::Clo(_, caps) = cell {
-                for cap in caps.iter_mut() {
-                    retain_col(cap);
-                }
-            }
-        }
         if !self.row_keys.is_empty() {
             self.row_keys = keep.iter().map(|&i| self.row_keys[i as usize]).collect();
         }
         self.width = keep.len();
     }
 
-    /// A clone (its room shared).
+    /// A clone (its shape, strings and room shared).
     pub fn clone_block(&self) -> Rt2<N> {
-        Rt2 {
-            width: self.width,
-            structure: self.structure.clone(),
-            cols: self.cols.clone(),
-            globals: self.globals.clone(),
-            strings: self.strings.clone(),
-            room: self.room,
-            shape_hash: self.shape_hash,
-            row_keys: self.row_keys.clone(),
-        }
+        Rt2 { width: self.width, shape: self.shape.clone(), cols: self.cols.clone(), strings: self.strings.clone(), room: self.room, row_keys: self.row_keys.clone() }
     }
 }
 
 impl<N: Arithmetic> Rt2<N> {
-    /// The BOUNDARY: level-0 widenings, canonical renumbering (the GC) and
-    /// the shape hash, lanes kept.
+    /// The BOUNDARY: level-0 widenings and canonical renumbering (the GC)
+    /// into the canonical shape, lanes kept.
     pub fn boundary_canonicalize(&mut self) {
         self.boundary_prepare();
         self.widen_to(crate::widening::Level::EXACT);

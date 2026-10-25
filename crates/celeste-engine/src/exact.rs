@@ -32,8 +32,8 @@ use celeste_core::arith::Arithmetic;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::runtime2::{mix64, Cell2, Rt2, AV, P8};
-use crate::shape::{sig, Anchors, KeyRole, Layout};
+use crate::runtime2::{mix64, Rt2, AV, P8};
+use crate::shape::{Anchors, Cell, KeyRole, Layout};
 
 /// A packed key: (bits 64..127, bits 0..63). Bit 127 tags a PROVISIONAL key.
 pub type Key = (u64, u64);
@@ -1029,15 +1029,15 @@ impl<N: Arithmetic> KeySpace<N> {
     /// (a difference is FATAL); a row whose leader misses holds its
     /// followers' codes in its content (`add_misses` records them).
     pub fn row_keys(&self, rt2: &Rt2<N>) -> Vec<RowKey<N>> {
-        let Some(s) = self.shapes.get(&rt2.shape_hash) else {
+        let Some(s) = self.shapes.get(&rt2.shape_hash()) else {
             // An unknown shape: every field is missing (its followers too,
             // whatever its layout).
             let s = ShapeKeys::<N>::new(std::sync::Arc::new(Layout::of_deps(rt2, Vec::new())));
             return (0..rt2.width)
-                .map(|lane| RowKey::Miss(MissKey { shape: rt2.shape_hash, partial: (0, 0), missing: s.value_cells().map(|c| (c, s.code_at(rt2, c, lane))).collect() }))
+                .map(|lane| RowKey::Miss(MissKey { shape: rt2.shape_hash(), partial: (0, 0), missing: s.value_cells().map(|c| (c, s.code_at(rt2, c, lane))).collect() }))
                 .collect();
         };
-        assert!(sig::is_of(s.layout.sig(), rt2), "exact keys: two shapes under the hash {:#x} (a shape-hash collision)", rt2.shape_hash);
+        assert!(s.layout.sig() == rt2.shape.sig(), "exact keys: two shapes under the hash {:#x} (a shape-hash collision)", rt2.shape_hash());
         let cells = s.layout.keyed();
         (0..rt2.width)
             .map(|lane| {
@@ -1058,7 +1058,7 @@ impl<N: Arithmetic> KeySpace<N> {
                         for (slot, &c) in fl.cells.iter().enumerate() {
                             let (got, want) = (s.code_at(rt2, c, lane), fl.code(slot, lead));
                             if got != want {
-                                follower_violation(rt2.shape_hash, fl.leader, s.code_at(rt2, fl.leader, lane), lead, c, got, want, &format!("the boundary, lane {lane}"));
+                                follower_violation(rt2.shape_hash(), fl.leader, s.code_at(rt2, fl.leader, lane), lead, c, got, want, &format!("the boundary, lane {lane}"));
                             }
                         }
                     }
@@ -1069,7 +1069,7 @@ impl<N: Arithmetic> KeySpace<N> {
                     if !s.follows.is_empty() {
                         missing.sort_unstable_by_key(|m| m.0);
                     }
-                    RowKey::Miss(MissKey { shape: rt2.shape_hash, partial: to_key(k), missing })
+                    RowKey::Miss(MissKey { shape: rt2.shape_hash(), partial: to_key(k), missing })
                 }
             })
             .collect()
@@ -1092,7 +1092,7 @@ impl<N: Arithmetic> KeySpace<N> {
     pub fn absorb(&mut self, blocks: &[&Rt2<N>]) -> KeyAdditions<N> {
         let mut adds = KeyAdditions::default();
         let mut shapes: Vec<&Rt2<N>> = blocks.to_vec();
-        shapes.sort_by_key(|b| b.shape_hash);
+        shapes.sort_by_key(|b| b.shape_hash());
         for b in &shapes {
             self.add_shape(&std::sync::Arc::new(Layout::of(b)), &mut adds);
         }
@@ -1201,19 +1201,17 @@ impl<N: Arithmetic> Provisional<N> {
 /// beside it). Equal bytes = equal states; no tree needed.
 pub type ExactRow = Box<[u8]>;
 
-/// Block `rt2`'s rows' canonical bytes (its shape's signature registered
-/// with the process's: a second structure under its name is FATAL).
+/// Block `rt2`'s rows' canonical bytes.
 pub fn exact_rows<N: Arithmetic>(rt2: &Rt2<N>) -> Vec<ExactRow> {
-    sig::intern_of(rt2);
     let pos = Anchors::of(rt2).pos();
-    let cells: Vec<(u32, KeyRole)> = (0..rt2.structure.len() as u32)
-        .filter(|&c| matches!(rt2.structure[c as usize], Cell2::Val))
+    let cells: Vec<(u32, KeyRole)> = (0..rt2.cells().len() as u32)
+        .filter(|&c| rt2.cells()[c as usize] == Cell::Val)
         .map(|c| (c, if pos.is_some_and(|(x, y)| c == x || c == y) { KeyRole::Position } else { KeyRole::Value }))
         .collect();
     (0..rt2.width)
         .map(|lane| {
             let mut out = Vec::with_capacity(8 + cells.len() * 5);
-            out.extend_from_slice(&rt2.shape_hash.to_le_bytes());
+            out.extend_from_slice(&rt2.shape_hash().to_le_bytes());
             for &(c, role) in &cells {
                 let code = role.code(rt2.cols[c as usize].at(lane));
                 match code.kind {
@@ -1253,17 +1251,18 @@ mod tests {
     #[test]
     fn an_absent_global_is_not_in_a_shapes_identity() {
         use crate::runtime2::{Col, NONE};
+        use crate::shape::sig;
         let room = celeste_core::room::Room::of((1, 0));
-        let mut b = Rt2::<P8>::empty(1, celeste_names::GLOBAL_NAMES.len(), celeste_names::STRINGS, room);
         let x = celeste_names::field("x");
-        b.structure = vec![Cell2::Val, Cell2::Obj(vec![(x, 2)]), Cell2::Val];
-        b.cols = vec![Col::U(AV::Ptr(1)), Col::U(AV::Nil), Col::U(AV::Num(P8::from_i16(3)))];
-        b.globals[celeste_names::global("objects") as usize] = 0;
-        b.canonicalize_ids();
-        let (hash, sig) = (b.shape_hash_of(), sig::of(&b));
-        b.globals.push(NONE);
-        assert_eq!((b.shape_hash_of(), sig::of(&b)), (hash, sig.clone()), "an appended, absent global moves the shape");
-        assert!(sig.len() < celeste_names::GLOBAL_NAMES.len(), "the signature lists the globals present, not every slot");
+        let mut globals = vec![NONE; celeste_names::GLOBAL_NAMES.len()];
+        globals[celeste_names::global("objects") as usize] = 0;
+        let cols = vec![Col::U(AV::Ptr(1)), Col::U(AV::Nil), Col::U(AV::Num(P8::from_i16(3)))];
+        let b = Rt2::<P8>::canonical_of(1, vec![Cell::Val, Cell::Obj(Box::new([(x, 2)])), Cell::Val], cols, globals, crate::runtime2::static_strings(), room);
+        let (hash, words) = (b.shape_hash(), b.shape.sig().to_vec());
+        let mut more = b.shape.globals().to_vec();
+        more.push(NONE);
+        assert_eq!((sig::hash(b.cells(), &more), sig::of(b.cells(), &more)), (hash, words.clone()), "an appended, absent global moves the shape");
+        assert!(words.len() < celeste_names::GLOBAL_NAMES.len(), "the signature lists the globals present, not every slot");
     }
 
     fn n(x: i32) -> Code {
@@ -1422,15 +1421,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "declared key dependency is VIOLATED")]
     fn a_follower_other_than_the_record_is_fatal_at_the_boundary() {
-        use crate::runtime2::Col;
+        use crate::runtime2::{Col, NONE};
         let room = celeste_core::room::Room::of((1, 0));
-        let mut b = Rt2::<P8>::empty(2, celeste_names::GLOBAL_NAMES.len(), celeste_names::STRINGS, room);
-        b.structure = vec![Cell2::Val, Cell2::Val, Cell2::Val];
+        let shape = crate::shape::Shape::intern(vec![Cell::Val, Cell::Val, Cell::Val], vec![NONE; celeste_names::GLOBAL_NAMES.len()]);
         let num = |x: i16| AV::Num(P8::from_i16(x));
-        b.cols = vec![Col::U(num(7)), Col::U(num(1)), Col::V(vec![num(1), num(2)])];
+        let b = Rt2::<P8>::new(2, shape, vec![Col::U(num(7)), Col::U(num(1)), Col::V(vec![num(1), num(2)])], crate::runtime2::static_strings(), room);
         let deps = Deps { leader: 0, followers: vec![1, 2] };
-        let rec = ShapeRecord { hash: b.shape_hash_of(), sig: sig::of(&b), pos: None, deps: vec![deps] };
-        b.shape_hash = rec.hash;
+        let rec = ShapeRecord { hash: b.shape_hash(), sig: b.shape.sig().to_vec(), pos: None, deps: vec![deps] };
         let mut ks = KeySpace::new();
         let mut adds = KeyAdditions::default();
         ks.add_shape(&lay(&rec), &mut adds);

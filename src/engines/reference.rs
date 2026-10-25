@@ -662,15 +662,15 @@ fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A>, fn_inf
         };
         let mut b = to_rt2(&traced, rt2.room, num, boolean)?;
         let s = skeleton::<_, A>(&traced, rt2.room)?;
-        let first = |x: &Rt2<A>, y: &Rt2<A>| (0..x.structure.len().max(y.structure.len())).find(|&c| x.structure.get(c) != y.structure.get(c) || x.cols.get(c) != y.cols.get(c));
+        let first = |x: &Rt2<A>, y: &Rt2<A>| (0..x.cells().len().max(y.cells().len())).find(|&c| x.cells().get(c) != y.cells().get(c) || x.cols.get(c) != y.cols.get(c));
         ensure!(
-            a.structure == b.structure && a.cols == b.cols && a.globals == b.globals && a.strings == b.strings,
+            a.cells() == b.cells() && a.cols == b.cols && a.shape.globals() == b.shape.globals() && a.strings == b.strings,
             "lane {lane}: the reference's block and the tracer's differ, first at cell {:?}",
             first(&a, &b)
         );
         let pointers = |x: &Rt2<A>| -> Vec<Option<AV<A>>> { x.cols.iter().map(|c| matches!(c, Col::U(AV::Ptr(_))).then(|| c.at(0))).collect() };
         ensure!(
-            s.structure == a.structure && s.globals == a.globals && pointers(&s) == pointers(&a) && s.shape_hash == a.shape_hash,
+            s.cells() == a.cells() && s.shape.globals() == a.shape.globals() && pointers(&s) == pointers(&a) && s.shape_hash() == a.shape_hash(),
             "lane {lane}: the tracer's skeleton is not the reference block's shape"
         );
         a.canonical();
@@ -711,7 +711,8 @@ mod tests {
     /// reference row.
     #[test]
     fn a_builtin_in_several_slots_converts_alike_on_both_sides() {
-        use celeste_engine::runtime2::{Cell2, Col, AV};
+        use celeste_engine::runtime2::{Col, AV};
+        use celeste_engine::shape::Cell;
         let eng = RefEngine::new(&Default::default()).expect("ref engine");
         let mut st = eng.base.clone();
         let g = st.globals;
@@ -722,8 +723,8 @@ mod tests {
         st.heap.tables.get_mut(&room).expect("room").hash.insert("x".to_string(), Value::Builtin("abs"));
         let row = to_block(&st, eng.room()).expect("block");
         let abs = crate::builtins::BUILTIN_NAMES.iter().position(|n| *n == "abs").expect("abs") as u32;
-        assert_eq!(row.structure.iter().filter(|c| **c == Cell2::Bi(abs)).count(), 3, "a Bi cell at each of the three slots");
-        let points_at_builtin = |c: &Col| matches!(c, Col::U(AV::Ptr(p)) if matches!(row.structure[*p as usize], Cell2::Bi(_)));
+        assert_eq!(row.cells().iter().filter(|c| **c == Cell::Bi(abs)).count(), 3, "a Bi cell at each of the three slots");
+        let points_at_builtin = |c: &Col| matches!(c, Col::U(AV::Ptr(p)) if matches!(row.cells()[*p as usize], Cell::Bi(_)));
         assert!(!row.cols.iter().any(points_at_builtin), "no slot points at a builtin's cell");
         eng.check_agreement(&row).expect("both sides convert it alike");
     }

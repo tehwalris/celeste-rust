@@ -154,7 +154,7 @@ impl<N: KernelLanes> Kernels<N> {
                  (the reasons above); trace the missing shape and resume from the last checkpoint",
                 lanes.len(),
                 bucket.width,
-                bucket.shape_hash,
+                bucket.shape_hash(),
             );
         }
     }

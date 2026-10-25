@@ -36,9 +36,9 @@ pub fn explain_row<N: KernelLanes>(run: &Run, row: &Rt2<N>) -> Result<String> {
     anyhow::ensure!(row.width == 1, "explain one row, not {}", row.width);
     let cell = crate::storage::cells::block_cells(row)?[0];
     let region = run.settings.region_grid().filter(|_| !row.player_objects().is_empty()).and_then(|g| g.of_cell(cell));
-    let key = (row.shape_hash, region);
+    let key = (row.shape_hash(), region);
     let kernels = Kernels::<N>::new(run)?;
-    let digest = kernels.digest_of(key).ok_or_else(|| anyhow::anyhow!("shape {:#x} region {region:?}: no kernel of the set ({}) takes the row: a miss, not a decline", row.shape_hash, run.level))?;
+    let digest = kernels.digest_of(key).ok_or_else(|| anyhow::anyhow!("shape {:#x} region {region:?}: no kernel of the set ({}) takes the row: a miss, not a decline", row.shape_hash(), run.level))?;
     // The walk recurses deeply (as the kernel build does).
     std::thread::scope(|sc| {
         std::thread::Builder::new()
@@ -53,7 +53,7 @@ pub fn explain_row<N: KernelLanes>(run: &Run, row: &Rt2<N>) -> Result<String> {
 /// `explain_row`'s rebuild and evaluation (a big-stack thread).
 fn rebuilt_explains<N: KernelLanes>(run: &Run, row: &Rt2<N>, key: (u64, Option<crate::trace::walk::Region>), digest: u64) -> Result<String> {
     let refs = crate::trace::lower::lattice_kernel_refs::<N>(run).context("retracing the start room for the explanation")?;
-    let si = refs.iter().position(|(region, r)| (r.frame.in_rt2.shape_hash_of(), *region) == key).ok_or_else(|| anyhow::anyhow!("the walk traced no frame of shape {:#x} region {:?}", key.0, key.1))?;
+    let si = refs.iter().position(|(region, r)| (r.frame.in_rt2.shape_hash(), *region) == key).ok_or_else(|| anyhow::anyhow!("the walk traced no frame of shape {:#x} region {:?}", key.0, key.1))?;
     let r = &refs[si].1;
     let (fused, bodies) = (&r.lowered.fused, &r.lowered.bodies);
     let (flat_roots, _) = crate::compiled::asm_kernel::root_slots(bodies);

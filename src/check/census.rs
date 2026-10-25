@@ -92,7 +92,7 @@ fn rebuild(run: &Run) -> Result<Vec<KernelCensus>> {
     let refs = crate::trace::lower::lattice_kernel_refs::<Fixed>(run).context("retracing the start room for the census")?;
     crate::par::Pool::per_core().stack(128 << 20).map(refs.len(), |si| {
         let (region, r) = &refs[si];
-        let shape = r.frame.in_rt2.shape_hash_of();
+        let shape = r.frame.in_rt2.shape_hash();
         let (fused, bodies) = (&r.lowered.fused, &r.lowered.bodies);
         let (flat_roots, slot_of) = crate::compiled::asm_kernel::root_slots(bodies);
         let sym = crate::compiled::asm_kernel::kernel_sym(shape, si);

@@ -32,7 +32,7 @@ use super::asm_kernel::Recipe;
 use super::KernelLanes;
 
 /// The entries' format: a change of `Recipe` or of this layout bumps it.
-pub(crate) const KERNEL_CACHE_FORMAT: u32 = 3;
+pub(crate) const KERNEL_CACHE_FORMAT: u32 = 4;
 
 /// The entries' total size past which the least recently used go.
 const CAP_BYTES: u64 = 4 << 30;

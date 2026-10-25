@@ -414,13 +414,13 @@ fn widen_check<N: Rem + KernelLanes>(t: &TreeDir, frame: u32, emitted: usize) ->
         b.canonical();
         let (ea, eb) = (celeste_engine::exact::exact_rows(&a), celeste_engine::exact::exact_rows(&b));
         for l in 0..rt2.width {
-            if a.shape_hash == b.shape_hash && ea[l] == eb[l] {
+            if a.shape_hash() == b.shape_hash() && ea[l] == eb[l] {
                 continue;
             }
             moved += 1;
             if shown + moved <= 8 {
                 let (pa, pb) = (project_all(&a).swap_remove(l), project_all(&b).swap_remove(l));
-                println!("[check widen] {what} row {l} of shape {:#x} MOVED: {}", a.shape_hash, differential::field_diff(&pa, &pb).join(", "));
+                println!("[check widen] {what} row {l} of shape {:#x} MOVED: {}", a.shape_hash(), differential::field_diff(&pa, &pb).join(", "));
             }
         }
         moved

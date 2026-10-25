@@ -309,18 +309,18 @@ impl ArcSlots {
     /// about the remainder; so is a refused transfer.
     fn decode<N: KernelLanes>(&self, words: &RawWords<N>, chunk: &Rt2<N>, lane: usize, outcome: usize) -> crate::search::rem::Pair<N> {
         let one = N::Raw::from(1u32);
-        let num = |r: N::Raw| N::from_raw(r).unwrap_or_else(|| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: a transfer root {r:?} is no number", chunk.shape_hash));
+        let num = |r: N::Raw| N::from_raw(r).unwrap_or_else(|| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: a transfer root {r:?} is no number", chunk.shape_hash()));
         let axis = |a: usize| -> Capture<N> {
             let base = a * AxisRoots::N;
             let pair = |k: usize| (num(words[2 * (base + k)]), num(words[2 * (base + k) + 1]));
             assert!(
                 self.roots[base].1 == Ty::Bool && words[2 * base + 1] == one,
                 "arc edges: shape {:#x} outcome {outcome} lane {lane}: axis {a}'s `took` is not a decided boolean",
-                chunk.shape_hash
+                chunk.shape_hash()
             );
             Capture { took: words[2 * base] == one, pre: pair(1), frag: pair(2), ox: pair(3), fin: self.fin.then(|| pair(AxisRoots::FIN)) }
         };
-        crate::search::rem::decode(&axis(0), &axis(1)).unwrap_or_else(|e| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: {e}", chunk.shape_hash))
+        crate::search::rem::decode(&axis(0), &axis(1)).unwrap_or_else(|e| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: {e}", chunk.shape_hash()))
     }
 }
 

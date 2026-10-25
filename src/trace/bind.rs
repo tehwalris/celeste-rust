@@ -9,7 +9,8 @@
 use anyhow::{anyhow, bail, Result};
 
 use celeste_core::arith::Arithmetic;
-use celeste_engine::runtime2::{Cell2, Rt2};
+use celeste_engine::runtime2::Rt2;
+use celeste_engine::shape::Cell;
 
 use crate::transpile::garith::GraphArith;
 use celeste_engine::slots;
@@ -71,8 +72,8 @@ pub fn resolve_all<N: Arithmetic>(rt2: &Rt2<N>, paths: &[Path]) -> Result<Vec<u3
     for (i, c) in cells.iter().enumerate() {
         // A slot holds a VALUE; writing to an object cell would overwrite
         // the pointer topology.
-        if !matches!(rt2.structure[*c as usize], Cell2::Val) {
-            bail!("{} resolves to a {}, not a value cell", show(&paths[i]), rt2.structure[*c as usize].kind_name());
+        if !matches!(rt2.cells()[*c as usize], Cell::Val) {
+            bail!("{} resolves to a {}, not a value cell", show(&paths[i]), rt2.cells()[*c as usize].kind_name());
         }
         if let Some(j) = seen.insert(*c, i) {
             bail!(
@@ -100,17 +101,15 @@ mod tests {
         let w: serde_json::Value = serde_json::from_str(&text).expect("json");
         let cells = w["cells"].as_array().expect("cells");
         let room = celeste_core::room::Room::of(crate::settings::Settings::default().room);
-        let mut rt2 = Rt2::empty(1, gen::GLOBAL_NAMES.len(), gen::STRINGS, room);
-        rt2.structure = Vec::with_capacity(cells.len());
-        rt2.cols = Vec::with_capacity(cells.len());
+        let (mut structure, mut cols) = (Vec::with_capacity(cells.len()), Vec::with_capacity(cells.len()));
         for c in cells {
             let (cell, col) = match c["k"].as_str().unwrap_or("") {
                 "val" => match c["content"]["ptr"].as_u64() {
-                    Some(t) => (Cell2::Val, Col::U(AV::Ptr(t as u32))),
-                    None => (Cell2::Val, Col::U(AV::Nil)),
+                    Some(t) => (Cell::Val, Col::U(AV::Ptr(t as u32))),
+                    None => (Cell::Val, Col::U(AV::Nil)),
                 },
                 "obj" => (
-                    Cell2::Obj(
+                    Cell::Obj(
                         c["fields"]
                             .as_object()
                             .expect("fields")
@@ -123,7 +122,7 @@ mod tests {
                     Col::U(AV::Nil),
                 ),
                 "arr" => (
-                    Cell2::Arr(
+                    Cell::Arr(
                         c["items"]
                             .as_array()
                             .expect("items")
@@ -133,18 +132,15 @@ mod tests {
                     ),
                     Col::U(AV::Nil),
                 ),
-                "clo" => (Cell2::Clo(0, Box::new([])), Col::U(AV::Nil)),
-                "bi" => (Cell2::Bi(0), Col::U(AV::Nil)),
-                _ => (Cell2::Unk, Col::U(AV::Nil)),
+                "clo" => (Cell::Clo { f: 0, caps: Box::new([]) }, Col::U(AV::Nil)),
+                "bi" => (Cell::Bi(0), Col::U(AV::Nil)),
+                _ => (Cell::Unk, Col::U(AV::Nil)),
             };
-            rt2.structure.push(cell);
-            rt2.cols.push(col);
+            structure.push(cell);
+            cols.push(col);
         }
-        rt2.globals = gen::GLOBAL_NAMES
-            .iter()
-            .map(|n| w["globals"][*n].as_u64().map(|v| v as u32).unwrap_or(NONE))
-            .collect();
-        rt2
+        let globals = gen::GLOBAL_NAMES.iter().map(|n| w["globals"][*n].as_u64().map(|v| v as u32).unwrap_or(NONE)).collect();
+        Rt2::new(1, celeste_engine::shape::Shape::intern(structure, globals), cols, celeste_engine::runtime2::static_strings(), room)
     }
 
     /// The witness records, for every cell, the path the boundary's walk
@@ -223,10 +219,10 @@ mod tests {
             let c = resolve(&rt2, &p)
                 .unwrap_or_else(|e| panic!("{} did not resolve: {:#}", show(&p), e));
             assert!(
-                matches!(rt2.structure[c as usize], Cell2::Val),
+                matches!(rt2.cells()[c as usize], Cell::Val),
                 "{} resolved to a {}",
                 show(&p),
-                rt2.structure[c as usize].kind_name()
+                rt2.cells()[c as usize].kind_name()
             );
             if let Some(other) = seen.insert(c, p.clone()) {
                 panic!("{} and {} are the same cell {}", show(&other), show(&p), c);

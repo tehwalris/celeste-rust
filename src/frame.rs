@@ -123,7 +123,7 @@ pub fn wins_of<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Re
 /// over-approximates; the concrete search runs it exact).
 pub(crate) fn died<N: Arithmetic>(rt2: &Rt2<N>) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{NONE, AV};
-    let c = rt2.globals[celeste_names::global("will_restart") as usize];
+    let c = rt2.shape.globals()[celeste_names::global("will_restart") as usize];
     anyhow::ensure!(c != NONE, "wins: no `will_restart` global");
     Ok((0..rt2.width).map(|l| rt2.cols[c as usize].at(l) == AV::Bool(true)).collect())
 }
@@ -137,7 +137,7 @@ fn reaches_win<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Re
     }
     let (ids, lanes) = (crate::compiled::ids(), rt2.width);
     let has_orb: Vec<bool> = {
-        let c = rt2.globals[ids.g_max_djump as usize];
+        let c = rt2.shape.globals()[ids.g_max_djump as usize];
         anyhow::ensure!(c != celeste_engine::runtime2::NONE, "wins: no `max_djump` global");
         let two = N::from_i16(2);
         (0..lanes).map(|l| rt2.cols[c as usize].at(l) == AV::Num(two)).collect()
@@ -149,12 +149,13 @@ fn reaches_win<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Re
 /// level_index()]`, nil-padded)? An unknown (a coarse level) counts as
 /// taken: a win there over-approximates, and the exact level decides.
 pub(crate) fn got_fruit<N: Arithmetic>(rt2: &Rt2<N>, (x, y): (i16, i16)) -> Result<Vec<bool>> {
-    use celeste_engine::runtime2::{Cell2, Col, AV};
+    use celeste_engine::runtime2::{Col, AV};
+    use celeste_engine::shape::Cell;
     let lanes = rt2.width;
     let g = celeste_names::global("got_fruit");
     let i = crate::game_runner::level_index(x, y) as usize;
     let Some(arr) = rt2.global_target(g) else { return Ok(vec![false; lanes]) };
-    let Cell2::Arr(items) = &rt2.structure[arr as usize] else { return Ok(vec![false; lanes]) };
+    let Cell::Arr(items) = &rt2.cells()[arr as usize] else { return Ok(vec![false; lanes]) };
     let Some(&c) = items.get(i) else { return Ok(vec![false; lanes]) };
     Ok((0..lanes)
         .map(|l| match &rt2.cols[c as usize] {
@@ -486,7 +487,7 @@ pub(crate) fn widened_keys<N: Arithmetic>(
         keys.len() == rt2.width && cells.len() == rt2.width,
         "the widening changed the lane count"
     );
-    Ok((w.shape_hash, keys, cells))
+    Ok((w.shape_hash(), keys, cells))
 }
 
 /// The interface between the loop and the engines (kernels or reference):
@@ -968,7 +969,7 @@ pub(crate) fn restore_visited<N: Rem>(dir: &std::path::Path, last: u32, room: (i
     let mut batch: Vec<FrameIn<N>> = Vec::new();
     for f in 0..=last {
         for r in tree.file(f).filter(|_| f > 0).iter().flat_map(|x| x.header.skeletons.iter().chain(&x.header.emitted)) {
-            skeletons.register(&r.rt2(celeste_core::room::Room::of(room)))?;
+            skeletons.register(&r.rt2(celeste_core::room::Room::of(room))?)?;
         }
         // Past a frontier that died: no frame.
         let Some(file) = tree.file(f) else { continue };
@@ -1637,7 +1638,7 @@ mod tests {
             let x = r.obj_field_cell(platforms[1], celeste_names::field("x")).expect("the second platform's x");
             let deps = celeste_engine::widening::key_deps(r);
             assert!(deps.len() == 2 && deps[1].followers.contains(&x), "the second platform's x follows the first one's rem.x: {deps:?}");
-            for code in adds.codes.iter_mut().filter(|c| c.0 == r.shape_hash && c.1 == x) {
+            for code in adds.codes.iter_mut().filter(|c| c.0 == r.shape_hash() && c.1 == x) {
                 code.3 = celeste_engine::exact::Code::of(AV::Num(P8::from_i16(1000)));
                 corrupted += 1;
             }
@@ -1709,7 +1710,7 @@ mod tests {
             AV::Num(n) => n,
             other => panic!("not a number: {other:?}"),
         };
-        let global = |b: &Rt2, name: &str| num(b, b.globals[celeste_names::global(name) as usize]);
+        let global = |b: &Rt2, name: &str| num(b, b.shape.globals()[celeste_names::global(name) as usize]);
         let chest_state = |b: &Rt2| b.objects_of_type(ids.g_big_chest).first().map(|&o| num(b, b.obj_field_cell(o, ids.f_state).expect("a state")));
         let orb_still = |b: &Rt2| {
             b.objects_of_type(celeste_names::global("orb")).iter().any(|&o| {

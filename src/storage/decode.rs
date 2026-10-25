@@ -20,7 +20,8 @@ use celeste_core::pico8_num::Pico8Num as P8;
 
 use celeste_engine::exact::{Code, FieldDict, Key, KeySpace};
 use celeste_engine::shape::KeyRole;
-use celeste_engine::runtime2::{Cell2, Col, Rt2, AV};
+use celeste_engine::runtime2::{Col, Rt2, AV};
+use celeste_engine::shape::Cell;
 
 use crate::storage::cells::{cell_xy, room_offset, NO_CELL};
 
@@ -28,11 +29,11 @@ use crate::storage::cells::{cell_xy, room_offset, NO_CELL};
 /// unread). A run of one key's rows differs only in position: codes are
 /// looked up once a run, a column stays uniform until a run differs.
 pub(crate) fn decode_rows<N: Arithmetic>(keys: &KeySpace<N>, skel: &Rt2<N>, rows: &[(Key, u32)]) -> Result<Rt2<N>> {
-    let s = keys.shape(skel.shape_hash).ok_or_else(|| anyhow!("decode: shape {:016x} is not in the key space", skel.shape_hash))?;
+    let s = keys.shape(skel.shape_hash()).ok_or_else(|| anyhow!("decode: shape {:016x} is not in the key space", skel.shape_hash()))?;
     let n = rows.len();
     ensure!(n > 0, "decode: no rows");
     let layout = s.layout();
-    ensure!(layout.cells() == skel.structure.len(), "decode: shape {:016x}: a skeleton of {} cells, a layout of {}", skel.shape_hash, skel.structure.len(), layout.cells());
+    ensure!(layout.cells() == skel.cells().len(), "decode: shape {:016x}: a skeleton of {} cells, a layout of {}", skel.shape_hash(), skel.cells().len(), layout.cells());
     let mut runs: Vec<(Key, usize, usize)> = Vec::new();
     for (i, r) in rows.iter().enumerate() {
         match runs.last_mut() {
@@ -40,24 +41,16 @@ pub(crate) fn decode_rows<N: Arithmetic>(keys: &KeySpace<N>, skel: &Rt2<N>, rows
             _ => runs.push((r.0, i, i + 1)),
         }
     }
-    let shape = skel.shape_hash;
+    let shape = skel.shape_hash();
     let code_in = |f: &FieldDict<N>, c: usize, k: Key| -> Result<Code<N>> {
         let i = f.index_in(k);
         ensure!((i as usize) < f.len(), "decode: shape {shape:016x} cell {c}: index {i} past the dictionary's {}", f.len());
         Ok(f.code(i))
     };
-    let mut out = Rt2 {
-        width: n,
-        structure: skel.structure.clone(),
-        cols: Vec::with_capacity(skel.cols.len()),
-        globals: skel.globals.clone(),
-        strings: skel.strings.clone(),
-        room: skel.room,
-        shape_hash: skel.shape_hash,
-        row_keys: rows.iter().map(|r| r.0).collect(),
-    };
+    let mut out = Rt2::new(n, skel.shape.clone(), Vec::with_capacity(skel.cols.len()), skel.strings.clone(), skel.room);
+    out.row_keys = rows.iter().map(|r| r.0).collect();
     // Every value cell but the position's, from the key, by its role.
-    for c in 0..skel.structure.len() {
+    for c in 0..skel.cells().len() {
         let f = match layout.role(c as u32) {
             KeyRole::Structure => {
                 out.cols.push(skel.cols[c].clone());
@@ -277,12 +270,12 @@ impl<N: Arithmetic> Skeletons<N> {
     /// Register `skel` for its shape (checked against the shape's).
     pub(crate) fn register(&self, skel: &Rt2<N>) -> Result<()> {
         let rec = super::layer::SkelRecord::of(skel)?;
-        if let Some(a) = self.0.read().expect("skeletons").get(&skel.shape_hash) {
-            ensure!(a.0 == rec, "ROWS FROM KEYS: two skeletons of shape {:016x} (another structure, non-value cell or column kind): its rows would decode as the first's", skel.shape_hash);
+        if let Some(a) = self.0.read().expect("skeletons").get(&skel.shape_hash()) {
+            ensure!(a.0 == rec, "ROWS FROM KEYS: two skeletons of shape {:016x} (another structure, non-value cell or column kind): its rows would decode as the first's", skel.shape_hash());
             return Ok(());
         }
-        let rt2 = std::sync::Arc::new(rec.rt2(skel.room));
-        self.0.write().expect("skeletons").entry(skel.shape_hash).or_insert((rec, rt2));
+        let rt2 = std::sync::Arc::new(rec.rt2(skel.room)?);
+        self.0.write().expect("skeletons").entry(skel.shape_hash()).or_insert((rec, rt2));
         Ok(())
     }
 
@@ -304,11 +297,11 @@ impl<N: Arithmetic> Skeletons<N> {
     /// THE GUARD: `rows` (keys, `cells`) decode to exactly themselves, row
     /// by row, representation included (`Col::at`: `Num` vs `Ival`).
     pub(crate) fn check_decodes(&self, keys: &KeySpace<N>, rows: &Rt2<N>, cells: &[u32]) -> Result<()> {
-        let skel = self.get(rows.shape_hash)?;
+        let skel = self.get(rows.shape_hash())?;
         let keyed: Vec<(Key, u32)> = rows.row_keys.iter().copied().zip(cells.iter().copied()).collect();
         let d = decode_rows(keys, &skel, &keyed)?;
-        let lossy = |what: String| anyhow!("ROWS FROM KEYS: an emitted row of shape {:016x} is not what its key and cell decode to ({what}): the new layer would hold another state", rows.shape_hash);
-        if d.structure != rows.structure || d.globals != rows.globals || d.strings != rows.strings {
+        let lossy = |what: String| anyhow!("ROWS FROM KEYS: an emitted row of shape {:016x} is not what its key and cell decode to ({what}): the new layer would hold another state", rows.shape_hash());
+        if d.shape != rows.shape || d.strings != rows.strings {
             return Err(lossy("structure, globals or strings".into()));
         }
         for (c, (a, b)) in rows.cols.iter().zip(&d.cols).enumerate() {
@@ -327,8 +320,7 @@ impl<N: Arithmetic> Skeletons<N> {
 /// A reference row's skeleton: every value cell left to the decode (`Other`).
 pub(crate) fn reference_skeleton<N: Arithmetic>(row: &Rt2<N>) -> Rt2<N> {
     let mut b = celeste_engine::slots::reshape(row, 0);
-    b.cols = row.structure.iter().zip(&row.cols).map(|(cell, c)| if matches!(cell, Cell2::Val) { Col::V(Vec::new()) } else { Col::U(c.at(0)) }).collect();
-    b.shape_hash = row.shape_hash;
+    b.cols = row.cells().iter().zip(&row.cols).map(|(cell, c)| if *cell == Cell::Val { Col::V(Vec::new()) } else { Col::U(c.at(0)) }).collect();
     b
 }
 
@@ -338,7 +330,7 @@ pub(crate) fn reference_skeleton<N: Arithmetic>(row: &Rt2<N>) -> Rt2<N> {
 pub(crate) fn check_piece<N: Arithmetic>(keys: &KeySpace<N>, rt2: &Rt2<N>, cells: &[u32]) -> Result<()> {
     const CHUNK: usize = 1 << 15;
     ensure!(rt2.row_keys.len() == rt2.width && cells.len() == rt2.width, "check_piece: a block without its keys or cells");
-    let lossy = |what: String| anyhow!("ROWS FROM KEYS: a piece of shape {:016x} does not decode from its keys and cells ({what}); its rows would be stored lossy", rt2.shape_hash);
+    let lossy = |what: String| anyhow!("ROWS FROM KEYS: a piece of shape {:016x} does not decode from its keys and cells ({what}); its rows would be stored lossy", rt2.shape_hash());
     for (c, col) in rt2.cols.iter().enumerate() {
         let one = match col {
             Col::U(_) => false,

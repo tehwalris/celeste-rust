@@ -1,9 +1,12 @@
 //! A SHAPE: the canonical structure a block's shape hash names, and what a
 //! key is made of. One home each:
 //!
+//!   * `Shape`   - the structure, its `Cell`s and globals, interned: every
+//!                 block of a shape shares one (`Rt2::shape`); a second
+//!                 structure under a hash is FATAL
 //!   * `sig`     - the signature's codec: the words a shape hash hashes and a
 //!                 key space records, their one reader, and the process's
-//!                 one registry of them (two shapes under a hash: FATAL)
+//!                 one registry of them (two signatures under a hash: FATAL)
 //!   * `Anchors` - the cells a row's cell is computed from: the POSITION
 //!                 object's `x`/`y`, the `room`'s, the first player's
 //!   * `Layout`  - a shape's key as a key space lays it out: per cell its
@@ -13,11 +16,12 @@
 use std::sync::Arc;
 
 use celeste_core::arith::Arithmetic;
+use serde::{Deserialize, Serialize};
 
 use crate::exact::{Code, Deps, ShapeRecord};
 use crate::runtime2::{names, Rt2, AV};
 
-/// A cell's kind, as the signature names it (`Cell2::kind`).
+/// A cell's kind, as the signature names it (`Cell::kind`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Val,
@@ -39,10 +43,8 @@ pub enum Kind {
 pub mod sig {
     use std::sync::{Arc, RwLock};
 
-    use celeste_core::arith::Arithmetic;
-
-    use super::Kind;
-    use crate::runtime2::{Cell2, Rt2, NONE};
+    use super::{Cell, Kind};
+    use crate::runtime2::NONE;
 
     pub const VAL: u32 = 1;
     pub const OBJ: u32 = 2;
@@ -83,12 +85,12 @@ pub mod sig {
     }
 
     /// The signature of `cells` and `globals`, word by word.
-    pub fn write<N>(cells: &[Cell2<N>], globals: &[u32], mut w: impl FnMut(u32)) {
+    pub fn write(cells: &[Cell], globals: &[u32], mut w: impl FnMut(u32)) {
         let c = name_codes();
         for cell in cells {
             match cell {
-                Cell2::Val => w(VAL),
-                Cell2::Obj(fields) => {
+                Cell::Val => w(VAL),
+                Cell::Obj(fields) => {
                     w(OBJ);
                     w(fields.len() as u32);
                     for (k, t) in fields {
@@ -96,18 +98,18 @@ pub mod sig {
                         w(*t);
                     }
                 }
-                Cell2::Arr(items) => {
+                Cell::Arr(items) => {
                     w(ARR);
                     w(items.len() as u32);
                     items.iter().for_each(|t| w(*t));
                 }
-                Cell2::Unk => w(UNK),
-                Cell2::Clo(f, caps) => {
+                Cell::Unk => w(UNK),
+                Cell::Clo { f, caps } => {
                     w(CLO);
                     w(c.fns[*f as usize]);
                     w(caps.len() as u32);
                 }
-                Cell2::Bi(b) => {
+                Cell::Bi(b) => {
                     w(BI);
                     w(c.builtins[*b as usize]);
                 }
@@ -122,22 +124,19 @@ pub mod sig {
         }
     }
 
-    /// Block `b`'s signature.
-    pub fn of<N: Arithmetic>(b: &Rt2<N>) -> Vec<u32> {
-        let mut s = Vec::with_capacity(b.structure.len() * 2 + 16);
-        write(&b.structure, &b.globals, |x| s.push(x));
+    /// The signature of `cells` and `globals`.
+    pub fn of(cells: &[Cell], globals: &[u32]) -> Vec<u32> {
+        let mut s = Vec::with_capacity(cells.len() * 2 + 16);
+        write(cells, globals, |x| s.push(x));
         s
     }
 
-    /// Is `sig` block `b`'s signature (compared as written: nothing
-    /// allocated)?
-    pub fn is_of<N: Arithmetic>(sig: &[u32], b: &Rt2<N>) -> bool {
-        let (mut i, mut same) = (0, true);
-        write(&b.structure, &b.globals, |x| {
-            same &= sig.get(i) == Some(&x);
-            i += 1;
-        });
-        same && i == sig.len()
+    /// The shape hash of `cells` and `globals`: their signature, hashed.
+    pub fn hash(cells: &[Cell], globals: &[u32]) -> u64 {
+        use std::hash::Hasher;
+        let mut h = rustc_hash::FxHasher::default();
+        write(cells, globals, |x| h.write_u32(x));
+        h.finish()
     }
 
     /// The cells' kinds of a signature: its ONE reader. A signature that is
@@ -217,11 +216,127 @@ pub mod sig {
     pub fn intern(hash: u64, words: Vec<u32>) -> Arc<[u32]> {
         intern_by(hash, |s| *s == words[..], || words.clone())
     }
+}
 
-    /// Block `b`'s signature, under its shape hash (`intern_by`; a known
-    /// one compared as written).
-    pub fn intern_of<N: Arithmetic>(b: &Rt2<N>) -> Arc<[u32]> {
-        intern_by(b.shape_hash, |s| is_of(s, b), || of(b))
+/// One cell of a shape. A value (`Val`) holds its block's column at the
+/// cell's index (`Rt2::cols`); the others are the shape's: an object's
+/// fields `(name, cell)`, an array's items, a closure's function and its
+/// captures' targets (each the table holding it: `trace::block`), a
+/// builtin's name.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Cell {
+    Val,
+    Obj(Box<[(u32, u32)]>),
+    Arr(Box<[u32]>),
+    Unk,
+    Clo { f: u32, caps: Box<[u32]> },
+    Bi(u32),
+}
+
+impl Cell {
+    /// The cell's kind, as its shape's signature names it.
+    pub fn kind(&self) -> Kind {
+        match self {
+            Cell::Val => Kind::Val,
+            Cell::Obj(_) => Kind::Obj,
+            Cell::Arr(_) => Kind::Arr,
+            Cell::Unk => Kind::Unk,
+            Cell::Clo { .. } => Kind::Clo,
+            Cell::Bi(_) => Kind::Bi,
+        }
+    }
+
+    /// What the cell is, for messages.
+    pub fn kind_name(&self) -> &'static str {
+        match self.kind() {
+            Kind::Val => "value",
+            Kind::Obj => "object",
+            Kind::Arr => "array",
+            Kind::Unk => "unknown table",
+            Kind::Clo => "closure",
+            Kind::Bi => "builtin",
+        }
+    }
+}
+
+/// A SHAPE: a block's structure - its cells and the cells its globals are
+/// at (`NONE`: absent) - its signature (`sig`) and its hash, the shape's
+/// name. Interned: every block of a shape shares the one `Arc<Shape>`, and
+/// a second structure under a hash is FATAL (`Shape::intern`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Shape {
+    hash: u64,
+    sig: Arc<[u32]>,
+    cells: Box<[Cell]>,
+    globals: Box<[u32]>,
+}
+
+/// The process's shapes by hash.
+type Shapes = std::sync::RwLock<rustc_hash::FxHashMap<u64, Arc<Shape>>>;
+
+fn shapes() -> &'static Shapes {
+    static S: std::sync::OnceLock<Shapes> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+thread_local! {
+    /// The last shape this thread interned (a worker meets one shape many
+    /// times running).
+    static LAST_SHAPE: std::cell::RefCell<Option<Arc<Shape>>> = const { std::cell::RefCell::new(None) };
+}
+
+impl Shape {
+    /// THE shape of `cells` and `globals`: the registered one if they are
+    /// its structure, else them registered (their signature interned:
+    /// `sig::intern`). Another structure under a registered hash - another
+    /// signature, or capture targets the signature does not name - is FATAL.
+    pub fn intern(cells: Vec<Cell>, globals: Vec<u32>) -> Arc<Shape> {
+        let hash = sig::hash(&cells, &globals);
+        let collision = || -> ! { panic!("shape: two structures under the hash {hash:#x} (a shape-hash collision, or capture targets its signature does not name)") };
+        let last = LAST_SHAPE.with(|l| l.borrow().as_ref().filter(|s| s.hash == hash).cloned());
+        let known = last.or_else(|| shapes().read().expect("the shapes").get(&hash).cloned());
+        let s = match known {
+            Some(s) => {
+                if s.cells[..] != cells[..] || s.globals[..] != globals[..] {
+                    collision();
+                }
+                s
+            }
+            None => {
+                let sig = sig::intern(hash, sig::of(&cells, &globals));
+                let new = Arc::new(Shape { hash, sig, cells: cells.into_boxed_slice(), globals: globals.into_boxed_slice() });
+                let s = shapes().write().expect("the shapes").entry(hash).or_insert_with(|| new.clone()).clone();
+                if !Arc::ptr_eq(&s, &new) && *s != *new {
+                    collision();
+                }
+                s
+            }
+        };
+        LAST_SHAPE.with(|l| *l.borrow_mut() = Some(s.clone()));
+        s
+    }
+
+    /// The shape's name: its signature's hash.
+    #[inline]
+    pub fn hash(&self) -> u64 {
+        self.hash
+    }
+
+    #[inline]
+    pub fn sig(&self) -> &Arc<[u32]> {
+        &self.sig
+    }
+
+    #[inline]
+    pub fn cells(&self) -> &[Cell] {
+        &self.cells
+    }
+
+    /// Per global (`celeste_names::GLOBAL_NAMES`), the cell it is at
+    /// (`NONE`: absent).
+    #[inline]
+    pub fn globals(&self) -> &[u32] {
+        &self.globals
     }
 }
 
@@ -336,7 +451,7 @@ impl Layout {
 
     /// `of`, with the dependencies `deps` (none: every value keyed).
     pub fn of_deps<N: Arithmetic>(b: &Rt2<N>, deps: Vec<Deps>) -> Layout {
-        Layout::new(b.shape_hash, sig::intern_of(b), Anchors::of(b).pos(), deps).unwrap_or_else(|e| panic!("{e}"))
+        Layout::new(b.shape.hash(), b.shape.sig().clone(), Anchors::of(b).pos(), deps).unwrap_or_else(|e| panic!("{e}"))
     }
 
     /// A key space's record of a shape, as its layout.
@@ -442,33 +557,33 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::sig::{self, kinds};
-    use super::{Kind, KeyRole, Layout};
+    use super::{Cell, KeyRole, Kind, Layout, Shape};
     use crate::exact::{Deps, ShapeRecord};
-    use crate::runtime2::{Cell2, Col, Rt2, AV, P8};
+    use crate::runtime2::{AV, NONE, P8};
 
-    /// Every kind, as `sig::write` writes it, reads back as its cell's.
+    /// Every kind, as `sig::write` writes it, reads back as its cell's; a
+    /// shape's signature and hash are its cells' and globals'.
     #[test]
     fn the_signature_reads_back_its_cells_kinds() {
-        let room = celeste_core::room::Room::of((1, 0));
-        let mut b = Rt2::<P8>::empty(1, celeste_names::GLOBAL_NAMES.len(), celeste_names::STRINGS, room);
         let x = celeste_names::field("x");
-        b.structure = vec![
-            Cell2::Val,
-            Cell2::Obj(vec![(x, 2)]),
-            Cell2::Val,
-            Cell2::Arr(vec![0, 2]),
-            Cell2::Arr(vec![]),
-            Cell2::Unk,
-            Cell2::Clo(0, vec![Col::U(AV::Ptr(1))].into_boxed_slice()),
-            Cell2::Clo(1, Box::new([])),
-            Cell2::Bi(0),
-        ];
-        b.cols = vec![Col::U(AV::Nil); b.structure.len()];
-        b.globals[celeste_names::global("objects") as usize] = 3;
-        let words = sig::of(&b);
-        assert!(sig::is_of(&words, &b) && !sig::is_of(&words[1..], &b) && !sig::is_of(&[&words[..], &[0]].concat(), &b));
-        let want: Vec<Kind> = b.structure.iter().map(Cell2::kind).collect();
-        assert_eq!(kinds(&words), Ok(want));
+        let cells = vec![Cell::Val, Cell::Obj(Box::new([(x, 2)])), Cell::Val, Cell::Arr(Box::new([0, 2])), Cell::Arr(Box::new([])), Cell::Unk, Cell::Clo { f: 0, caps: Box::new([1]) }, Cell::Clo { f: 1, caps: Box::new([]) }, Cell::Bi(0)];
+        let mut globals = vec![NONE; celeste_names::GLOBAL_NAMES.len()];
+        globals[celeste_names::global("objects") as usize] = 3;
+        let shape = Shape::intern(cells.clone(), globals.clone());
+        assert_eq!((shape.hash(), &shape.sig()[..]), (sig::hash(&cells, &globals), &sig::of(&cells, &globals)[..]));
+        let want: Vec<Kind> = cells.iter().map(Cell::kind).collect();
+        assert_eq!(kinds(shape.sig()), Ok(want));
+        assert!(std::sync::Arc::ptr_eq(&shape, &Shape::intern(cells, globals)), "one shape, interned");
+    }
+
+    /// A second structure under an interned hash is FATAL, a capture target
+    /// the signature does not name included.
+    #[test]
+    #[should_panic(expected = "two structures under the hash")]
+    fn a_second_structure_under_a_shapes_hash_is_fatal() {
+        let globals = vec![NONE; celeste_names::GLOBAL_NAMES.len()];
+        Shape::intern(vec![Cell::Unk, Cell::Clo { f: 0, caps: Box::new([0]) }], globals.clone());
+        Shape::intern(vec![Cell::Unk, Cell::Clo { f: 0, caps: Box::new([1]) }], globals);
     }
 
     /// What is not a signature is refused, never misread.

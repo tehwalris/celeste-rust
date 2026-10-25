@@ -337,7 +337,7 @@ impl<N: KernelLanes> AsmKernel<N> {
         }
         eprintln!(
             "[kernel] shape {:#x} body of outcome {} declined lanes {:#06x} (live {:#06x} error {:#06x}):\n{rows}",
-            chunk.shape_hash, body.outcome, declined, live, error
+            chunk.shape_hash(), body.outcome, declined, live, error
         );
         let first = sink.state_of(lanes[declined.trailing_zeros() as usize]);
         eprintln!("[kernel] why its error holds: rewrite explain --tree TREE --step {} --state {} (TREE: this run's tree)", sink.frame() - 1, first.show());
@@ -352,7 +352,7 @@ impl<N: KernelLanes> AsmKernel<N> {
             .map(|(&cell, ty)| {
                 InputView::of(&chunk.cols[cell as usize], *ty).unwrap_or_else(|e| {
                     let name = crate::search::inspect::cell_names(chunk, crate::compiled::ids()).remove(&(cell as usize)).unwrap_or_else(|| "unnamed".to_string());
-                    panic!("{e}: input cell {cell} ({name}) of shape {:#x}", chunk.shape_hash)
+                    panic!("{e}: input cell {cell} ({name}) of shape {:#x}", chunk.shape_hash())
                 })
             })
             .collect()
@@ -745,7 +745,7 @@ impl<N: KernelLanes> Registry<N> {
         let mut idx: Vec<usize> = Vec::with_capacity(16);
         for run in by_region.chunk_by(|a, b| a.0 == b.0) {
             let key = run[0].0;
-            let Some(k) = self.kernels.get(&(chunk.shape_hash, key)) else {
+            let Some(k) = self.kernels.get(&(chunk.shape_hash(), key)) else {
                 return self.run_key(chunk, key, &[run[0].1], sink);
             };
             for part in run.chunks(16) {
@@ -760,17 +760,17 @@ impl<N: KernelLanes> Registry<N> {
     }
 
     fn run_key(&self, chunk: &Rt2<N>, key: Option<Region>, lanes: &[usize], sink: &mut crate::storage::unit::UnitSink<N>) -> bool {
-        match self.kernels.get(&(chunk.shape_hash, key)) {
+        match self.kernels.get(&(chunk.shape_hash(), key)) {
             Some(k) => k.run(chunk, lanes, sink),
             None => {
                 // A coverage gap, printed once per (shape, key).
                 static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(u64, Option<Region>)>>> =
                     std::sync::OnceLock::new();
                 let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-                if seen.lock().unwrap().insert((chunk.shape_hash, key)) {
+                if seen.lock().unwrap().insert((chunk.shape_hash(), key)) {
                     eprintln!(
                         "[asm] MISS: no kernel for shape {:#018x} key {key:?} ({} lanes); registry has {} kernels over shapes {:?}",
-                        chunk.shape_hash,
+                        chunk.shape_hash(),
                         lanes.len(),
                         self.kernels.len(),
                         self.kernels.keys().map(|k| format!("{:#018x}", k.0)).collect::<std::collections::BTreeSet<_>>(),
@@ -818,7 +818,7 @@ impl<N: KernelLanes> Registry<N> {
         let n_workers = pool.workers(refs.len());
         let built = pool.map(refs.len(), |si| {
             let (region, r) = &refs[si];
-            let (recipe, loaded) = build_one_shape::<N>(r, (r.frame.in_rt2.shape_hash_of(), *region), si)?;
+            let (recipe, loaded) = build_one_shape::<N>(r, (r.frame.in_rt2.shape_hash(), *region), si)?;
             let stored = store.is_some().then(|| Ok::<_, anyhow::Error>((recipe.clone(), loaded.bytes()?))).transpose()?;
             let key = (recipe.shape, recipe.region);
             Ok((key, AsmKernel::of(recipe, loaded, room, counting)?, stored))
@@ -902,9 +902,7 @@ fn unify<N: KernelLanes>(by_shape: &mut HashMap<(u64, Option<Region>), AsmKernel
             let own = &t.own;
             match unions.get_mut(&t.shape_hash) {
                 None => {
-                    let mut u = own.clone_block();
-                    u.shape_hash = t.shape_hash;
-                    unions.insert(t.shape_hash, u);
+                    unions.insert(t.shape_hash, own.clone_block());
                 }
                 Some(u) => {
                     anyhow::ensure!(u.cols.len() == own.cols.len(), "shape {:#x}: outcomes with different widths", t.shape_hash);
@@ -1013,16 +1011,16 @@ pub(crate) struct BodySlots {
     arc: ([u32; 2 * crate::transpile::kernel::AxisRoots::N], bool),
 }
 
-/// An outcome's rows' skeleton: a field's column empty and typed, or
+/// An outcome's rows' skeleton: its shape (cells and globals; interned
+/// when loaded) and per cell a column, a field's empty and typed, or
 /// uniform where every row holds one value (`OutField::uniform`, the
-/// buttons' unknown); its shape hash taken before (`Rt2::shape_hash_of`).
+/// buttons' unknown).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
 pub(crate) struct Skeleton<N: Arithmetic = P8> {
-    shape_hash: u64,
-    structure: Vec<celeste_engine::runtime2::Cell2<N>>,
-    cols: Vec<Col<N>>,
+    cells: Vec<celeste_engine::shape::Cell>,
     globals: Vec<u32>,
+    cols: Vec<Col<N>>,
 }
 
 impl<N: Arithmetic> Skeleton<N> {
@@ -1030,7 +1028,6 @@ impl<N: Arithmetic> Skeleton<N> {
     fn of<A: KernelLanes>(r: &crate::trace::lower::LoweredFrame<A>, oi: usize) -> Skeleton<A> {
         // Canonical: `block::skeleton` ends in `Rt2::canonicalize_ids`.
         let mut own = reshape(&r.frame.outs[oi].rt2, 0);
-        let shape_hash = own.shape_hash_of();
         for f in &r.bound.outcomes[oi].fields {
             own.cols[f.cell as usize] = match f.uniform {
                 Some(av) => Col::U(av),
@@ -1040,29 +1037,24 @@ impl<N: Arithmetic> Skeleton<N> {
         for &cell in &r.frame.outs[oi].ubool_cells {
             own.cols[cell as usize] = Col::U(AV::UBool);
         }
-        Skeleton { shape_hash, structure: own.structure, cols: own.cols, globals: own.globals }
+        Skeleton { cells: own.cells().to_vec(), globals: own.shape.globals().to_vec(), cols: own.cols }
     }
 
     /// As a block of no rows in `room`.
     fn rt2(&self, room: &'static Room) -> Rt2<N> {
-        let mut b = Rt2::empty(0, self.globals.len(), celeste_names::STRINGS, room);
-        b.globals = self.globals.clone();
-        b.structure = self.structure.clone();
-        b.cols = self.cols.clone();
-        b
+        let shape = celeste_engine::shape::Shape::intern(self.cells.clone(), self.globals.clone());
+        Rt2::new(0, shape, self.cols.clone(), celeste_engine::runtime2::static_strings(), room)
     }
 }
 
 impl<N: Arithmetic> AccTemplate<N> {
-    /// The template of skeleton `own` (`shape_hash` its shape's): the
-    /// shape's layout, its key laid out as the shape declares
-    /// (`widening::key_deps`), and the key's uniform fields (every value
-    /// cell uniform here, at its widened value, by its role: a follower's
-    /// among `uniform_follow`).
-    fn of(own: Rt2<N>, shape_hash: u64) -> Result<AccTemplate<N>> {
-        let mut canon = own.clone_block();
-        canon.shape_hash = shape_hash;
-        let layout = std::sync::Arc::new(Layout::of(&canon));
+    /// The template of skeleton `own`: its shape's layout, its key laid out
+    /// as the shape declares (`widening::key_deps`), and the key's uniform
+    /// fields (every value cell uniform here, at its widened value, by its
+    /// role: a follower's among `uniform_follow`).
+    fn of(own: Rt2<N>) -> Result<AccTemplate<N>> {
+        let shape_hash = own.shape_hash();
+        let layout = std::sync::Arc::new(Layout::of(&own));
         anyhow::ensure!(layout.deps().len() <= emit::MAX_DEPS, "shape {shape_hash:#x}: {} key dependencies, past the emission's {}", layout.deps().len(), emit::MAX_DEPS);
         let (mut uniform, mut uniform_follow) = (Vec::new(), Vec::new());
         for c in layout.value_cells() {
@@ -1161,7 +1153,7 @@ impl<N: KernelLanes> AsmKernel<N> {
     /// (`emit::Plan`), the earlier bodies each repeats.
     fn of(recipe: Recipe<N>, loaded: Loaded, room: &'static Room, counting: bool) -> Result<AsmKernel<N>> {
         let Recipe { shape: recipe_shape, compiled, forks, fused_nodes, may_unknown, bodies, outcomes, .. } = recipe;
-        let acc_templates: Vec<AccTemplate<N>> = outcomes.iter().map(|sk| AccTemplate::of(sk.rt2(room), sk.shape_hash)).collect::<Result<_>>()?;
+        let acc_templates: Vec<AccTemplate<N>> = outcomes.iter().map(|sk| AccTemplate::of(sk.rt2(room))).collect::<Result<_>>()?;
         let off = |s: u32| compiled.root_offsets[s as usize] as usize;
         let kind = |s: u32| compiled.root_kinds[s as usize];
         let mut asm_bodies = Vec::with_capacity(bodies.len());

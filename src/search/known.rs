@@ -299,7 +299,7 @@ fn verdict<N: Rem>(b: &Rt2<N>, s: u32, from: Option<Held<N>>, seeded: bool, rout
     // writes number and boolean columns only, never the structure): the
     // forward's lookup (the widened row's) is then `l1 check`'s (the
     // state's own, `level_minus_one::check_route`).
-    anyhow::ensure!(shape == b.shape_hash, "step {s}: the level's widening moved the state's shape {:#x} to {shape:#x}: level -1's lookups by shape would disagree", b.shape_hash);
+    anyhow::ensure!(shape == b.shape_hash(), "step {s}: the level's widening moved the state's shape {:#x} to {shape:#x}: level -1's lookups by shape would disagree", b.shape_hash());
     let (key, cell) = (keys[0], cells[0]);
     let node = match key {
         Some(k) => format!("node shape {shape:#x} key {:#x}:{:#x} cell {cell} {:?}", k.0, k.1, crate::storage::cells::cell_xy(cell)),

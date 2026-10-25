@@ -142,7 +142,7 @@ impl<'a, D: Domain> Interp<'a, D> {
     }
 
     /// The free variables of a body that resolve to a LOCAL of the defining
-    /// scope (`Cell2::Clo`'s columns), decided syntactically over variable
+    /// scope (`shape::Cell::Clo`'s captures), decided syntactically over variable
     /// positions only (`obj.x` does not capture `x`); the rest are globals.
     fn captures_of(
         &self,

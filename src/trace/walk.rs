@@ -70,7 +70,7 @@ pub type WalkNode = (ShapeKey, Option<Region>);
 
 /// The shape key of a state (its skeleton's shape hash).
 pub fn shape_key<A: GraphArith>(st: &super::state::State<super::domain::Symbolic<A>>, room: &'static celeste_core::room::Room) -> Result<ShapeKey> {
-    Ok(super::block::skeleton::<_, A>(st, room)?.shape_hash)
+    Ok(super::block::skeleton::<_, A>(st, room)?.shape_hash())
 }
 
 /// The walk's REPRESENTATIVES: a shape's state as a one-lane block
@@ -320,7 +320,7 @@ fn state_id<A: GraphArith>(shape: ShapeKey, consts: &std::collections::BTreeMap<
 fn next_entry<A: GraphArith>(reps: &Reps<A>, d: &mut super::domain::Symbolic<A>, st: &super::state::State<super::domain::Symbolic<A>>, opts: &crate::abstraction::Level) -> Result<Entry<A>> {
     let consts = super::shapes::field_constants(st, d, opts)?;
     let rep = reps.block(st, d, true)?;
-    Ok((rep.shape_hash, reps.state(&rep, d)?, consts))
+    Ok((rep.shape_hash(), reps.state(&rep, d)?, consts))
 }
 
 /// A numeric field's hull per path (raw 16.16, inclusive).
@@ -633,7 +633,7 @@ impl<A: GraphArith> WalkState<A> {
             }
         }
         let start_rep = reps.block(&start_rep, &mut it.d, false)?;
-        let sk = start_rep.shape_hash;
+        let sk = start_rep.shape_hash();
         let mut ival_extra: std::collections::BTreeMap<ShapeKey, std::collections::BTreeSet<super::iface::Path>> = Default::default();
         if !start_ivals.is_empty() {
             ival_extra.insert(sk, start_ivals.keys().cloned().collect());
@@ -729,7 +729,7 @@ impl<A: GraphArith> WalkState<A> {
                         respawned |= self.outcome(it, chunks, (k, region), o, &mut next)?;
                     }
                     // The frame binds the block its representative is.
-                    anyhow::ensure!(frame.in_rt2.shape_hash_of() == k, "shape {k:#x} region {region:?}: the traced frame's input block has shape {:#x}", frame.in_rt2.shape_hash_of());
+                    anyhow::ensure!(frame.in_rt2.shape_hash() == k, "shape {k:#x} region {region:?}: the traced frame's input block has shape {:#x}", frame.in_rt2.shape_hash());
                     self.frames.insert(job.node, WalkFrame { frame, bounds: job.bounds.clone(), bound });
                 }
             }
@@ -961,7 +961,7 @@ fn walk_trace<A: GraphArith>(
         let spawn_phase = shapes::player_path(&o.st).is_none() && !super::widen::objects_of_type(&o.st, super::game::PLAYER_SPAWN).is_empty();
         let respawn = if grid.is_some() && spawn_phase && !job.spawn { Some(shapes::field_constants(&o.st, &tr.it.d, &opts)?) } else { None };
         let rep = reps.block(&o.st, &mut tr.it.d, true)?;
-        outs.push(WalkOutcome { key: rep.shape_hash, constants, ival, regions, rep, respawn });
+        outs.push(WalkOutcome { key: rep.shape_hash(), constants, ival, regions, rep, respawn });
     }
     let bound = super::lower::bind(&f, &tr.it.d.graph).map_err(|e| format!("{:#}", e));
     let illegal = std::mem::take(&mut tr.it.illegal);

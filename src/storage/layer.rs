@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 use celeste_core::arith::Arithmetic;
 use celeste_engine::exact::{Key, KeyAdditions, KeySpace};
-use celeste_engine::runtime2::{mix64, Cell2, Col, Rt2, P8};
+use celeste_engine::runtime2::{mix64, Col, Rt2, AV, P8};
+use celeste_engine::shape::{Cell, Shape};
 
 use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128, wide};
 use super::file::{self, At, Mapped, FORMAT_VERSION};
@@ -106,14 +107,14 @@ pub(crate) fn bits(mut m: u64) -> impl Iterator<Item = u32> {
 }
 
 /// A SHAPE'S SKELETON as the storage keeps it: everything of a shape's rows
-/// their keys do not say - structure with closure captures, globals,
-/// strings, the non-value cells' uniform columns, and per value
+/// their keys do not say - its shape (structure with closure captures,
+/// globals), strings, the non-value cells' uniform columns, and per value
 /// cell how its column holds numbers (`Repr`: the code merges `Num(n)` and
 /// `Ival(n, n)`). Equal records decode every key alike.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub(crate) struct SkelRecord<N = P8> {
     pub(crate) shape_hash: u64,
-    pub(crate) structure: Vec<Cell2<N>>,
+    pub(crate) structure: Vec<DiskCell<N>>,
     pub(crate) globals: Vec<u32>,
     pub(crate) strings: Vec<String>,
     /// The cells that are not values, with their (uniform) columns.
@@ -123,18 +124,59 @@ pub(crate) struct SkelRecord<N = P8> {
     pub(crate) numeric: Vec<(u32, u8)>,
 }
 
+/// A shape's cell as a frame file holds it: variant for variant the block
+/// cell it was before `shape::Cell` (a closure's captures as uniform
+/// pointer columns), so the files' bytes are the same.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub(crate) enum DiskCell<N = P8> {
+    Val,
+    Obj(Vec<(u32, u32)>),
+    Arr(Vec<u32>),
+    Unk,
+    Clo(u32, Vec<Col<N>>),
+    Bi(u32),
+}
+
+impl<N: Arithmetic> DiskCell<N> {
+    fn of(c: &Cell) -> DiskCell<N> {
+        match c {
+            Cell::Val => DiskCell::Val,
+            Cell::Obj(fields) => DiskCell::Obj(fields.to_vec()),
+            Cell::Arr(items) => DiskCell::Arr(items.to_vec()),
+            Cell::Unk => DiskCell::Unk,
+            Cell::Clo { f, caps } => DiskCell::Clo(*f, caps.iter().map(|&t| Col::U(AV::Ptr(t))).collect()),
+            Cell::Bi(b) => DiskCell::Bi(*b),
+        }
+    }
+
+    fn cell(&self) -> Result<Cell> {
+        Ok(match self {
+            DiskCell::Val => Cell::Val,
+            DiskCell::Obj(fields) => Cell::Obj(fields.clone().into_boxed_slice()),
+            DiskCell::Arr(items) => Cell::Arr(items.clone().into_boxed_slice()),
+            DiskCell::Unk => Cell::Unk,
+            DiskCell::Clo(f, caps) => Cell::Clo {
+                f: *f,
+                caps: caps
+                    .iter()
+                    .map(|c| match c {
+                        Col::U(AV::Ptr(t)) => Ok(*t),
+                        other => Err(anyhow!("a skeleton's closure capture is {other:?}, not a pointer")),
+                    })
+                    .collect::<Result<_>>()?,
+            },
+            DiskCell::Bi(b) => Cell::Bi(*b),
+        })
+    }
+}
+
 impl<N: Arithmetic> SkelRecord<N> {
     /// The skeleton of `rt2`'s shape (its values are not read).
     pub(crate) fn of(rt2: &Rt2<N>) -> Result<SkelRecord<N>> {
-        for cell in &rt2.structure {
-            if let Cell2::Clo(_, caps) = cell {
-                ensure!(caps.iter().all(|c| matches!(c, Col::U(_))), "skeleton of {:016x}: a closure capture is not uniform", rt2.shape_hash);
-            }
-        }
         let (mut others, mut numeric) = (Vec::new(), Vec::new());
-        for (c, (cell, col)) in rt2.structure.iter().zip(&rt2.cols).enumerate() {
-            if !matches!(cell, Cell2::Val) {
-                ensure!(matches!(col, Col::U(_)), "skeleton of {:016x}: the non-value cell {c} has a varying column", rt2.shape_hash);
+        for (c, (cell, col)) in rt2.cells().iter().zip(&rt2.cols).enumerate() {
+            if *cell != Cell::Val {
+                ensure!(matches!(col, Col::U(_)), "skeleton of {:016x}: the non-value cell {c} has a varying column", rt2.shape_hash());
                 others.push((c as u32, col.clone()));
                 continue;
             }
@@ -144,24 +186,24 @@ impl<N: Arithmetic> SkelRecord<N> {
                 Repr::Other => {}
             }
         }
-        Ok(SkelRecord { shape_hash: rt2.shape_hash, structure: rt2.structure.clone(), globals: rt2.globals.clone(), strings: rt2.strings.clone(), others, numeric })
+        let structure = rt2.cells().iter().map(DiskCell::of).collect();
+        Ok(SkelRecord { shape_hash: rt2.shape_hash(), structure, globals: rt2.shape.globals().to_vec(), strings: rt2.strings.to_vec(), others, numeric })
     }
 
-    /// The skeleton as an empty block in a search from `room`.
-    pub(crate) fn rt2(&self, room: &'static celeste_core::room::Room) -> Rt2<N> {
-        let mut rt2 = Rt2::empty(0, self.globals.len(), &[], room);
-        rt2.structure = self.structure.clone();
-        rt2.globals = self.globals.clone();
-        rt2.strings = self.strings.clone();
-        rt2.shape_hash = self.shape_hash;
-        rt2.cols = vec![Repr::Other.empty(); self.structure.len()];
+    /// The skeleton as an empty block in a search from `room` (its shape
+    /// the record's: interned, its hash checked).
+    pub(crate) fn rt2(&self, room: &'static celeste_core::room::Room) -> Result<Rt2<N>> {
+        let cells = self.structure.iter().map(DiskCell::cell).collect::<Result<Vec<Cell>>>()?;
+        let shape = Shape::intern(cells, self.globals.clone());
+        ensure!(shape.hash() == self.shape_hash, "a skeleton record of shape {:016x} holds the structure of {:016x}", self.shape_hash, shape.hash());
+        let mut cols = vec![Repr::Other.empty(); self.structure.len()];
         for (c, col) in &self.others {
-            rt2.cols[*c as usize] = col.clone();
+            cols[*c as usize] = col.clone();
         }
         for &(c, r) in &self.numeric {
-            rt2.cols[c as usize] = if r == 0 { Repr::Num.empty() } else { Repr::Ival.empty() };
+            cols[c as usize] = if r == 0 { Repr::Num.empty() } else { Repr::Ival.empty() };
         }
-        rt2
+        Ok(Rt2::new(0, shape, cols, self.strings.clone().into(), room))
     }
 }
 
@@ -399,7 +441,7 @@ impl<N: Arithmetic> FrameFile<N> {
         ensure!(layer.set.tables().len() == n, "{}: an empty region", self.path().display());
         if let Some(room) = room {
             for s in &self.header.skeletons {
-                layer.skeletons.insert(s.shape_hash, Arc::new(s.rt2(celeste_core::room::Room::of(room))));
+                layer.skeletons.insert(s.shape_hash, Arc::new(s.rt2(celeste_core::room::Room::of(room))?));
             }
         }
         Ok((layer, wins))
@@ -570,7 +612,7 @@ impl<N: Arithmetic> Tree<N> {
     /// The skeleton of `shape` in frame `f`'s files, in a search from `room`.
     pub(crate) fn skeleton(&self, f: u32, shape: u64, room: (i16, i16)) -> Result<Rt2<N>> {
         let r = self.file(f).into_iter().flat_map(|x| x.header.skeletons.iter()).find(|r| r.shape_hash == shape).ok_or_else(|| anyhow!("{}: frame {f} has no skeleton of shape {shape:016x}", self.dir.display()))?;
-        Ok(r.rt2(celeste_core::room::Room::of(room)))
+        r.rt2(celeste_core::room::Room::of(room))
     }
 
     /// Frame `f`'s ROWS in a search from `room` (`decode_states`; keys set).
