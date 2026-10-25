@@ -4,16 +4,14 @@
 //! reference engine.
 //!
 //! Per file: played in the tool with the exact trace (`love::Opts::exact`),
-//! its BUFFERED jumps re-timed (`canonical_jumps`) and, where any moved,
-//! the re-timed file played too and checked to make the same run (the
-//! player's position, remainder and speed after every update, bit for bit)
-//! with no buffered jump left. The trace, the draw-only objects dropped,
-//! goes to `DIR/KEY_LEVEL.trace.zst` (zstd -19) and a line to
+//! AS IT IS (the traced cart buffers a jump press as the original does,
+//! plans/correctness.md C7). The trace, the draw-only objects dropped, goes
+//! to `DIR/KEY_LEVEL.trace.zst` (zstd -19) and a line to
 //! `DIR/manifest.txt`:
 //!
 //! ```text
-//! KEY LEVEL room=X,Y seeds=S1,S2|- gemskip=0|1 updates=N uct=STATUS retimed=K
-//! KEY LEVEL room=X,Y seeds=S1,S2|- gemskip=0|1 jank=J|- updates=N celia=STATUS retimed=K
+//! KEY LEVEL room=X,Y seeds=S1,S2|- gemskip=0|1 updates=N uct=STATUS
+//! KEY LEVEL room=X,Y seeds=S1,S2|- gemskip=0|1 jank=J|- updates=N celia=STATUS
 //! ```
 //!
 //! (Celia's J: its IL load's loading jank, `starts::celia_jank`.) A file
@@ -28,7 +26,7 @@
 //! `trace::oracle::tests::the_local_goldens`). READ THE DIFF before
 //! committing: a golden that moved means the tool's run did.
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use std::path::{Path, PathBuf};
 
 use super::love::{self, Tool};
@@ -37,53 +35,9 @@ use super::tasdb;
 /// Our unsubmitted routes' goldens: outside the repository.
 pub const LOCAL: &str = "/var/tmp/float-goldens";
 
-const JUMP: u8 = 16;
-
 /// The repository (the binary's checkout).
 fn repo() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-}
-
-/// One exact-trace update: its input (`in`, -1: none), `kf`, the sounds,
-/// and the first player's `jbuffer` and `p_jump` after it (`None`: no player).
-struct Update {
-    input: i64,
-    kf: i64,
-    sounds: Vec<i64>,
-    player: Option<std::collections::BTreeMap<String, String>>,
-}
-
-fn read_trace(text: &str) -> Result<Vec<Update>> {
-    let mut ups: Vec<Update> = Vec::new();
-    let mut obj = false;
-    for line in text.lines() {
-        let w: Vec<&str> = line.split_whitespace().collect();
-        let int = |i: usize| -> Result<i64> { w.get(i).and_then(|s| s.parse().ok()).with_context(|| format!("a trace line {line:?}")) };
-        match w.first() {
-            None => {}
-            Some(&"u") => {
-                ups.push(Update { input: int(5)?, kf: int(3)?, sounds: Vec::new(), player: None });
-                obj = false;
-            }
-            Some(&"s") => {
-                let s = int(1)?;
-                ups.last_mut().context("a sound before the first update")?.sounds.push(s);
-            }
-            Some(&"o") => {
-                let up = ups.last_mut().context("an object before the first update")?;
-                obj = w.get(2) == Some(&"player") && up.player.is_none();
-                if obj {
-                    up.player = Some(Default::default());
-                }
-            }
-            Some(&"f") if obj && matches!(w.get(1), Some(&"jbuffer") | Some(&"p_jump")) => {
-                let p = ups.last_mut().and_then(|u| u.player.as_mut()).context("a field outside a player")?;
-                p.insert(w[1].to_string(), w.get(2).context("a field without a value")?.to_string());
-            }
-            _ => {}
-        }
-    }
-    Ok(ups)
 }
 
 /// The original cart's objects the traced program does not have: they only
@@ -110,119 +64,6 @@ pub fn hexfloat(s: &str) -> Result<f64> {
     // m < 2^53 converts exactly; a power of two scales exactly.
     let v = m as f64 * f64::powi(2.0, e);
     Ok(if neg { -v } else { v })
-}
-
-/// Whether `up` jumped: its player's `jbuffer` positive at the jump check,
-/// 0 after it. A player new in `up` starts with `jbuffer` 0 and no `p_jump`
-/// (it updates in the frame it is made).
-fn jumped(prev: &Update, up: &Update) -> Result<bool> {
-    let fresh_player = [("p_jump", "false"), ("jbuffer", "0x0p+0")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-    let a = prev.player.as_ref().filter(|p| !p.is_empty()).unwrap_or(&fresh_player);
-    let Some(b) = &up.player else { return Ok(false) };
-    let get = |p: &std::collections::BTreeMap<String, String>, k: &str| p.get(k).cloned().with_context(|| format!("a player without `{k}`"));
-    let fresh = up.input.max(0) as u8 & JUMP != 0 && get(a, "p_jump")? == "false";
-    if fresh && get(b, "p_jump")? == "false" {
-        // The player's update did not run (`freeze`, `pause_player`): it
-        // would have set `p_jump`.
-        return Ok(false);
-    }
-    let jb = hexfloat(&get(a, "jbuffer")?)?;
-    let expected = if fresh { 4.0 } else { (jb - 1.0).max(0.0) };
-    Ok(expected > 0.0 && hexfloat(&get(b, "jbuffer")?)? == 0.0)
-}
-
-/// A re-timing that cannot be made (`canonical_jumps`' refusal).
-#[derive(Debug)]
-pub struct Retime(pub String);
-
-/// A TAS file (tasdatabase format) with its BUFFERED jumps re-timed, from
-/// `tool`'s exact trace of it. FENCED with plans/correctness.md C7: the
-/// original cart buffers a jump press for 4 frames (`jbuffer`); the traced
-/// program jumps only on a fresh press. A jump the buffer made - a jump on
-/// an update with no FRESH jump press - is moved to its own frame: the
-/// press it came from and every input until the jump release the button,
-/// the jump's input presses it. Every other input is kept; a buffered jump
-/// past the file's end (the tool plays no buttons there) extends the file
-/// up to its press. A JUMP is read from the player's state (`jumped`); UCT's
-/// traces also record the jump sounds (`psfx` 1 and 2), and the two must
-/// agree on every update that leaves a player. The update that consumed
-/// file input k: UCT's (k+1)th update with an input; Celia's with `kf` k + 1.
-/// `name` names the file in a refusal.
-pub fn canonical_jumps(tool: Tool, trace: &str, tas: &str, name: &str) -> Result<std::result::Result<String, Retime>> {
-    let ups = read_trace(trace)?;
-    let text = tas.trim();
-    let head = text.split_once(']').map_or(text, |(h, _)| h);
-    let inputs: Vec<i64> = crate::concrete::parse_tas(text)?.1.into_iter().map(i64::from).collect();
-    let refuse = |why: String| Ok(Err(Retime(why)));
-    // The file input each update consumed, and what the tool played for it.
-    let k_of: Vec<(usize, i64)> = match tool {
-        Tool::Uct => ups.iter().enumerate().filter(|(_, u)| u.input >= 0).enumerate().map(|(k, (n, _))| (n, k as i64)).collect(),
-        Tool::Celia => ups.iter().enumerate().map(|(n, u)| (n, u.kf - 1)).collect(),
-    };
-    // Python's list indexing, negative from the end.
-    let at = |v: &[i64], k: i64| -> Option<i64> { usize::try_from(if k < 0 { v.len() as i64 + k } else { k }).ok().and_then(|i| v.get(i).copied()) };
-    let mut given: Vec<(i64, i64)> = Vec::new();
-    for &(n, k) in &k_of {
-        match given.iter().find(|(g, _)| *g == k) {
-            Some(&(_, v)) if v != ups[n].input => return refuse(format!("{name}: input {k} played as {v} and {}", ups[n].input)),
-            Some(_) => {}
-            None => given.push((k, ups[n].input)),
-        }
-    }
-    if given.iter().any(|&(k, v)| v != if k < inputs.len() as i64 { at(&inputs, k).unwrap_or(i64::MIN) } else { 0 }) {
-        return refuse(format!("{name}: the trace's inputs are not the file's"));
-    }
-    let top = given.iter().map(|g| g.0).max().unwrap_or(-1);
-    let mut original = inputs.clone();
-    while (original.len() as i64) < top + 1 {
-        original.push(0);
-    }
-    let mut out = original.clone();
-    let mut end = inputs.len();
-    // Presses as the ORIGINAL run made them (a re-timed jump must not hide
-    // the press of the next one).
-    let held = |k: i64| k >= 0 && at(&original, k).is_some_and(|v| v as u8 & JUMP != 0);
-    for n in 1..ups.len() {
-        let jump = jumped(&ups[n - 1], &ups[n])?;
-        // (A player killed, or a room left, in the update may still jump: no
-        // player is left to read, and nothing is to re-time.)
-        if tool == Tool::Uct && ups[n].player.is_some() && jump != ups[n].sounds.iter().any(|s| *s == 1 || *s == 2) {
-            return refuse(format!("{name}: update {n}: the player's state says {} jump, the sounds do not", if jump { "a" } else { "no" }));
-        }
-        let Some(&(_, k)) = k_of.iter().find(|(m, _)| *m == n) else { continue };
-        if !jump || (held(k) && !held(k - 1)) {
-            continue;
-        }
-        // The press it came from: the original's latest fresh press before.
-        let Some(p) = (0..k).rev().find(|&q| held(q) && !held(q - 1)) else {
-            return refuse(format!("{name}: a buffered jump at update {n} with no press before it"));
-        };
-        for q in p..k {
-            out[q as usize] &= !i64::from(JUMP);
-        }
-        out[k as usize] |= i64::from(JUMP);
-        end = end.max(k as usize + 1);
-    }
-    Ok(Ok(format!("{head}]{}", out[..end].iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","))))
-}
-
-/// The player's (x, y, rem, spd) after every update.
-fn player_path(trace: &str) -> Vec<std::collections::BTreeMap<String, String>> {
-    let (mut out, mut obj) = (Vec::new(), "");
-    for line in trace.lines() {
-        let w: Vec<&str> = line.split_whitespace().collect();
-        match w.first() {
-            Some(&"u") => out.push(std::collections::BTreeMap::new()),
-            Some(&"o") => obj = w.get(2).copied().unwrap_or(""),
-            Some(&"f") if obj == "player" && matches!(w.get(1), Some(&"x") | Some(&"y") | Some(&"rem.x") | Some(&"rem.y") | Some(&"spd.x") | Some(&"spd.y")) => {
-                if let (Some(cur), Some(v)) = (out.last_mut(), w.get(2)) {
-                    cur.insert(w[1].to_string(), v.to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-    out
 }
 
 /// The trace without the draw-only objects (`DRAW_ONLY`,
@@ -277,14 +118,13 @@ pub fn random_inputs(i: usize, level: i16) -> Vec<u8> {
 /// A file no golden is made of, and why.
 pub struct Skip(pub String);
 
-/// What `canonical` found.
-pub struct Canonical {
+/// What `played` found.
+pub struct Played {
     pub seeds: Vec<String>,
     pub inputs: Vec<u8>,
-    /// The tool's trace of the file played (the re-timed one where any moved).
+    /// The tool's trace of the file.
     pub trace: PathBuf,
     pub status: String,
-    pub retimed: usize,
 }
 
 /// The tool's run of `path` as category `cat` (`one_dash`), its exact trace
@@ -299,9 +139,8 @@ fn play(tool: Tool, level: i16, path: &Path, one_dash: bool, trace: &Path) -> St
 }
 
 /// The category's file for `level` (a `randomI` category: random file I;
-/// `path`: that file, played as category `cat`) as `tool` plays it, its
-/// buffered jumps re-timed.
-pub fn canonical(tool: Tool, cat: &str, level: i16, tmp: &Path, path: Option<&Path>) -> Result<std::result::Result<Canonical, Skip>> {
+/// `path`: that file, played as category `cat`) as `tool` plays it.
+pub fn played(tool: Tool, cat: &str, level: i16, tmp: &Path, path: Option<&Path>) -> Result<std::result::Result<Played, Skip>> {
     let skip = |why: String| Ok(Err(Skip(why)));
     // The goldens' categories include our own (`random0`, a witness's key):
     // those are any%.
@@ -323,44 +162,12 @@ pub fn canonical(tool: Tool, cat: &str, level: i16, tmp: &Path, path: Option<&Pa
         Tool::Uct => "uct",
         Tool::Celia => "celia",
     };
-    let orig = tmp.join("orig.trace");
-    let status = play(tool, level, &path, one_dash, &orig);
-    if status.contains("LUA ERROR") || std::fs::metadata(&orig).map_or(true, |m| m.len() == 0) {
+    let trace = tmp.join("file.trace");
+    let status = play(tool, level, &path, one_dash, &trace);
+    if status.contains("LUA ERROR") || std::fs::metadata(&trace).map_or(true, |m| m.len() == 0) {
         return skip(format!("{tname}: {status}"));
     }
-    let orig_text = std::fs::read_to_string(&orig)?;
-    let canon_text = match canonical_jumps(tool, &orig_text, &std::fs::read_to_string(&path)?, &path.display().to_string())? {
-        Ok(t) => t,
-        Err(Retime(why)) => return skip(format!("re-timing: {why}")),
-    };
-    let canon = tmp.join("canon.tas");
-    std::fs::write(&canon, &canon_text)?;
-    let (_, canon_inputs) = tasdb::read(&canon)?;
-    let retimed = inputs.iter().zip(&canon_inputs).filter(|(a, b)| a != b).count();
-    if retimed == 0 {
-        return Ok(Ok(Canonical { seeds, inputs, trace: orig, status, retimed }));
-    }
-    let fin = tmp.join("canon.trace");
-    let status2 = play(tool, level, &canon, one_dash, &fin);
-    let fin_text = std::fs::read_to_string(&fin).unwrap_or_default();
-    let (a, b) = (player_path(&orig_text), player_path(&fin_text));
-    // A file extended past its end (a buffered jump there) runs out a
-    // driver's clock later: the same run, longer, where neither finished
-    // nor died.
-    let extended = canon_inputs.len() > inputs.len();
-    let clock = |st: &str| !st.contains("finished") && !st.to_lowercase().contains("died");
-    let longest = a.len().max(b.len());
-    let n = if extended && clock(&status) && clock(&status2) { a.len().min(b.len()) } else { longest };
-    if a.len() < n || b.len() < n || a[..n] != b[..n] || (status2 != status && n == longest) {
-        let first = a.iter().zip(&b).position(|(x, y)| x != y).unwrap_or(a.len().min(b.len()));
-        return skip(format!("the re-timed file runs differently (update {first}; {status} -> {status2})"));
-    }
-    match canonical_jumps(tool, &fin_text, &canon_text, &canon.display().to_string())? {
-        Ok(again) if again == canon_text => {}
-        Ok(_) => return skip("a buffered jump is left after re-timing".into()),
-        Err(Retime(why)) => bail!("re-timing the re-timed file: {why}"),
-    }
-    Ok(Ok(Canonical { seeds, inputs: canon_inputs, trace: fin, status: status2, retimed }))
+    Ok(Ok(Played { seeds, inputs, trace, status }))
 }
 
 /// `trace` written as a golden to `out` (zstd -19), the draw-only objects
@@ -391,7 +198,7 @@ pub type Job = (String, i16, String, Option<PathBuf>);
 /// One golden of `tool`: its manifest line, or why it was skipped.
 fn one(tool: Tool, job: &Job, tmp: &Path, out: &Path) -> Result<std::result::Result<String, String>> {
     let (key, level, cat, path) = job;
-    let c = match canonical(tool, cat, *level, tmp, path.as_deref())? {
+    let c = match played(tool, cat, *level, tmp, path.as_deref())? {
         Ok(c) => c,
         Err(Skip(why)) => return Ok(Err(why)),
     };
@@ -420,10 +227,10 @@ fn one(tool: Tool, job: &Job, tmp: &Path, out: &Path) -> Result<std::result::Res
     let gemskip = u8::from(cat.parse::<crate::settings::Category>().is_ok_and(crate::settings::Category::gemskip));
     let status = c.status.replace(' ', "_");
     Ok(Ok(match tool {
-        Tool::Uct => format!("{key} {level} room={},{} seeds={seeds} gemskip={gemskip} updates={updates} uct={status} retimed={}", room.0, room.1, c.retimed),
+        Tool::Uct => format!("{key} {level} room={},{} seeds={seeds} gemskip={gemskip} updates={updates} uct={status}", room.0, room.1),
         Tool::Celia => {
             let j = crate::starts::celia_jank(room)?.map_or("-".to_string(), |j| j.to_string());
-            format!("{key} {level} room={},{} seeds={seeds} gemskip={gemskip} jank={j} updates={updates} celia={status} retimed={}", room.0, room.1, c.retimed)
+            format!("{key} {level} room={},{} seeds={seeds} gemskip={gemskip} jank={j} updates={updates} celia={status}", room.0, room.1)
         }
     }))
 }
@@ -522,17 +329,5 @@ mod tests {
         for (s, v) in [("0x0p+0", 0.0), ("0x1p+2", 4.0), ("0x1.8p+1", 3.0), ("-0x1p-1", -0.5), ("0x1.999999999999ap-4", 0.1)] {
             assert_eq!(hexfloat(s).expect("hex"), v, "{s}");
         }
-    }
-
-    /// A jump the buffer made moves to its own frame: pressed at file input
-    /// 1 (the player's update did not jump), jumping at input 3.
-    #[test]
-    fn a_buffered_jump_is_retimed() {
-        let up = |n: usize, input: i64, jb: &str, pj: &str, sounds: &str| format!("u {n} kf {} in {input}\n{sounds}o 1 player\nf jbuffer {jb}\nf p_jump {pj}\n", n + 1);
-        let trace = [up(0, 0, "0x0p+0", "false", ""), up(1, 16, "0x1p+2", "true", ""), up(2, 16, "0x1.8p+1", "true", ""), up(3, 0, "0x0p+0", "false", "s 1\n")].concat();
-        let out = canonical_jumps(Tool::Uct, &trace, "[0.5]0,16,16,0", "x").expect("parses").map_err(|r| r.0).expect("re-timed");
-        assert_eq!(out, "[0.5]0,0,0,16");
-        let bad = canonical_jumps(Tool::Uct, &trace, "[0.5]0,16,16,1", "x").expect("parses").map_err(|r| r.0).expect_err("not the file");
-        assert!(bad.contains("the trace's inputs are not the file's"), "{bad}");
     }
 }

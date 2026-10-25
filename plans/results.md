@@ -267,5 +267,7 @@ room alone and misses it; Celia models it.
   `spurious`, `check ref --row`, `check known`): that chain found the floor-collision
   join bug and room (1,3)'s keying bug.
 - Finding the reference: scan prologue offsets (23-37), replay in the
-  original cart (`rewrite pico8 replay --original`), then `rewrite trajectory` (the minimal cart
-  has no jump buffer, so raw inputs often do not transfer).
+  original cart (`rewrite pico8 replay --original`); the file plays on the
+  minimal cart as it is (the jump buffer is the original's since
+  2026-10-25; before, raw inputs often did not transfer and `rewrite
+  trajectory` found inputs that follow the file's positions).

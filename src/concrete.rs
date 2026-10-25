@@ -132,15 +132,6 @@ pub struct Witness {
     /// The frame the start room is left during (`frame::exits_of`; `None`:
     /// never). The replay stops there.
     pub exit: Option<u32>,
-    /// The inputs with the jump bit kept only where a jump FIRES: a fresh
-    /// press (not held the input before) after which the player's `spd.y`
-    /// is the jump's -2. The original cart buffers a press for 4 frames
-    /// (`jbuffer`); the minimal cart drops one that cannot jump at once,
-    /// so a press that does nothing here - one copied from a community TAS
-    /// by `--prefer` - can fire later there. With every press firing at
-    /// once, the buffer never holds one: the same route in both carts.
-    /// Inputs past the exit are kept as they are.
-    pub canonical: Vec<u8>,
     /// In a 100% category (the berry is the win's): the seed list with
     /// each chest's entry replaced by every other class of its draws - a
     /// chest's berry appears at x = start + s, s in [-1, 2), and only which
@@ -150,12 +141,8 @@ pub struct Witness {
     pub chest_seed_variants: Vec<Vec<String>>,
 }
 
-/// The jump's speed: `spd.y` right after a jump, ground or wall.
-const JUMP_SPD_Y: i16 = -2;
-
 /// `Witness` of `inputs` under `s` (16.16, the real game).
 pub fn witness(inputs: &[u8], s: &crate::settings::Settings) -> Result<Witness> {
-    use celeste_core::pico8_num::Pico8Num as P8;
     let seeds: Vec<String> = s.balloon_seeds.as_deref().unwrap_or("").split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect();
     let slots: Vec<&'static str> = crate::trace::cart::room_objects(s.room).into_iter().filter(|o| o.seeded).map(|o| o.kind).collect();
     let mut vals = seeds;
@@ -170,24 +157,17 @@ pub fn witness(inputs: &[u8], s: &crate::settings::Settings) -> Result<Witness> 
     };
     let mut eng = crate::engines::reference::RefEngine::new(&crate::settings::Settings { seed_chests: true, ..s.clone() })?;
     let mut state = eng.initial()?;
-    let (mut canonical, mut exit, mut prev) = (Vec::with_capacity(inputs.len()), None, 0u8);
+    let mut exit = None;
     for (i, &b) in inputs.iter().enumerate() {
-        if exit.is_some() {
-            canonical.push(b);
-            continue;
-        }
         let mut out = eng.frame(&state, b)?;
         anyhow::ensure!(out.len() == 1, "frame {}: {} leaves (an unseeded `rnd`)", i + 1, out.len());
         state = out.remove(0);
-        let spd_y = objects_of_type(&state, "player").first().and_then(|&p| num_at(&state, p, &["spd", "y"]));
-        let fired = b & 16 != 0 && prev & 16 == 0 && spd_y == Some(P8::from_i16(JUMP_SPD_Y));
-        canonical.push(b & !16 | if fired { 16 } else { 0 });
-        prev = b;
         if crate::frame::exits_of(&state, s)?[0] {
             exit = Some(i as u32 + 1);
+            break;
         }
     }
-    Ok(Witness { exit, canonical, chest_seed_variants })
+    Ok(Witness { exit, chest_seed_variants })
 }
 
 #[cfg(test)]
@@ -223,21 +203,37 @@ mod tests {
         }
     }
 
-    /// A WITNESS KEEPS ONLY THE JUMP PRESSES THAT FIRE: room (1,0)'s exit
-    /// witness (its nine presses all jump) with three presses added - before
-    /// the player exists, held after a jump, and fresh in mid-air - canonicalizes
-    /// back to the witness, which leaves the room on frame 99; a tasdatabase
-    /// file is not a witness from the room's load.
+    /// THE JUMP BUFFER AS A REAL PICO-8 RUNS IT (plans/correctness.md C7):
+    /// in room (1,0) a press in the air jumps on the landing two updates
+    /// later (the buffer keeps it 4), and the fresh press after it
+    /// wall-jumps on the next update. The original cart on PICO-8 (`rewrite
+    /// pico8 replay --original`) has the player at (49, 109), speed
+    /// (-2, -2), after frame 42; without the buffer it was (49, 112),
+    /// (0, -2).
     #[test]
-    fn a_witness_keeps_only_the_jump_presses_that_fire() {
-        let w = read_inputs("tas/room_1_0_exit_frame_99.txt").expect("tas");
-        let mut pressed = w.clone();
-        for k in [0, 31, 35] {
-            assert_eq!(pressed[k] & 16, 0);
-            pressed[k] |= 16;
+    fn a_buffered_jump_then_a_fresh_one_as_pico8_runs_them() {
+        use celeste_core::pico8_num::Pico8Num as P8;
+        let runs: [(u8, usize); 8] = [(0, 23), (2, 10), (34, 1), (0, 4), (16, 1), (0, 2), (16, 1), (0, 6)];
+        let inputs: Vec<u8> = runs.iter().flat_map(|&(b, n)| std::iter::repeat(b).take(n)).collect();
+        let mut eng = RefEngine::new(&Default::default()).expect("engine");
+        let mut state = eng.initial().expect("start");
+        for &b in &inputs[..42] {
+            state = eng.frame(&state, b).expect("frame").pop().expect("one leaf");
         }
+        let p = *objects_of_type(&state, "player").first().expect("a player");
+        let at = |path: &[&str]| num_at(&state, p, path).expect("a number");
+        assert_eq!((at(&["x"]), at(&["y"]), at(&["spd", "x"]), at(&["spd", "y"])), (P8::from_i16(49), P8::from_i16(109), P8::from_i16(-2), P8::from_i16(-2)));
+    }
+
+    /// A WITNESS IS PLAYED AS IT IS (the cart buffers a jump press as the
+    /// original does: nothing is re-timed): room (1,0)'s exit witness leaves
+    /// the room on frame 99; a tasdatabase file is not a witness from the
+    /// room's load.
+    #[test]
+    fn a_witness_is_played_as_it_is() {
+        let w = read_inputs("tas/room_1_0_exit_frame_99.txt").expect("tas");
         let s = crate::settings::Settings { balloon_seeds: Some("0".into()), ..Default::default() };
-        assert_eq!(witness(&pressed, &s).expect("witness"), Witness { exit: Some(99), canonical: w, chest_seed_variants: Vec::new() });
+        assert_eq!(witness(&w, &s).expect("witness"), Witness { exit: Some(99), chest_seed_variants: Vec::new() });
         assert_eq!(parse_tas("[0.5,0,]1,2\n3").expect("tasdatabase"), (Some(vec!["0.5".into(), "0".into()]), vec![1, 2, 3]));
         assert!(read_inputs("tas/tasdatabase/100/upload/TAS5.tas").is_err(), "a tasdatabase file is refused");
     }

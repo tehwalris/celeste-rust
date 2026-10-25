@@ -188,9 +188,8 @@ enum Command {
     /// stdout: `--inputs` replayed on the reference engine (the minimal
     /// cart) from the room's start, its balloons and chests seeded by
     /// `--balloon-seeds` as the TAS tools seed them: the frame it leaves
-    /// the room (`exit`), the inputs with the jump bit kept only where a
-    /// jump fires (`canonical`), and in a 100% category the chest seed
-    /// lists to try (`chest_seed_variants`).
+    /// the room (`exit`), and in a 100% category the chest seed lists to
+    /// try (`chest_seed_variants`).
     Witness(run::WitnessArgs),
     /// A REAL PICO-8, headless: one room replayed, a room in real play
     /// through the chain of rooms before it, the start real play enters a
