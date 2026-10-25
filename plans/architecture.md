@@ -334,7 +334,10 @@ grid); `level_minus_one` (the
 filter: `off` or H, S and the table's fingerprint; a tree serves horizons
 up to H and is never raised past it; the TABLE itself is `l1-table.bin`
 beside it, which every reader and extension of the tree uses, whatever
-binary); `filtered_for` (a ladder level's marks, horizon and filter);
+binary); `orb_cut` (`off`, or in the orb room the horizon H the tree was
+started for: a row whose big chest is still closed too late for H is not
+expanded, so the tree is never raised past H either); `filtered_for` (a
+ladder level's marks, horizon and filter);
 `done` (the one trust marker: the frame and the transfer table's trusted
 length). Beside it, `forward.tsv` (per-frame stats).
 

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 /// The tree record's format (`storage::record`): a tree without one, or
 /// with another, is refused where its settings are checked
 /// (tools/fixtures.sh rebuilds its fixtures on a change).
-pub const VERSION: u32 = 4;
+pub const VERSION: u32 = 5;
 
 /// The order of a tree's transfer table (`storage::edges::XferTable`):
 /// a frame's new transfers are numbered at each slice's GATHER (the pairs

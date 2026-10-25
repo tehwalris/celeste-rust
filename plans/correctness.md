@@ -22,16 +22,30 @@ settled here. Evidence is file:line at develop 19869c5d.
   backward computes distances; about -1,000 lines net; every level -1 result
   re-verified. The known-route check must cover it first (this item).
 
-## C2. The orb deadline: a hand-derived bound nothing checks
-- `ORB_MIN_FRAMES_AFTER_CHEST = 70` (frame.rs:284-286): "61 paused + 8 until
-  the orb is collectable + 10 frozen = 79, taken as 70". No test derives or
-  checks it against the cart.
-- Its ceiling is level -1's H (`TreeL1::orb_ceiling`, frame.rs): without
-  level -1 the orb room never gets the cut (sound, but arbitrary coupling).
-- To do: check the bound with the reference engine (or derive it), and give
-  the cut its own horizon (the search's).
-- It also mixes units: the cut compares steps with frames (frame.rs:160-163);
-  sound today only because the orb room is not split-frame.
+## C2. The orb deadline: a hand-derived bound nothing checks (FIXED, branch correctness-batch)
+- CHECKED: `ORB_MIN_FRAMES_AFTER_CHEST = 70` against the cart
+  (`frame::tests::the_orb_deadline_is_below_the_carts_chest_to_orb_time`,
+  reference engine, unsplit and split): room (5,2)'s any% witness to its
+  chest's opening, then no input (the shortest: nothing freezes the draw
+  that ticks the chest and the orb) to the orb at rest, collectable, 68
+  frames; the witness's collection to the first update that runs, 11 (10
+  frozen). A win is >= 79 frames after the opening, identical split and
+  unsplit; 70 keeps its margin, and the test fails if the constant passes
+  the cart's figure.
+- OWN HORIZON: the cut is `frame::OrbCut`, the horizon the tree was started
+  for (the search's, `forward --steps`), recorded as the tree's `orb_cut`
+  line (settings VERSION 5); `grow_tree` refuses to raise a tree past it,
+  as for level -1. `TreeL1::orb_ceiling` is gone: the orb room is cut with
+  or without level -1.
+- UNITS: the cut counts frames. A chest closed after step k opens at the
+  earliest in frame `frame_of(k + 1)`; it is skipped when that plus 70
+  exceeds the horizon's frame (`the_orb_cut_counts_frames_under_the_split_frame`).
+  Unsplit this is the old test exactly (`frame + 1 + 70 > H`), so a tree
+  built under level -1 at the search's horizon is unchanged.
+- No result changes: a cut row cannot win by the horizon (the bound above).
+  The witnesses through the orb (any% 150, nodiag 157) replay to their
+  exits with the orb under the new code; no winning route meets the cut,
+  which starts at frame H-70 while a route exiting by H opened by H-79.
 
 ## C3. Room (2,1): the split frame reaches FEWER states than unsplit at `p`
 - Noted in architecture.md ("unexplained"). Fewer states is the direction a
