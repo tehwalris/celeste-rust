@@ -11,7 +11,7 @@ use celeste_core::lua_f64::LuaF64;
 use celeste_engine::runtime2::Rt2;
 use celeste_core::pico8_num::Pico8Num as P8;
 
-use super::backward::{backward, gate_w_hash, optimum, Seeds, Winning, BLOCK};
+use super::backward::{backward, optimum, Seeds, Winning, BLOCK};
 use super::concrete::{concrete_search, inputs_text, NodeKeys, Side, Witness};
 use super::reach::{inside_w, ReachEdges};
 use super::rem::{start_point, Rem};
@@ -183,7 +183,6 @@ fn dual(spec: &SearchSpec, float: &Settings, levels: &[Level], res: &mut SearchR
         let label = format!("label dual witness, valid in both arithmetics: {} exits on frame {f}, real play on frame {} (the float half's path)\n", float.arith, w.fixed_exit);
         std::fs::write(&path, label + &std::fs::read_to_string(&path)?)?;
     }
-    println!("[gate] h{horizon} dual optimum {f} fixed exit {} inputs {}", w.fixed_exit, inputs_text(&w.inputs));
     Ok(Verdict::Optimal)
 }
 
@@ -305,7 +304,7 @@ pub(crate) struct Arcs<N: Rem = P8> {
     /// by its projection: the tree holds the start unwidened), and the
     /// optimum in search steps (`None`: the horizon is REFUTED).
     pub(crate) start: Option<u32>,
-    steps: Option<u32>,
+    pub(crate) steps: Option<u32>,
 }
 
 impl<N: Rem> Arcs<N> {
@@ -324,78 +323,33 @@ impl<N: Rem> Arcs<N> {
 
 /// THE ARC PHASE over a finished tree, before the edge files close: the
 /// backward from its wins and the optimum, the edges kept for the reach.
-struct ArcPhase<N: Rem> {
-    seeds: Seeds<N>,
-    arcs: Arcs<N>,
+/// Its readers: the search, `check known`, `check::gate`.
+pub(crate) struct ArcPhase<N: Rem> {
+    pub(crate) seeds: Seeds<N>,
+    pub(crate) arcs: Arcs<N>,
 }
 
 impl<N: Rem> ArcPhase<N> {
     /// `backward` and `optimum` over the tree in `dir` (at `level` under
-    /// `s`) to step `horizon`; its `[gate]` fingerprints printed (W's
-    /// support, W per frame, the optimum; over content, independent of
-    /// scheduling).
-    fn of(dir: &Path, level: Level, horizon: u32, s: &Settings) -> Result<Self> {
+    /// `s`) to step `horizon`, its closed spans and W's nodes in files under
+    /// `scratch` (mapped, unlinked; the directory replaced).
+    pub(crate) fn of(dir: &Path, level: Level, horizon: u32, s: &Settings, scratch: &Path) -> Result<Self> {
         s.check(dir, level)?;
         crate::metrics::mem_phase("arc: start");
         let seeds = Seeds::<N>::load(dir, horizon)?;
         crate::metrics::mem_phase("arc: edge files opened");
         let tb = std::time::Instant::now();
-        // The closed spans and W's nodes go to scratch files beside the tree
-        // (mapped, unlinked).
-        let scratch = dir.join("arc-scratch");
         if scratch.exists() {
-            std::fs::remove_dir_all(&scratch)?;
+            std::fs::remove_dir_all(scratch)?;
         }
-        let w = backward(&seeds.store, &seeds.pairs, &seeds.wins, horizon, s.threads(), Some(&scratch))?;
+        let w = backward(&seeds.store, &seeds.pairs, &seeds.wins, horizon, s.threads(), Some(scratch))?;
         crate::metrics::mem_phase("arc: backward");
         let tb = tb.elapsed().as_secs_f64();
         let start = w.index(seeds.start);
         let steps = optimum(&w, start, start_point::<N>(), horizon);
         eprintln!("[arc] backward {tb:.2} s; optimum {steps:?} (steps)");
         let arcs = Arcs { w, shapes: seeds.shapes.clone(), space: seeds.space.clone(), level, horizon, start, steps };
-        let ap = ArcPhase { seeds, arcs };
-        ap.gate_lines(s.threads())?;
-        crate::metrics::mem_phase("arc: fingerprints");
-        Ok(ap)
-    }
-
-    /// THE `[gate]` LINES: W's support (its nodes, a content hash over
-    /// them: `Visited::fingerprint`'s), per frame the nodes with a set and
-    /// the sum of their (node, set) hashes, the optimum. Each span is added
-    /// at its first frame and taken off past its last (the sums commute, so
-    /// the nodes go in parallel).
-    fn gate_lines(&self, threads: usize) -> Result<()> {
-        let (w, horizon) = (&self.arcs.w, self.arcs.horizon);
-        let content = self.arcs.space.content_hash();
-        let parts = crate::par::Pool::new(threads).chunks(w.len().div_ceil(BLOCK), 4096, |lo, hi| {
-            let (mut fp, mut delta) = (0u64, vec![(0i64, 0u64); horizon as usize + 2]);
-            for x in w.nodes_from(lo * BLOCK, hi * BLOCK) {
-                let (shape, key, cell) = self.seeds.state(x.id);
-                let h = content.state(shape, key, cell);
-                fp = fp.wrapping_add(h);
-                for (lo, hi, r) in x.spans() {
-                    let g = gate_w_hash(h, r);
-                    delta[lo as usize] = (delta[lo as usize].0 + 1, delta[lo as usize].1.wrapping_add(g));
-                    delta[hi as usize + 1] = (delta[hi as usize + 1].0 - 1, delta[hi as usize + 1].1.wrapping_sub(g));
-                }
-            }
-            (fp, delta)
-        });
-        let (mut fp, mut delta) = (0u64, vec![(0i64, 0u64); horizon as usize + 2]);
-        for (f, d) in parts {
-            fp = fp.wrapping_add(f);
-            for (a, b) in delta.iter_mut().zip(d) {
-                *a = (a.0 + b.0, a.1.wrapping_add(b.1));
-            }
-        }
-        println!("[gate] h{horizon} support {} {fp:016x}", w.len());
-        let (mut n, mut acc) = (0i64, 0u64);
-        for (t, d) in delta[..=horizon as usize].iter().enumerate() {
-            (n, acc) = (n + d.0, acc.wrapping_add(d.1));
-            println!("[gate] h{horizon} W f{t:03} {n} {acc:016x}");
-        }
-        println!("[gate] h{horizon} arc optimum {}", self.arcs.steps.map_or("none".to_string(), |f| f.to_string()));
-        Ok(())
+        Ok(ArcPhase { seeds, arcs })
     }
 
     /// W's support as marks rows, each node's deadline its last frame
@@ -445,7 +399,8 @@ impl<N: Rem> ArcPhase<N> {
 #[allow(clippy::type_complexity)]
 fn arc_level<N: KernelLanes>(dir: &Path, level: Level, horizon: u32, s: &Settings, next: bool, save: Option<&Path>, known: Option<&super::known::Route<N>>) -> Result<(Arcs<N>, Option<Visited<N>>, Option<u32>)> {
     use crate::frame::{mark_row, save_marks};
-    let ap = ArcPhase::<N>::of(dir, level, horizon, s)?;
+    // The scratch beside the tree (the search's own).
+    let ap = ArcPhase::<N>::of(dir, level, horizon, s, &dir.join("arc-scratch"))?;
     let space = &ap.seeds.space;
     if let Some(out) = save {
         std::fs::create_dir_all(out)?;
@@ -477,37 +432,46 @@ fn arc_level<N: KernelLanes>(dir: &Path, level: Level, horizon: u32, s: &Setting
 }
 
 /// THE CONCRETE SEARCH of a search's last level (inside its W, from the arc
-/// bound `bound`): its witness, its `[gate]` line printed and, with `save`,
-/// the UI's `witness.txt`.
+/// bound `bound`): its witness and, with `save`, the UI's `witness.txt`.
 fn concrete_level<N: KernelLanes>(arcs: &Arcs<N>, bound: u32, prefer: Option<&[u8]>, save: Option<&Path>, s: &Settings) -> Result<Option<Witness>> {
     let found = concrete_search(&arcs.side(s)?, arcs.horizon, bound, prefer)?;
-    if let Some(wt) = &found {
-        println!("[gate] h{} concrete optimum {} inputs {}", arcs.horizon, wt.inputs.len(), inputs_text(&wt.inputs));
-        if let Some(out) = save {
-            wt.save(&out.join("witness.txt"))?;
-        }
+    if let (Some(wt), Some(out)) = (&found, save) {
+        wt.save(&out.join("witness.txt"))?;
     }
     Ok(found)
+}
+
+/// A finished search's record (`result.json` in `search_dir`) and the trees
+/// of the levels it ran, in its order (a dual search's halves, fixed
+/// first): each one's directory, settings (its record's, with the run's
+/// own from `run`) and level, checked against the record's.
+pub(crate) fn levels_of(search_dir: &Path, run: &Settings) -> Result<(SearchResult, Vec<(std::path::PathBuf, Settings, Level)>)> {
+    let res = SearchResult::read(search_dir)?;
+    let mut trees = Vec::new();
+    for l in &res.levels {
+        let d = search_dir.join(&l.dir);
+        let (s, lvl) = Settings::of_tree(&d, run)?;
+        anyhow::ensure!(lvl.to_string() == Level::parse(&l.spec).map_err(|e| anyhow::anyhow!(e))?.to_string(), "{}: level {lvl}, the search's record says {}", d.display(), l.spec);
+        trees.push((d, s, lvl));
+    }
+    Ok((res, trees))
 }
 
 /// `rewrite check known`: a KNOWN route against the finished search in
 /// `dir`: per level the arc phase rerun, the route checked at every pruning
 /// step (the hull forward's claim too). Levels and horizon from
-/// `result.json` (a dual half: its parent's) unless `horizon`, settings from
-/// each tree's record. An error at the first check that drops the route.
+/// `result.json` (`levels_of`; a dual half: its parent's, the half's levels)
+/// unless `horizon`. An error at the first check that drops the route.
 pub fn check_known(dir: &Path, inputs: &[u8], horizon: Option<u32>, run: &Settings) -> Result<()> {
-    let res = SearchResult::read(dir).or_else(|e| match dir.parent() {
-        Some(p) if super::result::path(p).exists() => SearchResult::read(p),
-        _ => Err(e),
-    })?;
+    let (res, trees) = match dir.parent() {
+        Some(p) if !super::result::path(dir).exists() && super::result::path(p).exists() => {
+            let (res, trees) = levels_of(p, run)?;
+            (res, trees.into_iter().filter(|(d, ..)| d.starts_with(dir)).collect())
+        }
+        _ => levels_of(dir, run)?,
+    };
+    anyhow::ensure!(!trees.is_empty(), "{}: the search ran no level here", dir.display());
     let horizon = horizon.unwrap_or(res.horizon);
-    let mut trees = Vec::new();
-    for (li, spec) in res.level.split(',').enumerate() {
-        let d = dir.join(format!("level{li:02}"));
-        let (s, lvl) = Settings::of_tree(&d, run)?;
-        anyhow::ensure!(lvl.to_string() == Level::parse(spec).map_err(|e| anyhow::anyhow!(e))?.to_string(), "{}: level {lvl}, the search's record says {spec}", d.display());
-        trees.push((d, s, lvl));
-    }
     crate::with_arith!(trees[0].1.arith, N => check_known_in::<N>(&trees, inputs, horizon))
 }
 

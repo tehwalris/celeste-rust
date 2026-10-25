@@ -293,9 +293,14 @@ gate10_forward() {
     ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/g10" --steps 44 --edges --hulls > "$C/t2/g10.ckhash" || return 1
     same "$C/t2/g10.ckhash" gates/ckhash_room10_f000-044.txt
 }
+# gate NAME: the finished search $C/t2/NAME's [gate] lines (`rewrite gate`:
+# per level its arc phase rerun, then its witness) into $C/t2/NAME.gate.
+gate() {
+    ./safe-run.sh --memory "$MEM" -- "$B" gate --search-dir "$C/t2/$1" > "$C/t2/$1.gate"
+}
 gate10_arc() {
     ./safe-run.sh --memory "$MEM" -- "$B" search --frames 35 --win-at 9,101 --search-dir "$C/t2/arc10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10-marks" > "$C/t2/arc10.out" || return 1
-    grep '^\[gate\]' "$C/t2/arc10.out" > "$C/t2/arc10.gate"
+    gate arc10 || return 1
     same "$C/t2/arc10.gate" gates/arc_room10_win9-101_h35.txt
 }
 # The same oracles in float (`--arith float`, plans/float.md).
@@ -306,22 +311,23 @@ gate10f_forward() {
 }
 gate10f_arc() {
     ./safe-run.sh --memory "$MEM" -- "$B" search --arith float --frames 35 --win-at 9,101 --search-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10f-marks" > "$C/t2/arc10f.out" || return 1
-    grep '^\[gate\]' "$C/t2/arc10f.out" > "$C/t2/arc10f.gate"
+    gate arc10f || return 1
     same "$C/t2/arc10f.gate" gates/float_arc_room10_win9-101_h35.txt
 }
 # The dual search (`rewrite dual`) at the same synthetic win, the known
-# route valid in both: its bound and witness pinned (each half's [gate]
-# lines are the two gates above).
+# route valid in both: its bound (stdout) and witness (`rewrite gate`)
+# pinned (each half's [gate] lines are the two gates above).
 gate10d_dual() {
     ./safe-run.sh --memory "$MEM" -- "$B" dual --frames 35 --win-at 9,101 --search-dir "$C/t2/dual10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/dual10-marks" > "$C/t2/dual10.out" || return 1
-    grep -E '^DUAL BOUND|^\[gate\] h35 dual' "$C/t2/dual10.out" > "$C/t2/dual10.gate"
+    ./safe-run.sh --memory "$MEM" -- "$B" gate --search-dir "$C/t2/dual10" > "$C/t2/dual10.lines" || return 1
+    { grep '^DUAL BOUND' "$C/t2/dual10.out"; grep '^\[gate\] h35 dual' "$C/t2/dual10.lines"; } > "$C/t2/dual10.gate"
     same "$C/t2/dual10.gate" gates/dual_room10_win9-101_h35.txt
 }
 # The objects ladder (r0sxn filtering r0sx) at a synthetic win, its
 # witness as the known route: every level's [gate] lines pinned.
 search42() {
     ./safe-run.sh --memory "$MEM" -- "$B" search --room 4,2 --level r0sxn,r0sx --frames 50 --win-at 32,56 --search-dir "$C/t2/s42" --prefer "$G/known_room42_win32-56.txt" --save-marks "$C/t2/s42-marks" > "$C/t2/s42.out" || return 1
-    grep '^\[gate\]' "$C/t2/s42.out" > "$C/t2/s42.gate"
+    gate s42 || return 1
     same "$C/t2/s42.gate" "$G/search42.gate"
 }
 # The UI export (`rewrite export-ui`) of the searches above with their

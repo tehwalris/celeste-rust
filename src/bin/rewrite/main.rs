@@ -130,6 +130,16 @@ enum Command {
     /// THE BENCHMARKS of a finished tree: one forward or backward frame.
     #[command(subcommand)]
     Bench(bench::Command),
+    /// THE ARC GATE'S FINGERPRINTS of a finished search (`check::gate`;
+    /// CLAUDE.md "Gates"): its `[gate]` lines, on stdout.
+    ///
+    /// Per level the search ran (a dual search's halves in its order), the
+    /// arc phase rerun over its tree as the search ran it: W's support (its
+    /// nodes and a content hash), per frame the nodes with a set and a hash
+    /// of their (node, set), the arc optimum in steps; then the concrete
+    /// optimum and witness from `result.json` (a dual search's: its exit and
+    /// real play's). Content only: the same at every thread count.
+    Gate(GateArgs),
     /// WHY A KERNEL DECLINES A STATE (`check::explain`; the decline report
     /// prints this command).
     ///
@@ -226,7 +236,7 @@ enum Command {
 impl Command {
     /// A command that reads finished trees: their records give the settings.
     fn reads_trees(&self) -> bool {
-        matches!(self, Command::Ckhash(_) | Command::Check(_) | Command::Bench(_) | Command::Explain(_) | Command::Census(_) | Command::ExportUi(_) | Command::L1(l1::Command::Probe(_)))
+        matches!(self, Command::Ckhash(_) | Command::Check(_) | Command::Bench(_) | Command::Gate(_) | Command::Explain(_) | Command::Census(_) | Command::ExportUi(_) | Command::L1(l1::Command::Probe(_)))
     }
 }
 
@@ -326,6 +336,13 @@ pub struct ExportUiArgs {
     /// byte (the tasdatabase upload the category runner verified).
     #[arg(long)]
     download: Option<String>,
+}
+
+#[derive(clap::Args)]
+pub struct GateArgs {
+    /// The search's directory (its `result.json` and levels' trees).
+    #[arg(long)]
+    search_dir: std::path::PathBuf,
 }
 
 #[derive(clap::Args)]
@@ -526,6 +543,12 @@ fn main() -> Result<()> {
         Command::Ckhash(a) => diag::ckhash(&cfg, a),
         Command::Check(c) => check::run(&cfg, c),
         Command::Bench(c) => bench::run(&cfg, c),
+        Command::Gate(a) => {
+            for l in celeste_rust::check::gate::search_lines(&a.search_dir, &cfg)? {
+                println!("{l}");
+            }
+            Ok(())
+        }
         Command::Explain(a) => {
             let t = a.tree.open(&cfg)?;
             print!("{}", celeste_rust::with_arith!(t.settings.arith, N => celeste_rust::check::explain::explain::<N>(&t, a.step, a.state)?));

@@ -300,7 +300,10 @@ impl Drop for Scratch {
 
 /// `bench backward` of `frame` in the arithmetic of `N`, the winning sets
 /// for `horizon`.
-fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize) -> Result<()> {
+fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize) -> Result<()>
+where
+    N::C: celeste_rust::check::gate::GateWord,
+{
     let cfg = &tree.settings;
     anyhow::ensure!(frame < horizon, "--step {frame}: below the horizon {horizon}");
     let t = std::time::Instant::now();
@@ -328,7 +331,7 @@ fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize)
         for (id, r) in c.current() {
             let (shape, key, cell) = seeds.state(id);
             n += 1;
-            acc = acc.wrapping_add(celeste_rust::search::backward::gate_w_hash(content.state(shape, key, cell), r));
+            acc = acc.wrapping_add(celeste_rust::check::gate::w_hash(content.state(shape, key, cell), r));
         }
         let ms = |k: usize| (after[k] - before[k]).as_secs_f64() * 1e3;
         eprintln!("[bench backward] rep {rep}: W f{frame} in {:.1} ms (read {:.1}, pull {:.1}, merge {:.1} ms)", wall.as_secs_f64() * 1e3, ms(0), ms(1), ms(2));

@@ -70,8 +70,11 @@ celeste-rust (src/)
                         them (`conventions`): differential (the checks'
                         one harness and verdict), arcs (the transfers
                         against the reference), replay (the tree from its
-                        recorded graph), census (the kernel census,
-                        rebuilt), explain (a kernel's decline, rebuilt)
+                        recorded graph), keys (the keys against the
+                        boundary, through `frame::RowCheck`), gate (the arc
+                        gate's fingerprints, the arc phase rerun), census
+                        (the kernel census, rebuilt), explain (a kernel's
+                        decline, rebuilt)
   settings.rs           the run's settings (flags), the tree's record
   starts.rs             the feasible loading-jank J's and their classes
   par.rs, metrics.rs, concrete.rs, game_runner.rs

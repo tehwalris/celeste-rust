@@ -19,8 +19,9 @@ byte-identical, or re-pins them on evidence.
   their pins by `./check.sh fixtures`.
 - **The room (1,0) gates** (t2): the f0-f44 `ckhash` (states, edges and
   hulls), and the arc gate. The arc gate pins the marks, W at every frame
-  f0-f35, the optimum, the concrete witness and the known route
-  (`--prefer`, `search::known`).
+  f0-f35, the optimum, the concrete witness (its `[gate]` lines: `rewrite
+  gate --search-dir`, the arc phase rerun over the finished search) and the
+  known route (`--prefer`, `search::known`).
 - **The objects-ladder search** (t2): room (4,2) `r0sxn,r0sx`, every
   `[gate]` line, and its UI export.
 - **The float and dual gates** (t2), and the float twins' frames (t1).

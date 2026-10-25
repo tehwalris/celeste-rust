@@ -67,7 +67,7 @@ crate::storage::stats::registry! {
 pub(crate) type ArcStats = crate::storage::stats::Stats<A, { <A as crate::storage::stats::Registry>::ALL.len() }>;
 
 /// Nodes per block of `Winning` (a lookup decodes at most this many).
-pub(super) const BLOCK: usize = 16;
+pub(crate) const BLOCK: usize = 16;
 
 /// The winning sets, `t` in `0..=horizon`, of W's SUPPORT, by state. A
 /// node's set is non-empty from its layer to its last frame and only grows
@@ -235,7 +235,7 @@ impl<C: Circle> Winning<C> {
         self.decode_at(&mut pos, &mut id)
     }
     /// Nodes `lo..hi` in id order (`lo` a block's first).
-    pub(super) fn nodes_from(&self, lo: usize, hi: usize) -> Nodes<'_, C> {
+    pub(crate) fn nodes_from(&self, lo: usize, hi: usize) -> Nodes<'_, C> {
         assert!(lo % BLOCK == 0, "nodes from a block's first");
         Nodes { w: self, k: lo, end: hi.min(self.n), pos: 0, id: Sk::default() }
     }
@@ -1023,20 +1023,6 @@ impl<N: Rem> Seeds<N> {
     pub fn state(&self, s: Sk) -> (u64, (u64, u64), u32) {
         (self.shapes[s.shape() as usize], s.key, s.cell())
     }
-}
-
-/// One node's term of the gate's `W f{t}` line: its content hash
-/// (`exact::ContentHash::state`) folded with its set's rectangles.
-pub fn gate_w_hash<C: Circle>(node: u64, r: RegionRef<C>) -> u64 {
-    use celeste_engine::runtime2::mix64;
-    let mut h = node;
-    for (y, xs) in r.slabs() {
-        h = mix64(h ^ C::seg_word(y));
-        for x in xs {
-            h = mix64(h ^ C::seg_word(x));
-        }
-    }
-    h
 }
 
 #[cfg(test)]
