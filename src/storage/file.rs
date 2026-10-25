@@ -1,6 +1,6 @@
 //! THE TREE FILES' ONE CONTAINER (frame and edge files; value
 //! files: the marks): a 4-byte magic (the file's kind, in
-//! its arithmetic: `magic`), a u32 version (`FORMAT_VERSION`; the edge
+//! its arithmetic: `magic`; a marks file's too, its keys the tree's), a u32 version (`FORMAT_VERSION`; the edge
 //! files' their own), the header's length (u64; both little-endian), the
 //! header (bincode 1), then the BLOCKS back to back, zstd -1, placed by the
 //! header (`At`). A value file is a header and no block. Written once, to a
@@ -175,20 +175,21 @@ fn header_len(b: &[u8], magic: [u8; 4], version: u32, path: &Path, what: &str) -
     Ok(n)
 }
 
-/// Save a value (the marks): a file of no block.
-pub(crate) fn save_value<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    write(path, *VALUE, FORMAT_VERSION, value, |_| Ok(())).map(drop)
+/// Save a value (the marks) in arithmetic `N` (a marks file's key space is
+/// its tree's: the magic says which): a file of no block.
+pub(crate) fn save_value<N: celeste_core::arith::Arithmetic, T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    write(path, magic::<N>(VALUE), FORMAT_VERSION, value, |_| Ok(())).map(drop)
 }
 
-/// Load a value `save_value` saved.
-pub(crate) fn load_value<T: DeserializeOwned>(path: &Path) -> Result<T> {
-    open_value(path)?.header()
+/// Load a value `save_value::<N>` saved (another arithmetic's is refused).
+pub(crate) fn load_value<N: celeste_core::arith::Arithmetic, T: DeserializeOwned>(path: &Path) -> Result<T> {
+    open_value::<N>(path)?.header()
 }
 
-/// A value file mapped, for readers that walk a large value in place (its
-/// bincode: `header_bytes`).
-pub(crate) fn open_value(path: &Path) -> Result<Mapped> {
-    let m = Mapped::open(path, *VALUE, FORMAT_VERSION, "a value file")?;
+/// A value file of arithmetic `N` mapped, for readers that walk a large
+/// value in place (its bincode: `header_bytes`).
+pub(crate) fn open_value<N: celeste_core::arith::Arithmetic>(path: &Path) -> Result<Mapped> {
+    let m = Mapped::open(path, magic::<N>(VALUE), FORMAT_VERSION, &format!("a value file in {}", N::NAME))?;
     m.ends_at(0)?;
     Ok(m)
 }

@@ -87,7 +87,7 @@ pub fn run(cfg: &Settings, c: Command) -> Result<()> {
             // The tracer recurses through the cart's AST: a big stack.
             let report = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)
-                .spawn(move || level_minus_one::probe(&opts, &cfg))
+                .spawn(move || celeste_rust::with_arith!(cfg.arith, N => level_minus_one::probe::<N>(&opts, &cfg)))
                 .context("spawn the level -1 probe")?
                 .join()
                 .map_err(|_| anyhow!("the level -1 probe panicked"))??;

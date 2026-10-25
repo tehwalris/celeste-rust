@@ -1018,12 +1018,13 @@ pub(crate) fn mark_row(shape: u64, key: (u64, u64), cell: u32, deadline: u16, ho
 /// once, with the key space its keys are in.
 pub(crate) fn save_marks<N: Arithmetic>(path: &std::path::Path, mut rows: Vec<MarkRow>, horizon: u32, keys: &celeste_engine::exact::KeySpace<N>) -> Result<()> {
     rows.sort_unstable();
-    crate::storage::file::save_value(path, &(rows, horizon, keys.to_additions()))
+    crate::storage::file::save_value::<N, _>(path, &(rows, horizon, keys.to_additions()))
 }
 
-/// A marks file's rows, horizon and key space.
-pub(crate) fn load_marks(path: &std::path::Path) -> Result<(Vec<MarkRow>, u32, celeste_engine::exact::KeySpace)> {
-    let (rows, horizon, adds): (Vec<MarkRow>, u32, celeste_engine::exact::KeyAdditions) = crate::storage::file::load_value(path)?;
+/// A marks file's rows, horizon and key space, in arithmetic `N` (a file of
+/// another is refused: its magic is its arithmetic's).
+pub(crate) fn load_marks<N: Arithmetic>(path: &std::path::Path) -> Result<(Vec<MarkRow>, u32, celeste_engine::exact::KeySpace<N>)> {
+    let (rows, horizon, adds): (Vec<MarkRow>, u32, celeste_engine::exact::KeyAdditions<N>) = crate::storage::file::load_value::<N, _>(path)?;
     Ok((rows, horizon, celeste_engine::exact::KeySpace::from_additions(adds).with_context(|| format!("{}: its key space", path.display()))?))
 }
 
@@ -1109,10 +1110,10 @@ impl<N: Arithmetic> Visited<N> {
     }
 }
 
-impl Visited {
+impl<N: Arithmetic> Visited<N> {
     /// THE MARKS FILE (also read by the UI export): `(rows, horizon, key
     /// space)`, `dist` = horizon - deadline; no deadline saves as 0 (filters
-    /// alike).
+    /// alike), under its arithmetic's magic.
     #[cfg(test)]
     pub(crate) fn save(&self, path: &std::path::Path, horizon: u32) -> Result<()> {
         let mut rows: Vec<MarkRow> = Vec::with_capacity(self.len());
@@ -1122,9 +1123,9 @@ impl Visited {
         save_marks(path, rows, horizon, &self.keys)
     }
 
-    /// A marks file (`save`).
+    /// A marks file (`save`) of arithmetic `N`.
     pub(crate) fn load(path: &std::path::Path) -> Result<Self> {
-        let (rows, horizon, keys) = load_marks(path)?;
+        let (rows, horizon, keys) = load_marks::<N>(path)?;
         let mut out = Self::new(keys);
         for (shape, cell, k0, k1, dist) in rows {
             anyhow::ensure!(dist <= horizon, "{}: a mark {dist} frames before h{horizon}", path.display());
@@ -1337,7 +1338,7 @@ mod tests {
     fn marks_files_keep_their_deadlines() {
         let path = std::env::temp_dir().join(format!("celeste-marks-roundtrip-{}.bin", std::process::id()));
         // A key space with shapes 1 and 9, two codes in one field each.
-        let mut space = celeste_engine::exact::KeySpace::new();
+        let mut space = celeste_engine::exact::KeySpace::<P8>::new();
         let mut adds = Default::default();
         for shape in [1, 9] {
             space.add_shape(&celeste_engine::exact::ShapeRecord { hash: shape, sig: vec![1, u32::MAX], pos: None, deps: Vec::new() }, &mut adds);
@@ -1348,12 +1349,38 @@ mod tests {
         v.insert_until(1, (0, 1), 4, 12);
         v.insert(9, (0, 0), 8);
         v.save(&path, 12).expect("save");
-        let w = Visited::load(&path).expect("load");
+        let w = Visited::<P8>::load(&path).expect("load");
         std::fs::remove_file(&path).expect("rm");
         assert_eq!(w.fingerprint(), v.fingerprint());
         assert_eq!(w.deadline(1, (0, 0), 4), Some(7));
         assert_eq!(w.deadline(1, (0, 1), 4), Some(12));
         assert_eq!(w.deadline(9, (0, 0), 8), Some(12), "no deadline: the horizon");
+    }
+
+    /// A MARKS FILE IS IN ITS TREE'S ARITHMETIC: a float tree's loads as
+    /// float, its key space intact, and is REFUSED as 16.16 (its codes are
+    /// doubles' raws: read as 16.16 they would key other states); a 16.16
+    /// file is refused as float.
+    #[test]
+    fn a_marks_file_loads_in_its_own_arithmetic_alone() {
+        use celeste_core::arith::{Fixed, Float};
+        use celeste_engine::exact::{Code, KeySpace, ShapeRecord};
+        let path = std::env::temp_dir().join(format!("celeste-marks-arith-{}.bin", std::process::id()));
+        let mut space = KeySpace::<Float>::new();
+        let mut adds = Default::default();
+        space.add_shape(&ShapeRecord { hash: 1, sig: vec![1, u32::MAX], pos: None, deps: Vec::new() }, &mut adds);
+        space.add_codes(1, 0, &[Code::<Float>::num(0, 0), Code::<Float>::num(1.5f64.to_bits(), 2.5f64.to_bits())], &mut adds);
+        let mut v = Visited::<Float>::new(space);
+        v.insert_until(1, (0, 1), 4, 7);
+        v.save(&path, 12).expect("save");
+        let w = Visited::<Float>::load(&path).expect("a float marks file loads as float");
+        assert_eq!((w.fingerprint(), w.deadline(1, (0, 1), 4)), (v.fingerprint(), Some(7)));
+        let e = Visited::<Fixed>::load(&path).err().expect("a float marks file loaded as 16.16");
+        assert!(e.to_string().contains("not a value file in fixed"), "{e:#}");
+        let fixed = Visited::<Fixed>::new(KeySpace::new());
+        fixed.save(&path, 12).expect("save");
+        assert!(Visited::<Float>::load(&path).is_err(), "a 16.16 marks file loaded as float");
+        std::fs::remove_file(&path).expect("rm");
     }
 
     /// A resume (`ForwardState::at`) takes the frontier the uninterrupted
