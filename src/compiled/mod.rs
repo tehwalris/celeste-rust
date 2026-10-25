@@ -56,8 +56,6 @@ pub struct BoundaryIds {
     pub f_state: u32,
     /// The orb room's big chest (`frame::orb_deadline_skip`).
     pub g_big_chest: u32,
-    /// The moving platforms (a frame test).
-    pub g_platform: u32,
     /// The balloon's phase and bob (`concrete::lookup_view`, a seeded state).
     pub g_balloon: u32,
     pub f_offset: u32,
@@ -84,7 +82,6 @@ fn boundary_ids() -> BoundaryIds {
         g_fake_wall: g("fake_wall"),
         f_state: f("state"),
         g_big_chest: g("big_chest"),
-        g_platform: g("platform"),
         g_balloon: g("balloon"),
         f_offset: f("offset"),
         f_start: f("start"),

@@ -240,41 +240,53 @@ mod tests {
         assert!(text.contains(super::SOURCES) && text.contains("gcc ") && text.contains("glibc "), "{text}");
     }
 
-    /// CACHED = FRESH: two fresh builds of room (1,0)'s r0sxh kernels store
-    /// the same entry (recipes and code, byte for byte), a third build loads
-    /// it (the same kernel text), and a damaged entry is a miss, rebuilt.
+    /// CACHED = FRESH: per case, two fresh builds store the same entry
+    /// (recipes and code, byte for byte) and a third build loads it: the
+    /// same kernel text and the same KEY LAYOUTS. Room (1,0) r0sxh, and room
+    /// (6,0) r0sxhf split, whose ten exact platforms are keyed by
+    /// dependencies (`exact::Deps`; the followers' templates are no
+    /// recipe's: `AsmKernel::of` makes them from the level, alike for both).
+    /// A damaged entry is a miss, rebuilt.
     #[test]
-    #[ignore = "slow, ./check.sh t2 runs it: three builds of room (1,0)'s kernels, ~15 s"]
+    #[ignore = "slow, ./check.sh t2 runs it: three builds each of room (1,0)'s and room (6,0)'s kernels, ~60 s"]
     fn a_cached_kernel_set_is_the_fresh_one() {
         use super::super::asm_kernel::Registry;
-        let level = Level::parse("r0sxh").expect("level");
-        let s = Settings::default();
-        let roots: Vec<std::path::PathBuf> = (0..2).map(|i| std::env::temp_dir().join(format!("celeste-kernel-cache-{}-{i}", std::process::id()))).collect();
-        for r in &roots {
-            let _ = std::fs::remove_dir_all(r);
-        }
-        let stores: Vec<super::Store> = roots.iter().map(|r| super::Store::at(r)).collect();
-        let key = super::key::<Pico8Num>(level, &s).expect("key");
-        let entry = |i: usize| -> Vec<(String, Vec<u8>)> {
-            let dir = stores[i].dir.join(&key.name);
-            let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&dir).expect("the entry").flatten().map(|f| (f.file_name().to_string_lossy().into_owned(), std::fs::read(f.path()).expect("read"))).collect();
-            files.sort();
-            files
-        };
-        let fresh: Vec<Registry<Pico8Num>> = stores.iter().map(|st| Registry::build_with(level, &s, Some(st)).expect("a fresh build")).collect();
-        assert_eq!(entry(0), entry(1), "two fresh builds store the same entry");
-        assert!(entry(0).iter().filter(|(n, _)| n.ends_with(".so")).count() == fresh[0].len(), "an entry holds every kernel's code");
-        let cached = Registry::<Pico8Num>::build_with(level, &s, Some(&stores[0])).expect("a cached build");
-        assert_eq!(cached.text_digest(), fresh[0].text_digest(), "the cached kernels are the fresh ones");
-        // A damaged entry is a miss: rebuilt and stored again.
-        let so = stores[0].dir.join(&key.name).join("k0.so");
-        let mut bytes = std::fs::read(&so).expect("k0.so");
-        bytes[100] ^= 1;
-        std::fs::write(&so, bytes).expect("write");
-        assert!(stores[0].load::<Pico8Num>(&key).expect("load").is_none(), "a damaged entry is not used");
-        assert!(!stores[0].dir.join(&key.name).exists(), "a damaged entry is removed");
-        for r in &roots {
-            let _ = std::fs::remove_dir_all(r);
+        let cases = [("r0sxh", Settings::default()), ("r0sxhf", Settings { room: (6, 0), split_frame: true, ..Settings::default() })];
+        for (case, (level, s)) in cases.iter().enumerate() {
+            let level = Level::parse(level).expect("level");
+            let roots: Vec<std::path::PathBuf> = (0..2).map(|i| std::env::temp_dir().join(format!("celeste-kernel-cache-{}-{case}-{i}", std::process::id()))).collect();
+            for r in &roots {
+                let _ = std::fs::remove_dir_all(r);
+            }
+            let stores: Vec<super::Store> = roots.iter().map(|r| super::Store::at(r)).collect();
+            let key = super::key::<Pico8Num>(level, s).expect("key");
+            let entry = |i: usize| -> Vec<(String, Vec<u8>)> {
+                let dir = stores[i].dir.join(&key.name);
+                let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&dir).expect("the entry").flatten().map(|f| (f.file_name().to_string_lossy().into_owned(), std::fs::read(f.path()).expect("read"))).collect();
+                files.sort();
+                files
+            };
+            let fresh: Vec<Registry<Pico8Num>> = stores.iter().map(|st| Registry::build_with(level, s, Some(st)).expect("a fresh build")).collect();
+            assert_eq!(entry(0), entry(1), "room {:?}: two fresh builds store the same entry", s.room);
+            assert!(entry(0).iter().filter(|(n, _)| n.ends_with(".so")).count() == fresh[0].len(), "an entry holds every kernel's code");
+            let cached = Registry::<Pico8Num>::build_with(level, s, Some(&stores[0])).expect("a cached build");
+            assert_eq!(cached.text_digest(), fresh[0].text_digest(), "room {:?}: the cached kernels are the fresh ones", s.room);
+            let layouts = cached.key_layouts();
+            assert!(layouts == fresh[0].key_layouts(), "room {:?}: the cached kernels' key layouts are the fresh ones'", s.room);
+            let with_deps = layouts.iter().filter(|l| l.1.iter().any(|(r, _)| !r.deps.is_empty())).count();
+            assert_eq!(with_deps > 0, s.room == (6, 0), "room {:?}: {with_deps} of {} kernels key by dependencies", s.room, layouts.len());
+            if case == 0 {
+                // A damaged entry is a miss: rebuilt and stored again.
+                let so = stores[0].dir.join(&key.name).join("k0.so");
+                let mut bytes = std::fs::read(&so).expect("k0.so");
+                bytes[100] ^= 1;
+                std::fs::write(&so, bytes).expect("write");
+                assert!(stores[0].load::<Pico8Num>(&key).expect("load").is_none(), "a damaged entry is not used");
+                assert!(!stores[0].dir.join(&key.name).exists(), "a damaged entry is removed");
+            }
+            for r in &roots {
+                let _ = std::fs::remove_dir_all(r);
+            }
         }
     }
 }

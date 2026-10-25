@@ -26,7 +26,9 @@ byte-identical, or re-pins them on evidence.
 - **The float and dual gates** (t2), and the float twins' frames (t1).
 - **The differential checks against the reference engine**:
   - t1: `check ref`, `check arcs` (and `check arcs --fault action` must fail),
-    `--key-check` and `check widen`;
+    `--key-check` and `check widen`; `keycheck-r60s`, the one fixture whose
+    keys have FOLLOWERS (room (6,0)'s ten platforms, `exact::Deps`), every
+    row's key recomputed at the boundary with its followers checked;
   - t2: `reference10[f]`, the reference engine's forward tree equal to the
     kernels', f0-f27 with edges and hulls, fixed and float;
   - t2: `hull10[f]`, the hull replay over the recorded edges.
@@ -119,8 +121,9 @@ The steps run in four lanes:
   f0-f27), and
   `hull10[f]` (`check replay` over the kernels' tree to f36: its recorded
   edges reproduce its states at every frame);
-- **platforms**: `forward60-platforms` (room (6,0) `r0sxhfp` split frame to
-  step 71, its `ckhash --edges --hulls` the r60s pin) and `widen-r60s`;
+- **platforms**: `forward60-platforms` (room (6,0) `r0sxhf` split frame to
+  step 71, its ten platforms exact and keyed by the first one's; its
+  `ckhash --edges --hulls` the r60s pin) and `widen-r60s`;
 - **slow**: the `slow, ` tests. These are the hull forward between the exact
   reach and the widened forward (f34), the bounds the region and platform
   kernels check, the split frame at a near level, a run killed before its
@@ -256,7 +259,7 @@ never committed.
 | r42n, f42n | room (4,2) 2100m `r0sxhn`, level -1 (71,5), to f61; frame 60 -> 61 | 15-25 s |
 | r42x, f42x | room (4,2) `r0sxh` (objects exact) to f56: the reference checks' object room | 14-18 s |
 | r10arc, f10arc | `search --level r0sxh --frames 56 --win-at 40,64`: the backward's tree | 4-5 s |
-| r60s | room (6,0) 700m `r0sxhfp`, split frame, to step 71 | 26-40 s |
+| r60s | room (6,0) 700m `r0sxhf` (ten exact platforms keyed by the first), split frame, to step 71 | 18-40 s |
 | r62h57 (big) | room (6,2) 100% to f57, the reference frame | 57 s |
 
 ## Re-pinning

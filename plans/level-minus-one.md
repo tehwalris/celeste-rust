@@ -93,7 +93,8 @@ d is weak by design (start's d ~45 against optima of 80-130: the player
 may move S px a frame in any direction). It bites in the last ~20 frames,
 exactly where a room's level 0 explodes when its frames do not dedupe
 (springs, ice). It does not rescue a room whose every frame is new (room
-(6,0) with platforms exact: d 31 against the real 46; that needed `p`).
+(6,0) with platforms exact: d 31 against the real 46; that needed `p`,
+until the exact platforms keyed by the first one's fit, 2026-10-25).
 
 ## Build failures and their fixes
 
@@ -111,7 +112,8 @@ weakened:
   start holds as an interval are seeded from its literal.
 
 Still refused or not converging: the summit (it measures the room exit) and
-the platform rooms (6,0), (2,1), (1,2), in fixed and float.
+the platform rooms (6,0), (2,1), (1,2), in fixed and float (measured at
+`p`; not tried since the platforms are exact).
 
 ## Deferred: the off-screen lane
 

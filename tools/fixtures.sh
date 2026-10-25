@@ -51,8 +51,9 @@ spec() {
         # checks' object room (the reference forks r0sxhn's widened objects
         # into thousands of paths a row: plans/devloop.md).
         r42x) FLAGS="--level-minus-one 71,5"; CMD="forward --room 4,2 --level r0sxh --steps 56"; LAST=56 ;;
-        # Room (6,0) 700m, platforms unknown, split frame: steps 70 -> 71.
-        r60s) FLAGS="--split-frame"; CMD="forward --room 6,0 --level r0sxhfp --steps 71"; LAST=71 ;;
+        # Room (6,0) 700m, split frame: its ten platforms exact, keyed by the
+        # first one's (`widening::CLOCKS`, the followers checked): steps 70 -> 71.
+        r60s) FLAGS="--split-frame"; CMD="forward --room 6,0 --level r0sxhf --steps 71"; LAST=71 ;;
         # A finished search for the backward: room (1,0) r0sxh, synthetic
         # win at (40,64) (first win f47, optimum 49), horizon 56.
         r10arc) CMD="search --room 1,0 --level r0sxh --frames 56 --win-at 40,64"; TREE=level00; LAST=56 ;;

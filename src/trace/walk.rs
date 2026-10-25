@@ -62,10 +62,6 @@ impl RegionGrid {
 
 pub type InputRanges<A = Fixed> = Vec<(super::iface::Path, (<A as Arithmetic>::Lit, <A as Arithmetic>::Lit))>;
 
-/// Frames of platform motion the platform worlds cover: a platforms-unknown
-/// level is sound only up to this horizon and refuses a longer search.
-pub const PLATFORM_WORLD_FRAMES: usize = 127;
-
 /// A walk SHAPE: its block's shape hash (`Rt2::shape_hash`), what the
 /// kernels are keyed by.
 pub type ShapeKey = u64;
@@ -518,9 +514,6 @@ fn boot<A: GraphArith>(s: &crate::settings::Settings, opts: crate::abstraction::
     let mut it = super::interp::Interp::new(super::domain::Symbolic::<A>::default());
     it.d.build_trace = s.diag.build_trace;
     it.d.level = opts;
-    if opts.platforms {
-        it.d.worlds = Some(std::sync::Arc::new(crate::concrete::platform_worlds::<A>(PLATFORM_WORLD_FRAMES, s)?));
-    }
     let start = super::cart::boot(&mut it, chunks, s.room)?;
     Ok((Tracer { it, chunks }, start))
 }

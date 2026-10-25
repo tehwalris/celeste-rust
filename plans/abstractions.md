@@ -1,7 +1,7 @@
 # The level flags: what each widens, why it is sound, what refutes it
 
-A level is `celeste_engine::widening::Level { held, fruit, floors_near,
-platforms }`, written `r0sx[h][f][n][p]` (`Level::parse`). The `r0sx`
+A level is `celeste_engine::widening::Level { held, fruit, floors_near }`,
+written `r0sx[h][f][n]` (`Level::parse`). The `r0sx`
 prefix is what every level shares: the remainder widened at the boundary
 and tracked exactly by the arcs, the speed exact. A search runs one level,
 or the OBJECTS LADDER (`--level r0sxhn,r0sxh`: each finer level filtered by
@@ -12,11 +12,15 @@ the coarser one's reached nodes; plans/architecture.md "The search").
 | `r0sx` | rooms without objects (or `r0sxh`: held buttons unknown) |
 | `r0sxhn` | the object default: springs, fall floors, balloons, key, chest |
 | `r0sxhf`, `r0sxhfn` | a fly fruit |
-| `r0sxhfp`, `r0sxhnp` | moving platforms |
 | `r0sxhn,r0sxh` (and down to `r0sx`) | the ladder, where level 0's bound is loose |
 
+Moving platforms have no flag: they are EXACT at every level, keyed by the
+first platform's fields where a room has several ("Moving platforms"
+below). The `p` flag that widened them was removed on 2026-10-25
+(plans/correctness.md C13); a spec holding `p` is refused.
+
 **Every widening is one entry of ONE table** (`celeste_engine::widening::
-TABLE`): per entry its flag (every level, or `h`, `f`, `n`, `p`), its
+TABLE`): per entry its flag (every level, or `h`, `f`, `n`), its
 objects, per slot what it STORES, how the frame READS it, whether it is
 EXACT or an OVER-APPROXIMATION, and why. The tracer interprets the table in
 the graph (`trace::widen`), the block side over columns (`Rt2::widen_to`);
@@ -47,9 +51,8 @@ checks that they agree. The table below is GENERATED
   eager point split made every outcome's `live` read every comparison
   (room (6,0) `r0sxhp`: 2^70 bodies an outcome). Forks happen only where an
   undecided select survives folding (`split::split_undecided_selects`).
-- **The reference engine as a frame step refuses `p`** (no reference form
-  for the worlds); `h`, `f` and `n` it forks per path. The concrete
-  search's own steps are exact whatever the level.
+- **The reference engine as a frame step** forks `h`, `f` and `n` per
+  path. The concrete search's own steps are exact whatever the level.
 
 ## The table
 
@@ -85,9 +88,6 @@ checks that they agree. The table below is GENERATED
 |  |  |  | `offset` | one period [0, 0.99998] | as stored |  |
 | near fall floor | `n` | `fall_floor` | `state` | [0, 2]; owed: inside | by the hook | over, hook `NearFloor` |
 |  |  |  | `collideable` | the unknown boolean | by the hook |  |
-| platform path | `p` | `platform` | `x` | [-16, 128]; owed: inside | by the hook | over, hook `PlatformInputs` |
-|  |  |  | `last` | `x`'s; owed: equal to `x` | by the hook |  |
-| platform remainder | `p` | `platform` | `rem.x` | [-0.5, 0.49998]; owed: inside | by the hook | over, hook `PlatformInputs` |
 | balloon offset | every | `balloon` | `offset` (may be absent) | a full period as [0, 0.99998]; owed: the width | as stored | exact |
 | absent fall floor delay | every | `fall_floor` | `delay` (may be absent) | 0 where absent | as stored | exact |
 | absent spring delay | every | `spring` | `delay` (may be absent) | 0 where absent | as stored | exact |
@@ -103,9 +103,7 @@ checks that they agree. The table below is GENERATED
 - **balloon countdown** (over-approximation). As the fall floor's countdown.
 - **spring phase** (over-approximation). The spring's sprite (0 hidden, 18 ready, 19 compressed) its range, so `spr == 18` splits like a floor's state; its countdowns the unknown number. Its update becomes "maybe bounce". Refuted by the CONCRETE SEARCH.
 - **balloon phase** (over-approximation). The balloon's sprite (0 popped, 22 present) its range and its `y` the bob band `start +- 2` (the bob runs only when `spr == 22`, and an exact `y` would give every state a twin). Its update becomes "maybe refill the dash". The phase `offset` is read only as `sin(offset)` into `y`, so one period [0, 1) covers every `y` the bob makes (an unseeded `rnd` phase is that period already; a SEEDED one, which the float tools always set, would otherwise split on every undecided `spr == 22`: room (4,2)'s six balloons made f^6 states before the player). Refuted by the CONCRETE SEARCH.
-- **near fall floor** (over-approximation). Each fall floor's `state` [0, 2] and `collideable` unknown, EXCEPT where a player certainly overlaps the floor at the frame's end (there the cart's invariant, hidden, owed; with `p` the computed value). The input derives `collideable` as `state ~= 2` (the cart keeps them in step). Refuted by the CONCRETE SEARCH or the ladder `r0sxhn,r0sxh`.
-- **platform path** (over-approximation). Every moving platform's `x` the interval of its whole path [-16, 128] (the wrap keeps it inside, proved on the traced select or owed), `last` the same node (`last == x` at every frame boundary, checked). The worlds (`concrete::platform_worlds`) keep the platforms mutually consistent (`split::Points`). Refuted by the CONCRETE SEARCH (the reference engine refuses `p`).
-- **platform remainder** (over-approximation). A platform's `rem.x` the whole remainder, read as the literal (owed per lane): a pixel of slack at this level. Refuted by the CONCRETE SEARCH.
+- **near fall floor** (over-approximation). Each fall floor's `state` [0, 2] and `collideable` unknown, EXCEPT where a player certainly overlaps the floor at the frame's end (there the cart's invariant, hidden, owed). The input derives `collideable` as `state ~= 2` (the cart keeps them in step). Refuted by the CONCRETE SEARCH or the ladder `r0sxhn,r0sxh`.
 - **balloon offset** (EXACT). The balloon's `rnd` phase is read only through `sin(offset)`, and `sin` of a full period is [-1, 1] whatever the interval's ends, so a full-period interval is stored as the canonical [0, 1) (a point, a seeded phase, is left). Room (5,0) reaches the same balloon-free states with it.
 - **absent fall floor delay** (EXACT). A fall floor gains `delay` only when it first breaks, which made "which floors ever broke" heap shape. A missing `delay` is written as 0: the cart can tell nil from 0 only by raising (`delay - 1`, `delay <= 0` halt PICO-8 on nil), and `cart::check_absent_fields` refuses a cart that reads it any other way. Exact on every execution that does not raise.
 - **absent spring delay** (EXACT). As the fall floor's: a spring gains `delay` when it first breaks.
@@ -113,16 +111,13 @@ checks that they agree. The table below is GENERATED
 
 "stored" is what the frame's end writes; "owed" is checked per lane where
 the frame cannot prove it (on blocks an assertion); "read as" is the input
-side. Two things a slot cannot say are HOOKS:
+side. What a slot cannot say is a HOOK:
 
 - **`NearFloor`** (`n`): the stored value depends on ANOTHER object (the
   player overlapping the floor at the frame's end). Overlapped, it stores
-  the cart's invariant (owed) or, with `p`, the computed value; mid split
-  frame `collideable` stays computed in the player's probe window
-  (`widen::PLAYER_PROBE`); the input derives `collideable` from `state`.
-- **`PlatformInputs`** (`p`): the input is per WORLD (which world platform
-  an object is, `x` restricted to the path and recorded for
-  `split::Points`, `spd.x` bound by the worlds).
+  the cart's invariant (owed); mid split frame `collideable` stays computed
+  in the player's probe window (`widen::PLAYER_PROBE`); the input derives
+  `collideable` from `state`.
 
 Not in the table: `rnd` (the cart's own draw, below); the region key (a
 dispatch); the bounds a kernel assumes (`Restrict`, pins: assumptions on an
@@ -166,7 +161,7 @@ input, never a stored value); the concrete search's seeded-balloon view
 - **Why**: while waiting, `step += 0.05` (inexact in 16.16) and the bob
   mean no fruit state recurs across frames; once flying, rows split by the
   frame of the dash. Room (3,0) f50: 3.6x fewer states.
-- **Mechanisms it brought** (shared by the floors and platforms): literals
+- **Mechanisms it brought** (shared by the floors): literals
   stay literals; a merge no lane decides joins to a hull, one lane data
   decides stays two successors (`Interp::joins_independent`); a literal's
   `__split_by_flr` fragments rejoin at the call's return.
@@ -205,28 +200,35 @@ input, never a stored value); the concrete search's seeded-balloon view
   is too loose for the concrete search alone (room (7,0): bound 80, the
   optimum 84), the ladder `r0sxhn,r0sxh` (bound 84).
 
-## p: moving platforms unknown (platform rooms)
+## Moving platforms: exact, keyed by the first (no flag)
 
-- **Widens**: every platform's `x` and `last` to the whole path [-16, 128]
-  (`last == x` at every frame boundary, bound as one node and checked; the
-  wrap keeps `x` inside, proved or owed), `rem.x` the literal [-0.5, 0.5).
-  The carry `(b + c) - b = c` cancels exactly in the tracer.
-- **Why**: an exact platform is a frame counter in every state (room (6,0)
-  x1.4 a frame, 81M states at f50).
-- **The points**: the platforms are a function of one number (frames since
-  the room loaded), so `concrete::platform_worlds` records every
-  arrangement and the split pass carries per path the (world, player pixel)
-  points its answers hold at. Nothing about worlds reaches a lane.
-- **With `n`**: countdown atoms stay three-valued; an overlapped floor
-  stores its COMPUTED `state`/`collideable` (owing nothing). Why `p` reaches
-  an outcome with the overlapped floor solid is not proven (likely: a merge
-  `p` refuses leaves a `live` read as live on a lane where it is dead).
+- **Exact at every level.** A platform is a CLOCK: `move` steps `rem.x` by
+  `dir * 0.65` an update and nothing but its own update writes it, so every
+  platform is a function of the updates since the room loaded, and no state
+  merges across frames. Affordable in every platform room (below); `p`,
+  which widened them, is gone (plans/lessons.md).
+- **Keyed by the first platform** (`widening::CLOCKS`, `widening::key_deps`,
+  `exact::Deps`): where a shape holds two or more platforms, the first
+  one's `spd.x` LEADS the other `spd.x`s and its `rem.x` every other
+  platform value cell (`x`, `last`, `rem`, `hitbox`, ...). Followers carry no
+  key bits: their codes are recorded with each leader code and every row is
+  CHECKED against that record wherever a key is formed (the boundary, a
+  provisional key made final, the kernels' emission), a difference FATAL.
+  Not a widening: two states differing in a follower can never share a key
+  unnoticed. `rem.x` alone repeats once, across the room's first update
+  (`move` reads `spd.x` before that update sets it, so the update changes
+  only `spd.x`): the kernel check caught it at step 2. Without the
+  dependencies room (6,0)'s ten platforms need more than 127 key bits by
+  step 17; with them its keys take 42. A room with one platform ((2,1),
+  (1,2)) declares nothing.
 - **The arcs**: the carry is `move_x` (whole pixels, no split); a carry
   blocked by a wall sets `rem.x = 0` before the player's move, decoded as
   a constant. There is no second player split.
-- **Measured**: room (6,0) `r0sxhfp` split frame to step 150: 1.68G
-  visited, optimum 70. Room (1,2): the platform exact at level 1 marked
-  253M states against level 0's 22.6M.
+- **Measured** (2026-10-25, release, `--prefer` the stored witness, every
+  result kept): room (6,0) split `r0sxhf` any% 70 in 11 min, 18.2 GB (1.61G
+  visited, 42 key bits); (2,1) `r0sxhn` 82 in 6 min, 9.6 GB; (1,2) `r0sxhn`
+  103 in 8 min, 6.7 GB; nodiag alike (plans/results.md, "The platform rooms
+  without `p`").
 
 ## `rnd`, and the region key
 
@@ -247,5 +249,9 @@ input, never a stored value); the concrete search's seeded-balloon view
 
 Position buckets (`x2`, `y2`), speed buckets (`s16`, ...), floors fully
 unknown (`b`), timers only (`t`) and the remainder rungs (`r1sx`..`r15sx`,
-`rxsx`) are gone (2026-10-04/05; `r1sx`/`rxsx` are refused).
+`rxsx`) are gone (2026-10-04/05; `r1sx`/`rxsx` are refused). Moving
+platforms unknown (`p`: `x`, `last` the whole path, `rem.x` the whole
+remainder, player-vs-platform decided per "platform world" from a no-input
+reference run) went on 2026-10-25 (plans/correctness.md C13; `p` is
+refused).
 plans/lessons.md has the measurement that killed each.

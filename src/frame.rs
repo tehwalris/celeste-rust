@@ -1177,14 +1177,14 @@ mod tests {
         row
     }
 
-    /// Does `registry` run `r`'s one lane (else its kernel declines)?
-    fn kernel_runs(registry: &Registry<P8>, r: &Rt2, level: Level, s: &Settings) -> bool {
+    /// Does `registry` run `r`'s one lane (else its kernel declines), keyed
+    /// against `visited`'s key space?
+    fn kernel_runs(registry: &Registry<P8>, r: &Rt2, level: Level, s: &Settings, visited: &crate::storage::visited::VisitedSet<P8>) -> bool {
         let cells = crate::storage::cells::block_cells(r).expect("cells");
-        let visited = crate::storage::visited::VisitedSet::new();
         let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
         let prov = celeste_engine::exact::Provisional::default();
         let (base, xtab) = (crate::storage::edges::XferTable::default(), Default::default());
-        let mut sink = crate::storage::unit::UnitSink::new(&visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &base, &xtab, s);
+        let mut sink = crate::storage::unit::UnitSink::new(visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &base, &xtab, s);
         sink.begin(0);
         let si = sink.push_source(0, (0, 0));
         sink.push_lane(si, cells[0], Hull::full());
@@ -1341,7 +1341,7 @@ mod tests {
         let mut space = celeste_engine::exact::KeySpace::new();
         let mut adds = Default::default();
         for shape in [1, 9] {
-            space.add_shape(&celeste_engine::exact::ShapeRecord { hash: shape, sig: vec![1, u32::MAX], pos: None }, &mut adds);
+            space.add_shape(&celeste_engine::exact::ShapeRecord { hash: shape, sig: vec![1, u32::MAX], pos: None, deps: Vec::new() }, &mut adds);
             space.add_codes(shape, 0, &[celeste_engine::exact::Code::num(0, 0), celeste_engine::exact::Code::num(1, 1)], &mut adds);
         }
         let mut v = Visited::new(space);
@@ -1505,7 +1505,7 @@ mod tests {
         let runs = |r: &Rt2| -> bool {
             let cells = crate::storage::cells::block_cells(r).expect("cells");
             assert!(grid.of_cell(cells[0]).is_some(), "the lane has a region");
-            kernel_runs(&registry, r, level, &s)
+            kernel_runs(&registry, r, level, &s, &crate::storage::visited::VisitedSet::new())
         };
         let px = |n: i16| P8::from_i16(n);
         let half = P8::from_parts(0, 0x8000);
@@ -1518,50 +1518,50 @@ mod tests {
         assert!(!runs(&with(ids.f_rem, ids.f_x, half)), "a remainder of 0.5 declines");
     }
 
-    /// A PLATFORMS-UNKNOWN KERNEL CHECKS ITS PLATFORMS: a lane whose platform
-    /// `x` reaches past the path, whose `rem.x` lies outside the literal the
-    /// kernel reads in its place, or whose `spd.x` lies outside its range over
-    /// the worlds DECLINES.
+    /// THE KERNELS' EMISSION CHECKS THE FOLLOWERS (`exact::Deps`): room
+    /// (6,0)'s first three steps keyed (its ten platforms keyed by the first
+    /// one's), the second step's row runs against its record; with the second
+    /// platform's `x` (a follower of the first one's `rem.x`) recorded as
+    /// another number at every leader index, the same step is FATAL at the
+    /// emission.
     #[test]
-    #[ignore = "slow, ./check.sh t2 runs it: room (2,1)'s platform kernels, ~100 CPU-s"]
-    fn a_lane_outside_its_platform_bounds_declines() {
-        let s = Settings { room: (2, 1), ..Default::default() };
-        let level = Level::parse("r0sxhnp").expect("level");
+    #[ignore = "slow, ./check.sh t2 runs it: room (6,0)'s split kernels, ~40 CPU-s"]
+    fn the_kernels_emission_checks_the_followers() {
+        let s = Settings { room: (6, 0), split_frame: true, ..Default::default() };
+        let level = Level::parse("r0sxhf").expect("level");
         let registry = crate::compiled::asm_kernel::registry(level, &s);
-        let row = standing_row(&s, level);
-        let ids = crate::compiled::ids();
-        let platform = *row.objects_of_type(ids.g_platform).first().expect("a moving platform");
-        let sub = |rt2: &Rt2, f: u32, axis: u32| -> usize {
-            let pc = rt2.obj_field_cell(platform, f).expect("the platform's table field");
-            let Col::U(AV::Ptr(t)) = rt2.cols[pc as usize] else { panic!("the platform's field is not a table") };
-            rt2.obj_field_cell(t, axis).expect("its axis") as usize
-        };
-        let x = row.obj_field_cell(platform, ids.f_x).expect("the platform's x") as usize;
-        let (rem, spd) = (sub(&row, ids.f_rem, ids.f_x), sub(&row, ids.f_spd, ids.f_x));
-        // `row` with one cell set; an interval column stays one.
-        let with = |c: usize, lo: P8, hi: P8| -> Rt2 {
-            let mut r = row.clone_block();
-            r.cols[c] = match r.cols[c] {
-                Col::U(AV::Ival(..)) | Col::I(_) => Col::U(AV::Ival(lo, hi)),
-                _ => {
-                    assert_eq!(lo, hi, "a number column holds a point");
-                    Col::U(AV::Num(lo))
-                }
-            };
-            r
-        };
-        let runs = |r: &Rt2| kernel_runs(&registry, r, level, &s);
-        let px = |n: i16| P8::from_i16(n);
-        let (path_lo, path_hi) = (px(celeste_engine::widening::PLATFORM_PATH.0), px(celeste_engine::widening::PLATFORM_PATH.1));
-        let half = P8::from_parts(0, 0x8000);
-        let Col::U(AV::Num(speed)) = row.cols[spd] else { panic!("the platform's spd.x is not a number") };
-        assert!(runs(&row), "the lane as played runs");
-        assert!(runs(&with(x, path_lo, path_hi)), "x over the whole path runs");
-        let add = |a: P8, b: P8| a.checked_add(b).expect("small");
-        assert!(!runs(&with(x, path_lo, add(path_hi, P8::from_raw(1)))), "x past the path declines");
-        assert!(!runs(&with(x, add(path_lo, px(-1)), path_hi)), "x before the path declines");
-        assert!(!runs(&with(rem, half.wrapping_neg(), half)), "a remainder reaching 0.5 declines");
-        assert!(!runs(&with(spd, add(speed, px(1)), add(speed, px(1)))), "spd.x past its worlds' range declines");
+        let mut reference = RefEngine::new(&s).expect("ref engine");
+        let start = reference.initial().expect("start");
+        let one = reference.step_one(&start, 0).expect("step 1");
+        let two = reference.step_one(&one, 0).expect("step 2");
+        let rows: Vec<Rt2> = [start, one, two]
+            .into_iter()
+            .map(|mut r| {
+                r.widen_to(level);
+                r.canonicalized()
+            })
+            .collect();
+        let mut visited = crate::storage::visited::VisitedSet::new();
+        crate::storage::wave::seed(&mut visited, &rows, Hull::full(), &s).expect("the steps keyed");
+        assert!(kernel_runs(&registry, &rows[1], level, &s, &visited), "the second step runs against its own record");
+        let ty = celeste_names::global("platform");
+        let mut adds = visited.keys.to_additions();
+        let mut corrupted = 0;
+        for r in &rows {
+            let platforms = r.objects_of_type(ty);
+            let x = r.obj_field_cell(platforms[1], celeste_names::field("x")).expect("the second platform's x");
+            let deps = celeste_engine::widening::key_deps(r);
+            assert!(deps.len() == 2 && deps[1].followers.contains(&x), "the second platform's x follows the first one's rem.x: {deps:?}");
+            for code in adds.codes.iter_mut().filter(|c| c.0 == r.shape_hash && c.1 == x) {
+                code.3 = celeste_engine::exact::Code::of(AV::Num(P8::from_i16(1000)));
+                corrupted += 1;
+            }
+        }
+        assert!(corrupted > 0, "the follower's records");
+        visited.keys = celeste_engine::exact::KeySpace::from_additions(adds).expect("the records replay");
+        let fatal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| kernel_runs(&registry, &rows[1], level, &s, &visited))).expect_err("a follower other than its record is FATAL");
+        let msg = fatal.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("declared key dependency is VIOLATED") && msg.contains("the kernels' emission"), "{msg}");
     }
 
     /// A DYING EXIT IS NO WIN (plans/correctness.md C8). Room (2,2)'s top

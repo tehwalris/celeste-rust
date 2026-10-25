@@ -287,7 +287,7 @@ pub struct ForwardArgs {
     #[arg(long, default_value = DEFAULT_CHECKPOINT_DIR)]
     tree: String,
     /// Run the REFERENCE engine instead of the kernels: `ckhash` of the
-    /// two trees must agree. Slow. Not at platforms-unknown (`p`) levels.
+    /// two trees must agree. Slow.
     #[arg(long)]
     reference: bool,
 }

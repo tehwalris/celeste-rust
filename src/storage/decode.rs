@@ -61,7 +61,22 @@ pub(crate) fn decode_rows<N: Arithmetic>(keys: &KeySpace<N>, skel: &Rt2<N>, rows
             out.cols.push(skel.cols[c].clone());
             continue;
         }
-        let f = s.field(c).ok_or_else(|| anyhow!("decode: shape {shape:016x} cell {c} is not a key field"))?;
+        let Some(f) = s.field(c) else {
+            // A FOLLOWER: the code its leader's index recorded.
+            let mut b = Builder::new(Repr::of(&skel.cols[c]), n);
+            let (g, slot) = s.follower(c as u32).ok_or_else(|| anyhow!("decode: shape {shape:016x} cell {c} is not a key field"))?;
+            let fl = &s.follows()[g];
+            let lead = s.field(fl.leader() as usize).ok_or_else(|| anyhow!("decode: shape {shape:016x}: the leader is not keyed"))?;
+            runs.iter()
+                .try_for_each(|&(k, lo, hi)| {
+                    let i = lead.index_in(k);
+                    ensure!((i as usize) < lead.len(), "decode: shape {shape:016x} leader cell {}: index {i} past the dictionary's {}", fl.leader(), lead.len());
+                    b.push(fl.code(slot, i), hi - lo)
+                })
+                .with_context(|| format!("decode: shape {shape:016x} follower cell {c}"))?;
+            out.cols.push(b.finish());
+            continue;
+        };
         if is_pos(c as u32) {
             out.cols.push(Col::U(AV::Nil));
             continue;

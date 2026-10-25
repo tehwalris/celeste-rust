@@ -87,7 +87,7 @@ pub enum Command {
     /// `forward --reference`, under the tree's settings and level) into a
     /// scratch tree, and both fingerprinted (`ckhash --edges --hulls`): the
     /// states, frontiers and edges with their transfers must agree at every
-    /// step. Slow; not at platform (`p`) levels.
+    /// step. Slow.
     Reference(ReferenceArgs),
 }
 

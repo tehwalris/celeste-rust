@@ -37,8 +37,9 @@ left open is in plans/architecture.md "Open issues".
 - `plans/architecture.md` - the system as it is: interfaces, the tracer and
   kernel model, keys, the hull forward and its storage, the recorded edges,
   the search, the checks, open issues.
-- `plans/abstractions.md` - every level flag (`h f n p`; the remainder):
-  what it widens, why it is sound, what refutes it (the widening table).
+- `plans/abstractions.md` - every level flag (`h f n`; the remainder; moving
+  platforms are always exact): what it widens, why it is sound, what refutes
+  it (the widening table).
 - `plans/float.md` - the float arithmetic and the dual search.
 - `plans/level-minus-one.md` - the cost-to-go filter.
 - `plans/devloop.md` - the check ladder (`./check.sh`), the fixtures, the
