@@ -227,6 +227,15 @@ input, never a stored value); the concrete search's seeded-balloon view
 - **Measured**: room (6,0) `r0sxhfp` split frame to step 150: 1.68G
   visited, optimum 70. Room (1,2): the platform exact at level 1 marked
   253M states against level 0's 22.6M.
+- **Without `p`** (prototype, branch `platform-deps`): the platforms are
+  exact, and where a shape holds two or more of them they are keyed by
+  the first platform's `spd.x` and `rem.x` (`widening::CLOCKS`: the other
+  `spd.x`s FOLLOW the first, every other platform cell its `rem.x`,
+  `exact::Deps`; `rem.x` alone repeats once, across the first update,
+  which only sets `spd.x`). Not a widening: every
+  row's followers are checked against the codes recorded with its leader,
+  a difference fatal (plans/architecture.md "Keys"). Without it room
+  (6,0)'s ten platforms need more than 127 key bits by step 17.
 
 ## `rnd`, and the region key
 

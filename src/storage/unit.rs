@@ -866,7 +866,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         w.widen_to(level);
         w.canonical();
         if self.keys.shape(w.shape_hash).is_none() {
-            self.note_shape(&celeste_engine::exact::ShapeRecord::of(&w));
+            self.note_shape(&celeste_engine::exact::ShapeRecord::of(&w, self.level));
         }
         let key = match self.keys.row_keys(&w).swap_remove(0) {
             RowKey::Hit(k) => k,

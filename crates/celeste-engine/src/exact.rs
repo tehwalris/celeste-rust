@@ -11,9 +11,19 @@
 //!                    dictionary has yet (new by construction)
 //!   * `ExactRow`   - a whole state's canonical bytes (the concrete search's
 //!                    dedup, independent of any tree)
+//!   * `Deps`       - a FUNCTIONAL DEPENDENCY a level declares in a shape:
+//!                    FOLLOWER cells whose codes are a function of a LEADER
+//!                    cell's; they carry no key bits (`Follow`)
 //!
 //! Bits once given to a field never move and an old index is zero in a
 //! field's later bits, so a key never changes as the dictionaries grow.
+//!
+//! A follower is EXACT, not widened: its code is recorded per leader index
+//! (`Follow`) when the leader's code is added, and every row whose leader
+//! hits has its followers CHECKED against that record wherever a key is
+//! formed (`KeySpace::row_keys`, `complete`, `add_misses`; the kernels'
+//! emission). A row that differs from the record is FATAL: two states that
+//! differ only in a follower would share a key, a merge nothing refutes.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -23,6 +33,7 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime2::{mix64, Cell2, Rt2, AV, P8};
+use crate::widening::Level;
 
 /// A packed key: (bits 64..127, bits 0..63). Bit 127 tags a PROVISIONAL key.
 pub type Key = (u64, u64);
@@ -133,6 +144,12 @@ impl<N: Arithmetic> Code<N> {
         };
         let whole = lo.whole_i16().unwrap_or_else(|| panic!("a position coordinate {lo:?} past the i16 pixels"));
         Code::num(lo.less_whole(whole), hi.less_whole(whole))
+    }
+
+    /// A number (or interval) code?
+    #[inline]
+    pub fn is_num(self) -> bool {
+        self.kind == K_NUM
     }
 
     /// A number's word for `FieldDict::find_num` (`kind == 0` only).
@@ -309,6 +326,12 @@ impl<N: Arithmetic> FieldDict<N> {
         idx as u32
     }
 
+    /// The key bits the field's runs cover.
+    #[inline]
+    pub fn mask(&self) -> u128 {
+        self.runs.iter().fold(0u128, |m, &(pos, len)| m | ((1u128 << len) - 1) << pos)
+    }
+
     #[inline]
     pub fn place(&self, idx: u32) -> u128 {
         match self.runs.len() {
@@ -406,31 +429,103 @@ pub fn shape_sig<N: Arithmetic>(rt2: &Rt2<N>) -> Vec<u32> {
     s
 }
 
-/// A shape as the key space records it: its name (hash), signature and
-/// position cells.
+/// A FUNCTIONAL DEPENDENCY within a shape (a level's declaration,
+/// `widening::Level::key_deps`): every FOLLOWER cell's code is a function of
+/// the LEADER cell's. Followers carry no key bits; their codes are recorded
+/// per leader index (`Follow`) and checked on every row (module doc). A
+/// shape may hold several, their cells disjoint.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Deps {
+    pub leader: u32,
+    /// Sorted, distinct, the leader not among them.
+    pub followers: Vec<u32>,
+}
+
+/// A shape as the key space records it: its name (hash), signature,
+/// position cells and its key's dependencies (the LAYOUT: two producers of
+/// one shape under different layouts are told apart like a collision).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ShapeRecord {
     pub hash: u64,
     pub sig: Vec<u32>,
     pub pos: Option<(u32, u32)>,
+    pub deps: Vec<Deps>,
 }
 
 impl ShapeRecord {
-    pub fn of<N: Arithmetic>(rt2: &Rt2<N>) -> ShapeRecord {
-        ShapeRecord { hash: rt2.shape_hash, sig: shape_sig(rt2), pos: rt2.position_cells() }
+    /// `rt2`'s shape, its key laid out as `level` declares
+    /// (`Level::key_deps`).
+    pub fn of<N: Arithmetic>(rt2: &Rt2<N>, level: Level) -> ShapeRecord {
+        ShapeRecord { hash: rt2.shape_hash, sig: shape_sig(rt2), pos: rt2.position_cells(), deps: level.key_deps(rt2) }
     }
 }
 
-/// One shape's dictionaries (by cell; `None` for a cell that is not a value).
+/// One dependency's FOLLOWERS (`Deps`): per follower, its code at each
+/// index of the leader's dictionary (as long as the leader's dictionary,
+/// always).
+#[derive(Clone, Debug)]
+pub struct Follow<N: Arithmetic = P8> {
+    leader: u32,
+    cells: Vec<u32>,
+    cols: Vec<Vec<Code<N>>>,
+}
+
+impl<N: Arithmetic> Follow<N> {
+    #[inline]
+    pub fn leader(&self) -> u32 {
+        self.leader
+    }
+
+    /// The follower cells, sorted; a follower's SLOT is its place here.
+    #[inline]
+    pub fn cells(&self) -> &[u32] {
+        &self.cells
+    }
+
+    #[inline]
+    pub fn slot(&self, cell: u32) -> Option<usize> {
+        self.cells.binary_search(&cell).ok()
+    }
+
+    /// The code follower `slot` holds wherever the leader's index is `idx`.
+    #[inline]
+    pub fn code(&self, slot: usize, idx: u32) -> Code<N> {
+        self.cols[slot][idx as usize]
+    }
+
+    /// Leader indices recorded.
+    fn len(&self) -> usize {
+        self.cols.first().map_or(0, |c| c.len())
+    }
+}
+
+/// THE VIOLATION of a declared dependency: FATAL (module doc).
+#[cold]
+#[allow(clippy::too_many_arguments)]
+pub fn follower_violation<N: Arithmetic>(shape: u64, leader: u32, lcode: Code<N>, idx: u32, cell: u32, got: Code<N>, want: Code<N>, at: &str) -> ! {
+    panic!(
+        "exact keys: shape {shape:#x}: follower cell {cell} holds {:?} where the leader cell {leader} holds {:?} (index {idx}), \
+         recorded with {:?} ({at}): the level's declared key dependency is VIOLATED, and the two states would share a key",
+        got.value(),
+        lcode.value(),
+        want.value()
+    );
+}
+
+/// One shape's dictionaries (by cell; `None` for a cell that is not a value,
+/// or a follower: `Follow`).
 #[derive(Clone, Debug)]
 pub struct ShapeKeys<N: Arithmetic = P8> {
     pub record: ShapeRecord,
     fields: Vec<Option<FieldDict<N>>>,
     next_bit: u32,
+    follows: Vec<Follow<N>>,
 }
 
 impl<N: Arithmetic> ShapeKeys<N> {
-    fn new(record: ShapeRecord) -> ShapeKeys<N> {
+    /// A record's dictionaries; its dependencies must name its value cells
+    /// (leaders and followers all distinct, none a position cell).
+    fn new(record: ShapeRecord) -> Result<ShapeKeys<N>, String> {
         // The signature names each cell's kind: a `Val` is a lone 1.
         let mut fields = Vec::new();
         let sig = &record.sig;
@@ -447,12 +542,51 @@ impl<N: Arithmetic> ShapeKeys<N> {
             fields.push(val.then(FieldDict::new));
             i += step;
         }
-        ShapeKeys { record, fields, next_bit: 0 }
+        let hash = record.hash;
+        let mut taken = std::collections::BTreeSet::new();
+        for d in &record.deps {
+            if d.followers.is_empty() || d.followers.windows(2).any(|w| w[0] >= w[1]) {
+                return Err(format!("exact keys: shape {hash:#x}: followers {:?} not sorted, distinct and nonempty", d.followers));
+            }
+            for &c in std::iter::once(&d.leader).chain(&d.followers) {
+                let val = fields.get(c as usize).is_some_and(|f| f.is_some());
+                if !val || record.pos.is_some_and(|(x, y)| c == x || c == y) || !taken.insert(c) {
+                    return Err(format!("exact keys: shape {hash:#x}: dependency cell {c} is a position, not a value cell, or in two places"));
+                }
+            }
+        }
+        let mut follows = Vec::new();
+        for d in &record.deps {
+            for &c in &d.followers {
+                fields[c as usize] = None;
+            }
+            follows.push(Follow { leader: d.leader, cells: d.followers.clone(), cols: vec![Vec::new(); d.followers.len()] });
+        }
+        Ok(ShapeKeys { record, fields, next_bit: 0, follows })
     }
 
+    /// A KEYED field's dictionary (`None`: not a value cell, or a follower).
     #[inline]
     pub fn field(&self, cell: usize) -> Option<&FieldDict<N>> {
         self.fields.get(cell).and_then(|f| f.as_ref())
+    }
+
+    /// The dependencies (empty: none), in the record's order.
+    #[inline]
+    pub fn follows(&self) -> &[Follow<N>] {
+        &self.follows
+    }
+
+    /// A follower's dependency and slot.
+    #[inline]
+    pub fn follower(&self, cell: u32) -> Option<(usize, usize)> {
+        self.follows.iter().enumerate().find_map(|(g, fl)| Some((g, fl.slot(cell)?)))
+    }
+
+    /// The dependency `cell` leads.
+    #[inline]
+    fn leads(&self, cell: u32) -> Option<usize> {
+        self.follows.iter().position(|fl| fl.leader == cell)
     }
 
     #[inline]
@@ -464,8 +598,9 @@ impl<N: Arithmetic> ShapeKeys<N> {
         self.next_bit
     }
 
+    /// Every value cell, keyed or follower, in order.
     pub fn value_cells(&self) -> impl Iterator<Item = u32> + '_ {
-        self.fields.iter().enumerate().filter(|(_, f)| f.is_some()).map(|(c, _)| c as u32)
+        (0..self.fields.len() as u32).filter(move |&c| self.fields[c as usize].is_some() || self.follower(c).is_some())
     }
 
     #[inline]
@@ -478,28 +613,50 @@ impl<N: Arithmetic> ShapeKeys<N> {
         }
     }
 
-    /// The key of `codes` (by value cell, in order), all present.
+    /// The key of `codes` (by value cell, in order), all present (a
+    /// follower's code the one recorded for its leader's among them).
     pub fn key_of_codes(&self, codes: &[(u32, Code<N>)]) -> Option<Key> {
         let mut k = 0u128;
+        let mut lead = vec![NONE; self.follows.len()];
         for &(c, code) in codes {
-            let f = self.field(c as usize)?;
+            let Some(f) = self.field(c as usize) else { continue };
             let i = f.find(code);
             if i == NONE {
                 return None;
             }
+            if let Some(g) = self.leads(c) {
+                lead[g] = i;
+            }
             k |= f.place(i);
+        }
+        for &(c, code) in codes {
+            if self.field(c as usize).is_some() {
+                continue;
+            }
+            let (g, slot) = self.follower(c)?;
+            if lead[g] == NONE || self.follows[g].code(slot, lead[g]) != code {
+                return None;
+            }
         }
         Some(to_key(k))
     }
 
-    /// The fields' codes of a key (the packing inverted).
-    pub fn decode(&self, k: Key) -> Vec<(u32, Code<N>)> {
-        let mut out = Vec::new();
-        for (c, f) in self.fields.iter().enumerate() {
-            let Some(f) = f else { continue };
-            out.push((c as u32, f.codes.get(f.index_in(k) as usize).copied().unwrap_or(Code::other(u8::MAX, 0))));
+    /// Value cell `c`'s code in key `k` (a follower's by its leader's
+    /// index; `None`: an index past a dictionary).
+    pub fn code_in(&self, c: u32, k: Key) -> Option<Code<N>> {
+        if let Some(f) = self.field(c as usize) {
+            return f.codes.get(f.index_in(k) as usize).copied();
         }
-        out
+        let (g, slot) = self.follower(c)?;
+        let fl = &self.follows[g];
+        let d = self.field(fl.leader as usize).expect("a leader is keyed");
+        let i = d.index_in(k);
+        ((i as usize) < fl.len()).then(|| fl.code(slot, i))
+    }
+
+    /// The fields' codes of a key (the packing inverted), followers too.
+    pub fn decode(&self, k: Key) -> Vec<(u32, Code<N>)> {
+        self.value_cells().map(|c| (c, self.code_in(c, k).unwrap_or(Code::other(u8::MAX, 0)))).collect()
     }
 }
 
@@ -561,7 +718,7 @@ pub struct MissKey<N: Arithmetic = P8> {
 #[serde(bound = "")]
 pub struct KeyAdditions<N: Arithmetic = P8> {
     pub shapes: Vec<ShapeRecord>,
-    /// `(shape, cell, index, code)`.
+    /// `(shape, cell, index, code)`; a follower's index is its leader's.
     pub codes: Vec<(u64, u32, u32, Code<N>)>,
     /// `(shape, cell, run number of the field, first bit, bits)`.
     pub runs: Vec<(u64, u32, u32, u8, u8)>,
@@ -615,7 +772,8 @@ impl<N: Arithmetic> KeySpace<N> {
     /// Bytes its dictionaries hold (approximately: their vectors' room).
     pub fn alloc_bytes(&self) -> usize {
         let field = |f: &FieldDict<N>| std::mem::size_of::<FieldDict<N>>() + f.codes.capacity() * std::mem::size_of::<Code<N>>() + f.num_slots.capacity() * std::mem::size_of::<NumSlot<N>>() + f.others.capacity() * std::mem::size_of::<(Code<N>, u32)>() + f.runs.capacity() * 2;
-        self.shapes.values().map(|s| s.fields.iter().flatten().map(field).sum::<usize>() + s.fields.capacity() * std::mem::size_of::<Option<FieldDict<N>>>()).sum::<usize>() + self.run_counts.capacity() * 20
+        let follow = |s: &ShapeKeys<N>| s.follows.iter().flat_map(|fl| &fl.cols).map(|c| c.capacity() * std::mem::size_of::<Code<N>>()).sum::<usize>();
+        self.shapes.values().map(|s| s.fields.iter().flatten().map(field).sum::<usize>() + s.fields.capacity() * std::mem::size_of::<Option<FieldDict<N>>>() + follow(s)).sum::<usize>() + self.run_counts.capacity() * 20
     }
 
     fn bump(&mut self) {
@@ -643,10 +801,11 @@ impl<N: Arithmetic> KeySpace<N> {
     /// under one hash are FATAL); true if new.
     pub fn add_shape(&mut self, record: &ShapeRecord, adds: &mut KeyAdditions<N>) -> bool {
         if let Some(s) = self.shapes.get(&record.hash) {
+            assert!(s.record.deps == record.deps || s.record.sig != record.sig, "exact keys: shape {:#x} under two key layouts ({:?} and {:?})", record.hash, s.record.deps, record.deps);
             assert!(s.record == *record, "exact keys: two shapes under the hash {:#x} (a shape-hash collision)", record.hash);
             return false;
         }
-        self.shapes.insert(record.hash, ShapeKeys::new(record.clone()));
+        self.shapes.insert(record.hash, ShapeKeys::new(record.clone()).unwrap_or_else(|e| panic!("{e}")));
         adds.shapes.push(record.clone());
         self.bump();
         true
@@ -654,14 +813,91 @@ impl<N: Arithmetic> KeySpace<N> {
 
     /// Append `codes` (sorted, distinct, none present) to `shape`'s field
     /// `cell`, giving it bits if it needs more: a new run at the shape's
-    /// next free bit. Recorded in `adds`. Past `KEY_BITS`: FATAL.
+    /// next free bit. Recorded in `adds`. Past `KEY_BITS`: FATAL. Not a
+    /// leader's (its codes come with their followers': `add_misses`).
     pub fn add_codes(&mut self, shape: u64, cell: u32, codes: &[Code<N>], adds: &mut KeyAdditions<N>) {
+        let s = self.shapes.get(&shape).unwrap_or_else(|| panic!("exact keys: codes for the unknown shape {shape:#x}"));
+        assert!(s.leads(cell).is_none(), "exact keys: shape {shape:#x}: the leader cell {cell}'s codes added without their followers'");
+        self.push_codes(shape, cell, codes, adds);
+    }
+
+    /// `rows`' leader codes (sorted, distinct, none present) appended to
+    /// the leader of `shape`'s dependency `g`, each with its followers'
+    /// codes (in `Follow::cells` order) recorded at its index.
+    fn add_leader_codes(&mut self, shape: u64, g: usize, rows: &[(Code<N>, Vec<Code<N>>)], adds: &mut KeyAdditions<N>) {
+        let s = self.shapes.get(&shape).unwrap_or_else(|| panic!("exact keys: codes for the unknown shape {shape:#x}"));
+        let fl = &s.follows[g];
+        let (leader, first) = (fl.leader, fl.len() as u32);
+        let codes: Vec<Code<N>> = rows.iter().map(|r| r.0).collect();
+        self.push_codes(shape, leader, &codes, adds);
+        let fl = &mut self.shapes.get_mut(&shape).expect("the shape").follows[g];
+        for (i, (_, fol)) in rows.iter().enumerate() {
+            assert_eq!(fol.len(), fl.cells.len(), "exact keys: shape {shape:#x}: a leader code with {} of its {} followers' codes", fol.len(), fl.cells.len());
+            for (slot, &code) in fol.iter().enumerate() {
+                adds.codes.push((shape, fl.cells[slot], first + i as u32, code));
+                fl.cols[slot].push(code);
+            }
+        }
+    }
+
+    /// Every code of `misses` the dictionaries lack, per field SORTED and
+    /// appended (fields in (shape, cell) order: the dictionaries are a
+    /// function of the set of misses). A new leader code comes with its
+    /// followers' codes, which every miss holding it must agree on (else
+    /// FATAL: the dependency is violated); a miss holds its followers'
+    /// codes exactly when its leader's is new (`row_keys`). Their shapes
+    /// must be in.
+    pub fn add_misses<'a>(&mut self, misses: impl IntoIterator<Item = &'a MissKey<N>>, adds: &mut KeyAdditions<N>)
+    where
+        N: 'a,
+    {
+        use std::collections::btree_map::Entry;
+        enum New<N: Arithmetic> {
+            Codes(std::collections::BTreeSet<Code<N>>),
+            Leader(usize, std::collections::BTreeMap<Code<N>, Vec<Code<N>>>),
+        }
+        let mut new: std::collections::BTreeMap<(u64, u32), New<N>> = Default::default();
+        for m in misses {
+            let s = self.shapes.get(&m.shape).unwrap_or_else(|| panic!("exact keys: codes for the unknown shape {:#x}", m.shape));
+            let code_of = |fc: u32| m.missing.iter().find(|x| x.0 == fc).map(|x| x.1);
+            for &(c, code) in &m.missing {
+                if let Some(g) = s.leads(c) {
+                    let fl = &s.follows[g];
+                    let fol: Vec<Code<N>> = fl.cells.iter().map(|&fc| code_of(fc).unwrap_or_else(|| panic!("exact keys: shape {:#x}: a new leader code without follower cell {fc}'s", m.shape))).collect();
+                    let New::Leader(_, rows) = new.entry((m.shape, c)).or_insert_with(|| New::Leader(g, Default::default())) else { unreachable!("the leader's entry") };
+                    match rows.entry(code) {
+                        Entry::Vacant(e) => {
+                            e.insert(fol);
+                        }
+                        Entry::Occupied(e) => {
+                            if let Some(slot) = (0..fol.len()).find(|&k| e.get()[k] != fol[k]) {
+                                follower_violation(m.shape, c, code, NONE, fl.cells[slot], fol[slot], e.get()[slot], "two new states, one new leader code");
+                            }
+                        }
+                    }
+                } else if let Some((g, _)) = s.follower(c) {
+                    assert!(code_of(s.follows[g].leader).is_some(), "exact keys: shape {:#x}: follower cell {c} missing while its leader hit", m.shape);
+                } else {
+                    let New::Codes(set) = new.entry((m.shape, c)).or_insert_with(|| New::Codes(Default::default())) else { unreachable!("a field's entry") };
+                    set.insert(code);
+                }
+            }
+        }
+        for ((shape, cell), n) in new {
+            match n {
+                New::Codes(set) => self.add_codes(shape, cell, &set.into_iter().collect::<Vec<_>>(), adds),
+                New::Leader(g, rows) => self.add_leader_codes(shape, g, &rows.into_iter().collect::<Vec<_>>(), adds),
+            }
+        }
+    }
+
+    fn push_codes(&mut self, shape: u64, cell: u32, codes: &[Code<N>], adds: &mut KeyAdditions<N>) {
         if codes.is_empty() {
             return;
         }
         let s = self.shapes.get_mut(&shape).unwrap_or_else(|| panic!("exact keys: codes for the unknown shape {shape:#x}"));
         let next_bit = s.next_bit;
-        let f = s.fields.get_mut(cell as usize).and_then(|f| f.as_mut()).unwrap_or_else(|| panic!("exact keys: shape {shape:#x} cell {cell} is not a value"));
+        let f = s.fields.get_mut(cell as usize).and_then(|f| f.as_mut()).unwrap_or_else(|| panic!("exact keys: shape {shape:#x} cell {cell} is not a keyed value"));
         for w in codes.windows(2) {
             assert!(w[0] < w[1], "exact keys: codes added unsorted");
         }
@@ -698,6 +934,12 @@ impl<N: Arithmetic> KeySpace<N> {
         adds.codes.sort_unstable_by_key(|&(s, c, i, _)| (s, c, i));
         for &(shape, cell, idx, code) in &adds.codes {
             let s = self.shapes.get_mut(&shape).ok_or_else(|| anyhow::anyhow!("exact keys: a code of the unknown shape {shape:#x}"))?;
+            if let Some((g, slot)) = s.follower(cell) {
+                let col = &mut s.follows[g].cols[slot];
+                anyhow::ensure!(idx as usize == col.len(), "exact keys: shape {shape:#x} follower cell {cell}: leader index {idx} recorded after {}", col.len());
+                col.push(code);
+                continue;
+            }
             let f = s.fields.get_mut(cell as usize).and_then(|f| f.as_mut()).ok_or_else(|| anyhow::anyhow!("exact keys: shape {shape:#x} cell {cell} is not a value"))?;
             anyhow::ensure!(idx as usize == f.len(), "exact keys: shape {shape:#x} cell {cell}: index {idx} recorded after {} codes", f.len());
             anyhow::ensure!(f.find(code) == NONE, "exact keys: shape {shape:#x} cell {cell}: code {code:?} recorded twice");
@@ -725,6 +967,12 @@ impl<N: Arithmetic> KeySpace<N> {
                     anyhow::ensure!(f.bits >= bits_for(f.len()), "exact keys: shape {:#x} cell {c}: {} codes in {} bits", s.record.hash, f.len(), f.bits);
                 }
             }
+            for fl in &s.follows {
+                let n = s.field(fl.leader as usize).expect("the leader is keyed").len();
+                for (slot, col) in fl.cols.iter().enumerate() {
+                    anyhow::ensure!(col.len() == n, "exact keys: shape {:#x} follower cell {}: {} codes for the leader's {n}", s.record.hash, fl.cells[slot], col.len());
+                }
+            }
         }
         self.bump();
         Ok(())
@@ -739,7 +987,16 @@ impl<N: Arithmetic> KeySpace<N> {
                 let mut fields = Vec::new();
                 for (c, f) in s.fields.iter().enumerate() {
                     let Some(f) = f else { continue };
-                    let hashes: Vec<u64> = f.codes.iter().map(|&code| ContentHash::code_hash(c as u32, code)).collect();
+                    let mut hashes: Vec<u64> = f.codes.iter().map(|&code| ContentHash::code_hash(c as u32, code)).collect();
+                    // The leader's index stands for its followers' codes
+                    // too: a state hashes as it would keyed field by field.
+                    if let Some(fl) = s.leads(c as u32).map(|g| &s.follows[g]) {
+                        for (i, h) in hashes.iter_mut().enumerate() {
+                            for (slot, &fc) in fl.cells.iter().enumerate() {
+                                *h = h.wrapping_add(ContentHash::code_hash(fc, fl.code(slot, i as u32)));
+                            }
+                        }
+                    }
                     if f.runs.is_empty() {
                         // No bits: index 0 (a field never stored holds no code).
                         fixed = fixed.wrapping_add(hashes.first().copied().unwrap_or(0));
@@ -771,6 +1028,14 @@ impl<N: Arithmetic> KeySpace<N> {
                     out.runs.push((h, c as u32, n as u32, pos, len));
                 }
             }
+            // A follower's codes by the leader's index.
+            for fl in &s.follows {
+                for (slot, &c) in fl.cells.iter().enumerate() {
+                    for (i, &code) in fl.cols[slot].iter().enumerate() {
+                        out.codes.push((h, c, i as u32, code));
+                    }
+                }
+            }
         }
         out
     }
@@ -783,18 +1048,21 @@ impl<N: Arithmetic> KeySpace<N> {
 
     /// Every row's key of a CANONICAL block: packed where every code is in the
     /// dictionaries, else its exact content. A block whose shape is known must
-    /// have its signature.
+    /// have its signature. A row whose leader hits has its followers CHECKED
+    /// (a difference is FATAL); a row whose leader misses holds its
+    /// followers' codes in its content (`add_misses` records them).
     pub fn row_keys(&self, rt2: &Rt2<N>) -> Vec<RowKey<N>> {
         let Some(s) = self.shapes.get(&rt2.shape_hash) else {
-            // An unknown shape: every field is missing.
-            let rec = ShapeRecord::of(rt2);
-            let s = ShapeKeys::<N>::new(rec);
+            // An unknown shape: every field is missing (its followers too,
+            // whatever its layout).
+            let rec = ShapeRecord { hash: rt2.shape_hash, sig: shape_sig(rt2), pos: rt2.position_cells(), deps: Vec::new() };
+            let s = ShapeKeys::<N>::new(rec).expect("a layout without dependencies");
             return (0..rt2.width)
                 .map(|lane| RowKey::Miss(MissKey { shape: rt2.shape_hash, partial: (0, 0), missing: s.value_cells().map(|c| (c, s.code_at(rt2, c, lane))).collect() }))
                 .collect();
         };
         assert!(s.record.sig == shape_sig(rt2), "exact keys: two shapes under the hash {:#x} (a shape-hash collision)", rt2.shape_hash);
-        let cells: Vec<u32> = s.value_cells().collect();
+        let cells: Vec<u32> = (0..s.fields.len() as u32).filter(|&c| s.fields[c as usize].is_some()).collect();
         (0..rt2.width)
             .map(|lane| {
                 let (mut k, mut missing) = (0u128, Vec::new());
@@ -806,9 +1074,25 @@ impl<N: Arithmetic> KeySpace<N> {
                         i => k |= f.place(i),
                     }
                 }
+                for fl in &s.follows {
+                    let lead = s.field(fl.leader as usize).expect("the leader is keyed").find(s.code_at(rt2, fl.leader, lane));
+                    if lead == NONE {
+                        missing.extend(fl.cells.iter().map(|&c| (c, s.code_at(rt2, c, lane))));
+                    } else {
+                        for (slot, &c) in fl.cells.iter().enumerate() {
+                            let (got, want) = (s.code_at(rt2, c, lane), fl.code(slot, lead));
+                            if got != want {
+                                follower_violation(rt2.shape_hash, fl.leader, s.code_at(rt2, fl.leader, lane), lead, c, got, want, &format!("the boundary, lane {lane}"));
+                            }
+                        }
+                    }
+                }
                 if missing.is_empty() {
                     RowKey::Hit(to_key(k))
                 } else {
+                    if !s.follows.is_empty() {
+                        missing.sort_unstable_by_key(|m| m.0);
+                    }
                     RowKey::Miss(MissKey { shape: rt2.shape_hash, partial: to_key(k), missing })
                 }
             })
@@ -828,34 +1112,54 @@ impl<N: Arithmetic> KeySpace<N> {
     }
 
     /// Add every code of the rows of `blocks` (CANONICAL) the dictionaries
-    /// lack - per field SORTED - and their shapes: frame 0's seeding.
-    pub fn absorb(&mut self, blocks: &[&Rt2<N>]) -> KeyAdditions<N> {
+    /// lack - per field SORTED - and their shapes, laid out as `level`
+    /// declares: frame 0's seeding.
+    pub fn absorb(&mut self, blocks: &[&Rt2<N>], level: Level) -> KeyAdditions<N> {
         let mut adds = KeyAdditions::default();
         let mut shapes: Vec<&Rt2<N>> = blocks.to_vec();
         shapes.sort_by_key(|b| b.shape_hash);
         for b in &shapes {
-            self.add_shape(&ShapeRecord::of(b), &mut adds);
+            self.add_shape(&ShapeRecord::of(b, level), &mut adds);
         }
-        let mut new: std::collections::BTreeMap<(u64, u32), std::collections::BTreeSet<Code<N>>> = Default::default();
-        for b in blocks {
-            for r in self.row_keys(b) {
-                if let RowKey::Miss(m) = r {
-                    for (c, code) in m.missing {
-                        new.entry((m.shape, c)).or_default().insert(code);
-                    }
-                }
-            }
-        }
-        for ((shape, cell), codes) in new {
-            self.add_codes(shape, cell, &codes.into_iter().collect::<Vec<_>>(), &mut adds);
-        }
+        let misses: Vec<MissKey<N>> = blocks
+            .iter()
+            .flat_map(|b| self.row_keys(b))
+            .filter_map(|r| match r {
+                RowKey::Miss(m) => Some(m),
+                RowKey::Hit(_) => None,
+            })
+            .collect();
+        self.add_misses(&misses, &mut adds);
         adds
     }
 
+    /// A miss's final key, its codes all in (`add_misses`); its followers,
+    /// present exactly where their leader is, CHECKED against the record.
     pub fn complete(&self, m: &MissKey<N>) -> Key {
         let s = self.shapes.get(&m.shape).unwrap_or_else(|| panic!("exact keys: completing a key of the unknown shape {:#x}", m.shape));
-        let rest = s.key_of_codes(&m.missing).unwrap_or_else(|| panic!("exact keys: completing a key whose codes are not all in"));
-        to_key(of_key(m.partial) | of_key(rest))
+        let mut k = of_key(m.partial);
+        let mut lead: Vec<Option<(u32, Code<N>)>> = vec![None; s.follows.len()];
+        for &(c, code) in &m.missing {
+            let Some(f) = s.field(c as usize) else { continue };
+            let i = f.find(code);
+            assert!(i != NONE, "exact keys: completing a key whose codes are not all in (shape {:#x} cell {c})", m.shape);
+            if let Some(g) = s.leads(c) {
+                lead[g] = Some((i, code));
+            }
+            k |= f.place(i);
+        }
+        for &(c, code) in &m.missing {
+            if s.field(c as usize).is_some() {
+                continue;
+            }
+            let (g, slot) = s.follower(c).unwrap_or_else(|| panic!("exact keys: shape {:#x} cell {c} is not a value", m.shape));
+            let fl = &s.follows[g];
+            let (i, lcode) = lead[g].unwrap_or_else(|| panic!("exact keys: shape {:#x}: follower cell {c} missing while its leader hit", m.shape));
+            if fl.code(slot, i) != code {
+                follower_violation(m.shape, fl.leader, lcode, i, c, code, fl.code(slot, i), "a provisional key made final");
+            }
+        }
+        to_key(k)
     }
 }
 
@@ -999,7 +1303,7 @@ mod tests {
     /// the records (in any order) rebuilds the same keys.
     #[test]
     fn keys_are_stable_exact_and_replayable() {
-        let rec = ShapeRecord { hash: 7, sig: vec![1, 1, 4, 1, u32::MAX], pos: None };
+        let rec = ShapeRecord { hash: 7, sig: vec![1, 1, 4, 1, u32::MAX], pos: None, deps: Vec::new() };
         let mut ks = KeySpace::new();
         let mut adds = KeyAdditions::default();
         assert!(ks.add_shape(&rec, &mut adds));
@@ -1087,6 +1391,85 @@ mod tests {
         assert_ne!(Code::of_pos(AV::Ival(px(0), px(1 << 16))), Code::of_pos(AV::Ival(px(0), px(2 << 16))), "an interval's width is the key's");
     }
 
+    /// A three-value-cell shape (cells 0, 1, 2): cell 0 the leader of 1 and 2.
+    fn dep_space() -> (KeySpace, KeyAdditions) {
+        let rec = ShapeRecord { hash: 5, sig: vec![1, 1, 1, u32::MAX], pos: None, deps: vec![Deps { leader: 0, followers: vec![1, 2] }] };
+        let mut ks = KeySpace::new();
+        let mut adds = KeyAdditions::default();
+        ks.add_shape(&rec, &mut adds);
+        (ks, adds)
+    }
+
+    /// A miss of the dependent shape: the leader's code and its followers'.
+    fn dep_miss(l: i32, a: i32, b: i32) -> MissKey {
+        MissKey { shape: 5, partial: (0, 0), missing: vec![(0, n(l)), (1, n(a)), (2, n(b))] }
+    }
+
+    /// FOLLOWERS carry no key bits, decode from the leader's index, hash as
+    /// keyed fields would, and round-trip through the records.
+    #[test]
+    fn followers_have_no_bits_and_round_trip() {
+        let (mut ks, mut adds) = dep_space();
+        // Two misses share a new leader code with the same followers: one row.
+        ks.add_misses(&[dep_miss(7, 1, 1), dep_miss(3, 1, 2), dep_miss(7, 1, 1), dep_miss(9, 4, 2)], &mut adds);
+        let s = ks.shape(5).unwrap();
+        assert_eq!(s.bits(), 2, "three leader codes, no follower bits");
+        assert!(s.field(1).is_none() && s.field(2).is_none(), "followers have no dictionary");
+        let k = ks.complete(&dep_miss(9, 4, 2));
+        assert_eq!(s.decode(k), vec![(0, n(9)), (1, n(4)), (2, n(2))]);
+        assert_eq!(s.key_of_codes(&[(0, n(3)), (1, n(1)), (2, n(2))]), Some(ks.complete(&dep_miss(3, 1, 2))));
+        assert_eq!(s.key_of_codes(&[(0, n(3)), (1, n(1)), (2, n(1))]), None, "a follower other than the record's is no key");
+        let r = KeySpace::from_additions(adds.clone()).unwrap();
+        assert_eq!(r.shape(5).unwrap().decode(k), s.decode(k), "the records replay the followers");
+        let again = KeySpace::from_additions(ks.to_additions()).unwrap();
+        assert_eq!(again.shape(5).unwrap().decode(k), s.decode(k));
+        // The content hash is the layout's free: as if every cell were keyed.
+        let flat_rec = ShapeRecord { hash: 5, sig: vec![1, 1, 1, u32::MAX], pos: None, deps: Vec::new() };
+        let mut flat = KeySpace::new();
+        let mut fa = KeyAdditions::default();
+        flat.add_shape(&flat_rec, &mut fa);
+        flat.add_misses(&[dep_miss(7, 1, 1), dep_miss(3, 1, 2), dep_miss(9, 4, 2)], &mut fa);
+        let fk = flat.complete(&dep_miss(9, 4, 2));
+        assert_eq!(ks.content_hash().key(5, k), flat.content_hash().key(5, fk), "a state hashes alike in both layouts");
+        // A replay missing a follower's record is refused.
+        let mut cut = adds;
+        cut.codes.retain(|&(_, c, i, _)| !(c == 2 && i == 2));
+        assert!(KeySpace::from_additions(cut).is_err(), "a leader index without its follower's code");
+    }
+
+    /// Two new states holding one new leader code with different followers:
+    /// the dependency is violated, FATAL.
+    #[test]
+    #[should_panic(expected = "declared key dependency is VIOLATED")]
+    fn a_new_leader_with_two_followers_is_fatal() {
+        let (mut ks, _) = dep_space();
+        ks.add_misses(&[dep_miss(7, 1, 1), dep_miss(7, 1, 2)], &mut KeyAdditions::default());
+    }
+
+    /// A row whose leader hits but whose follower differs from the record:
+    /// FATAL at the boundary (a block keyed against the space).
+    #[test]
+    #[should_panic(expected = "declared key dependency is VIOLATED")]
+    fn a_follower_other_than_the_record_is_fatal_at_the_boundary() {
+        use crate::runtime2::Col;
+        let cache = std::sync::Arc::new(celeste_core::collision_cache::CollisionCache::new(1, 0));
+        let mut b = Rt2::<P8>::empty(2, celeste_names::GLOBAL_NAMES.len(), celeste_names::STRINGS, cache);
+        b.structure = vec![Cell2::Val, Cell2::Val, Cell2::Val];
+        let num = |x: i16| AV::Num(P8::from_i16(x));
+        b.cols = vec![Col::U(num(7)), Col::U(num(1)), Col::V(vec![num(1), num(2)])];
+        let deps = Deps { leader: 0, followers: vec![1, 2] };
+        let rec = ShapeRecord { hash: b.shape_hash_of(), sig: shape_sig(&b), pos: None, deps: vec![deps] };
+        b.shape_hash = rec.hash;
+        let mut ks = KeySpace::new();
+        let mut adds = KeyAdditions::default();
+        ks.add_shape(&rec, &mut adds);
+        let raw = |x: i32| Code::num((x << 16) as u32, (x << 16) as u32);
+        let first = MissKey { shape: rec.hash, partial: (0, 0), missing: vec![(0, raw(7)), (1, raw(1)), (2, raw(1))] };
+        ks.add_misses(&[first], &mut adds);
+        // Lane 0 is the record's; lane 1's cell 2 is not.
+        ks.row_keys(&b);
+    }
+
     /// Past 127 bits is fatal, never truncated.
     #[test]
     #[should_panic(expected = "past the 127 a key holds")]
@@ -1094,7 +1477,7 @@ mod tests {
         let sig: Vec<u32> = std::iter::repeat_n(1, 9).chain([u32::MAX]).collect();
         let mut ks = KeySpace::new();
         let mut adds = KeyAdditions::default();
-        ks.add_shape(&ShapeRecord { hash: 1, sig, pos: None }, &mut adds);
+        ks.add_shape(&ShapeRecord { hash: 1, sig, pos: None, deps: Vec::new() }, &mut adds);
         let codes: Vec<Code> = (0..1 << 15).map(n).collect();
         for c in 0..9 {
             ks.add_codes(1, c, &codes, &mut adds);

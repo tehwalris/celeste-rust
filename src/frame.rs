@@ -516,7 +516,7 @@ impl<N: Rem> ForwardState<N> {
         // exact where every other state holds it widened, beside its hull.
         anyhow::ensure!(initial.iter().all(|b| b.player_objects().is_empty()), "frame 0: an initial row holds a player, whose remainder the start's hull does not describe");
         let mut visited = crate::storage::visited::VisitedSet::<N>::new();
-        let seeded = crate::storage::wave::seed(&mut visited, &initial, crate::search::rem::start_hull::<N>(), s)?;
+        let seeded = crate::storage::wave::seed(&mut visited, &initial, crate::search::rem::start_hull::<N>(), level, s)?;
         checkpoint(dir, 0, &seeded, &[], s, &mut Stats::default())?;
         let won = !seeded.wins.is_empty();
         crate::storage::record::set_done(dir, 0, 0)?;
@@ -1124,7 +1124,7 @@ mod tests {
         w.widen_to(coarse);
         w.canonical();
         let mut space = celeste_engine::exact::KeySpace::new();
-        space.absorb(&[&w]);
+        space.absorb(&[&w], coarse);
         let (shape, keys, cells) = widened_keys(&block, coarse, &space).expect("keys");
         let mut marked = Visited::new(space.clone());
         marked.insert_until(shape, keys[0].expect("keyed"), cells[0], 5);
@@ -1262,7 +1262,7 @@ mod tests {
         let mut space = celeste_engine::exact::KeySpace::new();
         let mut adds = Default::default();
         for shape in [1, 9] {
-            space.add_shape(&celeste_engine::exact::ShapeRecord { hash: shape, sig: vec![1, u32::MAX], pos: None }, &mut adds);
+            space.add_shape(&celeste_engine::exact::ShapeRecord { hash: shape, sig: vec![1, u32::MAX], pos: None, deps: Vec::new() }, &mut adds);
             space.add_codes(shape, 0, &[celeste_engine::exact::Code::num(0, 0), celeste_engine::exact::Code::num(1, 1)], &mut adds);
         }
         let mut v = Visited::new(space);

@@ -23,7 +23,7 @@ use super::stats::{Lap, Stats, S};
 use crate::frame::{Filters, FrameStep};
 use crate::search::rem::Rem;
 use celeste_core::pico8_num::Pico8Num as P8;
-use celeste_engine::exact::{Code, KeyAdditions, MissKey, Provisional};
+use celeste_engine::exact::{KeyAdditions, MissKey, Provisional};
 
 /// An OLD frontier state: its hull grown since its last push (`was`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1279,15 +1279,7 @@ fn finalize_keys<N: Rem>(visited: &mut VisitedSet<N>, states: &[RouteState<N>], 
         let r = prov.shape_record(s).unwrap_or_else(|| panic!("exact keys: the new shape {s:#x} was not noted"));
         visited.keys.add_shape(&r, adds);
     }
-    let mut codes: std::collections::BTreeMap<(u64, u32), std::collections::BTreeSet<Code<N>>> = Default::default();
-    for m in &contents {
-        for &(c, code) in &m.missing {
-            codes.entry((m.shape, c)).or_default().insert(code);
-        }
-    }
-    for ((shape, cell), set) in codes {
-        visited.keys.add_codes(shape, cell, &set.into_iter().collect::<Vec<_>>(), adds);
-    }
+    visited.keys.add_misses(&contents, adds);
     keys.iter().zip(&contents).map(|(&k, m)| (k, visited.keys.complete(m))).collect()
 }
 
@@ -1303,14 +1295,14 @@ pub(crate) fn par_map<T: Sync, R: Send>(items: &[T], threads: usize, f: impl Fn(
 /// `trace::walk`) - and nothing looks the start up by projection
 /// (`backward::Seeds::load`, `known::Pruning::start`). Each row must decode
 /// to itself (`check_piece`).
-pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start: HullOf<N>, s: &crate::settings::Settings) -> Result<Wave<N>> {
+pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start: HullOf<N>, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Wave<N>> {
     let mut canon: Vec<celeste_engine::runtime2::Rt2<N>> = Vec::with_capacity(blocks.len());
     for b in blocks {
         let mut r = b.clone_block();
         r.canonical();
         canon.push(r);
     }
-    let keys_added = visited.keys.absorb(&canon.iter().collect::<Vec<_>>());
+    let keys_added = visited.keys.absorb(&canon.iter().collect::<Vec<_>>(), level);
     let mut shapes: Vec<u64> = canon.iter().map(|r| r.shape_hash).filter(|s| visited.shape_index(*s).is_none()).collect();
     shapes.sort_unstable();
     shapes.dedup();
@@ -1392,7 +1384,7 @@ pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Rt2<N>>, frame: u3
     let mut xfers = XferTable::<N>::default();
     let skeletons = Skeletons::<N>::default();
     let s = engine.settings();
-    let start = seed(&mut visited, &rows, HullOf::<N>::full(), &s)?.frontier;
+    let start = seed(&mut visited, &rows, HullOf::<N>::full(), engine.level(), &s)?.frontier;
     visited.forget_states();
     let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, filters: Filters::default(), frame, edges_dir: None, edges: None, skeletons: &skeletons };
     let wave = run_wave(engine, start, cx)?;
@@ -1423,7 +1415,7 @@ mod tests {
             view.canonical();
             assert_ne!(celeste_engine::exact::exact_rows(&view), celeste_engine::exact::exact_rows(&start), "room {:?}: the start is its own view", s.room);
             let mut visited = VisitedSet::new();
-            let wave = seed(&mut visited, std::slice::from_ref(&start), Hull::full(), &s).unwrap_or_else(|e| panic!("room {:?}: frame 0: {e:#}", s.room));
+            let wave = seed(&mut visited, std::slice::from_ref(&start), Hull::full(), crate::abstraction::Level::EXACT, &s).unwrap_or_else(|e| panic!("room {:?}: frame 0: {e:#}", s.room));
             let decoded = super::super::layer::decode_states(&wave.frontier.new, &visited.keys, visited.shapes(), usize::MAX, &|_| true).expect("decode");
             let [(sks, row)] = &decoded[..] else { panic!("room {:?}: frame 0 is {} blocks", s.room, decoded.len()) };
             assert_eq!(sks.len(), 1, "room {:?}: frame 0 is one state", s.room);
@@ -1460,5 +1452,33 @@ mod tests {
         for r in [0..0, 0..1, 3..4, 100..2000, 17..olds.len(), olds.len() - 1..olds.len()] {
             assert_eq!(l.range(r.clone()).collect::<Vec<_>>(), olds[r.clone()], "range {r:?}");
         }
+    }
+
+    /// EXACT PLATFORMS ARE KEYED BY THE FIRST ONE (`widening::CLOCKS`):
+    /// room (6,0)'s ten platforms, without `p`, declare the first one's
+    /// `spd.x` the leader of the other `spd.x`s and its `rem.x` of every
+    /// other platform cell, and frame 0 seeds and decodes with them
+    /// followers; with `p`, and in room (2,1) (one platform), nothing is
+    /// declared.
+    #[test]
+    fn exact_platforms_are_keyed_by_the_first() {
+        let start_of = |s: &Settings| crate::engines::reference::RefEngine::new(s).expect("engine").initial().expect("start").canonicalized();
+        let s = Settings { room: (6, 0), split_frame: true, ..Default::default() };
+        let start = start_of(&s);
+        let exact = crate::abstraction::Level::parse("r0sxhf").expect("level");
+        let platforms = start.objects_of_type(celeste_names::global("platform"));
+        assert_eq!(platforms.len(), 10, "room (6,0)'s platforms");
+        let deps = exact.key_deps(&start);
+        let [speed, rest] = &deps[..] else { panic!("ten exact platforms: two dependencies, {deps:?}") };
+        assert_eq!(speed.followers.len(), 9, "the first platform's `spd.x` leads the other nine");
+        assert!(rest.followers.len() >= 10 * 3, "every platform's `x`, `rem.x` and `last` at least: {rest:?}");
+        assert!(crate::abstraction::Level::parse("r0sxhfp").expect("level").key_deps(&start).is_empty(), "`p` widens them: nothing to declare");
+        let mut visited = VisitedSet::new();
+        seed(&mut visited, std::slice::from_ref(&start), Hull::full(), exact, &s).expect("frame 0 decodes with its followers");
+        let sk = visited.keys.shape(start.shape_hash).expect("the start's shape");
+        assert_eq!(sk.follows().iter().map(|f| f.cells().to_vec()).collect::<Vec<_>>(), deps.iter().map(|d| d.followers.clone()).collect::<Vec<_>>());
+        assert!(deps.iter().flat_map(|d| &d.followers).all(|&c| sk.field(c as usize).is_none()), "no follower is keyed");
+        let s21 = Settings { room: (2, 1), ..Default::default() };
+        assert!(exact.key_deps(&start_of(&s21)).is_empty(), "one platform: nothing to declare");
     }
 }

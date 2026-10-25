@@ -20,7 +20,7 @@
 
 use celeste_core::arith::Arithmetic;
 
-use crate::runtime2::{collapse_uniform, names, Col, Rt2, AV, NONE};
+use crate::runtime2::{collapse_uniform, names, Cell2, Col, Rt2, AV, NONE};
 
 /// A LEVEL: which objects the forward widens (plans/abstractions.md). Each
 /// widening over-approximates; the concrete search refutes it.
@@ -532,6 +532,104 @@ pub static TABLE: &[Entry] = &[
         why: "As the fall floor's: a spring gains `delay` when it first breaks.",
     },
 ];
+
+/// A CLOCK: objects whose every field is a function of the time since the
+/// room loaded (each moves on its own, nothing else writes it). Where a level
+/// keeps them EXACT (its `widened_by` flag off) and a shape holds two or
+/// more, a few fields of the FIRST instance key them all (`leads`, in
+/// order): every other value cell of every instance is a FOLLOWER of one of
+/// them (`exact::Deps`, `Level::key_deps`) and carries no key bits. Nothing
+/// is widened: a follower's code is recorded per leader code and every row
+/// is checked against it wherever a key is formed, a difference FATAL
+/// (`exact`'s module doc), so `why` is checked, never trusted.
+pub struct Clock {
+    pub objects: &'static str,
+    pub leads: &'static [Lead],
+    pub widened_by: Flag,
+    pub why: &'static str,
+}
+
+/// A leader: a field of a clock's first instance, and what follows it.
+pub struct Lead {
+    pub field: &'static [&'static str],
+    pub follows: Follows,
+}
+
+pub enum Follows {
+    /// The same field of every other instance.
+    SameField,
+    /// Every value cell of every instance that no earlier lead holds.
+    Rest,
+}
+
+pub const CLOCKS: &[Clock] = &[Clock {
+    objects: "platform",
+    leads: &[Lead { field: &["spd", "x"], follows: Follows::SameField }, Lead { field: &["rem", "x"], follows: Follows::Rest }],
+    widened_by: Flag::Platforms,
+    why: "A platform moves `dir * 0.65` an update (`move`: `rem.x` the sub-pixel remainder, `x` \
+          the pixels, wrapping between -16 and 128), `last` is `x` after its update, `spd.x` is \
+          set from `dir` by the update; nothing but its own update writes them, so every \
+          platform is a function of the updates since the room loaded (a restart reloads them \
+          all). `rem.x` steps by +-0x0000a666 modulo 1, so no value repeats within 32768 \
+          updates - except the first: `move` reads `spd.x` before the first update sets it, so \
+          that update leaves `rem.x` (and everything but `spd.x`) as loaded. `spd.x` is 0 only \
+          before it: `spd.x` tells those two apart and leads the other `spd.x`s, `rem.x` leads \
+          the rest.",
+}];
+
+impl Level {
+    /// The key dependencies this level declares in `rt2`'s shape (`CLOCKS`),
+    /// from its names: none where no clock has two or more instances, or the
+    /// level widens them.
+    pub fn key_deps<N: Arithmetic>(self, rt2: &Rt2<N>) -> Vec<crate::exact::Deps> {
+        let mut out = Vec::new();
+        for clock in CLOCKS.iter().filter(|c| !self.has(c.widened_by)) {
+            let ty = celeste_names::global(clock.objects);
+            let objs = rt2.objects_of_type(ty);
+            if objs.len() < 2 {
+                continue;
+            }
+            let path = |field: &[&str]| -> Vec<u32> { field.iter().map(|n| celeste_names::field(n)).collect() };
+            let cell = |obj: u32, field: &[&str]| rt2.slot_cell(Some(obj), &path(field)).unwrap_or_else(|| panic!("clock {}: an instance has no `{}`", clock.objects, field.join(".")));
+            let leaders: Vec<u32> = clock.leads.iter().map(|l| cell(objs[0], l.field)).collect();
+            let mut taken: std::collections::BTreeSet<u32> = leaders.iter().copied().collect();
+            for (lead, &leader) in clock.leads.iter().zip(&leaders) {
+                let mut followers: Vec<u32> = match lead.follows {
+                    Follows::SameField => objs[1..].iter().map(|&o| cell(o, lead.field)).collect(),
+                    Follows::Rest => objs.iter().flat_map(|&o| rt2.own_value_cells(o)).collect(),
+                };
+                followers.sort_unstable();
+                followers.dedup();
+                followers.retain(|c| !taken.contains(c));
+                taken.extend(followers.iter().copied());
+                out.push(crate::exact::Deps { leader, followers });
+            }
+        }
+        out
+    }
+}
+
+impl<N: Arithmetic> Rt2<N> {
+    /// An object's own value cells: its value fields and those of the
+    /// tables they point to (`rem`, `spd`, `hitbox`, ...), not its `type`'s.
+    fn own_value_cells(&self, obj: u32) -> Vec<u32> {
+        let val = |c: u32| matches!(self.structure[c as usize], Cell2::Val);
+        let mut out = Vec::new();
+        let Cell2::Obj(fields) = &self.structure[obj as usize] else { return out };
+        for &(name, cell) in fields.iter().filter(|f| val(f.1)) {
+            out.push(cell);
+            if name == names().type_ {
+                continue;
+            }
+            if let Col::U(AV::Ptr(sub)) = self.cols[cell as usize] {
+                if let Cell2::Obj(sub_fields) = &self.structure[sub as usize] {
+                    out.extend(sub_fields.iter().map(|f| f.1).filter(|&c| val(c)));
+                }
+            }
+        }
+        out
+    }
+}
 
 /// The `AbsentAsZero` slots: `(type global, field)`.
 pub fn absent_as_zero() -> impl Iterator<Item = (&'static str, &'static str)> {

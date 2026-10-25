@@ -225,6 +225,27 @@ GLOBAL_NAMES' order is the cell numbering (the walk from the globals): a
 reordering is a different search.
 The concrete search compares whole states, never keys.
 
+**Key dependencies** (`exact::Deps`, prototype, branch `platform-deps`):
+a level may declare, per shape, FOLLOWER cells whose codes are a function
+of one LEADER cell's, several such disjoint groups a shape
+(`widening::CLOCKS`, `Level::key_deps`; the shape's record carries them,
+so two producers under different layouts are fatal).
+Followers carry NO key bits: their codes are recorded per leader index when
+the leader's code is added (`KeySpace::add_misses`, replayed from
+`KeyAdditions` as `(shape, cell, leader index, code)`), decoded from the
+leader's index, and CHECKED on every row wherever a key is formed - the
+boundary (`row_keys`), a provisional key made final (`complete`, and new
+leader codes against each other in `add_misses`), the kernels' emission
+(`emit::check_follows`, per distinct leader index of a body's lanes). A
+difference is FATAL: two states differing only in a follower would share a
+key. A row whose leader misses carries its followers' codes in its
+provisional content. The one declaration: two or more moving platforms at
+a level without `p` - the first one's `spd.x` leads the other `spd.x`s, its
+`rem.x` every other platform cell (`rem.x` alone cannot tell the room's
+first update from the load: `move` reads `spd.x` before that update sets
+it). The content hash is the layout's free (a leader's code hashes with its
+followers').
+
 ## The room's start
 
 The search starts from `_init()` and `load_room(x, y)`. Real play enters a
