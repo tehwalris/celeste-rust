@@ -205,8 +205,8 @@ input, never a stored value); the concrete search's seeded-balloon view
 - **Exact at every level.** A platform is a CLOCK: `move` steps `rem.x` by
   `dir * 0.65` an update and nothing but its own update writes it, so every
   platform is a function of the updates since the room loaded, and no state
-  merges across frames. Affordable in every platform room (the measurements
-  below); `p`, which widened them, is gone (plans/lessons.md).
+  merges across frames. Affordable in every platform room (below); `p`,
+  which widened them, is gone (plans/lessons.md).
 - **Keyed by the first platform** (`widening::CLOCKS`, `widening::key_deps`,
   `exact::Deps`): where a shape holds two or more platforms, the first
   one's `spd.x` LEADS the other `spd.x`s and its `rem.x` every other
@@ -224,8 +224,11 @@ input, never a stored value); the concrete search's seeded-balloon view
 - **The arcs**: the carry is `move_x` (whole pixels, no split); a carry
   blocked by a wall sets `rem.x = 0` before the player's move, decoded as
   a constant. There is no second player split.
-- **Measured** (2026-10-25, release, with `--prefer` the stored witness):
-  see plans/results.md (any% (2,1), (6,0), (1,2); nodiag (2,1), (6,0), (1,2)).
+- **Measured** (2026-10-25, release, `--prefer` the stored witness, every
+  result kept): room (6,0) split `r0sxhf` any% 70 in 11 min, 18.2 GB (1.61G
+  visited, 42 key bits); (2,1) `r0sxhn` 82 in 6 min, 9.6 GB; (1,2) `r0sxhn`
+  103 in 8 min, 6.7 GB; nodiag alike (plans/results.md, "The platform rooms
+  without `p`").
 
 ## `rnd`, and the region key
 
