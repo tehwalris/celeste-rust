@@ -1238,7 +1238,7 @@ mod tests {
     /// THE HULL FORWARD LIES BETWEEN THE EXACT REACH AND THE WIDENED FORWARD,
     /// room (1,0) to f34: with every hull widened to the whole circle
     /// (`hull::WIDEN`) the frames are the pinned widened ones
-    /// (gates/ckhash_room10_f000-044_widened.txt); the hull forward keeps a
+    /// (gates/ckhash_room10_f000-034_widened.txt); the hull forward keeps a
     /// SUBSET of those states, each in a layer no earlier than the widened
     /// one's; and it holds every state the exact-remainder reach
     /// (`search::reach`) reaches, in a layer no later than the frame it is
@@ -1267,7 +1267,11 @@ mod tests {
         ForwardState::start(init(), &hull, to, None, level, &s).expect("start").extend(&e, &hull, to, None).expect("hull");
         let t = crate::storage::layer::Tree::<P8>::open(&wide, to).expect("tree");
         let lines: Vec<String> = (0..=to).map(|f| { let (n, acc) = t.layer(f, None, 4).expect("layer").0.content_fingerprint(&t.space, &t.shapes).expect("fp"); format!("f{f:03} {n} {acc:016x}") }).collect();
-        let pinned = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/gates/ckhash_room10_f000-044_widened.txt")).expect("the gate");
+        let pin = concat!(env!("CARGO_MANIFEST_DIR"), "/gates/ckhash_room10_f000-034_widened.txt");
+        if std::env::var_os("CELESTE_REGENERATE").is_some() {
+            std::fs::write(pin, lines.join("\n") + "\n").expect("write the pin");
+        }
+        let pinned = std::fs::read_to_string(pin).expect("the gate (CELESTE_REGENERATE=1 writes it)");
         assert_eq!(lines, pinned.lines().take(to as usize + 1).collect::<Vec<_>>(), "the widened forward is not the gate's");
         let (ws, hs) = (states(&wide), states(&hull));
         let first_in = |sets: &[rustc_hash::FxHashSet<u64>], h: u64| sets.iter().position(|x| x.contains(&h));

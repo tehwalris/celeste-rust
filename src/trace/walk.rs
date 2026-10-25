@@ -463,6 +463,12 @@ mod tests {
         assert!(e.contains("no-player chain, frame 0") && e.contains("the trace grew the graph"), "{e}");
     }
 
+    /// NEAR FLOORS SIDE BY SIDE SPLIT ONLY WHAT COLLISIONS READ: each fall
+    /// floor a region's player reaches makes two rows (solid, hidden), not
+    /// three (`verify::absorbed`; room (6,1) region (4,6) made 2 x 3^4 = 162
+    /// outcomes before it). The jump buffer's countdown (a buffered jump fires
+    /// or not) at most doubles a frame's outcomes: at most 144, twice the
+    /// buffer-less bound (measured 48 and 80; 32 and 48 without the buffer).
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (6,1)'s lattice walk, ~15 s"]
     fn near_floors_side_by_side_split_only_what_collisions_read() {
@@ -473,7 +479,7 @@ mod tests {
         let mut traced = 0;
         for ((shape, region), f) in &lw.frames {
             let Some(r) = region else { continue };
-            assert!(f.frame.outs.len() <= 72, "shape {shape} region ({},{}): {} outcomes", r.ix, r.iy, f.frame.outs.len());
+            assert!(f.frame.outs.len() <= 144, "shape {shape} region ({},{}): {} outcomes", r.ix, r.iy, f.frame.outs.len());
             traced += 1;
         }
         assert!(traced >= 2, "{traced} (shape, region) nodes traced");

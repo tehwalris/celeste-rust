@@ -53,9 +53,10 @@ RB=$T/release/rewrite
 G=gates/fixtures
 C=${CHECK_DIR:-/var/tmp/celeste-check-${PWD##*/}-$(printf %s "$PWD" | sha1sum | cut -c1-8)}
 TH=${THREADS:-16}
-# Every step's memory cap (safe-run.sh): the steps peak under 6 GB, and a
-# step that outgrows its cap fails instead of taking the machine's memory.
-# A lane runs one step at a time: 10G a lane; the test runs get 20G.
+# Every step's memory cap (safe-run.sh): the steps peak under 6 GB (but
+# `refcheck`, which has its own), and a step that outgrows its cap fails
+# instead of taking the machine's memory. A lane runs one step at a time:
+# 10G a lane; the test runs get 20G.
 MEM=10G
 mkdir -p "$C"
 # The failed and skipped steps, by name (lanes are subshells: a file).
@@ -158,9 +159,12 @@ widencheck() {
 }
 
 # refcheck NAME FRAME: the kernels against the reference engine, 32
-# sampled rows of a fixture's frame (an r0sx fixture's).
+# sampled rows of a fixture's frame (an r0sx fixture's). A worker holds
+# every fork path of its row, and the reference forks each row's buttons,
+# held buttons and jump buffer: room (4,2)'s rows peak at 8.5 GB (16.16)
+# and 12 GB (doubles) on 8 workers, 15 and 21 GB on 16.
 refcheck() {
-    ./safe-run.sh --memory "$MEM" -- "$B" check ref --tree "$F/$1" --step "$2" --samples 32 --threads "$TH"
+    ./safe-run.sh --memory 16G -- "$B" check ref --tree "$F/$1" --step "$2" --samples 32 --threads 8
 }
 
 # arccheck NAME FLAGS...: the recorded transfers of a fixture's f56
