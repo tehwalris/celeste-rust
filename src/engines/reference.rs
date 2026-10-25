@@ -763,10 +763,11 @@ mod tests {
         assert!(checked > 2 * runs, "{checked} inputs covered, {runs} run");
     }
 
-    /// Along a route, every `stride`-th state projected onto `level` makes the
-    /// same successors projected onto it, for every input (`all_inputs`, else
-    /// the route's own), with `step_at`'s pins as without them. Returns (states
-    /// with a `what`, leaves pinned, leaves without).
+    /// Along a route, every `stride`-th state projected onto `level` (but its
+    /// buttons' memory) makes the same successors projected onto it, for
+    /// every input (`all_inputs`, else the route's own), with `step_at`'s pins
+    /// as without them. Returns (states with a `what`, leaves pinned, leaves
+    /// without).
     fn pins_keep_the_projected_successors(settings: crate::settings::Settings, route: &str, stride: usize, all_inputs: bool, level: &str, what: &str) -> (usize, usize, usize) {
         let level = Level::parse(level).expect("level");
         let inputs = crate::concrete::read_inputs(route).expect("the route's inputs");
@@ -791,6 +792,16 @@ mod tests {
             if f % stride == 0 {
                 let mut abs = row.clone_block();
                 abs.widen_to(level);
+                // The buttons' memory as the route has it: the objects are
+                // the subject, and the jump buffer's forks would multiply the
+                // unpinned leaves past any memory (room (1,1): over 40 GB).
+                for p in row.player_objects() {
+                    for f in ["p_jump", "p_dash", "jbuffer"] {
+                        if let Some(c) = row.obj_field_cell(p, celeste_names::field(f)) {
+                            abs.cols[c as usize] = row.cols[c as usize].clone();
+                        }
+                    }
+                }
                 if !objects_of_type(&from_block(&abs, 0, &eng.fn_info, &eng.base).expect("state").0, what).is_empty() {
                     with += 1;
                 }
@@ -841,11 +852,9 @@ mod tests {
 
     /// `pin_isolated_floors`, along room (1,1)'s exit (four fall floors, the
     /// route passes by them) at `r0sxn`, under the route's inputs (unpinned,
-    /// the four floors make ~600 paths a step, ~2500 beside the player: 97k
-    /// leaves, ~200 s, hence ignored; run it when the pin or the cart's floor
-    /// changes).
+    /// the four floors fork every step: 26,957 leaves against 181 pinned).
     #[test]
-    #[ignore = "pre-merge, ./check.sh all runs it: ~200 CPU-s and 16 GB"]
+    #[ignore = "slow, ./check.sh t2 runs it: the reference along room (1,1)'s route, ~30 CPU-s"]
     fn pinning_isolated_floors_keeps_the_projected_successors() {
         let (with, pinned, full) = pins_keep_the_projected_successors(crate::settings::Settings { room: (1, 1), ..Default::default() }, "tas/room_1_1_exit_frame_94.txt", 4, false, "r0sxn", "fall_floor");
         assert!(with >= 20, "only {with} sampled states have a fall floor");

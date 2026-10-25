@@ -85,7 +85,7 @@ ones moved out. Every `#[ignore]` reason starts with the tier that runs it
 
 - `slow, `: t2 runs it (nextest `--run-ignored only`, 8 at a time);
 - `pre-merge, `: `all` runs it, one at a time (a level -1 table build,
-  ~250 CPU-s; the floors' pin, 16 GB);
+  ~250 CPU-s);
 - `local, `: `./check.sh local` runs it.
 
 So t0's "N skipped" is these, not a pass.

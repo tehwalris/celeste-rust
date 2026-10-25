@@ -455,7 +455,7 @@ fixtures() {
 }
 
 # The pre-merge tests (#[ignore = "pre-merge, ..."]), one at a time (the
-# floors' pin peaks at 16 GB).
+# level -1 table builds).
 premerge() {
     step premerge-tests ignoredtests pre-merge --test-threads 1
     grep -E 'Summary' "$C/premerge-tests.err" | tail -1
