@@ -49,8 +49,9 @@ struct AsmBody {
     error_root: usize,
     error_off: usize,
     live_off: usize,
-    /// Earlier bodies of the same outcome one fork away, with the root
-    /// slots whose equality makes a lane's emission theirs (`DupRef`).
+    /// Earlier bodies of the same outcome one fork away, with the root slots
+    /// whose equality makes a lane's emission theirs, or of an ALIKE outcome
+    /// emitting from the same slots (`dup_refs`, `DupRef`).
     dup_refs: Vec<DupRef>,
 }
 
@@ -1364,7 +1365,10 @@ impl<N: KernelLanes> AsmKernel<N> {
         for (b, rd) in asm_bodies.iter().zip(reads.iter_mut()) {
             rd.pos = pos_sources(&acc_templates[b.outcome].own, &b.fields)?;
         }
-        let dup_pairs = dup_refs(&mut asm_bodies, &reads);
+        // ALIKE outcomes: one shape and one key prefix, so their rows agree
+        // where their fields do.
+        let alike: Vec<Vec<bool>> = acc_templates.iter().map(|a| acc_templates.iter().map(|b| a.shape_hash == b.shape_hash && a.uniform == b.uniform).collect()).collect();
+        let dup_pairs = dup_refs(&mut asm_bodies, &reads, &alike);
         let plan = emit::Plan::of(&reads);
         let mix_slices = census.map(|c| crate::compiled::mix::counter(&compiled.sym, c));
         let (fused, flat_roots) = graphs.unwrap_or_default();
@@ -1387,10 +1391,18 @@ impl<N: KernelLanes> AsmKernel<N> {
     }
 }
 
-/// Every body's `dup_refs`: the earlier bodies of its outcome one fork away.
-/// Every root slot is compared (key fields and position sources are
-/// fields); differing kinds are no ref.
-fn dup_refs(bodies: &mut [AsmBody], reads: &[emit::BodyReads]) -> DupPairs {
+/// Every body's `dup_refs`: the earlier bodies of its outcome one fork away,
+/// with the root slots to compare on a lane; and every earlier body of an
+/// ALIKE outcome (`alike[a][b]`: one shape and one key prefix, the uniform
+/// fields) that emits from the very SAME slots - fields and transfer - so
+/// on every lane both take it emits the same row, edge and transfer: proven
+/// here, nothing to compare. The jump buffer makes those: widened, a
+/// released button may jump too, so a press and no press reach the same
+/// successors as different outcomes (plans/correctness.md C7; one ref with
+/// a slot to compare costs more than the emission it saves). Every root
+/// slot is compared (key fields and position sources are fields); differing
+/// kinds are no ref.
+fn dup_refs(bodies: &mut [AsmBody], reads: &[emit::BodyReads], alike: &[Vec<bool>]) -> DupPairs {
     let mut ids = DupPairs::default();
     let n = bodies.len();
     for j in 0..n {
@@ -1398,17 +1410,20 @@ fn dup_refs(bodies: &mut [AsmBody], reads: &[emit::BodyReads]) -> DupPairs {
         for i in 0..j {
             let (a, b) = (&bodies[i], &bodies[j]);
             let (aa, ab) = (&reads[i].arc, &reads[j].arc);
-            if a.outcome != b.outcome || a.splits.len() != b.splits.len() || aa.fin != ab.fin {
+            if !alike[a.outcome][b.outcome] || a.splits.len() != b.splits.len() || aa.fin != ab.fin {
                 continue;
             }
-            if a.splits.iter().zip(&b.splits).filter(|(x, y)| x != y).count() != 1 {
+            if a.outcome == b.outcome {
+                if a.splits.iter().zip(&b.splits).filter(|(x, y)| x != y).count() != 1 {
+                    continue;
+                }
+                assert!(a.fields.len() == b.fields.len() && a.fields.iter().zip(&b.fields).all(|(fa, fb)| fa.cell == fb.cell), "two bodies of one outcome");
+            } else if a.fields.len() != b.fields.len() || a.fields.iter().zip(&b.fields).any(|(fa, fb)| fa.cell != fb.cell) {
                 continue;
             }
-            assert_eq!(a.fields.len(), b.fields.len(), "two bodies of one outcome");
             let mut pairs: Vec<(usize, usize, Ty)> = Vec::new();
             let mut ok = true;
             for (fa, fb) in a.fields.iter().zip(&b.fields) {
-                assert_eq!(fa.cell, fb.cell, "two bodies of one outcome");
                 // The kinds, and the undecided-boolean guard (`may_unknown`),
                 // must agree: a masked lane skips its own body's push.
                 if fa.kind != fb.kind || fa.may_unknown != fb.may_unknown {
@@ -1428,7 +1443,7 @@ fn dup_refs(bodies: &mut [AsmBody], reads: &[emit::BodyReads]) -> DupPairs {
                     pairs.push((oa, ob, ka));
                 }
             }
-            if ok {
+            if ok && (a.outcome == b.outcome || pairs.is_empty()) {
                 pairs.sort_unstable_by_key(|p| (p.0, p.1));
                 pairs.dedup_by_key(|p| (p.0, p.1));
                 refs.push(DupRef { body: i, pairs: pairs.into_iter().map(|p| ids.id(p)).collect() });
