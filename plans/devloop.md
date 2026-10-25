@@ -166,8 +166,9 @@ The steps run in four lanes:
   `trace::probe::tests::the_golden_files_are_current` runs every probe
   corpus on a real PICO-8 (`rewrite pico8 probe-goldens`) and fails where
   its golden moved (rewritten in `lua/probe/`: read the diff). Where the
-  store or PICO-8 is absent, its test passes and prints SKIPPED, and the
-  run's last line says so.
+  store or PICO-8 is absent, its test passes and prints SKIPPED, the run's
+  last line says so, and the run FAILS: a check that compared nothing is
+  no pass (plans/correctness.md C14).
 - **fixtures**: `tools/fixtures.sh verify all big` rebuilds every fixture
   beside the installed one and checks its fingerprint. This is the only
   check of a fixture's early frames under the current code. The other tiers

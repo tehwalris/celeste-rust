@@ -253,12 +253,12 @@ fn explore_no_player<A: GraphArith>(
 ) -> Result<(usize, usize, usize)> {
     use super::shapes;
     let fruit = it.d.level.fruit;
-    let mut seen: std::collections::BTreeSet<(ShapeKey, String)> = Default::default();
+    let mut seen: std::collections::BTreeSet<StateId> = Default::default();
     let (key, st, consts) = entry;
     let mut todo = vec![(key, st, consts, 0usize)];
     let (mut states, mut followed, mut ended) = (0usize, 0usize, 0usize);
     while let Some((key, st, consts, depth)) = todo.pop() {
-        if !seen.insert((key, format!("{consts:?}"))) {
+        if !seen.insert(state_id(key, &consts)) {
             continue;
         }
         states += 1;
@@ -294,6 +294,27 @@ fn pins_of<A: GraphArith>(consts: &std::collections::BTreeMap<super::iface::Path
 /// A no-player state to explore: its shape, the state, its constants.
 type Entry<A> = (ShapeKey, super::state::State<super::domain::Symbolic<A>>, std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>);
 
+/// A constant by its exact bits (`Arithmetic::bits`): two constants are
+/// one exactly when their bits are.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ConstBits {
+    Num(u64),
+    Bool(bool),
+}
+
+/// A no-player state's IDENTITY: its shape and every constant, by path and
+/// exact bits (never a rendering of them: what dedups the exploration must
+/// be what tells the states apart).
+type StateId = (ShapeKey, Vec<(super::iface::Path, ConstBits)>);
+
+fn state_id<A: GraphArith>(shape: ShapeKey, consts: &std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>) -> StateId {
+    let bits = |c: &super::iface::Conc<A>| match *c {
+        super::iface::Conc::Num(n) => ConstBits::Num(A::bits(n)),
+        super::iface::Conc::Bool(b) => ConstBits::Bool(b),
+    };
+    (shape, consts.iter().map(|(p, c)| (p.clone(), bits(c))).collect())
+}
+
 /// The next frame's entry from outcome `st`: its constants at `opts` (read
 /// before the representative blanks them) and its representative's state.
 fn next_entry<A: GraphArith>(reps: &Reps<A>, d: &mut super::domain::Symbolic<A>, st: &super::state::State<super::domain::Symbolic<A>>, opts: &crate::abstraction::Level) -> Result<Entry<A>> {
@@ -319,7 +340,7 @@ struct NoPlayer<A: GraphArith = Fixed> {
     /// The spawn object's fields (by the path below it), likewise.
     spawn: Hull<A>,
     spawn_unknown: std::collections::BTreeSet<super::iface::Path>,
-    entries: std::collections::BTreeSet<(ShapeKey, String)>,
+    entries: std::collections::BTreeSet<StateId>,
 }
 
 impl<A: GraphArith> NoPlayer<A> {
@@ -405,6 +426,18 @@ impl<A: GraphArith> NoPlayer<A> {
 
 #[cfg(test)]
 mod tests {
+    /// A NO-PLAYER STATE IS ITS SHAPE AND ITS CONSTANTS' BITS: a double's -0
+    /// and 0 (equal to the cart's `==`) are two states, and equal bits one.
+    #[test]
+    fn a_no_player_states_identity_is_its_constants_bits() {
+        use super::super::iface::{Conc, Step};
+        use celeste_core::arith::Float;
+        let at = |v: f64| std::collections::BTreeMap::from([(vec![Step::Key("x".into())], Conc::Num(Float::new(v).expect("finite")))]);
+        assert!(super::state_id(1, &at(0.0)) != super::state_id(1, &at(-0.0)));
+        assert!(super::state_id(1, &at(0.5)) == super::state_id(1, &at(0.5)));
+        assert!(super::state_id(1, &at(0.5)) != super::state_id(2, &at(0.5)));
+    }
+
     /// THE NO-PLAYER CHAIN ENDS QUIETLY ONLY WHERE IT CANNOT RUN CONCRETELY.
     /// Room (5,0)'s balloon draws its `offset` from `rnd` in `_init`: the
     /// chain bounds nothing, and says so. Any other refusal of a chain frame
@@ -758,7 +791,7 @@ impl<A: GraphArith> WalkState<A> {
         // A RESPAWN entry: its no-player phase explored into the hulls (once
         // per entry); the shapes whose bounds grew are re-traced (`respawned`).
         if let (true, Some(c)) = (self.no_player.on, &o.respawn) {
-            if self.no_player.entries.insert((tk, format!("{c:?}"))) {
+            if self.no_player.entries.insert(state_id(tk, c)) {
                 let entry = self.reps.state(&o.rep, &mut it.d)?;
                 let (n, followed, ended) = explore_no_player(it, chunks, &self.reps, (tk, entry, c.clone()), self.opts, &mut self.no_player, "a respawn's")?;
                 let shape_no = |x: &ShapeKey| self.lattice.keys().position(|y| y == x).map_or("new".to_string(), |i| format!("#{i}"));

@@ -84,7 +84,6 @@ pub(crate) fn key<N: KernelLanes>(level: crate::abstraction::Level, s: &crate::s
     // diagnostics (but the census, which an entry holds).
     let settings = crate::settings::Settings {
         threads: None,
-        override_settings: false,
         diag: crate::settings::Diagnostics { kernel_metrics: s.diag.kernel_metrics, ..Default::default() },
         ..s.clone()
     };
