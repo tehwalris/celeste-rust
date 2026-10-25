@@ -299,7 +299,7 @@ gate() {
     ./safe-run.sh --memory "$MEM" -- "$B" gate --search-dir "$C/t2/$1" > "$C/t2/$1.gate"
 }
 gate10_arc() {
-    ./safe-run.sh --memory "$MEM" -- "$B" search --frames 35 --win-at 9,101 --search-dir "$C/t2/arc10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10-marks" > "$C/t2/arc10.out" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" search --frames 35 --win-at 9,101 --search-dir "$C/t2/arc10" --prefer gates/known_room10_win9-101.txt > "$C/t2/arc10.out" || return 1
     gate arc10 || return 1
     same "$C/t2/arc10.gate" gates/arc_room10_win9-101_h35.txt
 }
@@ -310,7 +310,7 @@ gate10f_forward() {
     same "$C/t2/g10f.ckhash" gates/float_ckhash_room10_f000-044.txt
 }
 gate10f_arc() {
-    ./safe-run.sh --memory "$MEM" -- "$B" search --arith float --frames 35 --win-at 9,101 --search-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/arc10f-marks" > "$C/t2/arc10f.out" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" search --arith float --frames 35 --win-at 9,101 --search-dir "$C/t2/arc10f" --prefer gates/known_room10_win9-101.txt > "$C/t2/arc10f.out" || return 1
     gate arc10f || return 1
     same "$C/t2/arc10f.gate" gates/float_arc_room10_win9-101_h35.txt
 }
@@ -318,7 +318,7 @@ gate10f_arc() {
 # route valid in both: its bound (stdout) and witness (`rewrite gate`)
 # pinned (each half's [gate] lines are the two gates above).
 gate10d_dual() {
-    ./safe-run.sh --memory "$MEM" -- "$B" dual --frames 35 --win-at 9,101 --search-dir "$C/t2/dual10" --prefer gates/known_room10_win9-101.txt --save-marks "$C/t2/dual10-marks" > "$C/t2/dual10.out" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" dual --frames 35 --win-at 9,101 --search-dir "$C/t2/dual10" --prefer gates/known_room10_win9-101.txt > "$C/t2/dual10.out" || return 1
     ./safe-run.sh --memory "$MEM" -- "$B" gate --search-dir "$C/t2/dual10" > "$C/t2/dual10.lines" || return 1
     { grep '^DUAL BOUND' "$C/t2/dual10.out"; grep '^\[gate\] h35 dual' "$C/t2/dual10.lines"; } > "$C/t2/dual10.gate"
     same "$C/t2/dual10.gate" gates/dual_room10_win9-101_h35.txt
@@ -326,16 +326,16 @@ gate10d_dual() {
 # The objects ladder (r0sxn filtering r0sx) at a synthetic win, its
 # witness as the known route: every level's [gate] lines pinned.
 search42() {
-    ./safe-run.sh --memory "$MEM" -- "$B" search --room 4,2 --level r0sxn,r0sx --frames 50 --win-at 32,56 --search-dir "$C/t2/s42" --prefer "$G/known_room42_win32-56.txt" --save-marks "$C/t2/s42-marks" > "$C/t2/s42.out" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" search --room 4,2 --level r0sxn,r0sx --frames 50 --win-at 32,56 --search-dir "$C/t2/s42" --prefer "$G/known_room42_win32-56.txt" > "$C/t2/s42.out" || return 1
     gate s42 || return 1
     same "$C/t2/s42.gate" "$G/search42.gate"
 }
 # The UI export (`rewrite export-ui`) of the searches above with their
-# marks, pinned by digest: every binary file and run.json (its timings are
-# timings.json's).
+# marks records, pinned by digest: every binary file and run.json (its
+# timings are timings.json's).
 export_ui() {
     for d in arc10 s42 arc10f dual10; do
-        ./safe-run.sh --memory "$MEM" -- "$B" export-ui --search-dir "$C/t2/$d" --arc "$C/t2/$d-marks" --out "$C/t2/ui-$d" > /dev/null || return 1
+        ./safe-run.sh --memory "$MEM" -- "$B" export-ui --search-dir "$C/t2/$d" --out "$C/t2/ui-$d" > /dev/null || return 1
         (cd "$C/t2" && sha256sum ui-$d/*.bin ui-$d/run.json)
     done > "$C/t2/export-ui.sha256"
     same "$C/t2/export-ui.sha256" "$G/export-ui.sha256"

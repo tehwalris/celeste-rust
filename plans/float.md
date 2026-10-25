@@ -164,9 +164,9 @@ arithmetics. Philippe's rule (b): the file's length is the FLOAT exit
   first win is the dual optimum.
 - The witness is replayed in both arithmetics before it is written
   (`dual::replay`), and recorded in `result.json` (`dual`).
-- `--save-marks DIR` writes the float half's arc pass and the dual
-  witness's path; `export-ui` reads every tree in the arithmetic its record
-  names, a dual record's levels named by half.
+- The marks record is the float half's arc pass, and `result.json` holds
+  the dual witness's path (the float half's); `export-ui` reads every tree
+  in the arithmetic its record names, a dual record's levels named by half.
 
 ## The robustness report
 

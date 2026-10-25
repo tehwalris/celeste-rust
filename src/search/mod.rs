@@ -16,6 +16,5 @@ pub mod rem;
 pub mod result;
 pub mod robust;
 pub mod tree;
-pub mod ui_export;
 
 pub use driver::{check_known, run, SearchSpec};

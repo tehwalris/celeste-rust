@@ -183,11 +183,13 @@ enum Command {
     /// a tree, checked against a known solution.
     #[command(subcommand)]
     L1(l1::Command),
-    /// Export a finished search for the web UI (`ui/`, `search::ui_export`).
+    /// Export a finished search for the web UI (`ui/`, `ui_export`).
     ///
-    /// Reads its record (`result.json`), the trees' checkpoint headers and
-    /// forward records (`forward.tsv`) and the marks files; its room is the
-    /// search's record's.
+    /// Reads its record (`result.json`: the levels, the witness and its
+    /// path), the trees' checkpoint headers and forward records
+    /// (`forward.tsv`) and its marks record (W's support and the arc-marked
+    /// nodes over its final level's tree, `search::result::marks_path`); its
+    /// room is the search's record's.
     ExportUi(ExportUiArgs),
     /// The room (`--room`) as the tools need it, as JSON on stdout.
     ///
@@ -263,14 +265,6 @@ pub struct SearchArgs {
     /// Stop at the arc bound (`dual`: the dual bound), no concrete search.
     #[arg(long)]
     no_witness: bool,
-    /// Write the web UI's arc pass into this directory (`export-ui --arc
-    /// DIR`): the winning sets' support (`level0.marks.bin`) and the
-    /// ARC-MARKED nodes (`arc.marks.bin`) as `(shape, cell, key, dist)` rows,
-    /// `dist` the horizon less the last frame the node still wins from; and
-    /// `witness.txt` (inputs and player position per frame). `dual`: the
-    /// FLOAT half's arc pass (the count) and the dual witness.
-    #[arg(long)]
-    save_marks: Option<String>,
     /// A known solution (a `tas/` file or a comma list of input bytes, the
     /// spawn prologue included): the concrete search tries its input first
     /// at every frame, so the witness is the optimum closest to it (every
@@ -319,11 +313,7 @@ pub struct ExportUiArgs {
     /// Output directory (the UI serves it as `data/`).
     #[arg(long, default_value = "/var/tmp/celeste-ui/data")]
     out: String,
-    /// The search's `--save-marks` directory: the winning sets' support
-    /// and the arc-marked nodes over the last level's tree (and the witness).
-    #[arg(long)]
-    arc: Option<String>,
-    /// A concrete run to draw instead of the arc directory's witness:
+    /// A concrete run to draw instead of the search's witness:
     /// `[label TEXT]`, `inputs a,b,..`, `[dashes F:DIR ..]`, then `f x y`
     /// per frame from 0 (`rewrite pico8 align --out DIR` writes one).
     #[arg(long)]
@@ -421,7 +411,7 @@ pub(crate) fn where_(c: u32) -> String {
 fn search(cfg: &Settings, float: Option<&Settings>, a: &SearchArgs) -> Result<()> {
     let prefer = a.prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
     let dir = std::path::Path::new(&a.search_dir);
-    let spec = celeste_rust::search::SearchSpec { settings: cfg, level: &a.level, horizon: a.frames, ceiling: a.ceiling, dir, bound_only: a.no_witness, save_marks: a.save_marks.as_deref().map(std::path::Path::new), prefer: prefer.as_deref(), dual: float };
+    let spec = celeste_rust::search::SearchSpec { settings: cfg, level: &a.level, horizon: a.frames, ceiling: a.ceiling, dir, bound_only: a.no_witness, prefer: prefer.as_deref(), dual: float };
     report(&celeste_rust::search::run(&spec)?, dir)
 }
 /// A search's verdict (`search::run`'s record), printed; an error where it
@@ -558,12 +548,11 @@ fn main() -> Result<()> {
         Command::Trajectory(a) => diag::trajectory(&cfg, a),
         Command::Robust(a) => diag::robust(&cfg, a),
         Command::L1(c) => l1::run(&cfg, c),
-        Command::ExportUi(a) => celeste_rust::search::ui_export::export(
+        Command::ExportUi(a) => celeste_rust::ui_export::export(
             std::path::Path::new(&a.search_dir),
             std::path::Path::new(&a.out),
             cfg.threads(),
-            a.arc.as_deref().map(std::path::Path::new),
-            celeste_rust::search::ui_export::Paths {
+            celeste_rust::ui_export::Paths {
                 witness: a.witness.as_deref().map(std::path::Path::new),
                 reference: a.reference.as_deref().map(std::path::Path::new),
                 download: a.download.as_deref().map(std::path::Path::new),
