@@ -22,16 +22,34 @@ settled here. Evidence is file:line at develop 19869c5d.
   backward computes distances; about -1,000 lines net; every level -1 result
   re-verified. The known-route check must cover it first (this item).
 
-## C2. The orb deadline: a hand-derived bound nothing checks
-- `ORB_MIN_FRAMES_AFTER_CHEST = 70` (frame.rs:284-286): "61 paused + 8 until
-  the orb is collectable + 10 frozen = 79, taken as 70". No test derives or
-  checks it against the cart.
-- Its ceiling is level -1's H (`TreeL1::orb_ceiling`, frame.rs): without
-  level -1 the orb room never gets the cut (sound, but arbitrary coupling).
-- To do: check the bound with the reference engine (or derive it), and give
-  the cut its own horizon (the search's).
-- It also mixes units: the cut compares steps with frames (frame.rs:160-163);
-  sound today only because the orb room is not split-frame.
+## C2. The orb deadline: a hand-derived bound nothing checks (FIXED, branch correctness-batch)
+- CHECKED: `ORB_MIN_FRAMES_AFTER_CHEST = 70` against the cart
+  (`frame::tests::the_orb_deadline_is_below_the_carts_chest_to_orb_time`,
+  reference engine, unsplit and split): room (5,2)'s any% witness to its
+  chest's opening, then no input (the shortest: nothing freezes the draw
+  that ticks the chest and the orb) to the orb at rest, collectable, 68
+  frames; the witness's collection to the first update that runs, 11 (10
+  frozen). A win is >= 79 frames after the opening, identical split and
+  unsplit; 70 keeps its margin, and the test fails if the constant passes
+  the cart's figure.
+- OWN HORIZON: the cut is `frame::OrbCut`, the horizon the tree was started
+  for (the search's, `forward --steps`), recorded as the tree's `orb_cut`
+  line (settings VERSION 5); `grow_tree` refuses to raise a tree past it,
+  as for level -1. `TreeL1::orb_ceiling` is gone: the orb room is cut with
+  or without level -1.
+- UNITS: the cut counts frames. A chest closed after step k opens at the
+  earliest in frame `frame_of(k + 1)`; it is skipped when that plus 70
+  exceeds the horizon's frame (`the_orb_cut_counts_frames_under_the_split_frame`).
+  Unsplit this is the old test exactly (`frame + 1 + 70 > H`), so a tree
+  built under level -1 at the search's horizon is unchanged.
+- No result changes: a cut row cannot win by the horizon (the bound above).
+  The witnesses through the orb (any% 150, nodiag 157) replay to their
+  exits with the orb under the new code; no winning route meets the cut,
+  which starts at frame H-70 while a route exiting by H opened by H-79.
+  Re-searched under it (fc516a4d): room (5,2) any% `search --level r0sx
+  --level-minus-one 150,5 --frames 150 --ceiling --prefer
+  tas/room_5_2_exit_frame_150.txt`: arc bound 150, concrete optimum 150,
+  the known route survives every pruning step (5.6 min, peak 7 GB).
 
 ## C3. Room (2,1): the split frame reaches FEWER states than unsplit at `p`
 - Noted in architecture.md ("unexplained"). Fewer states is the direction a
@@ -74,15 +92,21 @@ settled here. Evidence is file:line at develop 19869c5d.
   hulls); concrete members in place of `step_at`'s pins (audit
   kernel-pipeline.md K10).
 
-## C6. Closure captures are not part of a state's exact identity
+## C6. Closure captures are not part of a state's exact identity (FIXED, branch correctness-batch)
 - `shape_sig`/`shape_hash_of` hash a closure's function id and capture COUNT
   (exact.rs:435, runtime2.rs:391-395); `exact_rows` reads only `Val` cells
   (exact.rs:964-1000): capture targets are hashed nowhere.
-- Fixed by structure today (the converter refuses non-table captures; "every
-  capture in this cart is the owning object", trace/block.rs:198-205), and the
-  forward's `Skeletons::register` would catch a mismatch, but the concrete and
-  dual searches dedup on `ExactRow` without that check.
-- To do: assert in `trace::block` that a capture IS the closure's owner.
+- FIXED: the one converter (`trace::block::ToRt2::closure`) asserts every
+  capture IS the closure's OWNER, the one table holding it (`obj.move`
+  captures `obj`), which the block's structure already says; a capture of
+  another table, a closure with captures held by two tables or by a global,
+  is refused with an error naming the closure. Every block passes through it
+  (the tracer's skeletons and outcomes, the reference engine's rows), so the
+  concrete and dual searches' `ExactRow` dedup is exact by construction.
+  Test: `trace::block::tests::a_closure_capturing_another_table_than_its_owner_is_refused`
+  (room (1,0)'s start converts; with every captured name rebound to the
+  globals table it is refused); the whole ladder converts every block of the
+  real cart through the assert.
 
 ## C7. HIGH: the jump buffer is removed, so the search MISSES real states
 - The original buffers a jump press for 4 updates (orig 136-142, 211-212);
@@ -135,13 +159,39 @@ settled here. Evidence is file:line at develop 19869c5d.
   (also C13), nodiag (6,1) 92, nodiag (1,2) 113, 100% (6,1) 114, 100% (4,3)
   109. Decision pending (Philippe).
 
-## C8. Death and exit in the same update counts as a win
-- `kill_player` (orig 121-122) then `next_room()` (orig 305) in one update:
-  the search's win test is the room alone (frame.rs:189-212), so a dying exit
-  is a win (FAKE by the category rules; `rewrite pico8 chain` reports a death), and the
-  next room's pending-reload start is never searched (MISSES).
-- Rooms with side spikes in row 0 next to the exit: (2,2), (6,2), (0,3),
-  (2,3), (3,3). Not reached by any actual route yet.
+## C8. Death and exit in the same update counts as a win (FIXED, branch correctness-batch)
+- The original cart: `kill_player` (orig 121-122 spikes, 125-126 the bottom)
+  destroys the player and `restart_room()` sets `will_restart=true`,
+  `delay_restart=15`; the REST of the same update runs on the dead player's
+  table, so line 305's `if this.y<-4 ... next_room()` loads the next room in
+  that update; `load_room` leaves `will_restart` alone, so 15 updates later
+  `_update`'s restart block (1186-1190) reloads the NEW room and its player
+  respawns there. The minimal cart is the same (min 93/97, 231, 709-720,
+  778-783). The search's win test was the room alone, so a dying exit won.
+- POLICY (Philippe, 2026-10-25): a dying exit is NOT a win: the per-room
+  optima must chain in real play, where the next room restarts 15 updates
+  in (and the category rules count a death). The cart's semantics, no knob:
+  `frame::wins_of` requires `will_restart` false (`died`). Only
+  `kill_player` sets it, and it holds until the reload, during which no
+  player exists to leave the room: a row that left with it set left in its
+  player's dying update. Such a row is not expanded either (it is in the
+  next room). The level -1 table, a bound on the frames to ANY exit, stays a
+  lower bound.
+- Test: `frame::tests::a_dying_exit_is_no_win`, room (2,2): a constructed
+  rise at x 64 under the top row's right-facing spike (tile 59 at tile 8)
+  dies and loads (3,2) in one update: no win (the test fails without the
+  fix); the same rise at x 40 is a clean exit and wins.
+- The MISSES half (the next room's pending-reload start is never searched)
+  needs no handling: that start restarts its room 15 updates after entry,
+  so a dying exit could pay off only if it beat the room's best clean exit
+  by more than about 15 frames (everything the next room's player does
+  before the restart is lost), and it fails the real-play validity check (a
+  death) besides.
+- No result changes: fewer wins only raise bounds, and every witness still
+  wins. The 15 witnesses of the five rooms with spikes beside the exit
+  ((2,2), (6,2), (0,3), (2,3), (3,3): any%, 100%, nodiag, gemskipnodiag
+  and the community references) replay to their named exit frames under the
+  new test with a living winner; no winning lineage holds a pending restart.
 
 ## C9. The category runner falls back to the IL start
 - `tools::chain::entry_jank` (used by `rewrite category`): when the previous
@@ -160,17 +210,31 @@ settled here. Evidence is file:line at develop 19869c5d.
 - A frame is always `_update();_draw()` (PICO-8 skips draws over the CPU
   budget): suspected safe.
 
-## C11. Balloon seeds: PICO-8 verification hands them out in another order
-- The PICO-8 replay (`rewrite pico8 replay`, `tools::pico8::FENCED`:
-  `SeedOrder::Pop`; `--seed-order creation` is the alternative, implemented)
-  assigns a file's `[seeds]` in POP order (balloons at the load, chests when
-  opened); Rust's `--balloon-seeds`
-  (`RoomObject::seeded`) and UCT use CREATION order. Where a chest precedes a
-  balloon in creation order (rooms (3,3), (5,3)), the search's concrete
-  balloons and the PICO-8 verification's get different seeds: 3 of 45
-  chest-variant replays differ (found by agent F, 2026-10-20).
-- To do: settle which order the tasdatabase's tools (Celia, UCT) define, make
-  the replay match, and re-verify the (3,3) and (5,3) uploads.
+## C11. Balloon seeds: PICO-8 verification hands them out in another order (FIXED, branch correctness-batch)
+- SETTLED: both TAS tools hand a file's `[seeds]` out in CREATION order,
+  balloons and chests together: UniversalClassicTas `set_seeds`
+  (CelesteTAS/TAS.lua:537-559) walks `pico8.cart.objects`, Celia
+  `load_rng_seeds` (cctas.lua:646-672) the initial state's
+  `cart.objects`, each giving the next seed to the next balloon or chest;
+  the room's object list is `load_room`'s creation order (x outer, y
+  inner), `trace::cart::room_objects`'s, which the search already uses.
+- FIXED: the PICO-8 replay (`tools::pico8`) seeds by creation order
+  (`seed_table`); the POP variant and `--seed-order` are deleted. The two
+  agree on every first load (each `init` pops in creation order); they
+  differ only after a room reload in a single-room replay, where POP's list
+  was used up (measured: room (3,3), seeds 0.5,0.25, a run that dies at
+  f100: from the reload at f115 the balloon's offset is 0 under POP, its
+  seed under creation). That is the likely source of the 3 of 45 differing
+  chest-variant replays: a death no valid route has.
+- Re-verified, no verdict changed: `rewrite validate uploads` of the (3,3)
+  and (5,3) uploads (in-repo gemskip100, gemskipnodiag and nodiag TAS28,
+  gemskipnodiag TAS30, and /var/tmp/to-submit/gemskipnodiag TAS28 and
+  TAS30: all VALID) and of the database's own 100, gemskip100 and any%
+  TAS28 and TAS30 (VALID but the database's gemskip100 TAS28, INVALID as
+  before: it never exits on PICO-8): every row byte-identical under both
+  orders. `rewrite pico8 replay` of the eight (3,3) and (5,3) witnesses
+  (any%, the references, nodiag, gemskipnodiag): every frame line identical
+  under both orders, each exiting at its named frame.
 
 ## C12. Tooling degraded silently (FIXED, landed 4633008e)
 - Since f3123072 (2026-10-15) replay.py (now `rewrite pico8`, whose t0 test
@@ -224,22 +288,36 @@ settled here. Evidence is file:line at develop 19869c5d.
   return the frames it covers and guard on THAT. Then re-run (6,0)'s two
   results.
 
-## C14. Checks that can pass with nothing compared
-- `check ref` and `check arcs` pass when every sample was skipped over the
-  path cap (check.rs:335): a green check that compared nothing. Make "no
-  comparison" a failure (or a loud SKIPPED that fails the tier).
-- Identities as `Debug` strings: walk.rs:266/:666, driver.rs:230.
-- `l1 check` looks the table up by the UNWIDENED shape
-  (level_minus_one.rs:1961); likely agrees with the forward, unproven.
-- `rewrite l1 check` under `--split-frame` compares steps with a frame
-  horizon (level_minus_one.rs:1971, l1.rs:94): a valid route on (6,0)/(6,1)
-  is reported UNSOUND past mid-route (loud; fix `clock.steps(a.frames)`).
-- `l1 probe` reads a tree with the command line's settings instead of the
-  tree's record: a wrong `--room` silently probes the wrong room.
-- The `= P8` type defaults let fixed-only code run on float trees by
-  omission: `Visited::load` exists only for 16.16 (frame.rs:1037-1051) and
-  `l1 probe --marks` calls it on any tree (level_minus_one.rs:2089), decoding a
-  float key space as 16.16. Remove the defaults so the arithmetic is explicit.
-- `--override-settings` exists only for `--region`, but `--region off` also
-  turns off the no-player exploration (walk.rs:526-529): either the grid does
-  not change a tree (then don't record it) or overriding it is unsound.
+## C14. Checks that can pass with nothing compared (FIXED but (f), branch correctness-batch)
+- FIXED 99fd23ad: `differential::verdict` FAILS a check that compared
+  nothing (every sample SKIPPED over the path cap); the fence constant is
+  gone. `check arcs`/`check ref --path-cap 1` on the r10 fixture exited 0
+  before, 1 now. No tier step relied on it (t1's harness steps compare 32
+  of 32). check.sh's local tier, whose tests pass and print SKIPPED without
+  the store or PICO-8, now fails the run.
+- FIXED 9d68fb1b: the no-player exploration's identities (walk.rs) are
+  `state_id`: the shape and each constant's path and bits, not `Debug`
+  text; room (0,3)'s walk and kernel text identical. driver.rs's was
+  `MinusOne::text` since d47ae948.
+- SETTLED 24cf016e: `l1 check` by the UNWIDENED shape agrees with the
+  forward: the replay's states are canonical and the block side's widening
+  writes number and boolean columns only, never what `shape_words` hashes
+  or the renumbering follows. The known-route check (which looks level -1
+  up by the widened shape) asserts the two are equal at every step.
+- FIXED 24cf016e: `l1 check` under `--split-frame` judges the steps against
+  `clock.steps(frames)`; room (1,0) split's any% 99 route was UNSOUND from
+  step 57 before, passes now (a slow test).
+- FIXED ef53c2bb: `l1 probe` takes the tree's recorded settings and refuses
+  settings flags (a wrong `--room` is refused); `--marks` on a float tree is
+  refused (marks load as 16.16 only).
+- SETTLED ff553440: the region grid does not change a tree (ckhash with
+  edges and hulls identical under 16,6 and `--region off` in five forwards,
+  fixed, float, objects, fruit, split; level -1 tables identical in three
+  rooms; a grid the kernels cannot be built on fails at the build). It is
+  no longer recorded and `--override-settings` is deleted; settings
+  VERSION 4.
+- OPEN (f): the `= P8` type defaults let fixed-only code run on float trees
+  by omission (`Visited::load` exists only for 16.16); remove the defaults
+  so the arithmetic is explicit. Deferred: a wide mechanical change across
+  the engine and storage, which the `p` deletion (platforms-exact) is
+  rewriting now.

@@ -10,8 +10,8 @@
 #                frame
 #     perf       the RELEASE binary's instruction budget (gates/perf.txt;
 #                more than 2% over FAILS)
-#     local      the local goldens and the PICO-8 probe goldens (SKIPPED
-#                where the store or PICO-8 is absent)
+#     local      the local goldens and the PICO-8 probe goldens (SKIPPED,
+#                which FAILS the run, where the store or PICO-8 is absent)
 #     fixtures   every fixture rebuilt against its pinned fingerprint
 #     premerge   the pre-merge tests
 #     all        every tier above
@@ -423,8 +423,9 @@ perfcount() {
 
 # The local tier: the local goldens (trace::oracle), from the machine-local
 # store, and the PICO-8 probe goldens (trace::probe), from a real PICO-8;
-# where either is absent its test passes and says SKIPPED, repeated in the
-# run's last line.
+# where either is absent its test passes and says SKIPPED: the run's last
+# line repeats it, and the run FAILS (a check that compared nothing is no
+# pass).
 localgoldens() {
     step local-goldens ignoredtests local
     grep -h '\[local goldens\]' "$C/local-goldens.out" "$C/local-goldens.err" | sed 's/^/    /'
@@ -457,5 +458,5 @@ for TIER in "${TIERS[@]}"; do
 done
 FAILED=$(paste -sd' ' "$C/failed")
 SKIPPED=$(paste -sd' ' "$C/skipped")
-echo "[$(IFS=+; echo "${TIERS[*]}")] $((SECONDS - T_START)) s; $([[ -n $FAILED ]] && echo "FAILED: $FAILED" || echo "all ok")${SKIPPED:+ (SKIPPED: $SKIPPED)}"
-[[ -z $FAILED ]]
+echo "[$(IFS=+; echo "${TIERS[*]}")] $((SECONDS - T_START)) s; $([[ -n $FAILED ]] && echo "FAILED: $FAILED" || { [[ -n $SKIPPED ]] && echo "FAILED, nothing compared" || echo "all ok"; })${SKIPPED:+ (SKIPPED: $SKIPPED)}"
+[[ -z $FAILED && -z $SKIPPED ]]

@@ -6,7 +6,7 @@
 use anyhow::Result;
 use celeste_rust::settings::Settings;
 use celeste_rust::tools::chain;
-use celeste_rust::tools::pico8::{original_cart, Cart, Fenced, LoadingMove, Play, Runner, SeedOrder, Spec};
+use celeste_rust::tools::pico8::{original_cart, Cart, Fenced, LoadingMove, Play, Runner, Spec};
 use celeste_rust::tools::tasdb::{self, Cat};
 use std::path::PathBuf;
 
@@ -112,9 +112,6 @@ pub struct ReplayArgs {
     /// FENCED (plans/correctness.md C4): the loading frame's move.
     #[arg(long, value_enum, default_value = "unguarded")]
     loading_move: LoadingMove,
-    /// FENCED (plans/correctness.md C11): which object a seed is.
-    #[arg(long, value_enum, default_value = "pop")]
-    seed_order: SeedOrder,
     #[command(flatten)]
     p8: P8Args,
 }
@@ -151,7 +148,7 @@ pub fn run(cfg: &Settings, c: Command) -> Result<()> {
             let cart = if a.original { Cart::Original(a.original_lua.unwrap_or_else(original_cart)) } else { Cart::Minimal };
             let frames = a.frames.unwrap_or(inputs.len());
             let play = Play::Room { room: cfg.room, inputs, seeds };
-            let fenced = Fenced { loading_move: a.loading_move, seed_order: a.seed_order };
+            let fenced = Fenced { loading_move: a.loading_move };
             let spec = Spec { cart, play, frames, one_dash: cfg.category.gemskip(), jank: cfg.loading_jank, load_draw: false, dump: a.dump, trace_objects: a.trace_objects, fenced };
             for l in a.p8.runner()?.run(&spec)? {
                 println!("{l}");

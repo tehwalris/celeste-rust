@@ -39,16 +39,14 @@ pub fn run<E, T: Send>(threads: usize, n: usize, engine: impl Fn() -> Result<E> 
     })
 }
 
-/// FENCED (plans/correctness.md C14): a check whose every item was SKIPPED
-/// compared nothing - and PASSES, as it always has. This is the one place
-/// that decides it (the fix: `false`).
-pub const NOTHING_COMPARED_PASSES: bool = true;
-
 /// THE VERDICT of a check that compared `compared` items: `bad` of them
-/// disagreeing fails it with `why`.
+/// disagreeing fails it with `why`, and so does comparing NOTHING (every
+/// item SKIPPED, or none to pick): a green check must have held the
+/// implementation against its oracle at least once (plans/correctness.md
+/// C14).
 pub fn verdict(compared: usize, bad: usize, why: impl FnOnce() -> String) -> Result<()> {
     anyhow::ensure!(bad == 0, "{}", why());
-    anyhow::ensure!(compared > 0 || NOTHING_COMPARED_PASSES, "nothing compared: every item was SKIPPED");
+    anyhow::ensure!(compared > 0, "nothing compared: every item was SKIPPED (or there was none): a check that compared nothing is no pass");
     Ok(())
 }
 
@@ -66,7 +64,13 @@ mod tests {
         assert_eq!(super::spread(3, 8), [0, 1, 2]);
         assert_eq!(super::stride(10, 4), [0, 2, 4, 6]);
         assert_eq!(super::stride(3, 8), [0, 1, 2]);
-        assert!(super::verdict(0, 0, String::new).is_ok() == super::NOTHING_COMPARED_PASSES);
         assert!(super::verdict(5, 1, || "bad".into()).is_err());
+        assert!(super::verdict(5, 0, String::new).is_ok());
+    }
+
+    #[test]
+    fn a_check_that_compared_nothing_fails() {
+        let e = super::verdict(0, 0, String::new).expect_err("nothing compared passed");
+        assert!(e.to_string().contains("nothing compared"), "{e}");
     }
 }
