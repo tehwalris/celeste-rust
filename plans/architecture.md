@@ -51,8 +51,8 @@ celeste-rust (src/)
                         exact), concrete (the concrete search; dual: over
                         pairs), known, arcs (the sets; both circles),
                         hull, rem (the decode, the transfer records),
-                        arc_check, hull_replay, tree (a finished
-                        tree opened), result, ui_export, inspect, level_minus_one
+                        tree (a finished tree opened), result, ui_export,
+                        inspect, level_minus_one
                         (the cost-to-go table, its one builder), robust (a
                         float witness against the libm)
   trace/                the tracer: interp, state, heap, domain (Symbolic) and
@@ -64,7 +64,14 @@ celeste-rust (src/)
                         over RefDomain as a frame step)
   transpile/            graph IR, garith, ival, bdd, lowering, asm (codegen,
                         float codegen, call-outs, jit)
-  compiled/             FrameEngine, the kernel registry, emission, mix
+  compiled/             FrameEngine, the kernel registry, emission, the
+                        kernel cache
+  check/                the tools outside the core, which names none of
+                        them (`conventions`): differential (the checks'
+                        one harness and verdict), arcs (the transfers
+                        against the reference), replay (the tree from its
+                        recorded graph), census (the kernel census,
+                        rebuilt), explain (a kernel's decline, rebuilt)
   settings.rs           the run's settings (flags), the tree's record
   starts.rs             the feasible loading-jank J's and their classes
   par.rs, metrics.rs, concrete.rs, game_runner.rs
@@ -99,8 +106,7 @@ reference for semantics only.
    `/var/tmp/celeste-kernels`), keyed on every source file, the build
    profile, gcc and glibc, the program, the arithmetic, the level and the
    settings: only the same build of the same sources loads it again (the
-   `[asm build]` line says HIT or MISS; `--kernel-explain` and
-   `--build-trace` always build).
+   `[asm build]` line says HIT or MISS).
 
 To the outer loop a state is opaque: `(shape, key, cell)`.
 

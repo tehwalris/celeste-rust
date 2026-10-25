@@ -138,8 +138,8 @@ The float kernels are the same graph, lowered to `vaddpd`-class AVX-512 on
 - Checked as in fixed: `check ref`, `--key-check`, `check widen`,
   `check arcs`, `missed 0`; the float trees of (1,0) to f44 and (1,3) to f46
   equal the float reference engine's, frame by frame (`ckhash --edges
-  --hulls`). The kernel mix census (`--kernel-mix`, `bench frame
-  --metrics`) is 16.16's only.
+  --hulls`). The kernel census (`bench frame --metrics`,
+  `check::census`) is 16.16's only.
 
 ## The dual search and rule (b)
 

@@ -28,12 +28,16 @@ pub fn stride(len: usize, n: usize) -> Vec<usize> {
     (0..len).step_by((len / n.max(1)).max(1)).take(n).collect()
 }
 
+/// A worker's stack: the reference engine's interpreter recurses deeply
+/// (a whole golden's replay: `trace::oracle`).
+const ORACLE_STACK: usize = 64 << 20;
+
 /// Items `0..n` through `f` in parallel (`threads` workers, each with its
 /// own oracle engine from `engine`), in item order. An item the reference
 /// engine cannot take (`TooManyPaths`, over its path cap) is SKIPPED with
 /// the reason; any other error fails the check.
 pub fn run<E, T: Send>(threads: usize, n: usize, engine: impl Fn() -> Result<E> + Sync, f: impl Fn(&mut E, usize) -> Result<T> + Sync) -> Result<Vec<Ran<T>>> {
-    crate::par::Pool::new(threads).map_with(n, engine, |e, k| match f(e, k) {
+    crate::par::Pool::new(threads).stack(ORACLE_STACK).map_with(n, engine, |e, k| match f(e, k) {
         Err(err) if err.downcast_ref::<crate::engines::reference::TooManyPaths>().is_some() => Ok(Ran::Skipped(err.to_string())),
         other => other.map(Ran::Done),
     })

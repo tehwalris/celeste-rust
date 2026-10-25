@@ -262,8 +262,10 @@ struct MarksMap {
 const MARKS_ROWS_AT: usize = 8;
 
 impl MarksMap {
-    fn open(path: &Path) -> Result<Self> {
-        let map = crate::storage::file::open_value(path)?;
+    /// The marks file at `path`, in arithmetic `arith` (its tree's: a file
+    /// of another is refused).
+    fn open(path: &Path, arith: crate::settings::Arith) -> Result<Self> {
+        let map = crate::with_arith!(arith, N => crate::storage::file::open_value::<N>(path))?;
         let payload = map.header_bytes();
         anyhow::ensure!(payload.len() >= 8, "{}: too short for a marks file", path.display());
         let n = u64::from_le_bytes(payload[0..8].try_into().unwrap());
@@ -754,9 +756,10 @@ fn level_label(l: &super::result::LevelResult) -> String {
 /// `--arc DIR` (`search --save-marks DIR`): the last forward level gets W's
 /// support, a level after it the ARC backward over the same tree; the
 /// optimum is `last`'s arc bound unless `keep_optimal` (a dual search's is
-/// the pair's). Returns the witness if present.
-fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path, last: &super::result::LevelResult, keep_optimal: bool) -> Result<Option<Witness>> {
-    let rows = |name: &str| -> Result<u64> { Ok(MarksMap::open(&dir.join(name))?.rows as u64) };
+/// the pair's); the marks files are in `last`'s tree's arithmetic `arith`.
+/// Returns the witness if present.
+fn attach_arc(hr: &mut HorizonRun, optimal: &mut Option<u32>, dir: &Path, last: &super::result::LevelResult, arith: crate::settings::Arith, keep_optimal: bool) -> Result<Option<Witness>> {
+    let rows = |name: &str| -> Result<u64> { Ok(MarksMap::open(&dir.join(name), arith)?.rows as u64) };
     let found = last.arc_bound;
     hr.partial = false;
     let li = hr.levels.len() - 1;
@@ -801,8 +804,10 @@ pub fn export(checkpoint_dir: &Path, out: &Path, threads: usize, arc: Option<&Pa
     let nforward = levels.len();
     let (wall_s, mut optimal) = (Some(res.wall_s), res.optimal);
     let mut hr = HorizonRun { h, levels, refuted_at: None, partial: true };
+    // The marks are the last tree's, in its arithmetic.
+    let marks_arith = crate::settings::recorded_arith(&tree_dir(nforward - 1))?;
     let witness = match arc {
-        Some(dir) => attach_arc(&mut hr, &mut optimal, dir, last, res.dual.is_some())?,
+        Some(dir) => attach_arc(&mut hr, &mut optimal, dir, last, marks_arith, res.dual.is_some())?,
         None => None,
     };
     let witness = match paths.witness {
@@ -839,7 +844,7 @@ pub fn export(checkpoint_dir: &Path, out: &Path, threads: usize, arc: Option<&Pa
             for (l, name) in [(level, "level0.marks.bin"), (level + 1, "arc.marks.bin")] {
                 if !hr.levels[l].refuted {
                     let path = a.join(name);
-                    let (m, by) = scan_marks(MarksMap::open(&path)?, &path, threads)?;
+                    let (m, by) = scan_marks(MarksMap::open(&path, marks_arith)?, &path, threads)?;
                     by_cell_dist.push(by);
                     set_levels.push(l);
                     maps.push(m);
@@ -982,13 +987,13 @@ mod tests {
         let dir = crate::testutil::TestDir::new("ui-marks");
         std::fs::create_dir_all(&dir).unwrap();
         let save = |name: &str, rows: &[((u64, u64), u32, u64, u16)]| {
-            let mut v = crate::frame::Visited::new(Default::default());
+            let mut v = crate::frame::Visited::<celeste_engine::runtime2::P8>::new(Default::default());
             for &(key, cell, shape, deadline) in rows {
                 v.insert_until(shape, key, cell, deadline);
             }
             let path = dir.join(name);
             v.save(&path, 9).unwrap();
-            scan_marks(MarksMap::open(&path).unwrap(), &path, 2).unwrap()
+            scan_marks(MarksMap::open(&path, crate::settings::Arith::Fixed).unwrap(), &path, 2).unwrap()
         };
         let slot = 5u32;
         let c = |local: u32| crate::storage::cells::cell(slot, local);
@@ -1040,8 +1045,8 @@ mod tests {
         // Out of order: refused.
         let bad = dir.join("bad.bin");
         let rows: Vec<crate::frame::MarkRow> = vec![(7, 3, 5, 6, 0), (7, 3, 1, 2, 0)];
-        crate::storage::file::save_value(&bad, &(rows, 9u32, celeste_engine::exact::KeySpace::<celeste_engine::runtime2::P8>::default().to_additions())).unwrap();
-        assert!(scan_marks(MarksMap::open(&bad).unwrap(), &bad, 2).is_err());
+        crate::storage::file::save_value::<celeste_engine::runtime2::P8, _>(&bad, &(rows, 9u32, celeste_engine::exact::KeySpace::<celeste_engine::runtime2::P8>::default().to_additions())).unwrap();
+        assert!(scan_marks(MarksMap::open(&bad, crate::settings::Arith::Fixed).unwrap(), &bad, 2).is_err());
     }
 
     /// The forward's record reads back: a rerun frame's last row wins.

@@ -11,7 +11,6 @@ use celeste_names as gen;
 
 pub(crate) mod asm_kernel;
 pub(crate) mod cache;
-pub mod mix;
 
 pub use asm_kernel::{KernelLanes, Registry, Resident, Scratch};
 
@@ -113,6 +112,8 @@ pub fn collision_cache((room_x, room_y): (i16, i16)) -> Arc<CollisionCache> {
 pub struct Kernels<N: KernelLanes = celeste_core::pico8_num::Pico8Num> {
     level: crate::abstraction::Level,
     settings: Arc<crate::settings::Settings>,
+    /// Each kernel counts the slices it runs (`counting`).
+    counting: bool,
     registry: std::sync::OnceLock<Arc<asm_kernel::Registry<N>>>,
 }
 
@@ -122,11 +123,34 @@ pub type FrameEngine = Kernels<celeste_core::pico8_num::Pico8Num>;
 impl<N: KernelLanes> Kernels<N> {
     /// The engine for the start room of `settings`, its frames at `level`.
     pub fn new(settings: &crate::settings::Settings, level: crate::abstraction::Level) -> Result<Self> {
-        Ok(Kernels { level, settings: Arc::new(settings.clone()), registry: std::sync::OnceLock::new() })
+        Ok(Kernels { level, settings: Arc::new(settings.clone()), counting: false, registry: std::sync::OnceLock::new() })
+    }
+
+    /// The same kernels, each COUNTING the slices it runs (`slice_counts`:
+    /// the census's dynamic instructions, `check::census`). The same code
+    /// and cache entry as `new`'s; the counters are attached at load.
+    pub fn counting(settings: &crate::settings::Settings, level: crate::abstraction::Level) -> Result<Self> {
+        Ok(Kernels { counting: true, ..Kernels::new(settings, level)? })
     }
 
     fn registry(&self) -> &asm_kernel::Registry<N> {
-        self.registry.get_or_init(|| asm_kernel::registry::<N>(self.level, &self.settings))
+        self.registry.get_or_init(|| asm_kernel::registry::<N>(self.level, &self.settings, self.counting))
+    }
+
+    /// Per kernel its (shape, region), symbol and the slices it ran since
+    /// the last `reset_slices` (none unless `counting`), by key.
+    pub fn slice_counts(&self) -> Vec<((u64, Option<crate::trace::walk::Region>), String, u64)> {
+        self.registry().slice_counts()
+    }
+
+    /// Zero the slice counters (a bench's warm-up done).
+    pub fn reset_slices(&self) {
+        self.registry().reset_slices()
+    }
+
+    /// Kernel `k`'s text digest: a rebuilding tool's identity check.
+    pub(crate) fn digest_of(&self, k: (u64, Option<crate::trace::walk::Region>)) -> Option<u64> {
+        self.registry().digest_of(k)
     }
 
     /// One frame of one BUCKET (one shape's block), emitted into `sink`:
@@ -138,6 +162,7 @@ impl<N: KernelLanes> Kernels<N> {
         lanes: &[usize],
         sink: &mut crate::storage::unit::UnitSink<N>,
     ) {
+        sink.stats.add(crate::storage::stats::S::KernelLanesIn, lanes.len() as u64);
         if !self.registry().run_chunk(bucket, cell_in, lanes, sink) {
             // A COVERAGE GAP, not a degraded mode: there is no fallback.
             // The search resumes from the last completed frame's checkpoint.
@@ -152,19 +177,20 @@ impl<N: KernelLanes> Kernels<N> {
     }
 }
 
-/// The `kernel lanes:` (`missed 0` is what every log must say: a miss is
-/// FATAL in `Kernels::run_bucket`, so a run that prints this missed none),
-/// `kernel calls:` and `kernel utilization:` lines of `st`, the stats of
-/// the frames the kernels ran.
-pub fn print_kernel_stats(st: &crate::storage::stats::Stats) {
+/// The `kernel lanes:`, `kernel calls:` and `kernel utilization:` lines of
+/// `st`, the stats of the frames the kernels ran. `missed` is the lanes
+/// given the kernels that no slice ran: 0 in every log (a miss is FATAL in
+/// `Kernels::run_bucket`), and an error otherwise.
+pub fn print_kernel_stats(st: &crate::storage::stats::Stats) -> Result<()> {
     use crate::storage::stats::S;
-    let [calls, rows, slices, bodies, taken, takes, emitted] =
-        [S::KernelCalls, S::KernelRows, S::KernelSlices, S::KernelBodies, S::KernelBodiesTaken, S::KernelTakes, S::Emissions].map(|k| st.get(k));
+    let [lanes_in, calls, rows, slices, bodies, taken, takes, emitted] =
+        [S::KernelLanesIn, S::KernelCalls, S::KernelRows, S::KernelSlices, S::KernelBodies, S::KernelBodiesTaken, S::KernelTakes, S::Emissions].map(|k| st.get(k));
     if calls == 0 {
-        return;
+        return Ok(());
     }
     let slice_lanes = 16 * slices;
-    eprintln!("kernel lanes: traced {rows} missed 0");
+    let missed = lanes_in.checked_sub(rows).ok_or_else(|| anyhow::anyhow!("the kernels ran {rows} rows of the {lanes_in} lanes given them"))?;
+    eprintln!("kernel lanes: traced {rows} missed {missed}");
     eprintln!(
         "kernel calls: {calls} calls, {rows} rows ({:.1} rows/call), {slice_lanes} slice-lanes executed ({:.1}% padding)",
         rows as f64 / calls as f64,
@@ -177,6 +203,8 @@ pub fn print_kernel_stats(st: &crate::storage::stats::Stats) {
         takes as f64 / rows.max(1) as f64,
         100.0 * emitted as f64 / takes.max(1) as f64
     );
+    anyhow::ensure!(missed == 0, "the kernels missed {missed} of the {lanes_in} lanes given them");
+    Ok(())
 }
 
 /// The compiled `FrameStep` (the reference's: `RefEngine`).

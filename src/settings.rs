@@ -221,15 +221,6 @@ pub struct Diagnostics {
     /// decoded so) and compared.
     #[arg(long, global = true)]
     pub key_check: bool,
-    /// DIAGNOSTIC: kernels keep their graphs, so a decline names its premise.
-    #[arg(long, global = true)]
-    pub kernel_explain: bool,
-    /// The kernels' census and slice counters (`bench frame --metrics`).
-    #[arg(skip)]
-    pub kernel_metrics: bool,
-    /// DIAGNOSTIC: the kernel build's and the lattice walk's progress.
-    #[arg(long, global = true)]
-    pub build_trace: bool,
     /// DIAGNOSTIC: the wave workers' phase timings.
     #[arg(long, global = true)]
     pub phases: bool,
@@ -292,8 +283,6 @@ impl Settings {
             row("concrete_balloon_seeds", none(self.concrete_balloon_seeds.clone()), false),
             row("threads", none(self.threads.map(|t| t.to_string())), false),
             switch("key_check", self.diag.key_check, false),
-            switch("kernel_explain", self.diag.kernel_explain, false),
-            switch("build_trace", self.diag.build_trace, false),
             switch("phases", self.diag.phases, false),
         ]
     }

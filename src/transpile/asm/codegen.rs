@@ -246,8 +246,8 @@ fn input_bytes(ty: Ty) -> u32 {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Compiled {
     pub asm: String,
-    /// The text's digest, its `#@k` provenance comments aside (the same with
-    /// `--metrics` or without), kept once the text is dropped: what the
+    /// The text's digest, its `#@k` provenance comments aside (the same
+    /// with provenance or without), kept once the text is dropped: what the
     /// `[asm build]` line fingerprints a kernel set by.
     pub text_digest: u64,
     /// Input cells, in ascending order (layout: by type, `input_bytes`).
@@ -269,9 +269,9 @@ pub struct Compiled {
     pub spill_slots: usize,
     /// The stack frame in bytes, for the caller's stack check.
     pub frame_bytes: u32,
-    /// `bench-frame --metrics` only: per SSA instruction `k`, the graph node it
-    /// was lowered from and its kind (the text marks its lines with `#@k`).
-    /// Read by the census at the build only.
+    /// With provenance only (`compile`'s, the census's): per SSA
+    /// instruction `k`, the graph node it was lowered from and its kind (the
+    /// text marks its lines with `#@k`).
     #[serde(skip)]
     pub prov: Vec<(NodeId, &'static str)>,
     /// The doubles' kernels: the body computes 8 lanes and runs TWICE per call,
@@ -2206,22 +2206,20 @@ fn output_layout(kinds: &[Ty]) -> (Vec<u32>, u32) {
 }
 
 /// 16.16's kernel (`GraphArith::compile_kernel`).
-pub(crate) fn compile_fixed(g: &Graph<Fixed>, roots: &[NodeId], sym: &str, opts: super::AsmOptions) -> Result<Compiled> {
-    compile_with(g, roots, sym, opts, false, |lo, id| lo.lower_node(id))
+pub(crate) fn compile_fixed(g: &Graph<Fixed>, roots: &[NodeId], sym: &str, provenance: bool) -> Result<Compiled> {
+    compile_with(g, roots, sym, provenance, false, |lo, id| lo.lower_node(id))
 }
 
 /// The doubles' kernel, in two halves of eight lanes.
-pub(crate) fn compile_float(g: &Graph<Float>, roots: &[NodeId], sym: &str, opts: super::AsmOptions) -> Result<Compiled> {
-    compile_with(g, roots, sym, opts, true, |lo, id| lo.lower_node_f64(id))
+pub(crate) fn compile_float(g: &Graph<Float>, roots: &[NodeId], sym: &str, provenance: bool) -> Result<Compiled> {
+    compile_with(g, roots, sym, provenance, true, |lo, id| lo.lower_node_f64(id))
 }
 
-pub fn compile<A: GraphArith>(
-    g: &Graph<A>,
-    roots: &[NodeId],
-    sym: &str,
-    opts: super::AsmOptions,
-) -> Result<Compiled> {
-    A::compile_kernel(g, roots, sym, opts)
+/// The kernel computing `roots` of `g` as the function `sym`; with
+/// `provenance` (the census's, never production's) each instruction's node
+/// kept (`Compiled::prov`, the text's `#@k` lines).
+pub fn compile<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], sym: &str, provenance: bool) -> Result<Compiled> {
+    A::compile_kernel(g, roots, sym, provenance)
 }
 
 /// `compile` with the arithmetic's lowering (`lower`, one node) and lane
@@ -2230,7 +2228,7 @@ fn compile_with<A: LaneArith>(
     g: &Graph<A>,
     roots: &[NodeId],
     sym: &str,
-    opts: super::AsmOptions,
+    provenance: bool,
     halves: bool,
     mut lower: impl FnMut(&mut Lower<'_, A>, NodeId) -> Result<()>,
 ) -> Result<Compiled> {
@@ -2248,17 +2246,14 @@ fn compile_with<A: LaneArith>(
     };
     // A small batch keeps live temporaries well under the 26 homes.
     let batch = 4;
-    let t_lower = std::time::Instant::now();
     let order = schedule(g, &live, roots, batch);
-    let mix = opts.mix;
     let mut prov_node: Vec<NodeId> = Vec::new();
     for id in order {
         lower(&mut lo, id)?;
-        if mix {
+        if provenance {
             prov_node.resize(lo.insts.len(), id);
         }
     }
-    let t_lower = t_lower.elapsed();
 
     // Roots -> a PACKED output buffer, booleans first (not a line each).
     let root_kinds: Vec<Ty> = roots
@@ -2274,21 +2269,17 @@ fn compile_with<A: LaneArith>(
     for (r, &off) in roots.iter().zip(&root_offsets) {
         let v = lo.vals[*r as usize].expect("every root lowered");
         lo.store(v, off, halves);
-        if mix {
+        if provenance {
             prov_node.resize(lo.insts.len(), *r);
         }
     }
-    let t = std::time::Instant::now();
     let (insts, order) = reschedule(std::mem::take(&mut lo.insts), lo.next_vreg);
     lo.insts = insts;
-    let prov: Vec<(NodeId, &'static str)> = if mix {
+    let prov: Vec<(NodeId, &'static str)> = if provenance {
         order.iter().zip(&lo.insts).map(|(&i, inst)| (prov_node[i as usize], inst_kind(inst))).collect()
     } else {
         Vec::new()
     };
-    if opts.trace {
-        eprintln!("[build]   {sym}: {} insts, {} vregs: lower {:.1}s, reschedule {:.1}s", lo.insts.len(), lo.next_vreg, t_lower.as_secs_f64(), t.elapsed().as_secs_f64());
-    }
 
     // Rematerializable vregs (spilled for free) and each vreg's def.
     let mut remat = vec![false; lo.next_vreg as usize];
@@ -2301,11 +2292,7 @@ fn compile_with<A: LaneArith>(
         }
     }
 
-    let t_alloc = std::time::Instant::now();
     let (home, spill_slots) = allocate(&lo.insts, lo.next_vreg, &remat);
-    if opts.trace {
-        eprintln!("[build]   {sym}: allocate {:.1}s ({spill_slots} spill slots)", t_alloc.elapsed().as_secs_f64());
-    }
 
     let has_calls = lo.insts.iter().any(|i| matches!(i, Inst::Call { .. }));
     let spill_bytes = spill_slots as u32 * 64;
@@ -2331,7 +2318,7 @@ fn compile_with<A: LaneArith>(
     let mut body = String::new();
     std::mem::swap(&mut em.out, &mut body);
     for (k, inst) in lo.insts.iter().enumerate() {
-        if mix {
+        if provenance {
             // A comment line: assembles to nothing, and `drop_redundant_reloads` passes it.
             writeln!(em.out, "#@{k}").unwrap();
         }
@@ -2343,7 +2330,7 @@ fn compile_with<A: LaneArith>(
     // Frame: spill slots, then (with call-outs) the zmm save area and arg buffers.
     let extra = if has_calls { SAVE_BYTES + ARGBUF_BYTES } else { 0 };
     let frame = spill_bytes + extra;
-    let asm = wrap(sym, &body, &em.pool, frame, halves.then_some((input_bytes, out_bytes)), mix);
+    let asm = wrap(sym, &body, &em.pool, frame, halves.then_some((input_bytes, out_bytes)), provenance);
     let text_digest = text_digest(&asm);
     Ok(Compiled {
         asm,
@@ -2368,7 +2355,7 @@ fn compile_with<A: LaneArith>(
 /// callee-saved pushes, `frame` bytes of stack, the zero register; with
 /// `halves`, the doubles' loop over the two halves, each buffer's size its
 /// step), then the constant pool.
-fn wrap(sym: &str, body: &str, pool: &Pool, frame: u32, halves: Option<(u32, u32)>, mix: bool) -> String {
+fn wrap(sym: &str, body: &str, pool: &Pool, frame: u32, halves: Option<(u32, u32)>, provenance: bool) -> String {
     let mut asm = String::new();
     writeln!(asm, ".text").unwrap();
     writeln!(asm, ".globl {sym}").unwrap();
@@ -2396,7 +2383,7 @@ fn wrap(sym: &str, body: &str, pool: &Pool, frame: u32, halves: Option<(u32, u32
         writeln!(asm, ".Lhalf:").unwrap();
     }
     asm.push_str(body);
-    if mix {
+    if provenance {
         writeln!(asm, "#@end").unwrap();
     }
     if let Some((input_bytes, out_bytes)) = halves {

@@ -414,14 +414,6 @@ impl<A: GraphArith> NoPlayer<A> {
         }
         Ok(out)
     }
-
-    /// Each shape's bounds and the spawn object's, for the log.
-    fn show(&self) -> Vec<String> {
-        let show = |h: &Hull<A>, unknown: &std::collections::BTreeSet<super::iface::Path>| h.iter().filter(|(p, (lo, hi))| A::lt(*lo, *hi) && !unknown.contains(*p)).map(|(p, (a, b))| format!("{} [{:.2}, {:.2}]", super::iface::show(p), celeste_core::arith::Arithmetic::to_f64(*a), celeste_core::arith::Arithmetic::to_f64(*b))).collect::<Vec<_>>();
-        let mut out: Vec<String> = self.shapes.iter().enumerate().map(|(i, (_, h, unknown))| format!("[walk] no-player shape {i} ranges: {:?}", show(h, unknown))).collect();
-        out.push(format!("[walk] the spawn object's ranges: {:?}", show(&self.spawn, &self.spawn_unknown)));
-        out
-    }
 }
 
 #[cfg(test)]
@@ -518,7 +510,6 @@ mod tests {
 fn boot<A: GraphArith>(s: &crate::settings::Settings, opts: crate::abstraction::Level) -> Result<(Tracer<A>, super::state::State<super::domain::Symbolic<A>>)> {
     let chunks = super::cart::Chunks::parse(s)?.leak();
     let mut it = super::interp::Interp::new(super::domain::Symbolic::<A>::default());
-    it.d.build_trace = s.diag.build_trace;
     it.d.level = opts;
     let start = super::cart::boot(&mut it, chunks, s.room)?;
     Ok((Tracer { it, chunks }, start))
@@ -547,7 +538,6 @@ pub fn room_constant_lattice<A: GraphArith>(
         round += 1;
         traces += frontier.len();
         anyhow::ensure!(traces <= 20000, "constant-lattice fixpoint did not converge");
-        let t_round = std::time::Instant::now();
         let jobs = w.jobs(&frontier)?;
         // Each worker clones its own copy (a `Tracer` is `Send`, not `Sync`), and
         // per job a FRESH arena from it, so a graph depends on the job, not on
@@ -570,9 +560,6 @@ pub fn room_constant_lattice<A: GraphArith>(
                 next.extend(w.regions.get(&k).into_iter().flatten().map(|r| (k, *r)));
             }
         }
-        if w.trace {
-            eprintln!("[walk] round {round}: {} traced, {} next, {:.1} s", jobs.len(), next.len(), t_round.elapsed().as_secs_f64());
-        }
         frontier = next.into_iter().collect();
     }
     w.finish(Tracer { it, chunks }, format!("{traces} traces in {round} rounds, {:.1} s ({n_workers} workers)", t_walk.elapsed().as_secs_f64()))
@@ -584,8 +571,6 @@ struct WalkState<A: GraphArith> {
     grid: Option<RegionGrid>,
     /// The start's room: an outcome in another is a terminal.
     room0: (i16, i16),
-    /// `--build-trace`: the per-trace `[lattice]` lines.
-    trace: bool,
     reps: Reps<A>,
     no_player: NoPlayer<A>,
     start_key: ShapeKey,
@@ -628,11 +613,6 @@ impl<A: GraphArith> WalkState<A> {
             Some(_) => no_player_ranges(it, chunks, &reps, start, opts)?,
             None => NoPlayer::default(),
         };
-        if s.diag.build_trace {
-            for l in no_player.show() {
-                eprintln!("{l}");
-            }
-        }
         // The START state's own intervals (an `rnd` draw in `_init`) are interval
         // inputs at every level: no traced frame wrote them. Its representative
         // holds 0 there.
@@ -673,7 +653,6 @@ impl<A: GraphArith> WalkState<A> {
             opts,
             grid,
             room0: shapes::room_of(start, &it.d),
-            trace: s.diag.build_trace,
             reps,
             no_player,
             start_key: sk,
@@ -689,11 +668,6 @@ impl<A: GraphArith> WalkState<A> {
             dirty: Default::default(),
         };
         Ok((w, start_regions.into_iter().map(|r| (sk, r)).collect()))
-    }
-
-    /// The shape number `k` has in the lattice (`--build-trace`'s lines).
-    fn shape_no(&self, k: ShapeKey) -> usize {
-        self.lattice.keys().position(|x| *x == k).unwrap_or(usize::MAX)
     }
 
     /// The round's jobs: each frontier node's paths, pins, interval inputs
@@ -748,7 +722,7 @@ impl<A: GraphArith> WalkState<A> {
                     self.refused.insert(job.node, e);
                     self.frames.remove(&job.node);
                 }
-                WalkTraced::Traced { frame, bound, nodes_added, arena, outs, skipped, illegal: poisoned, can_raise } => {
+                WalkTraced::Traced { frame, bound, outs, illegal: poisoned, can_raise } => {
                     for (why, n) in poisoned {
                         *self.illegal.entry(why).or_default() += n;
                     }
@@ -756,20 +730,6 @@ impl<A: GraphArith> WalkState<A> {
                         self.raising.insert(job.node);
                     }
                     self.refused.remove(&job.node);
-                    if self.trace {
-                        eprintln!(
-                            "[lattice] trace shape #{} region {:?} ({} pinned): {} outcomes, {} nodes added ({} in the worker's arena)",
-                            self.shape_no(k),
-                            region,
-                            job.pin.len(),
-                            frame.outs.len(),
-                            nodes_added,
-                            arena
-                        );
-                        for s in &skipped {
-                            eprintln!("[lattice]   outcome skipped: {s}");
-                        }
-                    }
                     for o in outs {
                         respawned |= self.outcome(it, chunks, (k, region), o, &mut next)?;
                     }
@@ -814,17 +774,7 @@ impl<A: GraphArith> WalkState<A> {
         // Intervals beyond the boundary's widenings: inputs next frame.
         let mut new_ival = false;
         for p in o.ival {
-            if self.trace && !self.ival_extra.get(&tk).is_some_and(|s| s.contains(&p)) {
-                eprintln!("[lattice]   outcome: new interval slot {} (shape #{})", super::iface::show(&p), self.shape_no(tk));
-            }
             new_ival |= self.ival_extra.entry(tk).or_default().insert(p);
-        }
-        if self.trace {
-            let known = self.lattice.get(&tk).map(|m| m.iter().filter(|(p, v)| o.constants.get(*p) != Some(*v)).map(|(p, _)| super::iface::show(p)).collect::<Vec<_>>());
-            match known {
-                None => eprintln!("[lattice]   outcome: NEW shape, {} constants, from shape #{}", o.constants.len(), self.shape_no(k)),
-                Some(gone) => eprintln!("[lattice]   outcome: shape #{}, constants removed: {:?}", self.shape_no(tk), gone),
-            }
         }
         let changed = match self.lattice.get_mut(&tk) {
             None => {
@@ -863,11 +813,6 @@ impl<A: GraphArith> WalkState<A> {
                 if now != wf.bounds {
                     self.dirty.insert(*k);
                 }
-            }
-        }
-        if self.trace {
-            for l in self.no_player.show() {
-                eprintln!("{l}");
             }
         }
         Ok(())
@@ -955,10 +900,7 @@ enum WalkTraced<A: GraphArith = Fixed> {
     Traced {
         frame: super::frame::Frame<A>,
         bound: std::result::Result<Bound<A>, String>,
-        nodes_added: usize,
-        arena: usize,
         outs: Vec<WalkOutcome<A>>,
-        skipped: Vec<&'static str>,
         /// Paths this trace POISONED, by reason (drained per job).
         illegal: std::collections::BTreeMap<String, usize>,
         /// `Frame::raise` did not fold to `false`.
@@ -994,9 +936,7 @@ fn walk_trace<A: GraphArith>(
         // A refused trace's poisoned paths count too.
         Err(e) => return Ok(WalkTraced::Refused(format!("{:#}", e), std::mem::take(&mut tr.it.illegal))),
     };
-    let nodes_added = tr.it.d.node_count().saturating_sub(tr.it.trace_start_nodes);
     let mut outs = Vec::new();
-    let mut skipped = Vec::new();
     for o in &f.outs {
         // A non-constant room (-1) may hold this room's states: an error,
         // not skipped.
@@ -1005,7 +945,6 @@ fn walk_trace<A: GraphArith>(
         // The room exit is a TERMINAL, recorded and not stepped: the next
         // room's objects belong to its own kernel set.
         if room != room0 {
-            skipped.push("another room");
             continue;
         }
         let constants = shapes::field_constants(&o.st, &tr.it.d, &opts)?;
@@ -1034,7 +973,7 @@ fn walk_trace<A: GraphArith>(
     let illegal = std::mem::take(&mut tr.it.illegal);
     // Decided HERE: `f.raise` names a node of this worker's arena.
     let can_raise = tr.it.d.decide(&f.raise) != Some(false);
-    Ok(WalkTraced::Traced { frame: f, bound, nodes_added, arena: tr.it.d.node_count(), outs, skipped, illegal, can_raise })
+    Ok(WalkTraced::Traced { frame: f, bound, outs, illegal, can_raise })
 }
 
 /// The tracer a walk ran in, kept to re-trace a shape in the same arena.

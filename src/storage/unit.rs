@@ -673,6 +673,18 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         self.src.done();
     }
 
+    /// The state the unit's lane `lane` is (a decline's report).
+    pub(crate) fn state_of(&self, lane: usize) -> super::Sk {
+        let (entry, cell) = self.src.lanes[lane];
+        let (region, key) = self.src.srcs[entry as usize];
+        super::Sk { region, key, local: crate::storage::cells::slot_local(cell).1 as u8 }
+    }
+
+    /// The step the wave emits into (its states the layer of the one before).
+    pub(crate) fn frame(&self) -> u32 {
+        self.frame
+    }
+
     /// Does level -1 drop rows at emission (`minus_one_drops`)?
     #[inline]
     pub(crate) fn drops_at_emission(&self) -> bool {

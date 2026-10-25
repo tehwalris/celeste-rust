@@ -1,7 +1,7 @@
 //! The repository's own conventions, checked: check.sh finds its tiers'
-//! ignored tests (every `#[ignore]` names its tier), and every function is
-//! called. (That every run is under a memory cap is checked at run time:
-//! `settings::refuse_uncapped`, one-cargo.sh.)
+//! ignored tests (every `#[ignore]` names its tier), every function is
+//! called, and the core names no tool. (That every run is under a memory
+//! cap is checked at run time: `settings::refuse_uncapped`, one-cargo.sh.)
 
 /// The `.rs` files under `dir` (`target/` aside).
 fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -139,4 +139,78 @@ fn every_function_is_called() {
         .map(|(name, at)| format!("{at}: fn {name}"))
         .collect();
     assert!(uncalled.is_empty(), "functions no code line names (delete them, or name a trait's in CALLED_BY_THEIR_TRAIT):\n{}", uncalled.join("\n"));
+}
+
+/// The lines of `text` that are not test code, numbered: a `#[cfg(test)]`
+/// item (a `mod tests { .. }`, a `use ..;`) is skipped to its end by its
+/// braces, comments by `code_of`.
+fn non_test_lines(text: &str) -> Vec<(usize, &str)> {
+    let (mut out, mut skip, mut depth, mut pending) = (Vec::new(), false, 0i64, false);
+    for (n, line) in text.lines().enumerate() {
+        let Some(code) = code_of(line) else { continue };
+        let t = code.trim();
+        if !skip && t.starts_with("#[cfg(test)]") {
+            pending = true;
+            continue;
+        }
+        if pending && t.starts_with("#[") {
+            continue;
+        }
+        if pending {
+            (pending, skip, depth) = (false, true, 0);
+        }
+        if skip {
+            depth += code.matches('{').count() as i64 - code.matches('}').count() as i64;
+            if depth <= 0 && (t.ends_with('}') || t.ends_with(';')) {
+                skip = false;
+            }
+            continue;
+        }
+        out.push((n + 1, code));
+    }
+    out
+}
+
+/// THE CORE NAMES NO TOOL (plans/architecture.md "Code layout"): no file
+/// outside `src/check/`, `src/ui_export.rs` and `src/bin/` names
+/// `crate::check` or `crate::ui_export` in code that is not a test (a test
+/// may hold the core against a tool: `trace::oracle`), nor does a test-only
+/// module file count; the tools are the core's users, never the reverse.
+#[test]
+fn the_core_names_no_tool() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    sources(&root.join("src"), &mut files);
+    sources(&root.join("crates"), &mut files);
+    // The module files declared `#[cfg(test)] mod NAME;` (test-only).
+    let mut test_only: Vec<std::path::PathBuf> = Vec::new();
+    for p in &files {
+        let text = std::fs::read_to_string(p).expect("read");
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        for w in lines.windows(2) {
+            if let (true, Some(name)) = (w[0] == "#[cfg(test)]", w[1].strip_prefix("mod ").and_then(|m| m.strip_suffix(';'))) {
+                let dir = if p.file_name().is_some_and(|f| f == "mod.rs" || f == "lib.rs") { p.parent().expect("a dir").to_path_buf() } else { p.with_extension("") };
+                test_only.extend([dir.join(format!("{name}.rs")), dir.join(name).join("mod.rs")]);
+            }
+        }
+    }
+    let tools = ["src/check/", "src/ui_export.rs", "src/bin/"];
+    let (mut bad, mut users) = (Vec::new(), 0);
+    for p in &files {
+        let rel = p.strip_prefix(root).unwrap_or(p).to_string_lossy().into_owned();
+        let text = std::fs::read_to_string(p).expect("read");
+        for (n, code) in non_test_lines(&text) {
+            let names = ["crate::check", "crate::ui_export", "celeste_rust::check", "celeste_rust::ui_export"].iter().any(|t| code.contains(t));
+            if !names {
+                continue;
+            }
+            if tools.iter().any(|t| rel.starts_with(t)) {
+                users += 1;
+            } else if !test_only.contains(p) {
+                bad.push(format!("{rel}:{n}: {}", code.trim()));
+            }
+        }
+    }
+    assert!(users > 0, "the scan found the tools' users");
+    assert!(bad.is_empty(), "the core names a tool (the tools use the core, never the reverse):\n{}", bad.join("\n"));
 }

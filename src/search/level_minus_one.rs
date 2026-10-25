@@ -1989,7 +1989,9 @@ pub fn check_route<N: crate::search::rem::Rem>(inputs: &[u8], horizon: u32, spd:
     Ok(rep)
 }
 
-pub fn probe(opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
+/// The probe of the tree `opts.level_dir` (in its arithmetic `N`, its
+/// marks too) against the table built for its settings `s`.
+pub fn probe<N: crate::search::rem::Rem>(opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
     measures_the_exit(s)?;
     let mut rep = String::new();
     let t_all = std::time::Instant::now();
@@ -2018,7 +2020,7 @@ pub fn probe(opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
     // The soundness check against the recorded transitions: every edge of
     // the tree, as (source cell, target cell).
     use crate::storage::cells::{cell_xy, NO_CELL};
-    let pairs = crate::with_arith!(s.arith, N => recorded_cell_pairs::<N>(&opts.level_dir, opts.threads)?);
+    let pairs = recorded_cell_pairs::<N>(&opts.level_dir, opts.threads)?;
     let mut pos_edges: HashSet<(i16, i16, i16, i16)> = HashSet::new();
     let mut exit_src: HashSet<(i16, i16)> = HashSet::new();
     for w in chain.windows(2) {
@@ -2064,7 +2066,7 @@ pub fn probe(opts: &Opts, s: &crate::settings::Settings) -> Result<String> {
         say!(rep, "  not allowed: {b}")?;
     }
 
-    crate::with_arith!(s.arith, N => compare_with_tree::<N>(opts, &by_hash, &g1, &sound, &mut rep)?);
+    compare_with_tree::<N>(opts, &by_hash, &g1, &sound, &mut rep)?;
     say!(rep, "\ntotal {:.1} s", t_all.elapsed().as_secs_f64())?;
     Ok(rep)
 }
@@ -2090,11 +2092,8 @@ fn compare_with_tree<N: Arithmetic>(opts: &Opts, by_hash: &HashMap<u64, usize>, 
     let xy_of = |c: u32| -> (i16, i16) { if c == NO_CELL { (NONE, NONE) } else { cell_xy(c).map(|(x, y)| (x as i16, y as i16)).expect("a grid cell") } };
     let marks = match &opts.marks {
         Some(p) => {
-            // A marks file loads in 16.16 alone (`Visited::load`): a float
-            // tree's would decode as another key space (plans/correctness.md
-            // C14, the `= P8` defaults).
-            ensure!(N::NAME == celeste_core::arith::Fixed::NAME, "--marks on a {} tree: a marks file loads as 16.16 only", N::NAME);
-            let v = crate::frame::Visited::load(p)?;
+            // In the tree's arithmetic (its magic says it; another's is refused).
+            let v = crate::frame::Visited::<N>::load(p)?;
             say!(rep, "\n{} marked states in {}", v.len(), p.display())?;
             Some(v)
         }

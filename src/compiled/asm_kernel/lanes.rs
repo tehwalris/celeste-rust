@@ -46,9 +46,6 @@ pub trait KernelLanes: crate::search::rem::Rem + GraphArith + crate::transpile::
     /// Before every call of a kernel of this arithmetic: the doubles check
     /// the floating-point environment (`asm::check_mxcsr`), FATAL if wrong.
     fn before_call();
-    /// The kernel census (`compiled::mix`: `bench frame --metrics`),
-    /// 16.16's diagnostic; another arithmetic refuses it.
-    fn mix_report(inp: &crate::compiled::mix::Input<'_, Self>) -> anyhow::Result<crate::compiled::mix::Census>;
 }
 
 thread_local! {
@@ -145,9 +142,6 @@ impl KernelLanes for P8 {
     }
     #[inline]
     fn before_call() {}
-    fn mix_report(inp: &crate::compiled::mix::Input<'_, celeste_core::arith::Fixed>) -> anyhow::Result<crate::compiled::mix::Census> {
-        crate::compiled::mix::report(inp)
-    }
 }
 
 /// Where lane `l` of a doubles' slot at `off` lives.
@@ -216,8 +210,5 @@ impl KernelLanes for LuaF64 {
     #[inline]
     fn before_call() {
         crate::transpile::asm::check_mxcsr().unwrap_or_else(|e| panic!("a float kernel call: {e:#}"));
-    }
-    fn mix_report(_: &crate::compiled::mix::Input<'_, celeste_core::arith::Float>) -> anyhow::Result<crate::compiled::mix::Census> {
-        anyhow::bail!("the kernel census (bench frame --metrics) is 16.16's: not under float arithmetic")
     }
 }

@@ -3,23 +3,24 @@
 //! re-pushed where it grows - the forward without the engine (a node is
 //! expanded with its remainder widened, so its hull only decides which
 //! pushes land), a flow of `reach::forward`. It must reach exactly the
-//! tree's states at its frames.
+//! tree's states at its frames (`verdict`).
 
 use crate::search::hull::{AccOf, HullOf};
 use anyhow::{ensure, Result};
 use rustc_hash::FxHashMap;
 
-use super::reach::Flow;
-use super::rem::{Rem, Xfer};
+use crate::search::reach::Flow;
+use crate::search::rem::{Rem, Xfer};
 use crate::storage::edges::EdgeStore;
 use crate::storage::layer::Tree;
 use crate::storage::Sk;
 
-/// One frame of a replay: the states first reached there (equal to the
-/// tree's) and the edges recorded into it.
+/// One frame of a replay: the states first reached there, the tree's
+/// (`held`: the two must be equal) and the edges recorded into it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Frame {
     pub states: u64,
+    pub held: u64,
     pub edges: u64,
 }
 
@@ -92,7 +93,7 @@ impl<N: Rem> Flow for Replay<'_, N> {
 }
 
 /// Replay the tree at `dir` through frame `to` from the start's hull on its
-/// layer-0 states; per frame its counts (index 0 the start).
+/// layer-0 states; per frame its counts and the tree's (index 0 the start).
 pub fn replay<N: Rem>(dir: &std::path::Path, to: u32, threads: usize) -> Result<Vec<Frame>> {
     let start = crate::search::rem::start_hull::<N>();
     let tree = Tree::<N>::open(dir, to)?;
@@ -104,14 +105,20 @@ pub fn replay<N: Rem>(dir: &std::path::Path, to: u32, threads: usize) -> Result<
     let mut flow = Replay { store: &store, xfers, threads, hulls: FxHashMap::default(), out: FxHashMap::default(), edges: vec![0; to as usize + 2] };
     let starts: Vec<(Sk, HullOf<N>)> = tree.layer(0, None, threads)?.0.states_iter().map(|s| (s, start)).collect();
     flow.made(0, &starts);
-    super::reach::forward(&mut flow, starts, to, threads, |_, _, _| Ok(()))?;
-    let mut out: Vec<Frame> = (0..=to as usize).map(|f| Frame { states: 0, edges: flow.edges[f] }).collect();
+    crate::search::reach::forward(&mut flow, starts, to, threads, |_, _, _| Ok(()))?;
+    let mut out: Vec<Frame> = (0..=to as usize).map(|f| Frame { states: 0, held: 0, edges: flow.edges[f] }).collect();
     for &(_, f) in flow.hulls.values() {
         out[f as usize].states += 1;
     }
-    for (f, o) in out.iter().enumerate() {
-        let held = tree.layer(f as u32, None, threads)?.0.states();
-        ensure!(o.states == held, "{}: frame {f}: the replay reaches {} states first, the tree holds {held}", dir.display(), o.states);
+    for (f, o) in out.iter_mut().enumerate() {
+        o.held = tree.layer(f as u32, None, threads)?.0.states();
     }
     Ok(out)
+}
+
+/// THE VERDICT of a replay of the tree at `dir` (`replay`'s frames): at
+/// every frame the replay reached exactly the tree's states first.
+pub fn verdict(dir: &std::path::Path, frames: &[Frame]) -> Result<()> {
+    let bad: Vec<String> = frames.iter().enumerate().filter(|(_, x)| x.states != x.held).map(|(f, x)| format!("frame {f}: the replay reaches {} states first, the tree holds {}", x.states, x.held)).collect();
+    super::differential::verdict(frames.len(), bad.len(), || format!("check replay: {}: {}", dir.display(), bad.join("; ")))
 }
