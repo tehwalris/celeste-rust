@@ -61,9 +61,6 @@ pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + PartialOrd
     /// The points of guard `g` that `m` maps into `s`, EXACTLY (`m` is
     /// monotone: one segment).
     fn pull_mono(m: &Self::Mono, g: Seg<Self::P>, s: Seg<Self::P>) -> Option<Seg<Self::P>>;
-    /// `a` CORRUPTED, to check a check (`rewrite check arcs --fault
-    /// action`): its images moved (guard `g`).
-    fn fault(a: &Act<Self>, g: Seg<Self::P>) -> Act<Self>;
     /// A segment as one word of the gate's fingerprints (`backward::gate_w_hash`).
     fn seg_word(s: Seg<Self::P>) -> u64;
     /// A point in the middle of `s` (a probe).
@@ -133,20 +130,6 @@ impl<C: Circle> Transfer<C> {
             Act::Const(_) => "const",
         }
     }
-
-    /// CORRUPTED, to check a check (`rewrite check arcs --fault`): its
-    /// guard's lowest point dropped (`guard`), or its images moved.
-    pub(crate) fn faulty(&self, guard: bool) -> Self {
-        let mut t = *self;
-        if guard {
-            if C::next(t.guard.lo) < t.guard.hi {
-                t.guard.lo = C::next(t.guard.lo);
-            }
-        } else {
-            t.act = C::fault(&t.act, t.guard);
-        }
-        t
-    }
 }
 
 /// 16.16's circle: 65536 points, its transfers translations (`rem += ox`
@@ -186,14 +169,6 @@ impl Circle for Fixed16 {
         let lo = (s.lo as i64 - *d as i64).max(g.lo as i64);
         let hi = (s.hi as i64 - *d as i64).min(g.hi as i64);
         (lo < hi).then(|| Seg { lo: lo as u32, hi: hi as u32 })
-    }
-    /// A translation by one more point (one less at the circle's top), a
-    /// constant moved by one point.
-    fn fault(a: &Act<Fixed16>, g: Seg) -> Act<Fixed16> {
-        match *a {
-            Act::Mono(d) => Act::Mono(if g.hi as i64 + d as i64 + 1 <= CIRCLE as i64 { d + 1 } else { d - 1 }),
-            Act::Const(c) => Act::Const((c + 1) % CIRCLE),
-        }
     }
     #[inline]
     fn seg_word(s: Seg) -> u64 {
@@ -305,14 +280,6 @@ impl Circle for Doubles {
         let lo = first_in(g.lo, g.hi, |r| Self::apply(m, r) >= s.lo);
         let hi = first_in(lo, g.hi, |r| Self::apply(m, r) >= s.hi);
         (lo < hi).then_some(Seg { lo, hi })
-    }
-    /// A `Mono` collapsed onto its lowest point's image, a constant moved
-    /// by one point.
-    fn fault(a: &Act<Doubles>, g: Seg<u64>) -> Act<Doubles> {
-        match a {
-            Act::Mono(m) => Act::Const(Self::apply(m, g.lo)),
-            Act::Const(c) => Act::Const((c + 1) % POINTS),
-        }
     }
     #[inline]
     fn seg_word(s: Seg<u64>) -> u64 {

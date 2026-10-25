@@ -10,7 +10,7 @@
 use anyhow::{anyhow, Result};
 use celeste_engine::runtime2::{Col, Rt2, AV};
 
-use super::arcs::{Circle, Seg, Transfer};
+use super::arcs::{Act, Circle, Doubles, Fixed16, Seg, Transfer, CIRCLE, POINTS};
 use super::rem::{Point, Rem, Xfer};
 use crate::abstraction::Level;
 use crate::frame::widened_keys;
@@ -18,6 +18,49 @@ use crate::storage::edges::EdgeStore;
 use crate::storage::layer::Tree;
 use crate::storage::Sk;
 use crate::engines::reference::ReferenceEngine;
+
+/// A circle's transfers CORRUPTED, to check the check (`--fault`): the
+/// check's own, not the circle's (nothing else corrupts a transfer).
+pub trait Faulty: Circle {
+    /// `a` with its images moved (guard `g`).
+    fn fault(a: &Act<Self>, g: Seg<Self::P>) -> Act<Self>;
+}
+
+impl Faulty for Fixed16 {
+    /// A translation by one more point (one less at the circle's top), a
+    /// constant moved by one point.
+    fn fault(a: &Act<Fixed16>, g: Seg) -> Act<Fixed16> {
+        match *a {
+            Act::Mono(d) => Act::Mono(if g.hi as i64 + d as i64 + 1 <= CIRCLE as i64 { d + 1 } else { d - 1 }),
+            Act::Const(c) => Act::Const((c + 1) % CIRCLE),
+        }
+    }
+}
+
+impl Faulty for Doubles {
+    /// A `Mono` collapsed onto its lowest point's image, a constant moved
+    /// by one point.
+    fn fault(a: &Act<Doubles>, g: Seg<u64>) -> Act<Doubles> {
+        match a {
+            Act::Mono(m) => Act::Const(Doubles::apply(m, g.lo)),
+            Act::Const(c) => Act::Const((c + 1) % POINTS),
+        }
+    }
+}
+
+/// `t` CORRUPTED: its guard's lowest point dropped (`guard`), or its images
+/// moved.
+fn faulty<C: Faulty>(t: &Transfer<C>, guard: bool) -> Transfer<C> {
+    let mut t = *t;
+    if guard {
+        if C::next(t.guard.lo) < t.guard.hi {
+            t.guard.lo = C::next(t.guard.lo);
+        }
+    } else {
+        t.act = C::fault(&t.act, t.guard);
+    }
+    t
+}
 
 pub struct Opts<'a> {
     pub dir: &'a std::path::Path,
@@ -72,7 +115,10 @@ fn predicts<C: Circle>(t: &(Transfer<C>, Transfer<C>), p: (C::P, C::P), q: Optio
     }
 }
 
-pub fn run<N: Rem>(o: &Opts) -> Result<()> {
+pub fn run<N: Rem>(o: &Opts) -> Result<()>
+where
+    N::C: Faulty,
+{
     let (dir, to, level, cfg) = (o.dir, o.to, o.level, o.settings);
     cfg.check(dir, level)?;
     let ids = crate::compiled::ids();
@@ -130,7 +176,7 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()> {
     let corrupt = |t: Xfer<N>| -> Result<Xfer<N>> {
         Ok(match o.fault {
             None => t,
-            Some(k @ ("action" | "guard")) => (t.0.faulty(k == "guard"), t.1),
+            Some(k @ ("action" | "guard")) => (faulty(&t.0, k == "guard"), t.1),
             Some(other) => anyhow::bail!("--fault {other}: `action` or `guard`"),
         })
     };
