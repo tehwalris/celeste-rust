@@ -46,6 +46,10 @@ settled here. Evidence is file:line at develop 19869c5d.
   The witnesses through the orb (any% 150, nodiag 157) replay to their
   exits with the orb under the new code; no winning route meets the cut,
   which starts at frame H-70 while a route exiting by H opened by H-79.
+  Re-searched under it (fc516a4d): room (5,2) any% `search --level r0sx
+  --level-minus-one 150,5 --frames 150 --ceiling --prefer
+  tas/room_5_2_exit_frame_150.txt`: arc bound 150, concrete optimum 150,
+  the known route survives every pruning step (5.6 min, peak 7 GB).
 
 ## C3. Room (2,1): the split frame reaches FEWER states than unsplit at `p`
 - Noted in architecture.md ("unexplained"). Fewer states is the direction a
