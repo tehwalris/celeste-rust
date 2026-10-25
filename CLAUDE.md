@@ -37,8 +37,9 @@ left open is in plans/architecture.md "Open issues".
 - `plans/architecture.md` - the system as it is: interfaces, the tracer and
   kernel model, keys, the hull forward and its storage, the recorded edges,
   the search, the checks, open issues.
-- `plans/abstractions.md` - every level flag (`h f n p`; the remainder):
-  what it widens, why it is sound, what refutes it (the widening table).
+- `plans/abstractions.md` - every level flag (`h f n`; the remainder; moving
+  platforms are always exact): what it widens, why it is sound, what refutes
+  it (the widening table).
 - `plans/float.md` - the float arithmetic and the dual search.
 - `plans/level-minus-one.md` - the cost-to-go filter.
 - `plans/devloop.md` - the check ladder (`./check.sh`), the fixtures, the
@@ -94,8 +95,7 @@ latter.
   never environment variables: a binary refuses any `CELESTE_*` variable.
   They are parsed once into `settings::Settings` and PASSED (no globals). A
   tree records the settings that change it (`<level>/tree.txt`) and
-  refuses a run under others (`--override-settings` passes only
-  `--region`); a run's flags never default to the record. A command that
+  refuses a run under others; a run's flags never default to the record. A command that
   only READS a finished tree takes its settings from the record and refuses
   them as flags. A new tree setting is a field of `Settings` (its flag) and
   a row of `Settings::rows` (its record line), and bumps

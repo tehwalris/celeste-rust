@@ -11,8 +11,9 @@ one builder, `table`), `frame::TreeL1`, `UnitSink`'s level -1 drop.
 ./safe-run.sh -- ./target/release/rewrite search --room 2,0 --frames 95 --ceiling --level-minus-one 95,5
 # the table alone, with its fingerprint (cached in /var/tmp/celeste-l1-cache)
 ./safe-run.sh -- ./target/quick/rewrite l1 table --room 2,0 --spd 5
-# as a probe: the table against a tree's recorded transitions
-./safe-run.sh -- ./target/quick/rewrite l1 probe --room 2,0 --spd S --tree DIR --steps H --from-step F --to-step T [--marks MARKS]
+# as a probe: the table against a tree's recorded transitions (the tree's room and
+# settings: its record; a settings flag is refused)
+./safe-run.sh -- ./target/quick/rewrite l1 probe --spd S --tree DIR --steps H --from-step F --to-step T [--marks MARKS]
 # a known solution against the table (fails if a state of it is too late)
 ./safe-run.sh -- ./target/quick/rewrite l1 check --room X,Y --inputs tas/FILE --frames EXIT
 ```
@@ -92,7 +93,8 @@ d is weak by design (start's d ~45 against optima of 80-130: the player
 may move S px a frame in any direction). It bites in the last ~20 frames,
 exactly where a room's level 0 explodes when its frames do not dedupe
 (springs, ice). It does not rescue a room whose every frame is new (room
-(6,0) with platforms exact: d 31 against the real 46; that needed `p`).
+(6,0) with platforms exact: d 31 against the real 46; that needed `p`,
+until the exact platforms keyed by the first one's fit, 2026-10-25).
 
 ## Build failures and their fixes
 
@@ -110,7 +112,8 @@ weakened:
   start holds as an interval are seeded from its literal.
 
 Still refused or not converging: the summit (it measures the room exit) and
-the platform rooms (6,0), (2,1), (1,2), in fixed and float.
+the platform rooms (6,0), (2,1), (1,2), in fixed and float (measured at
+`p`; not tried since the platforms are exact).
 
 ## Deferred: the off-screen lane
 

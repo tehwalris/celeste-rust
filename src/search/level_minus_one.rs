@@ -1943,17 +1943,22 @@ fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate
 /// A KNOWN SOLUTION against the table (`rewrite l1 check`): `inputs`
 /// replayed (`search::replay`: every `rnd` leaf, the run's seeds), every
 /// state checked, and one on a lineage that exits that the table calls too
-/// late for the exit `horizon` (a frame) makes the table UNSOUND: an error.
-/// The report, a line per frame.
+/// late for the exit `horizon` (a FRAME) makes the table UNSOUND: an error.
+/// The replay, the table's d and the forward's filter count search STEPS
+/// (two a frame under `--split-frame`: `settings::Clock`), so the horizon
+/// is judged in steps, as the forward's filter judges it
+/// (`Settings::minus_one`). The report, a line per step.
 pub fn check_route<N: crate::search::rem::Rem>(inputs: &[u8], horizon: u32, spd: i32, s: &crate::settings::Settings) -> Result<String> {
     use crate::storage::cells::{block_cells, cell_xy};
     use std::fmt::Write as _;
     let mut rep = String::new();
     let table = table(spd, s)?;
+    let clock = s.clock();
     writeln!(rep, "[l1 check] table: {} entries, start d {}, fingerprint {:016x}", table.len(), table.start_d, table.fingerprint())?;
     let run = crate::search::replay::Replay::<N>::of(inputs, None, s)?;
     let (exit, won) = run.exit.as_ref().ok_or_else(|| anyhow!("the inputs never exit the room"))?;
     let on = run.on_a_win();
+    let h = clock.steps(horizon);
     let (mut checked, mut unknown, mut late) = (0usize, 0usize, BTreeSet::new());
     for (f, layer) in run.layers.iter().enumerate() {
         let mut line = Vec::new();
@@ -1968,7 +1973,7 @@ pub fn check_route<N: crate::search::rem::Rem>(inputs: &[u8], horizon: u32, spd:
                     }
                     Some(d) => {
                         checked += 1;
-                        let bad = table.too_late(shape, cell, f as u32, horizon);
+                        let bad = table.too_late(shape, cell, f as u32, h);
                         if bad && on {
                             late.insert(f);
                         }
@@ -1977,11 +1982,11 @@ pub fn check_route<N: crate::search::rem::Rem>(inputs: &[u8], horizon: u32, spd:
                 }
             }
         }
-        writeln!(rep, "[l1 check] f{f}: {}", line.join(", "))?;
+        writeln!(rep, "[l1 check] step {f} ({}): {}", clock.show(f as u32), line.join(", "))?;
     }
-    writeln!(rep, "[l1 check] exit during frame {exit} ({} winning leaves)", won.len())?;
-    writeln!(rep, "[l1 check] {checked} states checked, {unknown} not table nodes; on the exiting lineages TOO LATE for horizon {horizon} at frames {late:?}")?;
-    ensure!(late.is_empty(), "{rep}the level -1 table calls states of a known solution too late at frames {late:?}: UNSOUND");
+    writeln!(rep, "[l1 check] exit during frame {} (step {exit}; {} winning leaves)", clock.frame_of(*exit), won.len())?;
+    writeln!(rep, "[l1 check] {checked} states checked, {unknown} not table nodes; on the exiting lineages TOO LATE for horizon f{horizon} (step {h}) at steps {late:?}")?;
+    ensure!(late.is_empty(), "{rep}the level -1 table calls states of a known solution too late at steps {late:?}: UNSOUND");
     Ok(rep)
 }
 
@@ -2086,6 +2091,10 @@ fn compare_with_tree<N: Arithmetic>(opts: &Opts, by_hash: &HashMap<u64, usize>, 
     let xy_of = |c: u32| -> (i16, i16) { if c == NO_CELL { (NONE, NONE) } else { cell_xy(c).map(|(x, y)| (x as i16, y as i16)).expect("a grid cell") } };
     let marks = match &opts.marks {
         Some(p) => {
+            // A marks file loads in 16.16 alone (`Visited::load`): a float
+            // tree's would decode as another key space (plans/correctness.md
+            // C14, the `= P8` defaults).
+            ensure!(N::NAME == celeste_core::arith::Fixed::NAME, "--marks on a {} tree: a marks file loads as 16.16 only", N::NAME);
             let v = crate::frame::Visited::load(p)?;
             say!(rep, "\n{} marked states in {}", v.len(), p.display())?;
             Some(v)
@@ -2278,6 +2287,24 @@ mod room_tests {
         let s = crate::settings::Settings { room: (7, 1), ..Default::default() };
         let t = super::table(5, &s).unwrap_or_else(|e| panic!("{e:#}"));
         assert_eq!(t.start_d, 45);
+    }
+
+    /// THE KNOWN ROUTE AGAINST A SPLIT TABLE: room (1,0) under
+    /// `--split-frame` (the table's d, the replay and the forward's filter
+    /// all in steps, two a frame), its any% 99 route judged at its exit
+    /// frame. Comparing the steps with the frame horizon called the route
+    /// too late from step 57 on (`rewrite l1 check`, before the fix).
+    #[test]
+    #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s split lattice walk and its passes, ~80 CPU-s"]
+    fn a_split_rooms_known_route_is_judged_in_steps() {
+        let s = crate::settings::Settings { room: (1, 0), split_frame: true, ..Default::default() };
+        let inputs = crate::concrete::read_inputs("tas/room_1_0_exit_frame_99.txt").expect("the route");
+        let rep = super::check_route::<celeste_core::arith::Fixed>(&inputs, 99, 5, &s).unwrap_or_else(|e| panic!("{e:#}"));
+        assert!(rep.contains("exit during frame 99 (step 198;"), "{rep}");
+        // One frame earlier is a horizon the route cannot meet: the table
+        // must call it too late (the check is live).
+        let e = super::check_route::<celeste_core::arith::Fixed>(&inputs, 98, 5, &s).expect_err("the route judged at f98");
+        assert!(format!("{e:#}").contains("UNSOUND"), "{e:#}");
     }
 
     /// Room (1,0)'s table in FLOAT (Celia's start): start d 44, as fixed's.

@@ -162,7 +162,23 @@ sounds like one of these. The full write-ups are in git history.
 - **Level -1 for every room** (reverted `4b31c1b`): did not rescue room
   (6,0), whose every frame is new with exact platforms (d 31 against 46).
 - **Coarser level 0 for platforms by buckets**: OOM building kernels past
-  60 GB. Platforms needed `p`.
+  60 GB. Platforms needed `p` (until `p` itself went: below).
+- **Platforms widened by `p`, decided per "platform world"** (2026-09-29 ..
+  10-25): `x`/`last` the whole path, `rem.x` the whole remainder, and the
+  split pass decided player-vs-platform per world from a table a NO-INPUT
+  reference run made (`concrete::platform_worlds`). The table missed real
+  positions (plans/correctness.md C13): it counted steps, not frames, under
+  the split frame (room (6,0): 65 of 128 frames), and where the idle player
+  dies ((2,1): f49, restart f64) it never saw the later positions; an empty
+  (world, pixel) set dropped real successors, so (6,0)'s refutations were
+  unproven. A table that must cover what the search meets but is made
+  without the search is a second model nothing checks. Settled by
+  measurement: exact platforms are affordable in every platform room (room
+  (6,0)'s ten keyed by the first one's, `exact::Deps`; without that 127 key
+  bits by step 17): (2,1) any% 6 min / 9.6 GB, (6,0) any% split 11 min /
+  18.2 GB, (1,2) any% 8 min / 6.7 GB, every result kept (plans/results.md).
+  So `p`, the worlds, `split::Points` and the reference engine's refusal
+  went (2026-10-25).
 - **The rem rungs and the precision ladder** (deleted 2026-10-05): a move
   straddling a bucket edge emits a sliver row the boundary widens to the
   whole bucket, so marks grew 2-2.6x a rung; six ladders of room (3,3) ran

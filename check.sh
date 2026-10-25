@@ -10,8 +10,8 @@
 #                frame
 #     perf       the RELEASE binary's instruction budget (gates/perf.txt;
 #                more than 2% over FAILS)
-#     local      the local goldens and the PICO-8 probe goldens (SKIPPED
-#                where the store or PICO-8 is absent)
+#     local      the local goldens and the PICO-8 probe goldens (SKIPPED,
+#                which FAILS the run, where the store or PICO-8 is absent)
 #     fixtures   every fixture rebuilt against its pinned fingerprint
 #     premerge   the pre-merge tests
 #     all        every tier above
@@ -188,12 +188,13 @@ backward() {
 
 t1() {
     build
-    step fixtures tools/fixtures.sh ensure r10 r62h r42n r42x r10arc f10 f42n f42x f10arc
+    step fixtures tools/fixtures.sh ensure r10 r62h r42n r42x r10arc f10 f42n f42x f10arc r60s
     grep -h '^\[fixtures\]' "$C/fixtures.err"
     # One lane a fixture family.
     lane r10 t1_r10
     lane r62h t1_r62h
     lane r42 t1_r42
+    lane r60 t1_r60
     lane f10 t1_f10
     lane f42 t1_f42
     lanes
@@ -222,6 +223,12 @@ t1_r42() {
     step widen-r42n widencheck r42n 60
     step refcheck-r42x refcheck r42x 55
     step arccheck-r42x arccheck r42x
+}
+# The platform room: its rows' keys recomputed at the boundary, every
+# FOLLOWER checked (`exact::Deps`: room (6,0)'s ten platforms keyed by the
+# first one's), against the kernels' emission; the pinned f/h/e lines.
+t1_r60() {
+    step keycheck-r60s keycheck r60s 70
 }
 # The same in FLOAT (`--arith float`, Celia's start), without the metrics.
 t1_f10() {
@@ -270,7 +277,7 @@ t2_properties() {
 }
 t2_platforms() {
     step forward60-platforms forward60
-    # The widening table's two sides at `p`, a boundary and a mid-frame step
+    # The widening table's two sides, a boundary and a mid-frame step
     # (stored rows only: the emissions would build the kernels again).
     step widen-r60s widen60
 }
@@ -342,11 +349,12 @@ hull10() {
     ./safe-run.sh --memory "$MEM" -- "$B" check replay --tree "$C/t2/reference10${1:+-float}-kernels" --steps 36
 }
 
-# A platform room (platforms unknown, split frame) to step 71: the tree's
-# fingerprint is the r60s fixture's pin, which only `tools/fixtures.sh pin
-# r60s` writes (so not `same`: t2 --pin leaves it).
+# A platform room (ten exact platforms keyed by the first one's, split
+# frame) to step 71: the tree's fingerprint is the r60s fixture's pin, which
+# only `tools/fixtures.sh pin r60s` writes (so not `same`: t2 --pin leaves
+# it).
 forward60() {
-    ./safe-run.sh --memory "$MEM" -- "$B" forward --room 6,0 --level r0sxhfp --steps 71 --split-frame --tree "$C/t2/p60" > /dev/null || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" forward --room 6,0 --level r0sxhf --steps 71 --split-frame --tree "$C/t2/p60" > /dev/null || return 1
     ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/p60" --steps 71 --edges --hulls 2> /dev/null | diff "$G/r60s.ckhash" - >&2
 }
 
@@ -423,8 +431,9 @@ perfcount() {
 
 # The local tier: the local goldens (trace::oracle), from the machine-local
 # store, and the PICO-8 probe goldens (trace::probe), from a real PICO-8;
-# where either is absent its test passes and says SKIPPED, repeated in the
-# run's last line.
+# where either is absent its test passes and says SKIPPED: the run's last
+# line repeats it, and the run FAILS (a check that compared nothing is no
+# pass).
 localgoldens() {
     step local-goldens ignoredtests local
     grep -h '\[local goldens\]' "$C/local-goldens.out" "$C/local-goldens.err" | sed 's/^/    /'
@@ -457,5 +466,5 @@ for TIER in "${TIERS[@]}"; do
 done
 FAILED=$(paste -sd' ' "$C/failed")
 SKIPPED=$(paste -sd' ' "$C/skipped")
-echo "[$(IFS=+; echo "${TIERS[*]}")] $((SECONDS - T_START)) s; $([[ -n $FAILED ]] && echo "FAILED: $FAILED" || echo "all ok")${SKIPPED:+ (SKIPPED: $SKIPPED)}"
-[[ -z $FAILED ]]
+echo "[$(IFS=+; echo "${TIERS[*]}")] $((SECONDS - T_START)) s; $([[ -n $FAILED ]] && echo "FAILED: $FAILED" || { [[ -n $SKIPPED ]] && echo "FAILED, nothing compared" || echo "all ok"; })${SKIPPED:+ (SKIPPED: $SKIPPED)}"
+[[ -z $FAILED && -z $SKIPPED ]]

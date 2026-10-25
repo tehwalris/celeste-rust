@@ -87,7 +87,7 @@ pub enum Command {
     /// `forward --reference`, under the tree's settings and level) into a
     /// scratch tree, and both fingerprinted (`ckhash --edges --hulls`): the
     /// states, frontiers and edges with their transfers must agree at every
-    /// step. Slow; not at platform (`p`) levels.
+    /// step. Slow.
     Reference(ReferenceArgs),
 }
 
@@ -108,7 +108,8 @@ pub struct RefArgs {
     #[arg(long, default_value_t = 3)]
     show: usize,
     /// At most this many reference fork paths a row: a row that takes
-    /// more is SKIPPED (counted and reported), as in `check arcs`.
+    /// more is SKIPPED (counted and reported), as in `check arcs`; a check
+    /// whose every row is SKIPPED compared nothing and FAILS.
     #[arg(long)]
     path_cap: Option<usize>,
     /// A differing row's successors in full (every named field, both
@@ -138,7 +139,8 @@ pub struct ArcsArgs {
     /// At most this many reference fork paths a step: a sample whose
     /// source takes more is SKIPPED (counted and reported; it bounds a
     /// sample's time and memory where widened objects fork the
-    /// reference into thousands of paths).
+    /// reference into thousands of paths); a check whose every sample is
+    /// SKIPPED compared nothing and FAILS.
     #[arg(long)]
     path_cap: Option<usize>,
 }

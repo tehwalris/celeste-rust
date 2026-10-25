@@ -145,9 +145,12 @@ impl DupRef {
 /// constants, so the append emits rows already at the boundary.
 struct AccTemplate<N: Arithmetic = P8> {
     shape_hash: u64,
-    /// The key's uniform fields: every value cell uniform at the boundary,
-    /// at its WIDENED value, as `(cell, code)` by cell.
+    /// The key's uniform fields: every KEYED value cell uniform at the
+    /// boundary, at its WIDENED value, as `(cell, code)` by cell.
     uniform: Vec<(u32, Code<N>)>,
+    /// The uniform FOLLOWERS (`exact::Deps`, the record's): `(dependency,
+    /// slot, cell, code)` by cell.
+    uniform_follow: Vec<(u32, u32, u32, Code<N>)>,
     /// The shape as a key space records it (checked against its record).
     record: ShapeRecord,
     /// This outcome's own skeleton: a field's column empty and typed, or
@@ -842,6 +845,24 @@ impl<N: KernelLanes> Registry<N> {
         text_digest(&self.kernels)
     }
 
+    /// Its kernels' KEY LAYOUTS (`exact::Deps`), in key order: per outcome
+    /// its record and uniform followers, per body its leaders' and per-row
+    /// followers' cells (a cached set's must be the fresh one's).
+    #[cfg(test)]
+    pub(crate) fn key_layouts(&self) -> Vec<KeyLayout<N>> {
+        let mut out: Vec<KeyLayout<N>> = self
+            .kernels
+            .iter()
+            .map(|(k, v)| {
+                let outcomes = v.acc_templates.iter().map(|t| (t.record.clone(), t.uniform_follow.clone())).collect();
+                let bodies = (0..v.plan.bodies.len()).map(|bi| v.plan.follow_layout(bi)).collect();
+                (*k, outcomes, bodies)
+            })
+            .collect();
+        out.sort_unstable_by_key(|l| l.0);
+        out
+    }
+
     /// Run `chunk` (rows in cell order) on the matching kernels; `false` on a
     /// miss or a decline.
     pub fn run_chunk(
@@ -994,6 +1015,10 @@ impl<N: KernelLanes> Registry<N> {
         Ok(Registry { kernels, grid: s.region_grid() })
     }
 }
+
+/// A kernel's key layout (`Registry::key_layouts`).
+#[cfg(test)]
+pub(crate) type KeyLayout<N> = ((u64, Option<Region>), Vec<(ShapeRecord, Vec<(u32, u32, u32, Code<N>)>)>, Vec<emit::FollowLayout>);
 
 /// A kernel set's text, fingerprinted: each kernel's (shape, region) and
 /// text digest (`Compiled::text_digest`), in key order.
@@ -1191,9 +1216,10 @@ impl<N: Arithmetic> Skeleton<N> {
 
 impl<N: Arithmetic> AccTemplate<N> {
     /// The template of skeleton `own` (`shape_hash` its shape's): the key's
-    /// uniform fields (every value cell uniform here, at its widened value)
-    /// and the shape's record.
-    fn of(own: Rt2<N>, shape_hash: u64) -> AccTemplate<N> {
+    /// uniform fields (every value cell uniform here, at its widened value;
+    /// a follower's among `uniform_follow`) and the shape's record, its key
+    /// laid out as the shape declares (`widening::key_deps`).
+    fn of(own: Rt2<N>, shape_hash: u64) -> Result<AccTemplate<N>> {
         let pos = own.position_cells();
         let mut uniform = Vec::new();
         for (c, cell) in own.structure.iter().enumerate() {
@@ -1205,7 +1231,18 @@ impl<N: Arithmetic> AccTemplate<N> {
         }
         let mut canon = own.clone_block();
         canon.shape_hash = shape_hash;
-        AccTemplate { shape_hash, uniform, record: ShapeRecord::of(&canon), union: std::sync::Arc::new(own.clone_block()), own }
+        let record = ShapeRecord::of(&canon);
+        anyhow::ensure!(record.deps.len() <= emit::MAX_DEPS, "shape {shape_hash:#x}: {} key dependencies, past the emission's {}", record.deps.len(), emit::MAX_DEPS);
+        // The followers are no dictionary's: theirs is the record by leader.
+        let (follow, uniform): (Vec<_>, Vec<_>) = uniform.into_iter().partition(|(c, _)| follower_of(&record, *c).is_some());
+        let uniform_follow = follow
+            .into_iter()
+            .map(|(c, code)| {
+                let (g, slot) = follower_of(&record, c).expect("a follower");
+                (g, slot, c, code)
+            })
+            .collect();
+        Ok(AccTemplate { shape_hash, uniform, uniform_follow, record, union: std::sync::Arc::new(own.clone_block()), own })
     }
 }
 
@@ -1334,8 +1371,8 @@ impl<N: KernelLanes> AsmKernel<N> {
         cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
         graphs: Graphs<N>,
     ) -> Result<AsmKernel<N>> {
-        let Recipe { compiled, forks, fused_nodes, may_unknown, bodies, outcomes, input_names, census, .. } = recipe;
-        let acc_templates: Vec<AccTemplate<N>> = outcomes.iter().map(|sk| AccTemplate::of(sk.rt2(cache.clone()), sk.shape_hash)).collect();
+        let Recipe { shape: recipe_shape, compiled, forks, fused_nodes, may_unknown, bodies, outcomes, input_names, census, .. } = recipe;
+        let acc_templates: Vec<AccTemplate<N>> = outcomes.iter().map(|sk| AccTemplate::of(sk.rt2(cache.clone()), sk.shape_hash)).collect::<Result<_>>()?;
         // Per outcome, its position coordinates' cells (keyed without their whole pixels).
         let pos_cells: Vec<Option<(u32, u32)>> = acc_templates.iter().map(|t| t.own.position_cells()).collect();
         let off = |s: u32| compiled.root_offsets[s as usize] as usize;
@@ -1357,9 +1394,26 @@ impl<N: KernelLanes> AsmKernel<N> {
                     KeyField::new(cell, off(s), kind(s), pos)
                 })
                 .collect::<Result<Vec<_>>>()?;
+            // The FOLLOWERS (`exact::Deps`) are checked, not keyed; every
+            // one, and its leader, is per-row or uniform in each outcome
+            // (else a row's follower would go unchecked).
+            let t = &acc_templates[b.outcome];
+            let (follow, key_fields): (Vec<KeyField>, Vec<KeyField>) = key_fields.into_iter().partition(|f| follower_of(&t.record, f.cell).is_some());
+            let follow_fields: Vec<(KeyField, u32, u32)> = follow
+                .into_iter()
+                .map(|f| {
+                    let (g, slot) = follower_of(&t.record, f.cell).expect("a follower");
+                    (f, g, slot)
+                })
+                .collect();
+            for &c in t.record.deps.iter().flat_map(|d| std::iter::once(&d.leader).chain(&d.followers)) {
+                let seen = key_fields.iter().any(|f| f.cell == c) || follow_fields.iter().any(|f| f.0.cell == c) || t.uniform.iter().any(|u| u.0 == c) || t.uniform_follow.iter().any(|u| u.2 == c);
+                anyhow::ensure!(seen, "shape {:#x} outcome {}: the key dependency's cell {c} is neither per-row nor uniform: it would go unchecked", recipe_shape, b.outcome);
+            }
+            let leaders: Vec<u32> = t.record.deps.iter().map(|d| d.leader).collect();
             let arc = ArcSlots { roots: b.arc.0.map(|s| (off(s), kind(s))), fin: b.arc.1 };
             asm_bodies.push(AsmBody { outcome: b.outcome, splits: b.splits, fields, error_root: b.error as usize, error_off: off(b.error), live_off: off(b.live), dup_refs: Vec::new() });
-            reads.push(emit::BodyReads { outcome: b.outcome, shape: acc_templates[b.outcome].shape_hash, key_fields, arc, pos: None });
+            reads.push(emit::BodyReads { outcome: b.outcome, shape: t.shape_hash, key_fields, follow_fields, leaders, arc, pos: None });
         }
         for (b, rd) in asm_bodies.iter().zip(reads.iter_mut()) {
             rd.pos = pos_sources(&acc_templates[b.outcome].own, &b.fields)?;
@@ -1480,6 +1534,11 @@ fn pos_sources<N: Arithmetic>(template: &Rt2<N>, fields: &[AsmField]) -> Result<
         return Ok(None);
     };
     Ok(Some([px, py, rx, ry]))
+}
+
+/// A follower's dependency and slot in `r`'s layout (`exact::Deps`).
+fn follower_of(r: &ShapeRecord, cell: u32) -> Option<(u32, u32)> {
+    r.deps.iter().enumerate().find_map(|(g, d)| Some((g as u32, d.followers.binary_search(&cell).ok()? as u32)))
 }
 
 /// An arithmetic's resident kernel set and what it was built under.

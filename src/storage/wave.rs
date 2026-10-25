@@ -23,7 +23,7 @@ use super::stats::{Lap, Stats, S};
 use crate::frame::{Filters, FrameStep};
 use crate::search::rem::{Pair, Rem};
 use celeste_core::pico8_num::Pico8Num as P8;
-use celeste_engine::exact::{Code, KeyAdditions, MissKey, Provisional};
+use celeste_engine::exact::{KeyAdditions, MissKey, Provisional};
 
 /// An OLD frontier state: its hull grown since its last push (`was`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,10 +311,10 @@ struct UnitScratch {
 }
 
 /// ONE KERNEL UNIT: its states DECODED, `frame::not_expanded` (decided here,
-/// fresh or resumed; `ceiling`: the orb cut's, `TreeL1::orb_ceiling`) left
+/// fresh or resumed; `orb`: the tree's orb cut, `frame::OrbCut`) left
 /// out, the rest through the engine with their hulls.
 #[allow(clippy::too_many_arguments)]
-fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<usize>, state: usize, layer: &Layer<N>, hulls: &[HullOf<N>], starts: &[usize], shapes: &[u64], sink: &mut UnitSink<'_, N>, sc: &mut UnitScratch, layer_frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<()> {
+fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<usize>, state: usize, layer: &Layer<N>, hulls: &[HullOf<N>], starts: &[usize], shapes: &[u64], sink: &mut UnitSink<'_, N>, sc: &mut UnitScratch, layer_frame: u32, orb: Option<crate::frame::OrbCut>, s: &crate::settings::Settings) -> Result<()> {
     let t_dec = sink.stats.tick_start();
     sink.begin(u);
     sc.rows.clear();
@@ -344,7 +344,7 @@ fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<
     let shape = *shapes.get((region / crate::storage::cells::SLOTS) as usize).ok_or_else(|| anyhow!("a frontier region of no shape"))?;
     let skel = layer.skeletons.get(&shape).ok_or_else(|| anyhow!("ROWS FROM KEYS: the frontier holds no skeleton of shape {shape:016x}"))?;
     let block = super::decode::decode_rows(sink.keys(), skel, &sc.rows)?;
-    let skip = crate::frame::not_expanded(&block, layer_frame, ceiling, s)?;
+    let skip = crate::frame::not_expanded(&block, layer_frame, orb, s)?;
     sc.live.clear();
     sc.live.extend((0..block.width).filter(|&l| !skip[l]));
     sink.stats.tick(S::PhDecode, t_dec);
@@ -456,7 +456,7 @@ fn worker<N: Rem>(sh: &Shared<N>, sink: &mut UnitSink<N>, sc: &mut super::route:
             let t = Instant::now();
             match &plan.units[u] {
                 UnitSpec::Kernel { entries, state, .. } => {
-                    run_unit(sh.engine, u as u32, entries.clone(), *state, &sh.front.new, &sh.front.hulls, &plan.starts, sh.shapes, sink, &mut us, frame - 1, sh.cx.filters.l1.map(|l| l.orb_ceiling()), sh.s)?;
+                    run_unit(sh.engine, u as u32, entries.clone(), *state, &sh.front.new, &sh.front.hulls, &plan.starts, sh.shapes, sink, &mut us, frame - 1, sh.cx.filters.orb, sh.s)?;
                 }
                 UnitSpec::Repush { layer, frame: f, segs, .. } => {
                     let tr = sink.stats.tick_start();
@@ -725,14 +725,7 @@ fn next_layer<N: Rem>(new: Vec<super::route::Sealed<N>>, frame: u32, threads: us
 pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveCtx<N>) -> Result<Wave<N>> {
     use std::time::Instant;
     let frame = cx.frame;
-    // A platforms-unknown level knows only `PLATFORM_WORLD_FRAMES` worlds.
-    let (level, s) = (engine.level(), &engine.settings());
-    let game_frame = s.clock().frame_of(frame);
-    ensure!(
-        !level.platforms || game_frame as usize <= crate::trace::walk::PLATFORM_WORLD_FRAMES,
-        "frame {frame} at {level}: the platform worlds cover {} frames",
-        crate::trace::walk::PLATFORM_WORLD_FRAMES
-    );
+    let s = &engine.settings();
     ensure!(frame > 0, "a wave makes frame 1 on");
     ensure!(front.hulls.len() as u64 == front.new.states(), "frame {frame}: {} hulls for the frontier's {} new states", front.hulls.len(), front.new.states());
     ensure!(cx.edges.is_some() || front.old.is_empty(), "frame {frame}: old states to re-push without the tree's edge files");
@@ -1279,15 +1272,7 @@ fn finalize_keys<N: Rem>(visited: &mut VisitedSet<N>, states: &[RouteState<N>], 
         let r = prov.shape_record(s).unwrap_or_else(|| panic!("exact keys: the new shape {s:#x} was not noted"));
         visited.keys.add_shape(&r, adds);
     }
-    let mut codes: std::collections::BTreeMap<(u64, u32), std::collections::BTreeSet<Code<N>>> = Default::default();
-    for m in &contents {
-        for &(c, code) in &m.missing {
-            codes.entry((m.shape, c)).or_default().insert(code);
-        }
-    }
-    for ((shape, cell), set) in codes {
-        visited.keys.add_codes(shape, cell, &set.into_iter().collect::<Vec<_>>(), adds);
-    }
+    visited.keys.add_misses(&contents, adds);
     keys.iter().zip(&contents).map(|(&k, m)| (k, visited.keys.complete(m))).collect()
 }
 
@@ -1460,5 +1445,31 @@ mod tests {
         for r in [0..0, 0..1, 3..4, 100..2000, 17..olds.len(), olds.len() - 1..olds.len()] {
             assert_eq!(l.range(r.clone()).collect::<Vec<_>>(), olds[r.clone()], "range {r:?}");
         }
+    }
+
+    /// EXACT PLATFORMS ARE KEYED BY THE FIRST ONE (`widening::CLOCKS`):
+    /// room (6,0)'s ten platforms declare the first one's `spd.x` the
+    /// leader of the other `spd.x`s and its `rem.x` of every other platform
+    /// cell, and frame 0 seeds and decodes with them followers; in room
+    /// (2,1) (one platform) nothing is declared.
+    #[test]
+    fn exact_platforms_are_keyed_by_the_first() {
+        use celeste_engine::widening::key_deps;
+        let start_of = |s: &Settings| crate::engines::reference::RefEngine::new(s).expect("engine").initial().expect("start").canonicalized();
+        let s = Settings { room: (6, 0), split_frame: true, ..Default::default() };
+        let start = start_of(&s);
+        let platforms = start.objects_of_type(celeste_names::global("platform"));
+        assert_eq!(platforms.len(), 10, "room (6,0)'s platforms");
+        let deps = key_deps(&start);
+        let [speed, rest] = &deps[..] else { panic!("ten exact platforms: two dependencies, {deps:?}") };
+        assert_eq!(speed.followers.len(), 9, "the first platform's `spd.x` leads the other nine");
+        assert!(rest.followers.len() >= 10 * 3, "every platform's `x`, `rem.x` and `last` at least: {rest:?}");
+        let mut visited = VisitedSet::new();
+        seed(&mut visited, std::slice::from_ref(&start), Hull::full(), &s).expect("frame 0 decodes with its followers");
+        let sk = visited.keys.shape(start.shape_hash).expect("the start's shape");
+        assert_eq!(sk.follows().iter().map(|f| f.cells().to_vec()).collect::<Vec<_>>(), deps.iter().map(|d| d.followers.clone()).collect::<Vec<_>>());
+        assert!(deps.iter().flat_map(|d| &d.followers).all(|&c| sk.field(c as usize).is_none()), "no follower is keyed");
+        let s21 = Settings { room: (2, 1), ..Default::default() };
+        assert!(key_deps(&start_of(&s21)).is_empty(), "one platform: nothing to declare");
     }
 }

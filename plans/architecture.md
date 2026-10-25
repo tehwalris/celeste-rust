@@ -143,9 +143,7 @@ unknown split apart admit combinations no value gives).
 downstream cone per part, fold. Buttons, held trails and escaped atoms are
 2-way forks every lane takes both ways. `split::split_undecided_selects`
 runs after tracing: split a select driven by something lane-undecidable at
-its most upstream place, refold, dedupe outcomes. For the platforms it
-carries per path the (world, player pixel) POINTS its answers hold at
-(`split::Points`). `lower::specialize_frame` enumerates per outcome only
+its most upstream place, refold, dedupe outcomes. `lower::specialize_frame` enumerates per outcome only
 the forks in its own cone.
 
 **Error is derived, never carried** (`trace::error`): `error(n) =
@@ -186,10 +184,10 @@ every region has no kernel and stops the run.
 
 **Input assumptions are nodes on the raw input**, checked per lane
 (`Symbolic::assumptions`): `Restrict(lo, hi)` passes the value through with
-its range attached (the region's bounds, the no-player phase's hulls, the
-platforms' path); `Pin(c)` disconnects the input, every use reads the
+its range attached (the region's bounds, the no-player phase's hulls);
+`Pin(c)` disconnects the input, every use reads the
 constant (lattice constants; inputs read as a literal range so lanes merge:
-a platform's `rem.x`, the fly fruit's `spd.y`/`rem.y`). No input cell
+the fly fruit's `spd.y`/`rem.y`). No input cell
 carries a range; only a node does. The one assumption outside the family is
 open (below).
 
@@ -225,6 +223,32 @@ globals PRESENT, so appending a name to a table moves nothing.
 GLOBAL_NAMES' order is the cell numbering (the walk from the globals): a
 reordering is a different search.
 The concrete search compares whole states, never keys.
+
+**Key dependencies** (`exact::Deps`): a shape may declare FOLLOWER cells
+whose codes are a function of one LEADER cell's, several such disjoint
+groups a shape (`widening::CLOCKS`, `widening::key_deps`, from the shape
+alone; the shape's record carries them, so two producers under different
+layouts are fatal).
+Followers carry NO key bits: their codes are recorded per leader index when
+the leader's code is added (`KeySpace::add_misses`, replayed from
+`KeyAdditions` as `(shape, cell, leader index, code)`), decoded from the
+leader's index, and CHECKED on every row wherever a key is formed - the
+boundary (`row_keys`), a provisional key made final (`complete`, and new
+leader codes against each other in `add_misses`), the kernels' emission
+(`emit::check_follows`, per distinct leader index of a body's lanes). A
+difference is FATAL: two states differing only in a follower would share a
+key. A row whose leader misses carries its followers' codes in its
+provisional content. The one declaration: two or more moving platforms
+(room (6,0)'s ten) - the first one's `spd.x` leads the other `spd.x`s, its
+`rem.x` every other platform cell (`rem.x` alone cannot tell the room's
+first update from the load: `move` reads `spd.x` before that update sets
+it). The content hash is the layout's free (a leader's code hashes with its
+followers'). The kernels lay their templates out in `AsmKernel::of`, which
+a fresh build and a kernel cache hit share, and split each body's per-row
+fields into keyed ones and followers; a dependency cell neither per-row nor
+uniform in an outcome is a build error. The emission's dependency work is
+out of line (`emit::follow_lanes`): a shape without dependencies only tests
+for them.
 
 ## The room's start
 
@@ -329,12 +353,16 @@ resume.
 
 **The tree's record** (`storage::record`, `<level>/tree.txt`, one
 `key value` line each, rewritten whole and atomically): the settings that
-change the tree, the level included (a run under others is refused,
-`--override-settings` passes only `--region`); `level_minus_one` (the
+change the tree, the level included (a run under others is refused; the
+kernels' region grid is none of them: a tree is the same under every
+grid); `level_minus_one` (the
 filter: `off` or H, S and the table's fingerprint; a tree serves horizons
 up to H and is never raised past it; the TABLE itself is `l1-table.bin`
 beside it, which every reader and extension of the tree uses, whatever
-binary); `filtered_for` (a ladder level's marks, horizon and filter);
+binary); `orb_cut` (`off`, or in the orb room the horizon H the tree was
+started for: a row whose big chest is still closed too late for H is not
+expanded, so the tree is never raised past H either); `filtered_for` (a
+ladder level's marks, horizon and filter);
 `done` (the one trust marker: the frame and the transfer table's trusted
 length). Beside it, `forward.tsv` (per-frame stats).
 
@@ -481,21 +509,15 @@ verification surface behind it:
 
 ## Open issues
 
-- **The no-player platform's `spd.x`** (`trace/widen.rs`, the platform
-  input hook's no-player branch): read as its one moving speed v and owed
-  "0 or v" per lane (0 on the creation frame). The only input assumption
-  outside the Pin/Restrict family. Open: why the assertion is needed (the
-  move is unobservable without a player, `x` being the path at `p`), and
-  whether it should be a table entry plus a pin with a set check. Do not
-  change without Philippe.
 - **Absent-as-zero** fields (a fall floor's or spring's missing `delay`):
   exact modulo raises, guarded syntactically (`cart::check_absent_fields`);
   the clean form, a nil-or-number column, would re-pin everything.
-- **With `p`, an overlapped floor stores its computed value** because an
-  owe failed for unproven reasons; spurious states the concrete search
-  refutes.
-- **The split frame with `p`** reaches slightly fewer states than unsplit
-  in room (2,1) (unexplained).
+- **`check reference` at `f`** disagrees with the kernels from the first
+  step in room (6,0) (`r0sxhf`: the kernels 2 states a step through the
+  spawn, the reference 1; develop c67dbae6 alike): the reference engine
+  stores a row widened by the held buttons only (`UnitSink::row_key`),
+  the kernels the fly fruit too. `r0sxh` and `r0sx` agree. Its scope
+  should be stated, or the reference row widened as the kernels' is.
 - **`check arcs` at object levels** forks every straddling comparison on a
   widened phase (balloons, springs): room (7,0) `r0sxhn` exceeds its path
   cap. A different probe (concrete members of the row) is needed.
@@ -519,8 +541,7 @@ plans/refactor.md: `git show c4dd3241:plans/refactor.md`).
     `Rt2::player_objects`).
   - The tracer beyond its audit: one trace for every level (today each
     level re-traces), the split pass replaced. These change behaviour.
-  - `--category onlydiag` has no run yet (kept by Philippe); `--override-settings`
-    passes `--region` only.
+  - `--category onlydiag` has no run yet (kept by Philippe).
 - Dropped, with the reason:
   - Folding `widen::within` into `GraphArith::pieces_of` (the audit's
     T12): `within`'s facts from a select's `x op k` condition would change

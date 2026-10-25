@@ -1,12 +1,10 @@
-//! Concrete inputs and states: input bytes, reading a concrete row's
-//! fields, and the room's platform worlds. The concrete step itself is
-//! `RefEngine::step`.
+//! Concrete inputs and states: input bytes and reading a concrete row's
+//! fields. The concrete step itself is `RefEngine::step`.
 
 use anyhow::{anyhow, Context, Result};
 use celeste_core::arith::Arithmetic;
 use celeste_engine::runtime2::{Rt2, AV};
 
-use crate::engines::reference::ReferenceEngine;
 
 /// Human-readable input byte, e.g. "R+J", or "-" for none (bit 0 left,
 /// 1 right, 2 up, 3 down, 4 jump, 5 dash).
@@ -75,52 +73,6 @@ pub fn num_at<N: Arithmetic>(rt2: &Rt2<N>, obj: u32, path: &[&str]) -> Option<N>
         }
     }
     None
-}
-
-/// The platform fields a world fixes, as the arithmetic's numbers, in
-/// order: `x`, `last`, `rem.x`, `spd.x`, then the constant `y` and `dir`
-/// (what `widen::platform_inputs` matches a traced platform by).
-pub const WORLD_FIELDS: usize = 6;
-
-/// A room's platform worlds (`platform_worlds`): per world, per platform,
-/// its `WORLD_FIELDS`.
-pub struct PlatformWorlds<A: Arithmetic>(pub Vec<Vec<[A; WORLD_FIELDS]>>);
-
-/// THE PLATFORM WORLDS of the start room: every arrangement of its moving
-/// platforms in the first `frames` frames (`WORLD_FIELDS` per platform, in
-/// `objects` order), deduplicated.
-///
-/// Nothing the player does moves a platform, so the arrangement depends only
-/// on how many frames the platforms have updated (a freeze or restart only
-/// lowers that), and a no-input run visits every arrangement a search of up
-/// to `frames` frames can meet. The caller must refuse a longer search.
-/// `s`: the run's settings (its room); `A`: the arithmetic, whose reference
-/// engine runs the platforms (a double's `0.65` moves them otherwise).
-pub fn platform_worlds<A: Arithmetic>(frames: usize, s: &crate::settings::Settings) -> Result<PlatformWorlds<A>>
-where
-{
-    let mut eng = ReferenceEngine::<A>::new(s)?;
-    let mut state = eng.initial()?;
-    let mut seen: rustc_hash::FxHashSet<Vec<[A; WORLD_FIELDS]>> = Default::default();
-    let mut worlds = Vec::new();
-    for _ in 0..=frames {
-        let mut world = Vec::new();
-        for p in objects_of_type(&state, "platform") {
-            let field = |path: &[&str]| num_at(&state, p, path).ok_or_else(|| anyhow!("a platform without a numeric `{}`", path.join(".")));
-            // Its `x` and `last` are integers (the tracer's platform hook
-            // declares the input so: `Symbolic::integral_inputs`).
-            for path in [&["x"][..], &["last"]] {
-                let v = field(path)?;
-                anyhow::ensure!(A::num_eq(A::flr(v), v), "a platform's `{}` is {v:?}, not an integer", path.join("."));
-            }
-            world.push([field(&["x"])?, field(&["last"])?, field(&["rem", "x"])?, field(&["spd", "x"])?, field(&["y"])?, field(&["dir"])?]);
-        }
-        if seen.insert(world.clone()) {
-            worlds.push(world);
-        }
-        state = eng.step_one(&state, 0)?;
-    }
-    Ok(PlatformWorlds(worlds))
 }
 
 /// A WITNESS AS THE TOOLS NEED IT (`rewrite witness`; the category

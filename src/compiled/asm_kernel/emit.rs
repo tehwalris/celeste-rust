@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use celeste_core::arith::Arithmetic;
-use celeste_engine::exact::{Code, FieldDict, MissKey, ShapeKeys};
+use celeste_engine::exact::{follower_violation, Code, FieldDict, Follow, MissKey, ShapeKeys};
 use celeste_engine::runtime2::{Rt2, P8};
 
 use super::{AsmKernel, KernelLanes};
@@ -189,6 +189,28 @@ impl KeyField {
         miss
     }
 
+    /// The lanes whose code is `c` (a FOLLOWER's check against its record).
+    #[inline]
+    fn eq_code<N: KernelLanes>(&self, buf: &[u8], half: usize, c: Code<N>) -> u16 {
+        if self.read == Read::Bool {
+            let (v, k) = N::masks(buf, half, self.root);
+            return if c == Code::boolean(Some(true)) {
+                k & v
+            } else if c == Code::boolean(Some(false)) {
+                k & !v
+            } else if c == Code::boolean(None) {
+                !k
+            } else {
+                0
+            };
+        }
+        if !c.is_num() {
+            return 0;
+        }
+        let (lo, hi) = self.num_words::<N>(buf, half);
+        N::eq_word(&lo, &hi, c.word())
+    }
+
     /// Lane `i`'s code.
     fn code<N: KernelLanes>(&self, buf: &[u8], half: usize, i: usize) -> Code<N> {
         let w = |o: usize| N::lane(buf, half, o, i);
@@ -342,25 +364,34 @@ fn cells_of<N: KernelLanes>(set: &PosSet, buf: &[u8], half: usize, need: u16, st
     }
 }
 
+/// Key dependencies a shape may hold (`exact::Deps`) at emission.
+pub(super) const MAX_DEPS: usize = 4;
+
 /// An outcome's uniform fields in a key space: the packed codes that hit,
-/// the `(cell, code)` of those that miss.
+/// the `(cell, code)` of those that miss; which dependencies' leaders are
+/// among those (`exact::Deps`, a bit each), and per dependency the leader
+/// index its uniform followers were last checked at (`NONE`: none yet).
 pub(super) struct PartKey<N: Arithmetic = P8> {
     pub key: u128,
     pub missing: Vec<(u32, Code<N>)>,
+    leader_missing: u32,
+    checked: [u32; MAX_DEPS],
 }
 
 impl<N: Arithmetic> Default for PartKey<N> {
     fn default() -> Self {
-        PartKey { key: 0, missing: Vec::new() }
+        PartKey { key: 0, missing: Vec::new(), leader_missing: 0, checked: [celeste_engine::exact::NONE; MAX_DEPS] }
     }
 }
 
 impl<N: Arithmetic> PartKey<N> {
     /// `t`'s uniform fields in `sk` (`None`: a shape the key space lacks),
-    /// the template's signature checked against the key space's.
+    /// the template's record (signature and key layout) checked against the
+    /// key space's.
     pub(super) fn of(t: &super::AccTemplate<N>, sk: Option<&ShapeKeys<N>>) -> PartKey<N> {
         use celeste_engine::exact::NONE;
-        let Some(sk) = sk else { return PartKey { key: 0, missing: t.uniform.clone() } };
+        let Some(sk) = sk else { return PartKey { missing: t.uniform.clone(), leader_missing: u32::MAX, ..PartKey::default() } };
+        assert!(sk.record.deps == t.record.deps || sk.record.sig != t.record.sig, "exact keys: shape {:#x} under two key layouts", t.shape_hash);
         assert!(sk.record == t.record, "exact keys: two shapes under the hash {:#x} (a shape-hash collision)", t.shape_hash);
         let mut p = PartKey::default();
         for &(c, code) in &t.uniform {
@@ -368,6 +399,11 @@ impl<N: Arithmetic> PartKey<N> {
             match d.find(code) {
                 NONE => p.missing.push((c, code)),
                 i => p.key |= d.place(i),
+            }
+        }
+        for (g, fl) in sk.follows().iter().enumerate() {
+            if p.missing.iter().any(|m| m.0 == fl.leader()) {
+                p.leader_missing |= 1 << g;
             }
         }
         p
@@ -380,6 +416,10 @@ pub(super) struct BodyPlan {
     shape: u32,
     /// Its key fields (`Plan::reads`), as `Plan::body_reads[reads]`.
     reads: std::ops::Range<u32>,
+    /// Per dependency of its shape (`exact::Deps`), its leader's read where
+    /// per-row; its per-row followers, as `Plan::follows[follows]`.
+    leaders: Vec<Option<u32>>,
+    follows: std::ops::Range<u32>,
     arc: u32,
     pos: u32,
     /// Its (output shape, position set) column (`Plan::columns`).
@@ -395,6 +435,9 @@ pub(super) struct Plan {
     /// shape's.
     reads: Vec<(u32, KeyField)>,
     body_reads: Vec<u32>,
+    /// Per-row followers (each with its dependency and slot), checked per
+    /// body.
+    follows: Vec<(KeyField, u32, u32)>,
     /// Transfer root sets, each with the outcome of its first body (named
     /// by a decode failure).
     arcs: Vec<(ArcSlots, usize)>,
@@ -410,6 +453,10 @@ pub(super) struct BodyReads {
     pub outcome: usize,
     pub shape: u64,
     pub key_fields: Vec<KeyField>,
+    /// The per-row followers (`exact::Deps`) with their dependency and
+    /// slot, and each dependency's leader cell.
+    pub follow_fields: Vec<(KeyField, u32, u32)>,
+    pub leaders: Vec<u32>,
     pub arc: ArcSlots,
     pub pos: PosSet,
 }
@@ -422,19 +469,40 @@ fn intern<T: Clone + Eq + std::hash::Hash>(v: &mut Vec<T>, at: &mut HashMap<T, u
     })
 }
 
+/// A body's dependency reads (`Plan::follow_layout`): per dependency its
+/// leader's cell where per-row, and its per-row followers as `(cell,
+/// dependency, slot)`.
+#[cfg(test)]
+pub(crate) type FollowLayout = (Vec<Option<u32>>, Vec<(u32, u32, u32)>);
+
 impl Plan {
+    /// Body `bi`'s dependency reads.
+    #[cfg(test)]
+    pub(super) fn follow_layout(&self, bi: usize) -> FollowLayout {
+        let b = &self.bodies[bi];
+        let leaders = b.leaders.iter().map(|r| r.map(|r| self.reads[r as usize].1.cell)).collect();
+        let follows = self.follows[b.follows.start as usize..b.follows.end as usize].iter().map(|&(f, g, slot)| (f.cell, g, slot)).collect();
+        (leaders, follows)
+    }
+
     /// The plan of a kernel's bodies (in body order).
     pub(super) fn of(bodies: &[BodyReads]) -> Plan {
-        let mut p = Plan { shapes: Vec::new(), reads: Vec::new(), body_reads: Vec::new(), arcs: Vec::new(), pos: Vec::new(), columns: Vec::new(), bodies: Vec::with_capacity(bodies.len()) };
+        let mut p = Plan { shapes: Vec::new(), reads: Vec::new(), body_reads: Vec::new(), follows: Vec::new(), arcs: Vec::new(), pos: Vec::new(), columns: Vec::new(), bodies: Vec::with_capacity(bodies.len()) };
         let (mut shapes, mut reads, mut arcs, mut pos, mut columns) = (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new());
         let mut arc_sets: Vec<ArcSlots> = Vec::new();
         for b in bodies {
             let shape = intern(&mut p.shapes, &mut shapes, b.shape);
             let first = p.body_reads.len() as u32;
+            let mut leaders = vec![None; b.leaders.len()];
             for f in &b.key_fields {
                 let r = intern(&mut p.reads, &mut reads, (shape, *f));
                 p.body_reads.push(r);
+                if let Some(g) = b.leaders.iter().position(|&l| l == f.cell) {
+                    leaders[g] = Some(r);
+                }
             }
+            let follows = p.follows.len() as u32..(p.follows.len() + b.follow_fields.len()) as u32;
+            p.follows.extend_from_slice(&b.follow_fields);
             let n = arc_sets.len();
             let arc = intern(&mut arc_sets, &mut arcs, b.arc);
             if arc as usize == n {
@@ -442,7 +510,7 @@ impl Plan {
             }
             let ps = intern(&mut p.pos, &mut pos, b.pos);
             let column = intern(&mut p.columns, &mut columns, (shape, ps));
-            p.bodies.push(BodyPlan { shape, reads: first..p.body_reads.len() as u32, arc, pos: ps, column });
+            p.bodies.push(BodyPlan { shape, reads: first..p.body_reads.len() as u32, leaders, follows, arc, pos: ps, column });
         }
         p
     }
@@ -639,7 +707,7 @@ impl<N: KernelLanes> AsmKernel<N> {
             if parts[body.outcome].0 != generation {
                 parts[body.outcome] = (generation, PartKey::of(template, sk));
             }
-            let part = &parts[body.outcome].1;
+            let part = &mut parts[body.outcome].1;
             let mut packed = Placed::splat(part.key);
             let mut miss = 0u16;
             for &r in &plan.body_reads[b.reads.start as usize..b.reads.end as usize] {
@@ -651,12 +719,17 @@ impl<N: KernelLanes> AsmKernel<N> {
                 miss |= c.read_miss[r as usize];
             }
             miss &= take;
+            // THE FOLLOWERS (`exact::Deps`): where the leader hit, checked
+            // against the record (FATAL on a difference); where it missed,
+            // the row's content carries them.
+            let lead_miss = if b.leaders.is_empty() { [0u16; MAX_DEPS] } else { self.follow_lanes(bi, sk, part, &packed, take, &c.read_miss, buf, half) };
+            let part = &*part;
             let mut out_keys = [(0u64, 0u64); 16];
             for i in lanes_of(take) {
                 out_keys[i] = if miss >> i & 1 == 0 && part.missing.is_empty() {
                     (packed.0[1][i], packed.0[0][i])
                 } else {
-                    sink.provisional().intern(self.miss_key(bi, buf, half, i, &c.read_miss, shape, packed.get(i), &part.missing))
+                    sink.provisional().intern(self.miss_key(bi, buf, half, i, &c.read_miss, shape, packed.get(i), &part.missing, &lead_miss))
                 };
             }
             let targets = &c.targets[b.column as usize];
@@ -670,18 +743,98 @@ impl<N: KernelLanes> AsmKernel<N> {
 
     /// Body `bi`'s lane `i`'s exact content where a code is missing: its
     /// fields that hit packed (`partial`), and the outcome's and the body's
-    /// missing codes (a field whose read missed the lane, `read_miss`).
+    /// missing codes (a field whose read missed the lane, `read_miss`);
+    /// per dependency whose leader missed the lane (`lead_miss`), its
+    /// followers' codes too (`exact::KeySpace::row_keys`' content).
     #[allow(clippy::too_many_arguments)]
-    fn miss_key(&self, bi: usize, buf: &[u8], half: usize, i: usize, read_miss: &[u16], shape: u64, partial: u128, part_missing: &[(u32, Code<N>)]) -> MissKey<N> {
+    fn miss_key(&self, bi: usize, buf: &[u8], half: usize, i: usize, read_miss: &[u16], shape: u64, partial: u128, part_missing: &[(u32, Code<N>)], lead_miss: &[u16; MAX_DEPS]) -> MissKey<N> {
         let mut missing: Vec<(u32, Code<N>)> = part_missing.to_vec();
-        let r = &self.plan.bodies[bi].reads;
-        for &k in &self.plan.body_reads[r.start as usize..r.end as usize] {
+        let b = &self.plan.bodies[bi];
+        for &k in &self.plan.body_reads[b.reads.start as usize..b.reads.end as usize] {
             if read_miss[k as usize] >> i & 1 == 1 {
                 let f = &self.plan.reads[k as usize].1;
                 missing.push((f.cell, f.code::<N>(buf, half, i)));
             }
         }
+        if lead_miss.iter().any(|&m| m >> i & 1 == 1) {
+            let missed = |g: u32| lead_miss[g as usize] >> i & 1 == 1;
+            missing.extend(self.acc_templates[self.bodies[bi].outcome].uniform_follow.iter().filter(|u| missed(u.0)).map(|&(_, _, c, code)| (c, code)));
+            for &(f, g, _) in &self.plan.follows[b.follows.start as usize..b.follows.end as usize] {
+                if missed(g) {
+                    missing.push((f.cell, f.code::<N>(buf, half, i)));
+                }
+            }
+        }
         missing.sort_unstable_by_key(|m| m.0);
         MissKey { shape, partial: ((partial >> 64) as u64, partial as u64), missing }
+    }
+
+    /// Body `bi`'s lanes `take` per dependency of its shape: those whose
+    /// leader missed (returned: their content carries the followers), the
+    /// others' followers CHECKED (`check_follows`). Out of line: the
+    /// emission of a shape without dependencies only tests for them.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn follow_lanes(&self, bi: usize, sk: Option<&ShapeKeys<N>>, part: &mut PartKey<N>, packed: &Placed, take: u16, read_miss: &[u16], buf: &[u8], half: usize) -> [u16; MAX_DEPS] {
+        let mut lead_miss = [0u16; MAX_DEPS];
+        for (g, &leader) in self.plan.bodies[bi].leaders.iter().enumerate() {
+            lead_miss[g] = match (sk, leader) {
+                (None, _) => take,
+                _ if part.leader_missing >> g & 1 == 1 => take,
+                (Some(_), Some(r)) => read_miss[r as usize] & take,
+                (Some(_), None) => 0,
+            };
+            if let Some(sk) = sk {
+                self.check_follows(bi, sk, g, part, packed, take & !lead_miss[g], buf, half);
+            }
+        }
+        lead_miss
+    }
+
+    /// THE FOLLOWER CHECK of dependency `g` on body `bi`'s `lanes` (their
+    /// leader hit): per distinct leader index among them, every follower's
+    /// code is the one the key space recorded with it - the outcome's
+    /// uniform ones once an index (`PartKey::checked`), the per-row ones
+    /// lane-parallel. A difference is FATAL (`exact::follower_violation`).
+    #[allow(clippy::too_many_arguments)]
+    fn check_follows(&self, bi: usize, sk: &ShapeKeys<N>, g: usize, part: &mut PartKey<N>, packed: &Placed, lanes: u16, buf: &[u8], half: usize) {
+        let fl: &Follow<N> = &sk.follows()[g];
+        let ld = sk.field(fl.leader() as usize).expect("the leader is keyed");
+        let mask = ld.mask();
+        let (m0, m1) = (mask as u64, (mask >> 64) as u64);
+        let b = &self.plan.bodies[bi];
+        let follows = &self.plan.follows[b.follows.start as usize..b.follows.end as usize];
+        let uniform = &self.acc_templates[self.bodies[bi].outcome].uniform_follow;
+        let mut left = lanes;
+        while left != 0 {
+            let r = left.trailing_zeros() as usize;
+            let (k0, k1) = (packed.0[0][r] & m0, packed.0[1][r] & m1);
+            let mut same = 0u16;
+            for i in lanes_of(left) {
+                if packed.0[0][i] & m0 == k0 && packed.0[1][i] & m1 == k1 {
+                    same |= 1 << i;
+                }
+            }
+            left &= !same;
+            let idx = ld.index_in((packed.0[1][r], packed.0[0][r]));
+            assert!((idx as usize) < ld.len(), "exact keys: shape {:#x}: a leader index {idx} past its {} codes", sk.record.hash, ld.len());
+            let at = |lane: usize| format!("the kernels' emission, body {bi} lane {lane}");
+            if part.checked[g] != idx {
+                for &(_, slot, cell, code) in uniform.iter().filter(|u| u.0 as usize == g) {
+                    if fl.code(slot as usize, idx) != code {
+                        follower_violation(sk.record.hash, fl.leader(), ld.code(idx), idx, cell, code, fl.code(slot as usize, idx), &at(r));
+                    }
+                }
+                part.checked[g] = idx;
+            }
+            for &(f, _, slot) in follows.iter().filter(|f| f.1 as usize == g) {
+                let want = fl.code(slot as usize, idx);
+                let eq = f.eq_code::<N>(buf, half, want) & same;
+                if eq != same {
+                    let lane = (same & !eq).trailing_zeros() as usize;
+                    follower_violation(sk.record.hash, fl.leader(), ld.code(idx), idx, f.cell, f.code::<N>(buf, half, lane), want, &at(lane));
+                }
+            }
+        }
     }
 }
