@@ -716,8 +716,7 @@ impl<N: Rem> ForwardState<N> {
                 eprintln!("[fwd] first win at f{frame}");
             }
         }
-        crate::compiled::print_kernel_stats(&total);
-        Ok(())
+        crate::compiled::print_kernel_stats(&total)
     }
 }
 

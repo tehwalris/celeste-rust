@@ -352,7 +352,7 @@ where
     }
     println!("[check ref] {n} rows ({skipped} SKIPPED over the path cap): {rows_bad} differ; {sound_gaps} successors only in the reference, {precision_gaps} only in the kernels");
     println!("[check ref] the one converter: {alike} lanes (the rows, their kernel successors and reference leaves) convert alike on both sides");
-    celeste_rust::compiled::print_kernel_stats(&kernel_stats);
+    celeste_rust::compiled::print_kernel_stats(&kernel_stats)?;
     differential::verdict(n - skipped, sound_gaps, || format!("check ref: {sound_gaps} reference successors the kernels miss (a SOUNDNESS gap)"))
 }
 

@@ -98,10 +98,12 @@ registry! {
     Bundles "bundles" Count Bundles;
     WaitedSegments "waited_segments" Count WaitedSegments;
     WaitedBundles "waited_bundles" Count WaitedBundles;
-    // The kernels' calls (`compiled::print_kernel_stats`): the calls, the
-    // rows they ran, their 16-lane slices, the (body, slice) evaluations
-    // and those that took a lane, the lanes the bodies took (before level
-    // -1; `lanes_raw` after it).
+    // The kernels' calls (`compiled::print_kernel_stats`): the lanes given
+    // them, the calls, the rows they ran (every lane given: none missed),
+    // their 16-lane slices, the (body, slice) evaluations and those that
+    // took a lane, the lanes the bodies took (before level -1; `lanes_raw`
+    // after it).
+    KernelLanesIn "kernel_lanes_in" Count KernelLanesIn;
     KernelCalls "kernel_calls" Count KernelCalls;
     KernelRows "kernel_rows" Count KernelRows;
     KernelSlices "kernel_slices" Count KernelSlices;

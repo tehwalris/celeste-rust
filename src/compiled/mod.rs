@@ -162,6 +162,7 @@ impl<N: KernelLanes> Kernels<N> {
         lanes: &[usize],
         sink: &mut crate::storage::unit::UnitSink<N>,
     ) {
+        sink.stats.add(crate::storage::stats::S::KernelLanesIn, lanes.len() as u64);
         if !self.registry().run_chunk(bucket, cell_in, lanes, sink) {
             // A COVERAGE GAP, not a degraded mode: there is no fallback.
             // The search resumes from the last completed frame's checkpoint.
@@ -176,19 +177,20 @@ impl<N: KernelLanes> Kernels<N> {
     }
 }
 
-/// The `kernel lanes:` (`missed 0` is what every log must say: a miss is
-/// FATAL in `Kernels::run_bucket`, so a run that prints this missed none),
-/// `kernel calls:` and `kernel utilization:` lines of `st`, the stats of
-/// the frames the kernels ran.
-pub fn print_kernel_stats(st: &crate::storage::stats::Stats) {
+/// The `kernel lanes:`, `kernel calls:` and `kernel utilization:` lines of
+/// `st`, the stats of the frames the kernels ran. `missed` is the lanes
+/// given the kernels that no slice ran: 0 in every log (a miss is FATAL in
+/// `Kernels::run_bucket`), and an error otherwise.
+pub fn print_kernel_stats(st: &crate::storage::stats::Stats) -> Result<()> {
     use crate::storage::stats::S;
-    let [calls, rows, slices, bodies, taken, takes, emitted] =
-        [S::KernelCalls, S::KernelRows, S::KernelSlices, S::KernelBodies, S::KernelBodiesTaken, S::KernelTakes, S::Emissions].map(|k| st.get(k));
+    let [lanes_in, calls, rows, slices, bodies, taken, takes, emitted] =
+        [S::KernelLanesIn, S::KernelCalls, S::KernelRows, S::KernelSlices, S::KernelBodies, S::KernelBodiesTaken, S::KernelTakes, S::Emissions].map(|k| st.get(k));
     if calls == 0 {
-        return;
+        return Ok(());
     }
     let slice_lanes = 16 * slices;
-    eprintln!("kernel lanes: traced {rows} missed 0");
+    let missed = lanes_in.checked_sub(rows).ok_or_else(|| anyhow::anyhow!("the kernels ran {rows} rows of the {lanes_in} lanes given them"))?;
+    eprintln!("kernel lanes: traced {rows} missed {missed}");
     eprintln!(
         "kernel calls: {calls} calls, {rows} rows ({:.1} rows/call), {slice_lanes} slice-lanes executed ({:.1}% padding)",
         rows as f64 / calls as f64,
@@ -201,6 +203,8 @@ pub fn print_kernel_stats(st: &crate::storage::stats::Stats) {
         takes as f64 / rows.max(1) as f64,
         100.0 * emitted as f64 / takes.max(1) as f64
     );
+    anyhow::ensure!(missed == 0, "the kernels missed {missed} of the {lanes_in} lanes given them");
+    Ok(())
 }
 
 /// The compiled `FrameStep` (the reference's: `RefEngine`).

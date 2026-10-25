@@ -187,7 +187,7 @@ fn bench_frame<N: Rem + celeste_rust::compiled::KernelLanes>(t: &TreeDir, a: &Fr
             Some(first) => anyhow::ensure!(*first == out, "rep {rep} differs from rep 0:\n{out}against\n{first}"),
         }
         if rep == 0 {
-            celeste_rust::compiled::print_kernel_stats(&costs[0].stats);
+            celeste_rust::compiled::print_kernel_stats(&costs[0].stats)?;
             if let Some(path) = &a.metrics {
                 let kernels = celeste_rust::check::census::counted(&engine, level, cfg)?;
                 let slices: u64 = kernels.iter().map(|k| k.1).sum();
