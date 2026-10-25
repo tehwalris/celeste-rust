@@ -145,11 +145,11 @@ frame() {
     ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --step "$f" --edges --checkpoint --threads "$TH" --expect "$G/$name.frame" "${m[@]}" $PIN > "$C/$name.frame"
 }
 
-# keycheck NAME STEP: the step's rows' keys recomputed (--key-check), and
-# the pinned f/h/e lines.
+# keycheck NAME STEP: the step's rows' keys recomputed at the boundary
+# (`check keys`), and the pinned f/h/e lines.
 keycheck() {
     local name=$1 f=$2
-    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --step "$f" --edges --threads "$TH" --key-check --expect "$G/$name.frame" > "$C/keycheck-$name.frame"
+    ./safe-run.sh --memory "$MEM" -- "$B" check keys --tree "$F/$name" --step "$f" --threads "$TH" --expect "$G/$name.frame" > "$C/keycheck-$name.frame"
 }
 
 # widencheck NAME FRAME: `rewrite check widen` of a fixture's frame (the

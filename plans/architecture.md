@@ -218,7 +218,8 @@ code), each field's index in append-only bit runs of a 127-bit key that
 never moves as dictionaries grow. A shape needing more bits is fatal. The
 append step looks keys up read-only during a wave; a code they lack makes
 the key PROVISIONAL until the frame's end appends the new codes sorted.
-`--key-check` compares every row's key with `Rt2::boundary_canonicalize`.
+`check keys` compares every row's key with `Rt2::boundary_canonicalize`
+(`check::keys`, through the forward's one observer seam `frame::RowCheck`).
 
 The key holds NO POSITION: the position object's x/y contribute only their
 part past the cell's whole pixel (`Code::pos`). States sharing all but the
@@ -510,7 +511,7 @@ verification surface behind it:
   errors produce a wrong optimum or a false tie, never a fake improvement,
   so nothing else notices them.
 - **Kernels against the reference**: `check ref` (row by row),
-  `--key-check` (keys against the boundary), `check widen` (the widening
+  `check keys` (keys against the boundary), `check widen` (the widening
   table's two sides agree), `check arcs` (every edge has a transfer;
   sampled transfers probed with the reference inside and outside their
   guards). `kernel lanes: missed 0` in every log.

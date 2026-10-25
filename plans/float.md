@@ -135,7 +135,7 @@ The float kernels are the same graph, lowered to `vaddpd`-class AVX-512 on
   same glibc symbol).
 - `NoWrap` is FINITE: an operation that can leave the finite doubles is
   its own error, and a lane in error is a fatal coverage gap.
-- Checked as in fixed: `check ref`, `--key-check`, `check widen`,
+- Checked as in fixed: `check ref`, `check keys`, `check widen`,
   `check arcs`, `missed 0`; the float trees of (1,0) to f44 and (1,3) to f46
   equal the float reference engine's, frame by frame (`ckhash --edges
   --hulls`). The kernel census (`bench frame --metrics`,

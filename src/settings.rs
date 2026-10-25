@@ -216,11 +216,6 @@ pub struct Settings {
 /// Self-checks, logs and dumps: none changes a result.
 #[derive(clap::Args, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Diagnostics {
-    /// DIAGNOSTIC: every emitted row's key recomputed by the boundary, and
-    /// the row decoded back from its key and cell (the new layer is
-    /// decoded so) and compared.
-    #[arg(long, global = true)]
-    pub key_check: bool,
     /// DIAGNOSTIC: the wave workers' phase timings.
     #[arg(long, global = true)]
     pub phases: bool,
@@ -282,7 +277,6 @@ impl Settings {
             row("level_minus_one", none(self.level_minus_one.map(|(h, s)| format!("{h},{s}"))), false),
             row("concrete_balloon_seeds", none(self.concrete_balloon_seeds.clone()), false),
             row("threads", none(self.threads.map(|t| t.to_string())), false),
-            switch("key_check", self.diag.key_check, false),
             switch("phases", self.diag.phases, false),
         ]
     }
@@ -756,7 +750,7 @@ mod tests {
     fn a_record_reads_back() {
         let dir = std::env::temp_dir().join(format!("celeste-settings-back-{}", std::process::id()));
         let lvl = crate::abstraction::Level::parse("r0sxf").expect("a level");
-        let run = Settings { threads: Some(3), region: Some((8, 6)), diag: Diagnostics { key_check: true, ..Default::default() }, ..Settings::default() };
+        let run = Settings { threads: Some(3), region: Some((8, 6)), diag: Diagnostics { phases: true }, ..Settings::default() };
         let all = Settings { room: (6, 2), win_at: Some((8, 10, 64, 64)), split_frame: true, category: Category::GemskipNodiag, loading_jank: Some(2), balloon_seeds: Some("0,1".into()), ..run.clone() };
         let float = Settings { arith: Arith::Float(FloatTool::Uct), loading_jank: None, category: Category::Onlydiag, ..all.clone() };
         for s in [Settings { threads: Some(3), ..run.clone() }, all, float] {
@@ -813,7 +807,7 @@ mod tests {
         assert!(e.to_string().contains("has no record"), "{e}");
         sample.write(&dir, lvl("r0sxf")).expect("write");
         sample.check(&dir, lvl("r0sxf")).expect("the same settings");
-        let harmless = Settings { threads: Some(3), level_minus_one: Some((94, 5)), diag: Diagnostics { key_check: true, ..Default::default() }, ..sample.clone() };
+        let harmless = Settings { threads: Some(3), level_minus_one: Some((94, 5)), diag: Diagnostics { phases: true }, ..sample.clone() };
         harmless.check(&dir, lvl("r0sxf")).expect("threads, level -1 and diagnostics are not a tree's settings");
         let other = Settings { category: Category::Any, split_frame: true, win_at: Some((8, 8, 64, 64)), ..sample.clone() };
         let e = other.check(&dir, lvl("r0sx")).expect_err("other settings").to_string();
