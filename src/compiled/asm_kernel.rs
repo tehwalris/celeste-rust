@@ -950,7 +950,7 @@ impl<N: KernelLanes> Registry<N> {
                 for (i, (recipe, so)) in entry.into_iter().enumerate() {
                     let loaded = Loaded::from_bytes(&so, &format!("cached_{i}"), &recipe.compiled.sym)?;
                     let k = (recipe.shape, recipe.region);
-                    anyhow::ensure!(kernels.insert(k, AsmKernel::of(recipe, loaded, cache.clone(), None, opts)?).is_none(), "the kernel cache's entry {} holds kernel {k:?} twice", key.name);
+                    anyhow::ensure!(kernels.insert(k, AsmKernel::of(recipe, loaded, cache.clone(), None)?).is_none(), "the kernel cache's entry {} holds kernel {k:?} twice", key.name);
                 }
                 unify(&mut kernels)?;
                 eprintln!("[asm build] {} kernels: kernel cache HIT {}, {:.2}s; kernel text {:016x}", kernels.len(), key.name, t0.elapsed().as_secs_f64(), text_digest(&kernels));
@@ -975,7 +975,7 @@ impl<N: KernelLanes> Registry<N> {
             let (recipe, loaded, graphs) = build_one_shape::<N>(r, (r.frame.in_rt2.shape_hash_of(), *region), si, build, &mut times)?;
             let stored = store.is_some().then(|| Ok::<_, anyhow::Error>((recipe.clone(), loaded.bytes()?))).transpose()?;
             let key = (recipe.shape, recipe.region);
-            Ok((key, AsmKernel::of(recipe, loaded, r.cache.clone(), graphs, opts)?, times, stored))
+            Ok((key, AsmKernel::of(recipe, loaded, r.cache.clone(), graphs)?, times, stored))
         })?;
         let mut kernels = HashMap::new();
         let mut first: HashMap<(u64, Option<Region>), usize> = HashMap::new();
@@ -1215,12 +1215,11 @@ impl<N: Arithmetic> Skeleton<N> {
 }
 
 impl<N: Arithmetic> AccTemplate<N> {
-    /// The template of skeleton `own` (`shape_hash` its shape's) at
-    /// `level`: the key's uniform fields (every value cell uniform here, at
-    /// its widened value; a follower's among `uniform_follow`) and the
-    /// shape's record, its key laid out as the level declares
-    /// (`Level::key_deps`).
-    fn of(own: Rt2<N>, shape_hash: u64, level: crate::abstraction::Level) -> Result<AccTemplate<N>> {
+    /// The template of skeleton `own` (`shape_hash` its shape's): the key's
+    /// uniform fields (every value cell uniform here, at its widened value;
+    /// a follower's among `uniform_follow`) and the shape's record, its key
+    /// laid out as the shape declares (`widening::key_deps`).
+    fn of(own: Rt2<N>, shape_hash: u64) -> Result<AccTemplate<N>> {
         let pos = own.position_cells();
         let mut uniform = Vec::new();
         for (c, cell) in own.structure.iter().enumerate() {
@@ -1232,7 +1231,7 @@ impl<N: Arithmetic> AccTemplate<N> {
         }
         let mut canon = own.clone_block();
         canon.shape_hash = shape_hash;
-        let record = ShapeRecord::of(&canon, level);
+        let record = ShapeRecord::of(&canon);
         anyhow::ensure!(record.deps.len() <= emit::MAX_DEPS, "shape {shape_hash:#x}: {} key dependencies, past the emission's {}", record.deps.len(), emit::MAX_DEPS);
         // The followers are no dictionary's: theirs is the record by leader.
         let (follow, uniform): (Vec<_>, Vec<_>) = uniform.into_iter().partition(|(c, _)| follower_of(&record, *c).is_some());
@@ -1362,20 +1361,18 @@ fn build_one_shape<N: KernelLanes>(
 }
 
 impl<N: KernelLanes> AsmKernel<N> {
-    /// The kernel of `recipe`, its code `loaded`, in `cache`'s room, its
-    /// keys laid out as `level` declares (`graphs`: `--kernel-explain`'s
-    /// fused graph and roots): its accumulator templates, its bodies on
-    /// their slots with what each reads at emission (`emit::Plan`), the
-    /// earlier bodies each repeats.
+    /// The kernel of `recipe`, its code `loaded`, in `cache`'s room (`graphs`:
+    /// `--kernel-explain`'s fused graph and roots): its accumulator
+    /// templates, its bodies on their slots with what each reads at
+    /// emission (`emit::Plan`), the earlier bodies each repeats.
     fn of(
         recipe: Recipe<N>,
         loaded: Loaded,
         cache: std::sync::Arc<celeste_core::collision_cache::CollisionCache>,
         graphs: Graphs<N>,
-        level: crate::abstraction::Level,
     ) -> Result<AsmKernel<N>> {
         let Recipe { shape: recipe_shape, compiled, forks, fused_nodes, may_unknown, bodies, outcomes, input_names, census, .. } = recipe;
-        let acc_templates: Vec<AccTemplate<N>> = outcomes.iter().map(|sk| AccTemplate::of(sk.rt2(cache.clone()), sk.shape_hash, level)).collect::<Result<_>>()?;
+        let acc_templates: Vec<AccTemplate<N>> = outcomes.iter().map(|sk| AccTemplate::of(sk.rt2(cache.clone()), sk.shape_hash)).collect::<Result<_>>()?;
         // Per outcome, its position coordinates' cells (keyed without their whole pixels).
         let pos_cells: Vec<Option<(u32, u32)>> = acc_templates.iter().map(|t| t.own.position_cells()).collect();
         let off = |s: u32| compiled.root_offsets[s as usize] as usize;

@@ -335,9 +335,6 @@ pub struct Symbolic<A: GraphArith = Fixed> {
     pub level: celeste_engine::widening::Level,
     /// Keep undecided selects as selects (level -1); off, they become forks.
     pub no_known_forks: bool,
-    /// THE PLATFORM WORLDS: every arrangement of the moving platforms' `(x,
-    /// last, rem.x, spd.x)`. The split pass decides comparisons per world.
-    pub worlds: Option<std::sync::Arc<crate::concrete::PlatformWorlds<A>>>,
     /// What THIS trace accumulates (`frame::trace` starts each from a fresh
     /// one).
     pub frame: FrameScratch<A>,
@@ -381,11 +378,6 @@ pub struct FrameScratch<A: GraphArith = Fixed> {
     /// (`frame::trace_frame`'s `merge_refused_on`, `set_merge_refused`).
     merge_refused: Vec<u32>,
     merge_refused_memo: rustc_hash::FxHashMap<NodeId, bool>,
-    /// The platforms' `x` input cells, in the worlds' order.
-    pub platform_cells: Vec<NodeId>,
-    /// The inputs the hooks declare INTEGER-valued on every lane (a
-    /// platform's `x`), for `cancel_sub` where addition rounds.
-    pub integral_inputs: rustc_hash::FxHashSet<NodeId>,
 }
 
 use crate::transpile::garith::Pieces;
@@ -543,10 +535,10 @@ impl<A: GraphArith> Symbolic<A> {
         (node.op == Op::Sel && holds(&self.graph, n)).then(|| (node.args[0], node.args[1], node.args[2]))
     }
 
-    /// Is anything unknown in the traced set (fly fruit, platforms)? Enables
+    /// Is anything unknown in the traced set (the fly fruit)? Enables
     /// literal folding, independent joins and literal splits.
     pub fn unknowns(&self) -> bool {
-        self.level.fruit || self.level.platforms
+        self.level.fruit
     }
 
     /// `n` as `base + literal` (either side), else `n + 0`.
@@ -688,9 +680,9 @@ impl<A: GraphArith> Symbolic<A> {
     }
 
     /// Is `n` an integer on every lane? A whole literal, a floor, an integer
-    /// fork's fragment, an input a hook declares integral, and sums,
-    /// differences, negations, `abs`, `min`, `max` and selects of those (a
-    /// rounded sum of integers is an integer). Structural; `false` if unsure.
+    /// fork's fragment, and sums, differences, negations, `abs`, `min`, `max`
+    /// and selects of those (a rounded sum of integers is an integer).
+    /// Structural; `false` if unsure.
     fn integral(&self, n: NodeId, depth: u32) -> bool {
         if depth > 32 {
             return false;
@@ -703,7 +695,6 @@ impl<A: GraphArith> Symbolic<A> {
                 A::num_eq(A::flr(v), v)
             }
             Op::Flr | Op::Frag(Cut::Ints, _) => true,
-            Op::Restrict(..) if self.frame.integral_inputs.contains(&n) => true,
             Op::Add | Op::Sub | Op::Neg | Op::Abs | Op::Min | Op::Max => all(&node.args),
             Op::Sel => all(&node.args[1..]),
             _ => false,
@@ -1357,7 +1348,7 @@ mod tests {
         }
     }
 
-    /// `__split_by_round` of a LITERAL (a platform's `rem.x + spd.x` in
+    /// `__split_by_round` of a LITERAL (a literal remainder plus a speed, in
     /// float) splits into the arithmetic's round fragments, as a literal
     /// `__split_by_flr` into its floors; a point is no split.
     #[test]
@@ -1366,8 +1357,8 @@ mod tests {
         use celeste_core::lua_f64::{LuaF64, LuaF64Interval};
         let f = |v: f64| LuaF64::new(v).expect("finite");
         let mut d = Symbolic::<Float>::default();
-        d.level.platforms = true;
-        // The literal rem [-1/2, pred(1/2)] plus a platform's speed -0.65.
+        d.level.fruit = true;
+        // The literal rem [-1/2, pred(1/2)] plus a speed -0.65.
         let iv = LuaF64Interval::new(f(-0.5), f(0.5f64.next_down())).checked_add(LuaF64Interval::point(f(-0.65))).expect("finite");
         let lit = d.graph.leaf(Op::Const(Float::lit(iv.lo), Float::lit(iv.hi)));
         let frags = d.literal_fragments(&lit, true).expect("in range").expect("a split");

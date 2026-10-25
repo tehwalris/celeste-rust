@@ -11,7 +11,7 @@
 //!                    dictionary has yet (new by construction)
 //!   * `ExactRow`   - a whole state's canonical bytes (the concrete search's
 //!                    dedup, independent of any tree)
-//!   * `Deps`       - a FUNCTIONAL DEPENDENCY a level declares in a shape:
+//!   * `Deps`       - a FUNCTIONAL DEPENDENCY a shape declares:
 //!                    FOLLOWER cells whose codes are a function of a LEADER
 //!                    cell's; they carry no key bits (`Follow`)
 //!
@@ -33,7 +33,6 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::runtime2::{mix64, Cell2, Rt2, AV, P8};
-use crate::widening::Level;
 
 /// A packed key: (bits 64..127, bits 0..63). Bit 127 tags a PROVISIONAL key.
 pub type Key = (u64, u64);
@@ -429,8 +428,8 @@ pub fn shape_sig<N: Arithmetic>(rt2: &Rt2<N>) -> Vec<u32> {
     s
 }
 
-/// A FUNCTIONAL DEPENDENCY within a shape (a level's declaration,
-/// `widening::Level::key_deps`): every FOLLOWER cell's code is a function of
+/// A FUNCTIONAL DEPENDENCY within a shape (its declaration,
+/// `widening::key_deps`): every FOLLOWER cell's code is a function of
 /// the LEADER cell's. Followers carry no key bits; their codes are recorded
 /// per leader index (`Follow`) and checked on every row (module doc). A
 /// shape may hold several, their cells disjoint.
@@ -453,10 +452,10 @@ pub struct ShapeRecord {
 }
 
 impl ShapeRecord {
-    /// `rt2`'s shape, its key laid out as `level` declares
-    /// (`Level::key_deps`).
-    pub fn of<N: Arithmetic>(rt2: &Rt2<N>, level: Level) -> ShapeRecord {
-        ShapeRecord { hash: rt2.shape_hash, sig: shape_sig(rt2), pos: rt2.position_cells(), deps: level.key_deps(rt2) }
+    /// `rt2`'s shape, its key laid out as it declares
+    /// (`widening::key_deps`).
+    pub fn of<N: Arithmetic>(rt2: &Rt2<N>) -> ShapeRecord {
+        ShapeRecord { hash: rt2.shape_hash, sig: shape_sig(rt2), pos: rt2.position_cells(), deps: crate::widening::key_deps(rt2) }
     }
 }
 
@@ -505,7 +504,7 @@ impl<N: Arithmetic> Follow<N> {
 pub fn follower_violation<N: Arithmetic>(shape: u64, leader: u32, lcode: Code<N>, idx: u32, cell: u32, got: Code<N>, want: Code<N>, at: &str) -> ! {
     panic!(
         "exact keys: shape {shape:#x}: follower cell {cell} holds {:?} where the leader cell {leader} holds {:?} (index {idx}), \
-         recorded with {:?} ({at}): the level's declared key dependency is VIOLATED, and the two states would share a key",
+         recorded with {:?} ({at}): the declared key dependency is VIOLATED (`widening::CLOCKS`), and the two states would share a key",
         got.value(),
         lcode.value(),
         want.value()
@@ -1112,14 +1111,13 @@ impl<N: Arithmetic> KeySpace<N> {
     }
 
     /// Add every code of the rows of `blocks` (CANONICAL) the dictionaries
-    /// lack - per field SORTED - and their shapes, laid out as `level`
-    /// declares: frame 0's seeding.
-    pub fn absorb(&mut self, blocks: &[&Rt2<N>], level: Level) -> KeyAdditions<N> {
+    /// lack - per field SORTED - and their shapes: frame 0's seeding.
+    pub fn absorb(&mut self, blocks: &[&Rt2<N>]) -> KeyAdditions<N> {
         let mut adds = KeyAdditions::default();
         let mut shapes: Vec<&Rt2<N>> = blocks.to_vec();
         shapes.sort_by_key(|b| b.shape_hash);
         for b in &shapes {
-            self.add_shape(&ShapeRecord::of(b, level), &mut adds);
+            self.add_shape(&ShapeRecord::of(b), &mut adds);
         }
         let misses: Vec<MissKey<N>> = blocks
             .iter()
