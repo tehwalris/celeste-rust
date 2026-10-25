@@ -8,7 +8,10 @@
 //! released. Where this cart deliberately differs from the tracer's
 //! (`trace::cart`), the difference is a named variant (`Fenced`), its
 //! default what this replay has always done: plans/correctness.md C4 (the
-//! loading frame's move) and C11 (the order seeds are handed out).
+//! loading frame's move). A file's `[seeds]` go to the room's balloons and
+//! chests in CREATION order, as the TAS tools hand them out (C11:
+//! UniversalClassicTas `set_seeds` and Celia `load_rng_seeds` walk the
+//! room's object list) and the search seeds them (`trace::cart::room_objects`).
 
 use anyhow::{bail, ensure, Context, Result};
 use std::path::{Path, PathBuf};
@@ -54,28 +57,14 @@ pub enum LoadingMove {
     Guarded,
 }
 
-/// C11 (plans/correctness.md, FENCED): which object a `[seeds]` entry is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum SeedOrder {
-    /// Each balloon's and chest's `init` takes the next seed as it runs (a
-    /// chain: per room, from its first at every load): this replay's,
-    /// always.
-    Pop,
-    /// By the object's place among the room's seeded objects in creation
-    /// order (`trace::cart::room_objects`), as the search seeds them: the
-    /// same seed at every load.
-    Creation,
-}
-
 /// The fenced differences from the tracer's cart (module doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fenced {
     pub loading_move: LoadingMove,
-    pub seed_order: SeedOrder,
 }
 
 /// What this replay has always done.
-pub const FENCED: Fenced = Fenced { loading_move: LoadingMove::Unguarded, seed_order: SeedOrder::Pop };
+pub const FENCED: Fenced = Fenced { loading_move: LoadingMove::Unguarded };
 
 /// One room of a CHAIN: its room, its `[seeds]` as written, its inputs
 /// from the frame its player is created (the tasdatabase's convention).
@@ -156,8 +145,8 @@ pub fn cart(spec: &Spec) -> Result<String> {
     };
     let (room, inputs, seeds): ((i16, i16), &[u8], Option<&[String]>) = match &spec.play {
         Play::Room { room, inputs, seeds } => (*room, inputs, seeds.as_deref()),
-        // The chain's own seeds are its segments' (`__room_seeds`); the
-        // last segment's inputs still name `__inputs`.
+        // The chain's own seeds are its segments' (`seed_table`); the last
+        // segment's inputs still name `__inputs`.
         Play::Chain(segs) => {
             let (first, last) = (segs.first().context("a chain without segments")?, segs.last().expect("one"));
             (first.room, &last.inputs, Some(&[][..]))
@@ -173,13 +162,11 @@ pub fn cart(spec: &Spec) -> Result<String> {
         // `set_seeds`); a chest's seed s is what its LAST shake's `rnd(3)`
         // returns minus 1 (the tool's chest update), so its berry appears at
         // x = start + s. The earlier shakes only draw it.
-        let (balloon, chest) = match spec.fenced.seed_order {
-            SeedOrder::Pop => ("__balloon_seed()", "__balloon_seed()"),
-            // The chest's init has moved it 4 px left by then.
-            SeedOrder::Creation => ("__seed_at(this.x,this.y)", "__seed_at(this.x+4,this.y)"),
-        };
-        replace_once(&mut lua, "this.offset=rnd(1)", &format!("this.offset={balloon}"), "")?;
-        replace_once(&mut lua, "this.timer=20", &format!("this.timer=20 this.seed={chest}"), "")?;
+        // Each object's seed by its place among the room's seeded objects in
+        // creation order (`seed_table`): the same at every load. The chest's
+        // init has moved it 4 px left by then.
+        replace_once(&mut lua, "this.offset=rnd(1)", "this.offset=__seed_at(this.x,this.y)", "")?;
+        replace_once(&mut lua, "this.timer=20", "this.timer=20 this.seed=__seed_at(this.x+4,this.y)", "")?;
         replace_once(&mut lua, "this.x=this.start-1+rnd(3)", "this.x=this.start-1+(this.timer<=0 and this.seed+1 or rnd(3))", "")?;
     }
     // Each dash START, as the game itself decides it: the player's dash
@@ -199,8 +186,6 @@ pub fn cart(spec: &Spec) -> Result<String> {
     let mut prelude = vec![format!("__begin_game = {begin_game}")];
     prelude.extend(HOOK_STUBS.iter().map(|(_, stub)| stub.to_string()));
     prelude.extend([
-        format!("__balloon_seeds = {}", lua_list(seeds.unwrap_or(&[]))),
-        "function __balloon_seed() return deli(__balloon_seeds, 1) or 0 end".into(),
         format!("__inputs = {}", lua_list(inputs)),
         "__frame = 0".into(),
         "function btn(i)".into(),
@@ -212,17 +197,15 @@ pub fn cart(spec: &Spec) -> Result<String> {
     if let Play::Chain(segs) = &spec.play {
         // A segment's seeds are drawn by its room's load, which a transition
         // runs inside the frame, before the driver sees the new room: keyed
-        // by the level, restarted at every load (`load_room` below). Inputs
-        // as one string per segment, a byte each (chr(48 + b)): a table
-        // literal costs a token per input, and a boot chain's thousands
-        // exceed PICO-8's 8192 (it then halts, "program too large").
+        // by the level (`seed_table`). Inputs as one string per segment, a
+        // byte each (chr(48 + b)): a table literal costs a token per input,
+        // and a boot chain's thousands exceed PICO-8's 8192 (it then halts,
+        // "program too large").
         let lvl = |r: (i16, i16)| crate::game_runner::level_index(r.0, r.1);
         let text = |ins: &[u8]| ins.iter().map(|&b| char::from_u32(48 + u32::from(b)).expect("a char")).collect::<String>();
         prelude.extend([
             format!("__segs = {{{}}}", segs.iter().map(|s| format!("{{lvl={},inputs=\"{}\"}}", lvl(s.room), text(&s.inputs))).collect::<Vec<_>>().join(",")),
-            format!("__room_seeds = {{{}}}", segs.iter().map(|s| format!("[{}]={}", lvl(s.room), lua_list(&s.seeds))).collect::<Vec<_>>().join(",")),
-            "__seg, __seg_start, __seed_i = 1, nil, 0".into(),
-            "function __balloon_seed() __seed_i += 1 local q = __room_seeds[room.x % 8 + room.y * 8] return q and q[__seed_i] or 0 end".into(),
+            "__seg, __seg_start = 1, nil".into(),
             "function btn(i)".into(),
             "  if not __seg_start then return false end".into(),
             "  local b = (ord(__segs[__seg].inputs, __frame - __seg_start + 1) or 48) - 48".into(),
@@ -230,7 +213,7 @@ pub fn cart(spec: &Spec) -> Result<String> {
             "end".into(),
         ]);
     }
-    if spec.fenced.seed_order == SeedOrder::Creation && seeds.is_some() {
+    if seeds.is_some() {
         prelude.push(seed_table(&spec.play));
     }
 
@@ -348,9 +331,7 @@ const DUMP_OBJECTS: &str = "  for i = 1, #objects do
   end
 end";
 
-const CHAIN_HOOKS: &str = "local __load_room = load_room
-function load_room(x, y) __seed_i = 0 __load_room(x, y) end
-local __init_object = init_object
+const CHAIN_HOOKS: &str = "local __init_object = init_object
 function init_object(t, x, y)
   local o = __init_object(t, x, y)
   if t == player and not __seg_start then __seg_start = __frame end
@@ -407,9 +388,10 @@ end
 printh('@P8@ end')
 _init = nil _update = nil _draw = nil";
 
-/// C11's `Creation` order: `__seed_at(x, y)`, the seed of the seeded object
-/// created at pixel (x, y) of the current room, by its place in the room's
-/// creation order (`trace::cart::room_objects`); 0 where none is given.
+/// THE SEEDS' ORDER (plans/correctness.md C11): `__seed_at(x, y)`, the seed
+/// of the seeded object created at pixel (x, y) of the current room, by its
+/// place in the room's creation order (`trace::cart::room_objects`), as the
+/// TAS tools hand them out; 0 where none is given.
 fn seed_table(play: &Play) -> String {
     let rooms: Vec<((i16, i16), &[String])> = match play {
         Play::Room { room, seeds, .. } => vec![(*room, seeds.as_deref().unwrap_or(&[]))],
@@ -712,7 +694,7 @@ mod tests {
         assert!(missing.is_empty(), "the cart calls tracer hooks PICO-8 has no stub for (HOOK_STUBS): {missing:?}");
         let dead: Vec<&str> = HOOK_STUBS.iter().map(|(n, _)| *n).filter(|n| !called.iter().any(|h| h == n)).collect();
         assert!(dead.is_empty(), "stubs of hooks the cart does not call (HOOK_STUBS): {dead:?}");
-        for fenced in [FENCED, Fenced { loading_move: LoadingMove::Guarded, seed_order: SeedOrder::Creation }] {
+        for fenced in [FENCED, Fenced { loading_move: LoadingMove::Guarded }] {
             let room = |seeds: Option<Vec<String>>| Play::Room { room: (3, 3), inputs: vec![0, 1, 2], seeds };
             let chain = Play::Chain(vec![Segment { room: (2, 3), seeds: vec![], inputs: vec![1] }, Segment { room: (3, 3), seeds: vec!["0.5".into()], inputs: vec![2] }]);
             for (play, jank, load_draw, dump) in [(room(None), None, false, false), (room(Some(vec!["0.0".into()])), Some(2), false, true), (chain, None, true, true)] {

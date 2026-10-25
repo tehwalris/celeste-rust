@@ -210,17 +210,31 @@ settled here. Evidence is file:line at develop 19869c5d.
 - A frame is always `_update();_draw()` (PICO-8 skips draws over the CPU
   budget): suspected safe.
 
-## C11. Balloon seeds: PICO-8 verification hands them out in another order
-- The PICO-8 replay (`rewrite pico8 replay`, `tools::pico8::FENCED`:
-  `SeedOrder::Pop`; `--seed-order creation` is the alternative, implemented)
-  assigns a file's `[seeds]` in POP order (balloons at the load, chests when
-  opened); Rust's `--balloon-seeds`
-  (`RoomObject::seeded`) and UCT use CREATION order. Where a chest precedes a
-  balloon in creation order (rooms (3,3), (5,3)), the search's concrete
-  balloons and the PICO-8 verification's get different seeds: 3 of 45
-  chest-variant replays differ (found by agent F, 2026-10-20).
-- To do: settle which order the tasdatabase's tools (Celia, UCT) define, make
-  the replay match, and re-verify the (3,3) and (5,3) uploads.
+## C11. Balloon seeds: PICO-8 verification hands them out in another order (FIXED, branch correctness-batch)
+- SETTLED: both TAS tools hand a file's `[seeds]` out in CREATION order,
+  balloons and chests together: UniversalClassicTas `set_seeds`
+  (CelesteTAS/TAS.lua:537-559) walks `pico8.cart.objects`, Celia
+  `load_rng_seeds` (cctas.lua:646-672) the initial state's
+  `cart.objects`, each giving the next seed to the next balloon or chest;
+  the room's object list is `load_room`'s creation order (x outer, y
+  inner), `trace::cart::room_objects`'s, which the search already uses.
+- FIXED: the PICO-8 replay (`tools::pico8`) seeds by creation order
+  (`seed_table`); the POP variant and `--seed-order` are deleted. The two
+  agree on every first load (each `init` pops in creation order); they
+  differ only after a room reload in a single-room replay, where POP's list
+  was used up (measured: room (3,3), seeds 0.5,0.25, a run that dies at
+  f100: from the reload at f115 the balloon's offset is 0 under POP, its
+  seed under creation). That is the likely source of the 3 of 45 differing
+  chest-variant replays: a death no valid route has.
+- Re-verified, no verdict changed: `rewrite validate uploads` of the (3,3)
+  and (5,3) uploads (in-repo gemskip100, gemskipnodiag and nodiag TAS28,
+  gemskipnodiag TAS30, and /var/tmp/to-submit/gemskipnodiag TAS28 and
+  TAS30: all VALID) and of the database's own 100, gemskip100 and any%
+  TAS28 and TAS30 (VALID but the database's gemskip100 TAS28, INVALID as
+  before: it never exits on PICO-8): every row byte-identical under both
+  orders. `rewrite pico8 replay` of the eight (3,3) and (5,3) witnesses
+  (any%, the references, nodiag, gemskipnodiag): every frame line identical
+  under both orders, each exiting at its named frame.
 
 ## C12. Tooling degraded silently (FIXED, landed 4633008e)
 - Since f3123072 (2026-10-15) replay.py (now `rewrite pico8`, whose t0 test
