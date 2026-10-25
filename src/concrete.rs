@@ -129,8 +129,9 @@ where
 /// chests seeded by `--balloon-seeds` as the TAS tools seed them.
 #[derive(Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Witness {
-    /// The frame the start room is left during (`frame::exits_of`; `None`:
-    /// never). The replay stops there.
+    /// The frame the start room is left during, ALIVE (`leaving`; `None`:
+    /// never, or in an update the player died). The replay stops at the
+    /// first frame that leaves it.
     pub exit: Option<u32>,
     /// In a 100% category (the berry is the win's): the seed list with
     /// each chest's entry replaced by every other class of its draws - a
@@ -162,12 +163,23 @@ pub fn witness(inputs: &[u8], s: &crate::settings::Settings) -> Result<Witness> 
         let mut out = eng.frame(&state, b)?;
         anyhow::ensure!(out.len() == 1, "frame {}: {} leaves (an unseeded `rnd`)", i + 1, out.len());
         state = out.remove(0);
-        if crate::frame::exits_of(&state, s)?[0] {
-            exit = Some(i as u32 + 1);
+        if let Some(alive) = leaving(&state, s)? {
+            exit = alive.then_some(i as u32 + 1);
             break;
         }
     }
     Ok(Witness { exit, chest_seed_variants })
+}
+
+/// How a concrete state stands to the start room: still in it (`None`), or
+/// out of it (`frame::exits_of`) alive (`Some(true)`) or in the update its
+/// player DIED (`Some(false)`): a dying exit is no exit, as it is no win
+/// (`frame::wins_of`, plans/correctness.md C8).
+pub(crate) fn leaving<N: Arithmetic>(state: &Rt2<N>, s: &crate::settings::Settings) -> Result<Option<bool>> {
+    if !crate::frame::exits_of(state, s)?[0] {
+        return Ok(None);
+    }
+    Ok(Some(!crate::frame::died(state)?[0]))
 }
 
 #[cfg(test)]

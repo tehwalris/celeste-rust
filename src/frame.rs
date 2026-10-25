@@ -129,7 +129,7 @@ pub fn wins_of<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Re
 /// reports one), and the per-room optima must chain in real play
 /// (plans/correctness.md C8). An unknown counts as alive (an abstract win
 /// over-approximates; the concrete search runs it exact).
-fn died<N: Arithmetic>(rt2: &Rt2<N>) -> Result<Vec<bool>> {
+pub(crate) fn died<N: Arithmetic>(rt2: &Rt2<N>) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{NONE, AV};
     let c = rt2.globals[celeste_names::global("will_restart") as usize];
     anyhow::ensure!(c != NONE, "wins: no `will_restart` global");
@@ -1564,12 +1564,13 @@ mod tests {
         assert!(!runs(&with(spd, add(speed, px(1)), add(speed, px(1)))), "spd.x past its worlds' range declines");
     }
 
-    /// A DYING EXIT IS NO WIN (plans/correctness.md C8). Room (2,2)'s top
-    /// row holds a right-facing spike (tile 59) at tile 8, beside the exit. A
-    /// player at x 64 rising from y -3 at 2 px a frame is in its kill zone
-    /// after its move (not moving left) and above y -4: the one update kills
-    /// it and, on its table, loads room (3,2) with the restart pending. The
-    /// same rise at x 40, clear of the spike, is the room's clean exit.
+    /// A DYING EXIT IS NO WIN (plans/correctness.md C8), nor a witness's
+    /// exit (`concrete::leaving`). Room (2,2)'s top row holds a right-facing
+    /// spike (tile 59) at tile 8, beside the exit. A player at x 64 rising
+    /// from y -3 at 2 px a frame is in its kill zone after its move (not
+    /// moving left) and above y -4: the one update kills it and, on its
+    /// table, loads room (3,2) with the restart pending. The same rise at x
+    /// 40, clear of the spike, is the room's clean exit.
     #[test]
     fn a_dying_exit_is_no_win() {
         let s = Settings { room: (2, 2), ..Default::default() };
@@ -1598,9 +1599,12 @@ mod tests {
         assert_eq!(died(&dying).expect("died"), [true], "it died in that update");
         assert_eq!(wins_of(&dying, &s).expect("wins"), [false], "a dying exit is no win");
         assert_eq!(not_expanded(&dying, 1, None, &s).expect("not expanded"), [true], "nor is it expanded");
+        assert_eq!(crate::concrete::leaving(&dying, &s).expect("leaving"), Some(false), "nor is it a witness's exit");
         let clean = rise(40);
         assert_eq!(died(&clean).expect("died"), [false]);
         assert_eq!(wins_of(&clean, &s).expect("wins"), [true], "the clean exit wins");
+        assert_eq!(crate::concrete::leaving(&clean, &s).expect("leaving"), Some(true), "and is a witness's exit");
+        assert_eq!(crate::concrete::leaving(&st, &s).expect("leaving"), None, "the player in the room has not left it");
     }
 
     /// THE ORB DEADLINE AGAINST THE CART (plans/correctness.md C2), in
