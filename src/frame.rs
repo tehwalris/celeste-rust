@@ -969,7 +969,7 @@ pub(crate) fn restore_visited<N: Rem>(dir: &std::path::Path, last: u32, room: (i
     let mut batch: Vec<FrameIn<N>> = Vec::new();
     for f in 0..=last {
         for r in tree.file(f).filter(|_| f > 0).iter().flat_map(|x| x.header.skeletons.iter().chain(&x.header.emitted)) {
-            skeletons.register(&r.rt2(celeste_core::room::Room::of(room))?)?;
+            skeletons.register(&r.template(celeste_core::room::Room::of(room))?)?;
         }
         // Past a frontier that died: no frame.
         let Some(file) = tree.file(f) else { continue };

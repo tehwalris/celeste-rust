@@ -13,8 +13,7 @@ use celeste_core::arith::Arithmetic;
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::exact::Code;
 use celeste_engine::shape::{KeyRole, Layout};
-use celeste_engine::runtime2::{Col, Rt2, AV};
-use celeste_engine::slots::reshape;
+use celeste_engine::runtime2::{Col, ColRepr, Rt2, Template, AV};
 
 use crate::storage::stats::S;
 use crate::transpile::asm::{AsmCtx, CollisionEnv, Compiled, Loaded};
@@ -153,13 +152,13 @@ struct AccTemplate<N: Arithmetic = P8> {
     uniform_follow: Vec<(u32, u32, u32, Code<N>)>,
     /// The shape's key layout (checked against the key space's).
     layout: std::sync::Arc<Layout>,
-    /// This outcome's own skeleton: a field's column empty and typed, or
-    /// uniform where every row holds one value (`OutField::konst_av`, a
-    /// widened field's `widen_uniform`, the buttons' unknown).
-    own: Rt2<N>,
-    /// The SHAPE's skeleton, typed wherever any outcome varies a cell: every
+    /// This outcome's own template: a field's column typed, or uniform where
+    /// every row holds one value (`OutField::konst_av`, a widened field's
+    /// `widen_uniform`, the buttons' unknown).
+    own: Template<N>,
+    /// The SHAPE's template, typed wherever any outcome varies a cell: every
     /// queue and piece of the shape has these columns. Set by `unify`.
-    union: std::sync::Arc<Rt2<N>>,
+    union: std::sync::Arc<Template<N>>,
 }
 
 /// Rust's default spawned-thread stack, assumed without `set_thread_stack`.
@@ -501,7 +500,7 @@ struct BodyCols<N: Arithmetic = P8> {
 }
 
 impl<N: KernelLanes> BodyCols<N> {
-    fn of(body: &AsmBody, proto: &crate::storage::unit::RowBuf<N>, own: &Rt2<N>) -> Result<Self> {
+    fn of(body: &AsmBody, proto: &crate::storage::unit::RowBuf<N>, own: &Template<N>) -> Result<Self> {
         use crate::storage::unit::TCol;
         let (mut num, mut ival, mut num_as_ival, mut bool_) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut written = vec![false; proto.cols.len()];
@@ -524,7 +523,7 @@ impl<N: KernelLanes> BodyCols<N> {
             if written[ci] {
                 continue;
             }
-            let Col::U(av) = &own.cols[*cell] else {
+            let ColRepr::Uniform(av) = &own.cols[*cell] else {
                 anyhow::bail!("union column at cell {cell} is neither a body root nor uniform in its outcome");
             };
             match (col, av) {
@@ -874,66 +873,42 @@ fn text_digest<N: KernelLanes>(kernels: &HashMap<(u64, Option<Region>), AsmKerne
     h.finish()
 }
 
-/// The type of a typed column (or of a uniform value one could hold).
-fn kind_of<N: Arithmetic>(col: &Col<N>) -> Option<Ty> {
-    match col {
-        Col::N(_) | Col::U(AV::Num(_)) => Some(Ty::Num),
-        Col::I(_) | Col::U(AV::Ival(..)) => Some(Ty::Ival),
-        Col::V(_) | Col::U(AV::Bool(_)) | Col::U(AV::UBool) => Some(Ty::Bool),
-        _ => None,
+/// The column a field of type `ty` makes (`ColRepr::{Num, Ival, Bool}`).
+fn typed<N: Arithmetic>(ty: Ty) -> ColRepr<N> {
+    match ty {
+        Ty::Num => ColRepr::Num,
+        Ty::Ival => ColRepr::Ival,
+        Ty::Bool | Ty::UBool => ColRepr::Bool,
     }
 }
 
-fn typed<N: Arithmetic>(kind: Ty) -> Col<N> {
-    match kind {
-        Ty::Num => Col::N(Vec::new()),
-        Ty::Ival => Col::I(Vec::new()),
-        Ty::Bool | Ty::UBool => Col::V(Vec::new()),
-    }
-}
-
-/// Give every outcome template of a SHAPE the union skeleton (a cell is
-/// typed if any outcome varies it or two disagree; Num + Ival -> Ival) and
+/// Give every outcome template of a SHAPE the union template (a cell is
+/// typed if any outcome varies it or two disagree: `ColRepr::join`) and
 /// map every body onto its columns (`BodyCols`).
 fn unify<N: KernelLanes>(by_shape: &mut HashMap<(u64, Option<Region>), AsmKernel<N>>) -> Result<()> {
-    let mut unions: HashMap<u64, Rt2<N>> = HashMap::new();
+    let mut unions: HashMap<u64, Template<N>> = HashMap::new();
     for kernel in by_shape.values() {
         for t in &kernel.acc_templates {
             let own = &t.own;
             match unions.get_mut(&t.shape_hash) {
                 None => {
-                    unions.insert(t.shape_hash, own.clone_block());
+                    unions.insert(t.shape_hash, own.clone());
                 }
                 Some(u) => {
                     anyhow::ensure!(u.cols.len() == own.cols.len(), "shape {:#x}: outcomes with different widths", t.shape_hash);
-                    for c in 0..u.cols.len() {
-                        let (a, b) = (&u.cols[c], &own.cols[c]);
-                        if let (Col::U(x), Col::U(y)) = (a, b) {
-                            if x == y {
-                                continue;
-                            }
-                        }
-                        let (ka, kb) = (kind_of(a), kind_of(b));
-                        let k = match (ka, kb) {
-                            (Some(x), Some(y)) if x == y => x,
-                            (Some(Ty::Num), Some(Ty::Ival)) | (Some(Ty::Ival), Some(Ty::Num)) => Ty::Ival,
-                            _ => anyhow::bail!(
-                                "shape {:#x} cell {c}: outcomes disagree on a cell that cannot be a typed column ({a:?} vs {b:?})",
-                                t.shape_hash
-                            ),
-                        };
-                        u.cols[c] = typed(k);
+                    for (c, (a, b)) in u.cols.iter_mut().zip(own.cols.iter()).enumerate() {
+                        *a = a.join(*b).ok_or_else(|| anyhow::anyhow!("shape {:#x} cell {c}: outcomes disagree on a cell that cannot be a typed column ({a:?} vs {b:?})", t.shape_hash))?;
                     }
                 }
             }
         }
     }
-    let unions: HashMap<u64, std::sync::Arc<Rt2<N>>> = unions.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
+    let unions: HashMap<u64, std::sync::Arc<Template<N>>> = unions.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
     let mut widened = 0usize;
     for kernel in by_shape.values_mut() {
         apply_union(kernel, &unions)?;
         for t in &kernel.acc_templates {
-            widened += t.union.cols.iter().zip(&t.own.cols).filter(|(u, o)| !matches!(u, Col::U(_)) && matches!(o, Col::U(_))).count();
+            widened += t.union.cols.iter().zip(t.own.cols.iter()).filter(|(u, o)| !matches!(u, ColRepr::Uniform(_)) && matches!(o, ColRepr::Uniform(_))).count();
         }
     }
     let templates: usize = by_shape.values().map(|k| k.acc_templates.len()).sum();
@@ -961,17 +936,17 @@ fn unify<N: KernelLanes>(by_shape: &mut HashMap<(u64, Option<Region>), AsmKernel
     Ok(())
 }
 
-fn apply_union<N: KernelLanes>(kernel: &mut AsmKernel<N>, unions: &HashMap<u64, std::sync::Arc<Rt2<N>>>) -> Result<()> {
+fn apply_union<N: KernelLanes>(kernel: &mut AsmKernel<N>, unions: &HashMap<u64, std::sync::Arc<Template<N>>>) -> Result<()> {
     for t in &mut kernel.acc_templates {
         t.union = unions
             .get(&t.shape_hash)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("no union skeleton for output shape {:#x}", t.shape_hash))?;
+            .ok_or_else(|| anyhow::anyhow!("no union template for output shape {:#x}", t.shape_hash))?;
     }
     let mut body_cols = Vec::with_capacity(kernel.bodies.len());
     for b in &kernel.bodies {
         let t = &kernel.acc_templates[b.outcome];
-        let proto = crate::storage::unit::RowBuf::new((*t.union).clone_block());
+        let proto = crate::storage::unit::RowBuf::new(&t.union);
         body_cols.push(BodyCols::of(b, &proto, &t.own)?);
     }
     kernel.body_cols = body_cols;
@@ -993,8 +968,8 @@ pub(crate) struct Recipe<N: Arithmetic = P8> {
     /// (`AsmField::may_unknown`)?
     pub(crate) may_unknown: Vec<bool>,
     pub(crate) bodies: Vec<BodySlots>,
-    /// Per outcome, its rows' skeleton (`AccTemplate::own`).
-    pub(crate) outcomes: Vec<Skeleton<N>>,
+    /// Per outcome, its rows' template (`AccTemplate::own`).
+    pub(crate) outcomes: Vec<Outcome<N>>,
 }
 
 /// A fused body's roots as output slots (`Compiled::root_offsets`'
@@ -1011,61 +986,64 @@ pub(crate) struct BodySlots {
     arc: ([u32; 2 * crate::transpile::kernel::AxisRoots::N], bool),
 }
 
-/// An outcome's rows' skeleton: its shape (cells and globals; interned
-/// when loaded) and per cell a column, a field's empty and typed, or
-/// uniform where every row holds one value (`OutField::uniform`, the
-/// buttons' unknown).
+/// An outcome's rows' template as a recipe keeps it (`Template` but its
+/// shape as cells and globals, interned when loaded, and its room the
+/// kernel's): per cell a column, a field's typed, or uniform where every row
+/// holds one value (`OutField::uniform`, the buttons' unknown), a non-value
+/// cell's the traced outcome's.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
-pub(crate) struct Skeleton<N: Arithmetic = P8> {
+pub(crate) struct Outcome<N: Arithmetic = P8> {
     cells: Vec<celeste_engine::shape::Cell>,
     globals: Vec<u32>,
-    cols: Vec<Col<N>>,
+    cols: Vec<ColRepr<N>>,
 }
 
-impl<N: Arithmetic> Skeleton<N> {
+impl<N: Arithmetic> Outcome<N> {
     /// Outcome `oi` of a lowered frame's.
-    fn of<A: KernelLanes>(r: &crate::trace::lower::LoweredFrame<A>, oi: usize) -> Skeleton<A> {
-        // Canonical: `block::skeleton` ends in `Rt2::canonicalize_ids`.
-        let mut own = reshape(&r.frame.outs[oi].rt2, 0);
+    fn of<A: KernelLanes>(r: &crate::trace::lower::LoweredFrame<A>, oi: usize) -> Outcome<A> {
+        // Canonical: `block::skeleton` ends in `Rt2::canonicalize_ids`. A
+        // pointer is the shape's, every other value the fields'.
+        let out = &r.frame.outs[oi].rt2;
+        let mut cols: Vec<ColRepr<A>> = out.cols.iter().map(|c| ColRepr::Uniform(if let Col::U(AV::Ptr(t)) = c { AV::Ptr(*t) } else { AV::Nil })).collect();
         for f in &r.bound.outcomes[oi].fields {
-            own.cols[f.cell as usize] = match f.uniform {
-                Some(av) => Col::U(av),
+            cols[f.cell as usize] = match f.uniform {
+                Some(av) => ColRepr::Uniform(av),
                 None => typed(f.ty),
             };
         }
         for &cell in &r.frame.outs[oi].ubool_cells {
-            own.cols[cell as usize] = Col::U(AV::UBool);
+            cols[cell as usize] = ColRepr::Uniform(AV::UBool);
         }
-        Skeleton { cells: own.cells().to_vec(), globals: own.shape.globals().to_vec(), cols: own.cols }
+        Outcome { cells: out.cells().to_vec(), globals: out.shape.globals().to_vec(), cols }
     }
 
-    /// As a block of no rows in `room`.
-    fn rt2(&self, room: &'static Room) -> Rt2<N> {
+    /// The template, in `room`.
+    fn template(&self, room: &'static Room) -> Template<N> {
         let shape = celeste_engine::shape::Shape::intern(self.cells.clone(), self.globals.clone());
-        Rt2::new(0, shape, self.cols.clone(), celeste_engine::runtime2::static_strings(), room)
+        Template { shape, strings: celeste_engine::runtime2::static_strings(), room, cols: self.cols.clone().into_boxed_slice() }
     }
 }
 
 impl<N: Arithmetic> AccTemplate<N> {
-    /// The template of skeleton `own`: its shape's layout, its key laid out
-    /// as the shape declares (`widening::key_deps`), and the key's uniform
-    /// fields (every value cell uniform here, at its widened value, by its
-    /// role: a follower's among `uniform_follow`).
-    fn of(own: Rt2<N>) -> Result<AccTemplate<N>> {
+    /// The accumulator of template `own`: its shape's layout, its key laid
+    /// out as the shape declares (`widening::key_deps`), and the key's
+    /// uniform fields (every value cell uniform here, at its widened value,
+    /// by its role: a follower's among `uniform_follow`).
+    fn of(own: Template<N>) -> Result<AccTemplate<N>> {
         let shape_hash = own.shape_hash();
-        let layout = std::sync::Arc::new(Layout::of(&own));
+        let layout = std::sync::Arc::new(Layout::of(&own.empty()));
         anyhow::ensure!(layout.deps().len() <= emit::MAX_DEPS, "shape {shape_hash:#x}: {} key dependencies, past the emission's {}", layout.deps().len(), emit::MAX_DEPS);
         let (mut uniform, mut uniform_follow) = (Vec::new(), Vec::new());
         for c in layout.value_cells() {
-            let Col::U(v) = own.cols[c as usize] else { continue };
+            let ColRepr::Uniform(v) = own.cols[c as usize] else { continue };
             match layout.role(c) {
                 // The followers are no dictionary's: theirs is the record by leader.
                 KeyRole::Follower { dep, slot } => uniform_follow.push((dep as u32, slot as u32, c, layout.code(c, v))),
                 _ => uniform.push((c, layout.code(c, v))),
             }
         }
-        Ok(AccTemplate { shape_hash, uniform, uniform_follow, layout, union: std::sync::Arc::new(own.clone_block()), own })
+        Ok(AccTemplate { shape_hash, uniform, uniform_follow, layout, union: std::sync::Arc::new(own.clone()), own })
     }
 }
 
@@ -1141,7 +1119,7 @@ fn build_one_shape<N: KernelLanes>(
         fused_nodes: fused.len(),
         may_unknown: flat_roots.iter().map(|n| reads_unknown_output[*n as usize]).collect(),
         bodies: slots,
-        outcomes: (0..r.bound.outcomes.len()).map(|oi| Skeleton::<N>::of(r, oi)).collect(),
+        outcomes: (0..r.bound.outcomes.len()).map(|oi| Outcome::<N>::of(r, oi)).collect(),
     };
     Ok((recipe, loaded))
 }
@@ -1153,7 +1131,7 @@ impl<N: KernelLanes> AsmKernel<N> {
     /// (`emit::Plan`), the earlier bodies each repeats.
     fn of(recipe: Recipe<N>, loaded: Loaded, room: &'static Room, counting: bool) -> Result<AsmKernel<N>> {
         let Recipe { shape: recipe_shape, compiled, forks, fused_nodes, may_unknown, bodies, outcomes, .. } = recipe;
-        let acc_templates: Vec<AccTemplate<N>> = outcomes.iter().map(|sk| AccTemplate::of(sk.rt2(room))).collect::<Result<_>>()?;
+        let acc_templates: Vec<AccTemplate<N>> = outcomes.iter().map(|o| AccTemplate::of(o.template(room))).collect::<Result<_>>()?;
         let off = |s: u32| compiled.root_offsets[s as usize] as usize;
         let kind = |s: u32| compiled.root_kinds[s as usize];
         let mut asm_bodies = Vec::with_capacity(bodies.len());
@@ -1166,7 +1144,7 @@ impl<N: KernelLanes> AsmKernel<N> {
             // field; the FOLLOWERS (`exact::Deps`) are checked, not keyed.
             // A number stored `[v, v]` keys as the number.
             let (mut key_fields, mut follow_fields) = (Vec::new(), Vec::new());
-            for &(cell, s) in b.fields.iter().filter(|(cell, _)| !matches!(t.own.cols[*cell as usize], Col::U(_))) {
+            for &(cell, s) in b.fields.iter().filter(|(cell, _)| !matches!(t.own.cols[*cell as usize], ColRepr::Uniform(_))) {
                 let role = t.layout.role(cell);
                 let f = KeyField::new(cell, off(s), kind(s), role)?;
                 match role {
@@ -1274,8 +1252,8 @@ fn dup_refs(bodies: &mut [AsmBody], reads: &[emit::BodyReads], alike: &[Vec<bool
 
 /// Where a body's rows get player and room `x`/`y`; `None` (`NO_CELL`)
 /// without a numeric player position, as `cells::block_cells`.
-fn pos_sources<N: Arithmetic>(template: &Rt2<N>, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]>> {
-    let anchors = celeste_engine::shape::Anchors::of(template);
+fn pos_sources<N: Arithmetic>(template: &Template<N>, fields: &[AsmField]) -> Result<Option<[PosSrc; 4]>> {
+    let anchors = celeste_engine::shape::Anchors::of(&template.empty());
     let [room_x, room_y] = anchors.room.ok_or_else(|| anyhow::anyhow!("outcome template has no `room` global with `x` and `y`"))?;
     // `None` = not a plain number in every row.
     let src_of = |cell: u32| -> Result<Option<PosSrc>> {
@@ -1287,8 +1265,8 @@ fn pos_sources<N: Arithmetic>(template: &Rt2<N>, fields: &[AsmField]) -> Result<
             });
         }
         match template.cols[cell as usize] {
-            Col::U(AV::Num(n)) => Ok(Some(PosSrc::Konst(n.whole_i16().ok_or_else(|| anyhow::anyhow!("a constant position {n:?} past the i16 pixels"))?))),
-            Col::U(_) => Ok(None),
+            ColRepr::Uniform(AV::Num(n)) => Ok(Some(PosSrc::Konst(n.whole_i16().ok_or_else(|| anyhow::anyhow!("a constant position {n:?} past the i16 pixels"))?))),
+            ColRepr::Uniform(_) => Ok(None),
             _ => anyhow::bail!("position cell {cell} is neither an output field nor a constant"),
         }
     };

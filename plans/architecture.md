@@ -242,7 +242,11 @@ key LAYOUT (`shape::Layout`, recorded as an `exact::ShapeRecord`) gives
 every cell its `KeyRole` - structure, a keyed value, a position coordinate
 (keyed by its fraction), a dependency's leader or follower - and
 `KeyRole::code` is the code rule's one site; the position object's, the
-`room`'s and the first player's cells are `shape::Anchors::of`'s one rule.
+`room`'s and the first player's cells are `shape::Anchors::of`'s one rule. A block of no rows is a TEMPLATE (`runtime2::Template`: its shape,
+strings and room, per cell its `ColRepr` - one value in every row, or per
+row numbers, intervals, booleans, any values): a kernel outcome's rows and
+their union, a reference row's, a stored shape's skeleton
+(`layer::SkelRecord`, which decodes numbers by `ColRepr::decoded`).
 The concrete search compares whole states, never keys.
 
 **Key dependencies** (`exact::Deps`): a shape may declare FOLLOWER cells

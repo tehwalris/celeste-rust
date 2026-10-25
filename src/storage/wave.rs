@@ -1313,7 +1313,7 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start
         let cells = crate::storage::cells::block_cells(r)?;
         r.row_keys = keys.clone();
         super::decode::check_piece(&visited.keys, r, &cells).map_err(|e| e.context("frame 0"))?;
-        let rec = super::layer::SkelRecord::of(r)?;
+        let rec = super::layer::SkelRecord::of(&celeste_engine::Template::of_block(r))?;
         ensure!(skels.get(&r.shape_hash()).is_none_or(|x| *x == rec), "two initial blocks of shape {:016x} with other skeletons", r.shape_hash());
         skels.insert(r.shape_hash(), rec);
         let si = visited.shape_index(r.shape_hash()).expect("numbered above");
@@ -1359,7 +1359,7 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start
     drop(parts);
     ensure!(held == 0, "frame 0 into a visited set that held {held} of its states");
     for (h, rec) in skels {
-        next.skeletons.insert(h, std::sync::Arc::new(rec.rt2(canon[0].room)?));
+        next.skeletons.insert(h, std::sync::Arc::new(rec.template(canon[0].room)?));
     }
     let n = next.states() as usize;
     let mut stats = Stats::default();

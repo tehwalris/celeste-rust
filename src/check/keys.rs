@@ -157,9 +157,10 @@ mod tests {
         let key = visited.keys.lookup_keys(&row)[0].expect("the row is keyed");
         let cell = crate::storage::cells::block_cells(&row).expect("cells")[0];
         let (prov, skeletons) = (Provisional::default(), Skeletons::default());
-        skeletons.register(&row).expect("its skeleton");
+        let template = celeste_engine::Template::of_block(&row);
+        skeletons.register(&template).expect("its skeleton");
         let buf = |k: (u64, u64)| {
-            let mut b = RowBuf::new(row.clone_block());
+            let mut b = RowBuf::new(&template);
             b.push_row(&row, k, cell);
             b
         };

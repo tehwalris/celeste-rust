@@ -8,7 +8,8 @@
 //!     (`Code::of_pos`); the whole pixels are the cell's, less the room offset
 //!     (`cells::room_offset` of the row's own `room.x/y`);
 //!   * the code merges `Num(n)` and `Ival(n, n)` (producers disagree), so
-//!     the skeleton keeps each value column's `Repr`.
+//!     the skeleton (a `Template`) keeps each value column's representation
+//!     (`ColRepr::decoded`).
 //!
 //! A row its key does not determine is FATAL, never stored lossy: checked
 //! on a shape's first emission per worker and wave (`check keys`: every
@@ -19,21 +20,20 @@ use celeste_core::arith::Arithmetic;
 use celeste_core::pico8_num::Pico8Num as P8;
 
 use celeste_engine::exact::{Code, FieldDict, Key, KeySpace};
-use celeste_engine::shape::KeyRole;
-use celeste_engine::runtime2::{Col, Rt2, AV};
-use celeste_engine::shape::Cell;
+use celeste_engine::runtime2::{Col, ColRepr, Rt2, Template, AV};
+use celeste_engine::shape::{Cell, KeyRole};
 
 use crate::storage::cells::{cell_xy, room_offset, NO_CELL};
 
 /// The rows `(key, cell)` of `skel`'s shape as a block (`skel`'s values
 /// unread). A run of one key's rows differs only in position: codes are
 /// looked up once a run, a column stays uniform until a run differs.
-pub(crate) fn decode_rows<N: Arithmetic>(keys: &KeySpace<N>, skel: &Rt2<N>, rows: &[(Key, u32)]) -> Result<Rt2<N>> {
+pub(crate) fn decode_rows<N: Arithmetic>(keys: &KeySpace<N>, skel: &Template<N>, rows: &[(Key, u32)]) -> Result<Rt2<N>> {
     let s = keys.shape(skel.shape_hash()).ok_or_else(|| anyhow!("decode: shape {:016x} is not in the key space", skel.shape_hash()))?;
     let n = rows.len();
     ensure!(n > 0, "decode: no rows");
     let layout = s.layout();
-    ensure!(layout.cells() == skel.cells().len(), "decode: shape {:016x}: a skeleton of {} cells, a layout of {}", skel.shape_hash(), skel.cells().len(), layout.cells());
+    ensure!(layout.cells() == skel.cols.len(), "decode: shape {:016x}: a skeleton of {} cells, a layout of {}", skel.shape_hash(), skel.cols.len(), layout.cells());
     let mut runs: Vec<(Key, usize, usize)> = Vec::new();
     for (i, r) in rows.iter().enumerate() {
         match runs.last_mut() {
@@ -50,10 +50,10 @@ pub(crate) fn decode_rows<N: Arithmetic>(keys: &KeySpace<N>, skel: &Rt2<N>, rows
     let mut out = Rt2::new(n, skel.shape.clone(), Vec::with_capacity(skel.cols.len()), skel.strings.clone(), skel.room);
     out.row_keys = rows.iter().map(|r| r.0).collect();
     // Every value cell but the position's, from the key, by its role.
-    for c in 0..skel.cells().len() {
+    for c in 0..skel.cols.len() {
         let f = match layout.role(c as u32) {
             KeyRole::Structure => {
-                out.cols.push(skel.cols[c].clone());
+                out.cols.push(skel.cols[c].empty());
                 continue;
             }
             // Below, from the row's cell.
@@ -65,7 +65,7 @@ pub(crate) fn decode_rows<N: Arithmetic>(keys: &KeySpace<N>, skel: &Rt2<N>, rows
             KeyRole::Follower { dep, slot } => {
                 // The code its leader's index recorded.
                 let (g, slot) = (dep as usize, slot as usize);
-                let mut b = Builder::new(Repr::of(&skel.cols[c]), n);
+                let mut b = Builder::new(skel.cols[c], n);
                 let fl = &s.follows()[g];
                 let lead = s.field(fl.leader() as usize).ok_or_else(|| anyhow!("decode: shape {shape:016x}: the leader is not keyed"))?;
                 runs.iter()
@@ -79,7 +79,7 @@ pub(crate) fn decode_rows<N: Arithmetic>(keys: &KeySpace<N>, skel: &Rt2<N>, rows
                 continue;
             }
         };
-        let mut b = Builder::new(Repr::of(&skel.cols[c]), n);
+        let mut b = Builder::new(skel.cols[c], n);
         // A field without bits holds its one code in every row.
         if f.bits() == 0 {
             ensure!(f.len() == 1, "decode: shape {shape:016x} cell {c}: no bits for {} codes", f.len());
@@ -110,7 +110,7 @@ pub(crate) fn decode_rows<N: Arithmetic>(keys: &KeySpace<N>, skel: &Rt2<N>, rows
         s.field(px as usize).ok_or_else(|| anyhow!("decode: shape {shape:016x} position cell {px} is not a key field"))?,
         s.field(py as usize).ok_or_else(|| anyhow!("decode: shape {shape:016x} position cell {py} is not a key field"))?,
     );
-    let (mut bx, mut by) = (Builder::new(Repr::of(&skel.cols[px as usize]), n), Builder::new(Repr::of(&skel.cols[py as usize]), n));
+    let (mut bx, mut by) = (Builder::new(skel.cols[px as usize], n), Builder::new(skel.cols[py as usize], n));
     for &(k, lo, hi) in &runs {
         let (ox, oy) = room_offset(start, whole(code_in(rxf, rxc, k)?)?, whole(code_in(ryf, ryc, k)?)?)?;
         let (cx, cy) = (code_in(fx, px as usize, k)?, code_in(fy, py as usize, k)?);
@@ -159,8 +159,9 @@ impl<T: Copy + PartialEq> ColB<T> {
     }
 }
 
-/// A value cell's column in the making, by its `Repr` (`Other`: `N` if
-/// every row holds a number, `I` if an interval, else `V`).
+/// A value cell's column in the making, by its representation as decoded
+/// (`ColRepr::decoded`; `Other`: `N` if every row holds a number, `I` if an
+/// interval, else `V`).
 enum Builder<N: Arithmetic> {
     Num(ColB<N>),
     Ival(ColB<(N, N)>),
@@ -168,11 +169,11 @@ enum Builder<N: Arithmetic> {
 }
 
 impl<N: Arithmetic> Builder<N> {
-    fn new(repr: Repr, n: usize) -> Builder<N> {
-        match repr {
-            Repr::Num => Builder::Num(ColB::new(n)),
-            Repr::Ival => Builder::Ival(ColB::new(n)),
-            Repr::Other => Builder::Other(ColB::new(n)),
+    fn new(repr: ColRepr<N>, n: usize) -> Builder<N> {
+        match repr.decoded() {
+            ColRepr::Num => Builder::Num(ColB::new(n)),
+            ColRepr::Ival => Builder::Ival(ColB::new(n)),
+            _ => Builder::Other(ColB::new(n)),
         }
     }
 
@@ -223,42 +224,11 @@ impl<N: Arithmetic> Builder<N> {
     }
 }
 
-/// How a value column holds its numbers, which the code does not say; per
-/// piece, from the stored block's column (a frame file's header keeps it).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Repr {
-    /// `N`, or uniform `Num`.
-    Num,
-    /// `I`, or uniform `Ival`: points as `[n, n]`.
-    Ival,
-    /// `V` or any other uniform value: the column follows the values.
-    Other,
-}
-
-impl Repr {
-    pub(crate) fn of<N>(col: &Col<N>) -> Repr {
-        match col {
-            Col::N(_) | Col::U(AV::Num(_)) => Repr::Num,
-            Col::I(_) | Col::U(AV::Ival(..)) => Repr::Ival,
-            _ => Repr::Other,
-        }
-    }
-
-    /// An empty column of the representation (a skeleton's).
-    pub(crate) fn empty<N>(self) -> Col<N> {
-        match self {
-            Repr::Num => Col::N(Vec::new()),
-            Repr::Ival => Col::I(Vec::new()),
-            Repr::Other => Col::V(Vec::new()),
-        }
-    }
-}
-
 /// THE SHAPES' SKELETONS: per shape the first registered (a kernel's union
 /// template, `asm_kernel::unify`, or a `reference_skeleton`), as its
-/// `layer::SkelRecord` and that record's block. Another record under one
+/// `layer::SkelRecord` and that record's template. Another record under one
 /// shape (it would decode otherwise) is FATAL.
-pub(crate) struct Skeletons<N: Arithmetic = P8>(std::sync::RwLock<rustc_hash::FxHashMap<u64, (super::layer::SkelRecord<N>, std::sync::Arc<Rt2<N>>)>>);
+pub(crate) struct Skeletons<N: Arithmetic = P8>(std::sync::RwLock<rustc_hash::FxHashMap<u64, (super::layer::SkelRecord<N>, std::sync::Arc<Template<N>>)>>);
 
 impl<N: Arithmetic> Default for Skeletons<N> {
     fn default() -> Self {
@@ -268,14 +238,14 @@ impl<N: Arithmetic> Default for Skeletons<N> {
 
 impl<N: Arithmetic> Skeletons<N> {
     /// Register `skel` for its shape (checked against the shape's).
-    pub(crate) fn register(&self, skel: &Rt2<N>) -> Result<()> {
+    pub(crate) fn register(&self, skel: &Template<N>) -> Result<()> {
         let rec = super::layer::SkelRecord::of(skel)?;
         if let Some(a) = self.0.read().expect("skeletons").get(&skel.shape_hash()) {
             ensure!(a.0 == rec, "ROWS FROM KEYS: two skeletons of shape {:016x} (another structure, non-value cell or column kind): its rows would decode as the first's", skel.shape_hash());
             return Ok(());
         }
-        let rt2 = std::sync::Arc::new(rec.rt2(skel.room)?);
-        self.0.write().expect("skeletons").entry(skel.shape_hash()).or_insert((rec, rt2));
+        let t = std::sync::Arc::new(rec.template(skel.room)?);
+        self.0.write().expect("skeletons").entry(skel.shape_hash()).or_insert((rec, t));
         Ok(())
     }
 
@@ -290,7 +260,7 @@ impl<N: Arithmetic> Skeletons<N> {
         self.0.read().expect("skeletons").keys().copied().collect()
     }
 
-    pub(crate) fn get(&self, shape: u64) -> Result<std::sync::Arc<Rt2<N>>> {
+    pub(crate) fn get(&self, shape: u64) -> Result<std::sync::Arc<Template<N>>> {
         self.0.read().expect("skeletons").get(&shape).map(|x| x.1.clone()).ok_or_else(|| anyhow!("ROWS FROM KEYS: no skeleton of shape {shape:016x} (it was never emitted)"))
     }
 
@@ -317,11 +287,11 @@ impl<N: Arithmetic> Skeletons<N> {
     }
 }
 
-/// A reference row's skeleton: every value cell left to the decode (`Other`).
-pub(crate) fn reference_skeleton<N: Arithmetic>(row: &Rt2<N>) -> Rt2<N> {
-    let mut b = celeste_engine::slots::reshape(row, 0);
-    b.cols = row.cells().iter().zip(&row.cols).map(|(cell, c)| if *cell == Cell::Val { Col::V(Vec::new()) } else { Col::U(c.at(0)) }).collect();
-    b
+/// A reference row's skeleton: every value cell left to the decode (`Other`),
+/// the static strings.
+pub(crate) fn reference_skeleton<N: Arithmetic>(row: &Rt2<N>) -> Template<N> {
+    let cols = row.cells().iter().zip(&row.cols).map(|(cell, c)| if *cell == Cell::Val { ColRepr::Other } else { ColRepr::Uniform(c.at(0)) }).collect();
+    Template { shape: row.shape.clone(), strings: celeste_engine::runtime2::static_strings(), room: row.room, cols }
 }
 
 /// THE GUARD on the start's rows (`wave::seed`): they decode to exactly
@@ -344,10 +314,11 @@ pub(crate) fn check_piece<N: Arithmetic>(keys: &KeySpace<N>, rt2: &Rt2<N>, cells
     }
     // At most 32 chunks a piece (pieces are checked in parallel too).
     let size = CHUNK.max(rt2.width.div_ceil(32));
+    let skel = Template::of_block(rt2);
     let chunk = |lo: usize| -> Result<()> {
         let hi = (lo + size).min(rt2.width);
         let rows: Vec<(Key, u32)> = (lo..hi).map(|r| (rt2.row_keys[r], cells[r])).collect();
-        let d = decode_rows(keys, rt2, &rows)?;
+        let d = decode_rows(keys, &skel, &rows)?;
         for (c, (a, b)) in rt2.cols.iter().zip(&d.cols).enumerate() {
             // The common cases whole; else row by row.
             let same = match (a, b) {

@@ -1,5 +1,4 @@
-//! Naming a block's cells by PATH (`objects[0].spd.x`), and building a
-//! block from a shape.
+//! Naming a block's cells by PATH (`objects[0].spd.x`).
 //!
 //! A cell's id depends on the whole block's shape, so a traced slot is
 //! bound by its heap path and resolved against the block it is handed.
@@ -109,22 +108,4 @@ pub fn resolve_steps<N: Arithmetic>(rt2: &Rt2<N>, p: &[Step]) -> Result<u32, Str
         });
     }
     cur.ok_or_else(|| "empty path".to_string())
-}
-
-/// A fresh block with the same SHAPE as `src` and a new width.
-///
-/// The shape and pointer columns (what a shape determines) carry over;
-/// every other value cell starts `AV::Nil`, the strings the static ones.
-/// Not a clone: `Rt2` is deliberately not `Clone`, and the values are
-/// dropped on purpose.
-pub fn reshape<N: Arithmetic>(src: &Rt2<N>, width: usize) -> Rt2<N> {
-    let cols = src
-        .cols
-        .iter()
-        .map(|c| match c {
-            Col::U(AV::Ptr(t)) => Col::U(AV::Ptr(*t)),
-            _ => Col::U(AV::Nil),
-        })
-        .collect();
-    Rt2::new(width, src.shape.clone(), cols, crate::runtime2::static_strings(), src.room)
 }

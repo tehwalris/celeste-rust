@@ -78,6 +78,123 @@ impl<N: Copy + PartialEq> Col<N> {
     }
 }
 
+/// How a column holds its rows' values, in a block of no rows (a
+/// `Template`): one value in every row, or per row a number, an interval,
+/// a boolean (known or not), any value.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ColRepr<N = P8> {
+    Uniform(AV<N>),
+    Num,
+    Ival,
+    Bool,
+    Other,
+}
+
+impl<N: Arithmetic> ColRepr<N> {
+    /// A column's representation: uniform, numbers, intervals, or per row
+    /// any values (`V`).
+    pub fn of(col: &Col<N>) -> ColRepr<N> {
+        match col {
+            Col::U(v) => ColRepr::Uniform(*v),
+            Col::N(_) => ColRepr::Num,
+            Col::I(_) => ColRepr::Ival,
+            Col::V(_) => ColRepr::Other,
+        }
+    }
+
+    /// The column of a template's row of value `v`: a number, an interval
+    /// or a boolean per row, any other value uniform.
+    pub fn of_value(v: AV<N>) -> ColRepr<N> {
+        match v {
+            AV::Num(_) => ColRepr::Num,
+            AV::Ival(..) => ColRepr::Ival,
+            AV::Bool(_) | AV::UBool => ColRepr::Bool,
+            v => ColRepr::Uniform(v),
+        }
+    }
+
+    /// As the decode builds a value column from codes (the code merges
+    /// `Num(n)` and `Ival(n, n)`): numbers, intervals, or any value.
+    pub fn decoded(self) -> ColRepr<N> {
+        match self {
+            ColRepr::Num | ColRepr::Uniform(AV::Num(_)) => ColRepr::Num,
+            ColRepr::Ival | ColRepr::Uniform(AV::Ival(..)) => ColRepr::Ival,
+            _ => ColRepr::Other,
+        }
+    }
+
+    /// The per-row kind the column's rows have, or a uniform value could
+    /// (`None`: neither a number, an interval nor a boolean).
+    fn kind(self) -> Option<ColRepr<N>> {
+        match self {
+            ColRepr::Num | ColRepr::Uniform(AV::Num(_)) => Some(ColRepr::Num),
+            ColRepr::Ival | ColRepr::Uniform(AV::Ival(..)) => Some(ColRepr::Ival),
+            ColRepr::Bool | ColRepr::Uniform(AV::Bool(_)) | ColRepr::Uniform(AV::UBool) => Some(ColRepr::Bool),
+            _ => None,
+        }
+    }
+
+    /// One column for the rows of both: the same uniform value, else their
+    /// kind (a number and an interval: an interval); `None` where they
+    /// cannot share a typed column.
+    pub fn join(self, other: ColRepr<N>) -> Option<ColRepr<N>> {
+        if let (ColRepr::Uniform(x), ColRepr::Uniform(y)) = (self, other) {
+            if x == y {
+                return Some(self);
+            }
+        }
+        match (self.kind()?, other.kind()?) {
+            (a, b) if a == b => Some(a),
+            (ColRepr::Num, ColRepr::Ival) | (ColRepr::Ival, ColRepr::Num) => Some(ColRepr::Ival),
+            _ => None,
+        }
+    }
+
+    /// An empty column of the representation.
+    pub fn empty(self) -> Col<N> {
+        match self {
+            ColRepr::Uniform(v) => Col::U(v),
+            ColRepr::Num => Col::N(Vec::new()),
+            ColRepr::Ival => Col::I(Vec::new()),
+            ColRepr::Bool | ColRepr::Other => Col::V(Vec::new()),
+        }
+    }
+}
+
+/// A TEMPLATE: a block of no rows - its shape, strings and room, and per
+/// cell how its rows hold their values (`ColRepr`; a non-value cell's
+/// uniform). A kernel outcome's rows, a reference row's, a stored shape's.
+#[derive(Clone)]
+pub struct Template<N = P8> {
+    pub shape: Arc<Shape>,
+    pub strings: Arc<[String]>,
+    pub room: &'static Room,
+    pub cols: Box<[ColRepr<N>]>,
+}
+
+impl<N: Arithmetic> Template<N> {
+    /// The template of block `b` (its columns as they are: `ColRepr::of`).
+    pub fn of_block(b: &Rt2<N>) -> Template<N> {
+        Template { shape: b.shape.clone(), strings: b.strings.clone(), room: b.room, cols: b.cols.iter().map(ColRepr::of).collect() }
+    }
+
+    /// The template of one-row block `row`'s rows: by its values
+    /// (`ColRepr::of_value`), the static strings.
+    pub fn of_row(row: &Rt2<N>) -> Template<N> {
+        Template { shape: row.shape.clone(), strings: static_strings(), room: row.room, cols: row.cols.iter().map(|c| ColRepr::of_value(c.at(0))).collect() }
+    }
+
+    #[inline]
+    pub fn shape_hash(&self) -> u64 {
+        self.shape.hash()
+    }
+
+    /// As a block of no rows (`ColRepr::empty`).
+    pub fn empty(&self) -> Rt2<N> {
+        Rt2::new(0, self.shape.clone(), self.cols.iter().map(|c| c.empty()).collect(), self.strings.clone(), self.room)
+    }
+}
+
 /// The names the engine reads itself, as their ids (`celeste_names`): the
 /// anchors' (`shape::Anchors`: the position object, the player, else the
 /// player spawn, in `objects` by its `type`; the `room`) and their fields.

@@ -9,7 +9,7 @@ pub mod shape;
 pub mod slots;
 pub mod widening;
 
-pub use runtime2::{Col, Rt2, AV, NONE};
+pub use runtime2::{Col, ColRepr, Rt2, Template, AV, NONE};
 pub use shape::{Cell, Shape};
 
 /// The hasher the row machinery keys with. Part of this crate's ABI: maps
