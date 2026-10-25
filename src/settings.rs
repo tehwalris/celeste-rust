@@ -221,9 +221,6 @@ pub struct Diagnostics {
     /// decoded so) and compared.
     #[arg(long, global = true)]
     pub key_check: bool,
-    /// DIAGNOSTIC: kernels keep their graphs, so a decline names its premise.
-    #[arg(long, global = true)]
-    pub kernel_explain: bool,
     /// DIAGNOSTIC: the wave workers' phase timings.
     #[arg(long, global = true)]
     pub phases: bool,
@@ -286,7 +283,6 @@ impl Settings {
             row("concrete_balloon_seeds", none(self.concrete_balloon_seeds.clone()), false),
             row("threads", none(self.threads.map(|t| t.to_string())), false),
             switch("key_check", self.diag.key_check, false),
-            switch("kernel_explain", self.diag.kernel_explain, false),
             switch("phases", self.diag.phases, false),
         ]
     }

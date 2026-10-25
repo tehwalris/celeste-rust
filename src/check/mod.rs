@@ -5,3 +5,4 @@
 //! (`conventions`).
 #![warn(unreachable_pub)]
 pub mod census;
+pub mod explain;

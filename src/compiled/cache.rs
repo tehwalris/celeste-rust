@@ -19,9 +19,9 @@
 //! mismatch is a loud miss and a rebuild, never a use). Written to a
 //! process's own directory and renamed into place: of two processes storing
 //! one key, whichever rename wins is the entry. Past `CAP_BYTES` the least
-//! recently used entries go. `--kernel-explain` builds without it. A tool
-//! keeps what it derives from the set beside it, under the same key
-//! (`get`, `put`: the census's `<key>-census`).
+//! recently used entries go. A tool keeps what it derives from the set
+//! beside it, under the same key (`get`, `put`: the census's
+//! `<key>-census`).
 
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -32,7 +32,7 @@ use super::asm_kernel::Recipe;
 use super::KernelLanes;
 
 /// The entries' format: a change of `Recipe` or of this layout bumps it.
-pub(crate) const KERNEL_CACHE_FORMAT: u32 = 2;
+pub(crate) const KERNEL_CACHE_FORMAT: u32 = 3;
 
 /// The entries' total size past which the least recently used go.
 const CAP_BYTES: u64 = 4 << 30;

@@ -101,8 +101,32 @@ impl Sk {
         cells::cell(self.region % cells::SLOTS, self.local as u32)
     }
 
-    /// As text (`r{region}.{key hi}:{key lo}.c{local}`).
+    /// As text (`r{region}.{key hi}:{key lo}.c{local}`; `parse` reads it).
     pub fn show(&self) -> String {
         format!("r{}.{:x}:{:x}.c{}", self.region, self.key.0, self.key.1, self.local)
+    }
+
+    /// A state as `show` writes it.
+    pub fn parse(s: &str) -> std::result::Result<Sk, String> {
+        let bad = || format!("{s:?}: a state is r{{region}}.{{key hi}}:{{key lo}}.c{{cell}} (as the logs show it)");
+        let (region, rest) = s.strip_prefix('r').and_then(|r| r.split_once('.')).ok_or_else(bad)?;
+        let (key, local) = rest.split_once(".c").ok_or_else(bad)?;
+        let (hi, lo) = key.split_once(':').ok_or_else(bad)?;
+        let hex = |x: &str| u64::from_str_radix(x, 16).map_err(|_| bad());
+        let local: u8 = local.parse().ok().filter(|&l| u32::from(l) < cells::SIDE * cells::SIDE).ok_or_else(bad)?;
+        Ok(Sk { region: region.parse().map_err(|_| bad())?, key: (hex(hi)?, hex(lo)?), local })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A state reads back as the logs show it; other text is refused.
+    #[test]
+    fn a_state_reads_back_as_shown() {
+        let s = super::Sk::at(7, (0xdead_beef, 3), super::cells::cell_of(40, 64).expect("a cell"));
+        assert_eq!(super::Sk::parse(&s.show()), Ok(s));
+        for bad in ["", "r1.2:3", "r1.2.c3", "x1.2:3.c4", "r1.2:3.c64", "r1.g:3.c4"] {
+            assert!(super::Sk::parse(bad).is_err(), "{bad:?}");
+        }
     }
 }

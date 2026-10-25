@@ -1,8 +1,8 @@
 //! WHY a graph computes what it does, for diagnostics: a kernel's decline
-//! (`--kernel-explain`), the binder's and the codegen's refusals. A node is rendered with its value where one
-//! evaluation is at hand (else its type); around that, the moves they all
-//! make: the disjuncts of an `Or`-tree, a chain followed down the graph, a
-//! subtree, the path from a root to a node.
+//! (`check::explain`), the binder's and the codegen's refusals. A node is
+//! rendered with its value where one evaluation is at hand (else its type);
+//! around that, the moves they all make: the disjuncts of an `Or`-tree, a
+//! chain followed down the graph, a subtree, the path from a root to a node.
 
 use std::collections::HashSet;
 

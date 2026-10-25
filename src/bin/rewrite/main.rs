@@ -130,6 +130,16 @@ enum Command {
     /// THE BENCHMARKS of a finished tree: one forward or backward frame.
     #[command(subcommand)]
     Bench(bench::Command),
+    /// WHY A KERNEL DECLINES A STATE (`check::explain`; the decline report
+    /// prints this command).
+    ///
+    /// The state's row (of the tree's layers through `--step`, where the
+    /// forward ran it) and its kernel REBUILT as the set builds it (its text
+    /// checked against the running kernel's), the kernel's graph evaluated
+    /// on the row: per body that declines it (live and error both may hold)
+    /// the error's disjuncts that are not false, each followed down to its
+    /// first undecided condition, and its failing premises.
+    Explain(ExplainArgs),
     /// DIAGNOSTIC: a tree's states at `--step`, COUNTED per shape.
     ///
     /// Per shape: its rows, every varying column's distinct values (capped
@@ -217,7 +227,7 @@ enum Command {
 impl Command {
     /// A command that reads finished trees: their records give the settings.
     fn reads_trees(&self) -> bool {
-        matches!(self, Command::Ckhash(_) | Command::Check(_) | Command::Bench(_) | Command::Census(_) | Command::ExportUi(_) | Command::L1(l1::Command::Probe(_)))
+        matches!(self, Command::Ckhash(_) | Command::Check(_) | Command::Bench(_) | Command::Explain(_) | Command::Census(_) | Command::ExportUi(_) | Command::L1(l1::Command::Probe(_)))
     }
 }
 
@@ -317,6 +327,18 @@ pub struct ExportUiArgs {
     /// byte (the tasdatabase upload the category runner verified).
     #[arg(long)]
     download: Option<String>,
+}
+
+#[derive(clap::Args)]
+pub struct ExplainArgs {
+    #[command(flatten)]
+    tree: TreeArg,
+    /// The step the forward ran the state from (its layers through it are read).
+    #[arg(long)]
+    step: u32,
+    /// The state, as the decline report shows it (`r{region}.{key}.c{cell}`).
+    #[arg(long, value_parser = Sk::parse)]
+    state: Sk,
 }
 
 /// THE TREE a command reads, its settings its records' (`TreeDir`).
@@ -505,6 +527,11 @@ fn main() -> Result<()> {
         Command::Ckhash(a) => diag::ckhash(&cfg, a),
         Command::Check(c) => check::run(&cfg, c),
         Command::Bench(c) => bench::run(&cfg, c),
+        Command::Explain(a) => {
+            let t = a.tree.open(&cfg)?;
+            print!("{}", celeste_rust::with_arith!(t.settings.arith, N => celeste_rust::check::explain::explain::<N>(&t, a.step, a.state)?));
+            Ok(())
+        }
         Command::Census(a) => diag::census(&cfg, a),
         Command::Trajectory(a) => diag::trajectory(&cfg, a),
         Command::Robust(a) => diag::robust(&cfg, a),

@@ -102,8 +102,7 @@ reference for semantics only.
    `/var/tmp/celeste-kernels`), keyed on every source file, the build
    profile, gcc and glibc, the program, the arithmetic, the level and the
    settings: only the same build of the same sources loads it again (the
-   `[asm build]` line says HIT or MISS; `--kernel-explain` always
-   builds).
+   `[asm build]` line says HIT or MISS).
 
 To the outer loop a state is opaque: `(shape, key, cell)`.
 

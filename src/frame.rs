@@ -1486,22 +1486,7 @@ mod tests {
         let registry = crate::compiled::asm_kernel::registry(level, &s, false);
         let row = standing_row(&s, level);
         let ids = crate::compiled::ids();
-        let player = row.player_objects()[0];
-        let cell_of = |rt2: &Rt2, f: u32, axis: u32| -> usize {
-            let pc = rt2.obj_field_cell(player, f).expect("the player's table field");
-            let Col::U(AV::Ptr(t)) = rt2.cols[pc as usize] else { panic!("the player's field is not a table") };
-            rt2.obj_field_cell(t, axis).expect("its axis") as usize
-        };
-        // `row` with one field set; a number column or an interval one, as it was.
-        let with = |f: u32, axis: u32, v: P8| -> Rt2 {
-            let mut r = row.clone_block();
-            let c = cell_of(&r, f, axis);
-            r.cols[c] = match r.cols[c] {
-                Col::U(AV::Ival(..)) | Col::I(_) => Col::U(AV::Ival(v, v)),
-                _ => Col::U(AV::Num(v)),
-            };
-            r
-        };
+        let with = |f: u32, axis: u32, v: P8| with_player_field(&row, f, axis, v);
         let runs = |r: &Rt2| -> bool {
             let cells = crate::storage::cells::block_cells(r).expect("cells");
             assert!(grid.of_cell(cells[0]).is_some(), "the lane has a region");
@@ -1516,6 +1501,42 @@ mod tests {
         assert!(!runs(&with(ids.f_spd, ids.f_x, past)), "speed.x past the bound declines");
         assert!(!runs(&with(ids.f_spd, ids.f_y, past.wrapping_neg())), "speed.y past the bound declines");
         assert!(!runs(&with(ids.f_rem, ids.f_x, half)), "a remainder of 0.5 declines");
+    }
+
+    /// `row` with its player's table field `f`'s `axis` set to `v`; a number
+    /// column or an interval one, as it was.
+    fn with_player_field(row: &Rt2, f: u32, axis: u32, v: P8) -> Rt2 {
+        let mut r = row.clone_block();
+        let pc = r.obj_field_cell(r.player_objects()[0], f).expect("the player's table field");
+        let Col::U(AV::Ptr(t)) = r.cols[pc as usize] else { panic!("the player's field is not a table") };
+        let c = r.obj_field_cell(t, axis).expect("its axis") as usize;
+        r.cols[c] = match r.cols[c] {
+            Col::U(AV::Ival(..)) | Col::I(_) => Col::U(AV::Ival(v, v)),
+            _ => Col::U(AV::Num(v)),
+        };
+        r
+    }
+
+    /// A DECLINE EXPLAINED (`check::explain`, `rewrite explain`): the row
+    /// whose `spd.x` lies past its region kernel's bound
+    /// (`a_lane_outside_its_kernels_bounds_declines`), its kernel rebuilt and
+    /// evaluated on it, is declined by a body on a failing premise that is
+    /// the bound's check, named by its `Restrict`; the row at the bound is
+    /// declined by none.
+    #[test]
+    #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels rebuilt twice, ~30 CPU-s"]
+    fn a_decline_is_explained_by_the_bound_it_fails() {
+        let s = Settings::default();
+        let level = Level::parse("r0sxh").expect("level");
+        let grid = s.region_grid().expect("the default region grid");
+        let (row, ids) = (standing_row(&s, level), crate::compiled::ids());
+        let at = P8::from_i16(grid.speed as i16);
+        let past = at.checked_add(P8::from_parts(0, 0x8000)).expect("small");
+        let text = crate::check::explain::explain_row::<P8>(level, &s, &with_player_field(&row, ids.f_spd, ids.f_x, past)).expect("explained");
+        assert!(text.contains("declines the row") && text.contains("failing premise"), "{text}");
+        assert!(text.lines().any(|l| l.contains("the bound it checks") && l.contains("Restrict")), "no Restrict premise named:\n{text}");
+        let fine = crate::check::explain::explain_row::<P8>(level, &s, &with_player_field(&row, ids.f_spd, ids.f_x, at)).expect("explained");
+        assert!(fine.contains("no body declines the row"), "{fine}");
     }
 
     /// THE KERNELS' EMISSION CHECKS THE FOLLOWERS (`exact::Deps`): room
