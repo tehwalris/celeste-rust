@@ -1,6 +1,6 @@
 //! One scoped worker pool: `n` items pulled by index from an atomic cursor,
 //! each worker with its own state (a reference engine, a scratch buffer),
-//! the results in index order (`map`, `map_with`), or an unordered fold
+//! the results in index order (`map`, `map_with`, `map_on`), or an unordered fold
 //! into per-worker accumulators (`drain`). The first error stops the
 //! pulling and is returned; a worker's panic is resumed in the caller with
 //! its own message.
@@ -54,6 +54,18 @@ impl Pool {
         let next = AtomicUsize::new(0);
         let slots = slots(n);
         self.spawn(vec![(); self.workers(n)], |()| pull(&next, n, &slots, &mut init()?, &f))?;
+        Ok(results(slots))
+    }
+
+    /// `f(&mut states[w], i)` for every `i < n` on `min(states.len(), n)`
+    /// workers (at most this pool's), worker `w` holding `states[w]`
+    /// throughout (an engine each, built by the caller); results by index.
+    pub(crate) fn map_on<S: Send, T: Send>(&self, states: &mut [S], n: usize, f: impl Fn(&mut S, usize) -> Result<T> + Sync) -> Result<Vec<T>> {
+        assert!(n == 0 || !states.is_empty(), "a map over {n} items on no state");
+        let next = AtomicUsize::new(0);
+        let slots = slots(n);
+        let k = self.workers(n).min(states.len());
+        self.spawn(states.iter_mut().take(k).collect(), |s| pull(&next, n, &slots, s, &f))?;
         Ok(results(slots))
     }
 
@@ -184,6 +196,40 @@ mod tests {
     /// The panic's message, from a payload.
     fn message(p: Box<dyn std::any::Any + Send>) -> String {
         p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default()
+    }
+
+    /// `map_on`: results by index at 1, 3 and 32 states; each item once,
+    /// on one worker that holds its state throughout (a state is never on
+    /// two threads); an error stops the others early and is returned; a
+    /// panic is resumed with its message.
+    #[test]
+    fn a_map_on_states_runs_each_item_once_on_its_workers_state() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for k in [1, 3, 32] {
+            let mut states: Vec<(Option<std::thread::ThreadId>, Vec<usize>)> = vec![(None, Vec::new()); k];
+            let out = Pool::new(k)
+                .map_on(&mut states, 1000, |st, i| {
+                    let me = std::thread::current().id();
+                    assert_eq!(*st.0.get_or_insert(me), me, "a state on two workers");
+                    st.1.push(i);
+                    Ok(i * 3)
+                })
+                .unwrap();
+            assert_eq!(out, (0..1000).map(|i| i * 3).collect::<Vec<_>>(), "{k} states");
+            let mut all: Vec<usize> = states.iter().flat_map(|s| s.1.iter().copied()).collect();
+            all.sort_unstable();
+            assert_eq!(all, (0..1000).collect::<Vec<_>>(), "{k} states: each item once");
+            let ran = AtomicUsize::new(0);
+            let err = Pool::new(k).map_on(&mut states, 100_000, |_, i| {
+                ran.fetch_add(1, Ordering::Relaxed);
+                if i == 0 { anyhow::bail!("item {i}") } else { Ok(i) }
+            });
+            assert_eq!(err.unwrap_err().to_string(), "item 0");
+            assert!(ran.load(Ordering::Relaxed) < 100_000, "{k} states: the error stopped the others");
+            let p = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Pool::new(k).map_on(&mut states, 100, |_, i| if i == 5 { panic!("boom {i}") } else { Ok(i) })));
+            assert_eq!(message(p.expect_err("a panic")), "boom 5");
+        }
+        assert!(Pool::new(4).map_on(&mut Vec::<()>::new(), 0, |_, i| Ok(i)).unwrap().is_empty());
     }
 
     /// A drain takes each item of `from..n` exactly once into some
