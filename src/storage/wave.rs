@@ -311,10 +311,10 @@ struct UnitScratch {
 }
 
 /// ONE KERNEL UNIT: its states DECODED, `frame::not_expanded` (decided here,
-/// fresh or resumed; `ceiling`: the orb cut's, `TreeL1::orb_ceiling`) left
+/// fresh or resumed; `orb`: the tree's orb cut, `frame::OrbCut`) left
 /// out, the rest through the engine with their hulls.
 #[allow(clippy::too_many_arguments)]
-fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<usize>, state: usize, layer: &Layer<N>, hulls: &[HullOf<N>], starts: &[usize], shapes: &[u64], sink: &mut UnitSink<'_, N>, sc: &mut UnitScratch, layer_frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<()> {
+fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<usize>, state: usize, layer: &Layer<N>, hulls: &[HullOf<N>], starts: &[usize], shapes: &[u64], sink: &mut UnitSink<'_, N>, sc: &mut UnitScratch, layer_frame: u32, orb: Option<crate::frame::OrbCut>, s: &crate::settings::Settings) -> Result<()> {
     let t_dec = sink.stats.tick_start();
     sink.begin(u);
     sc.rows.clear();
@@ -344,7 +344,7 @@ fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<
     let shape = *shapes.get((region / crate::storage::cells::SLOTS) as usize).ok_or_else(|| anyhow!("a frontier region of no shape"))?;
     let skel = layer.skeletons.get(&shape).ok_or_else(|| anyhow!("ROWS FROM KEYS: the frontier holds no skeleton of shape {shape:016x}"))?;
     let block = super::decode::decode_rows(sink.keys(), skel, &sc.rows)?;
-    let skip = crate::frame::not_expanded(&block, layer_frame, ceiling, s)?;
+    let skip = crate::frame::not_expanded(&block, layer_frame, orb, s)?;
     sc.live.clear();
     sc.live.extend((0..block.width).filter(|&l| !skip[l]));
     sink.stats.tick(S::PhDecode, t_dec);
@@ -456,7 +456,7 @@ fn worker<N: Rem>(sh: &Shared<N>, sink: &mut UnitSink<N>, sc: &mut super::route:
             let t = Instant::now();
             match &plan.units[u] {
                 UnitSpec::Kernel { entries, state, .. } => {
-                    run_unit(sh.engine, u as u32, entries.clone(), *state, &sh.front.new, &sh.front.hulls, &plan.starts, sh.shapes, sink, &mut us, frame - 1, sh.cx.filters.l1.map(|l| l.orb_ceiling()), sh.s)?;
+                    run_unit(sh.engine, u as u32, entries.clone(), *state, &sh.front.new, &sh.front.hulls, &plan.starts, sh.shapes, sink, &mut us, frame - 1, sh.cx.filters.orb, sh.s)?;
                 }
                 UnitSpec::Repush { layer, frame: f, segs, .. } => {
                     let tr = sink.stats.tick_start();

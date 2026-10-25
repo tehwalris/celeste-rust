@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 pub(crate) const FILE: &str = "tree.txt";
 
 /// The lines that are not settings: what the tree's forward wrote.
-pub(crate) const TREE_KEYS: [&str; 3] = ["level_minus_one", "filtered_for", "done"];
+pub(crate) const TREE_KEYS: [&str; 4] = ["level_minus_one", "orb_cut", "filtered_for", "done"];
 
 /// A tree's record: its lines in order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -14,6 +14,8 @@ pub enum Command {
     Table(TableArgs),
     /// The table against a tree's recorded transitions, steps FROM..=TO
     /// under the horizon STEPS (and the backward's MARKS at that horizon).
+    /// The room, the category and every other setting are the TREE's (its
+    /// record), never the command line's: a settings flag is refused.
     Probe(ProbeArgs),
     /// The table against a known solution: none of its states may be too late.
     ///
@@ -77,8 +79,11 @@ pub fn run(cfg: &Settings, c: Command) -> Result<()> {
             Ok(())
         }
         Command::Probe(a) => {
+            // The table is built for the tree's room and settings, and the
+            // tree read in its arithmetic: both from its record.
+            let t = celeste_rust::search::tree::TreeDir::open(&a.tree, cfg)?;
             let opts = level_minus_one::Opts { spd_px: a.spd, level_dir: a.tree, ceiling: a.steps, from: a.from_step, to: a.to_step, marks: a.marks, threads: cfg.threads() };
-            let cfg = cfg.clone();
+            let cfg = t.settings;
             // The tracer recurses through the cart's AST: a big stack.
             let report = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)

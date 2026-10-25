@@ -328,12 +328,16 @@ resume.
 
 **The tree's record** (`storage::record`, `<level>/tree.txt`, one
 `key value` line each, rewritten whole and atomically): the settings that
-change the tree, the level included (a run under others is refused,
-`--override-settings` passes only `--region`); `level_minus_one` (the
+change the tree, the level included (a run under others is refused; the
+kernels' region grid is none of them: a tree is the same under every
+grid); `level_minus_one` (the
 filter: `off` or H, S and the table's fingerprint; a tree serves horizons
 up to H and is never raised past it; the TABLE itself is `l1-table.bin`
 beside it, which every reader and extension of the tree uses, whatever
-binary); `filtered_for` (a ladder level's marks, horizon and filter);
+binary); `orb_cut` (`off`, or in the orb room the horizon H the tree was
+started for: a row whose big chest is still closed too late for H is not
+expanded, so the tree is never raised past H either); `filtered_for` (a
+ladder level's marks, horizon and filter);
 `done` (the one trust marker: the frame and the transfer table's trusted
 length). Beside it, `forward.tsv` (per-frame stats).
 
@@ -516,8 +520,7 @@ plans/refactor.md: `git show c4dd3241:plans/refactor.md`).
     `Rt2::player_objects`).
   - The tracer beyond its audit: one trace for every level (today each
     level re-traces), the split pass replaced. These change behaviour.
-  - `--category onlydiag` has no run yet (kept by Philippe); `--override-settings`
-    passes `--region` only.
+  - `--category onlydiag` has no run yet (kept by Philippe).
 - Dropped, with the reason:
   - Folding `widen::within` into `GraphArith::pieces_of` (the audit's
     T12): `within`'s facts from a select's `x op k` condition would change

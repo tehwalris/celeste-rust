@@ -104,7 +104,8 @@ fn room_is<N: Arithmetic>(rt2: &Rt2<N>, (wx, wy): (i16, i16)) -> Result<Vec<bool
 }
 
 /// Per lane: on the win target? The exit, plus the orb in the orb room,
-/// and in a 100% run the room's berry taken.
+/// and in a 100% run the room's berry taken; never where the player DIED in
+/// the update (`died`).
 pub fn wins_of<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let mut wins = reaches_win(rt2, s)?;
     if s.category.hundred() {
@@ -112,7 +113,27 @@ pub fn wins_of<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Re
             *e &= b;
         }
     }
+    for (w, d) in wins.iter_mut().zip(died(rt2)?) {
+        *w &= !d;
+    }
     Ok(wins)
+}
+
+/// Per lane: is a room restart PENDING (`will_restart`)? Only `kill_player`
+/// sets it (`restart_room`), and it holds until the reload 15 updates later,
+/// during which no player exists to leave the room: so a row that left the
+/// room with it set left it in the update its player died. The cart runs
+/// the rest of the dead player's update on its table, and its `next_room()`
+/// loads the next room - which then restarts 15 updates in. A DYING EXIT is
+/// no win: by the category rules it is a death (`rewrite pico8 chain`
+/// reports one), and the per-room optima must chain in real play
+/// (plans/correctness.md C8). An unknown counts as alive (an abstract win
+/// over-approximates; the concrete search runs it exact).
+fn died<N: Arithmetic>(rt2: &Rt2<N>) -> Result<Vec<bool>> {
+    use celeste_engine::runtime2::{NONE, AV};
+    let c = rt2.globals[celeste_names::global("will_restart") as usize];
+    anyhow::ensure!(c != NONE, "wins: no `will_restart` global");
+    Ok((0..rt2.width).map(|l| rt2.cols[c as usize].at(l) == AV::Bool(true)).collect())
 }
 
 /// `wins_of` without its 100% condition.
@@ -151,16 +172,25 @@ pub(crate) fn got_fruit<N: Arithmetic>(rt2: &Rt2<N>, (x, y): (i16, i16)) -> Resu
         .collect())
 }
 
-/// A SOUND LOWER BOUND on frames from the big chest opening to a win: 61
-/// paused + 8 until the orb is collectable + 10 frozen = 79, taken as 70.
+/// A SOUND LOWER BOUND on the frames from the big chest's opening to a win
+/// (frames, split or not): the orb appears in the chest's 61st draw after
+/// it opens and is collectable in its own 8th (68 frames), then its 10
+/// frozen frames and the update that can exit make 79, measured on the cart
+/// and asserted against it
+/// (`tests::the_orb_deadline_is_below_the_carts_chest_to_orb_time`); 70
+/// keeps a margin.
 pub(crate) const ORB_MIN_FRAMES_AFTER_CHEST: u32 = 70;
 
 /// Per lane in the orb room: is the chest still CLOSED too late to win by
-/// `horizon` (the ceiling)? Such rows are not expanded.
-pub(crate) fn orb_deadline_skip<N: Arithmetic>(rt2: &Rt2<N>, frame: u32, horizon: u32) -> Vec<bool> {
+/// the horizon, step `h`? Closed after step `step`, the chest opens at the
+/// earliest in the draw of the frame the next step ends or is inside
+/// (`Clock::frame_of(step + 1)`), and a win comes at least
+/// `ORB_MIN_FRAMES_AFTER_CHEST` frames after: both counted in frames. Such
+/// rows are not expanded.
+pub(crate) fn orb_deadline_skip<N: Arithmetic>(rt2: &Rt2<N>, step: u32, h: u32, clock: crate::settings::Clock) -> Vec<bool> {
     use celeste_engine::runtime2::AV;
     let lanes = rt2.width;
-    if frame + 1 + ORB_MIN_FRAMES_AFTER_CHEST <= horizon {
+    if clock.frame_of(step + 1) + ORB_MIN_FRAMES_AFTER_CHEST <= clock.frame_of(h) {
         return vec![false; lanes];
     }
     let ids = crate::compiled::ids();
@@ -191,10 +221,10 @@ pub(crate) fn berry_lost<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Setti
 /// row whose chest is still closed too late for the ceiling). The one place
 /// it is decided, on every unit's decoded rows (`wave::run_unit`), so a
 /// resume expands exactly what an uninterrupted run does. `frame`: the
-/// rows' layer; `ceiling`: the tree's level -1 horizon. A state not
-/// expanded has no edges, so it is never re-pushed; one expanded is
-/// re-pushed whatever the orb's deadline says later: sound, less pruned.
-pub(crate) fn not_expanded<N: Arithmetic>(b: &Rt2<N>, frame: u32, ceiling: Option<u32>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
+/// rows' layer; `orb`: the tree's orb cut (`OrbCut`). A state not expanded
+/// has no edges, so it is never re-pushed; one expanded is re-pushed
+/// whatever the orb's deadline says later: sound, less pruned.
+pub(crate) fn not_expanded<N: Arithmetic>(b: &Rt2<N>, frame: u32, orb: Option<OrbCut>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
     let mut skip = exits_of(b, s)?;
     // Under a win rectangle a row that LEFT the room is no win, and its
     // shape has no kernel.
@@ -206,12 +236,50 @@ pub(crate) fn not_expanded<N: Arithmetic>(b: &Rt2<N>, frame: u32, ceiling: Optio
     for (w, lost) in skip.iter_mut().zip(berry_lost(b, s)?) {
         *w |= lost;
     }
-    if let (true, Some(h)) = (orb_required(s), ceiling) {
-        for (w, late) in skip.iter_mut().zip(orb_deadline_skip(b, frame, h)) {
+    if let Some(cut) = orb {
+        for (w, late) in skip.iter_mut().zip(orb_deadline_skip(b, frame, cut.h, s.clock())) {
             *w |= late;
         }
     }
     Ok(skip)
+}
+
+/// THE ORB CUT (`not_expanded`): in the orb room, where a win needs the orb,
+/// a row whose big chest is still closed too late for the tree's horizon is
+/// not expanded (`orb_deadline_skip`). The horizon is the step the tree was
+/// started for (the search's, the forward's `--steps`), its record's
+/// `orb_cut` line (`off` elsewhere, or `h H`). The tree's frames depend on
+/// it, so it serves horizons up to H and is never raised past it
+/// (`grow_tree`), as under level -1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OrbCut {
+    pub(crate) h: u32,
+}
+
+impl OrbCut {
+    /// The record's key.
+    const KEY: &'static str = "orb_cut";
+
+    /// A new tree's cut for horizon `to` (steps) under `s`, recorded.
+    fn start(to: u32, dir: &std::path::Path, s: &crate::settings::Settings) -> Result<Option<OrbCut>> {
+        let cut = orb_required(s).then_some(OrbCut { h: to });
+        crate::storage::record::update(dir, Self::KEY, cut.map_or("off".to_string(), |c| format!("h {}", c.h)))?;
+        Ok(cut)
+    }
+
+    /// The cut the tree `dir` records (`None`: off); an error without the
+    /// record's line (the cut is unknown) or with a garbled one.
+    pub(crate) fn recorded(dir: &std::path::Path) -> Result<Option<OrbCut>> {
+        let rec = crate::storage::record::Record::read(dir)?;
+        let v = rec.as_ref().and_then(|r| r.get(Self::KEY)).ok_or_else(|| anyhow::anyhow!("{}: no orb cut record: its cut is unknown", dir.display()))?;
+        if v == "off" {
+            return Ok(None);
+        }
+        match v.split_whitespace().collect::<Vec<_>>()[..] {
+            ["h", h] => Ok(Some(OrbCut { h: h.parse().with_context(|| format!("{}: not an orb cut line: {v:?}", dir.display()))? })),
+            _ => anyhow::bail!("{}: not an orb cut line: {v:?}", crate::storage::record::path(dir).display()),
+        }
+    }
 }
 
 /// Is the start room the orb room (5,2)? A win there also needs the orb
@@ -324,12 +392,6 @@ impl TreeL1 {
         self.table.too_late(shape, cell, step, self.h)
     }
 
-    /// THE ORB CUT'S CEILING (`not_expanded`): the tree's level -1 horizon.
-    /// A coupling, not a property of the filter (plans/correctness.md C2):
-    /// named here so the cut's own horizon is one change away.
-    pub(crate) fn orb_ceiling(&self) -> u32 {
-        self.h
-    }
 }
 
 /// What a forward filters by.
@@ -338,6 +400,8 @@ pub(crate) struct Filters<'a, N: Arithmetic = P8> {
     pub(crate) marks: Option<&'a MarkFilter<'a, N>>,
     /// The tree's level -1 filter.
     pub(crate) l1: Option<TreeL1>,
+    /// The tree's orb cut.
+    pub(crate) orb: Option<OrbCut>,
 }
 
 impl<N: Arithmetic> Clone for Filters<'_, N> {
@@ -350,7 +414,7 @@ impl<N: Arithmetic> Copy for Filters<'_, N> {}
 
 impl<N: Arithmetic> Default for Filters<'_, N> {
     fn default() -> Self {
-        Filters { marks: None, l1: None }
+        Filters { marks: None, l1: None, orb: None }
     }
 }
 
@@ -462,6 +526,8 @@ pub struct ForwardState<N: Rem = P8> {
     /// The level -1 filter the tree's frames were built under (the tree's
     /// table).
     l1: Option<TreeL1>,
+    /// The orb cut the tree's frames were built under.
+    orb: Option<OrbCut>,
 }
 
 pub struct ForwardResult {
@@ -490,9 +556,10 @@ fn checkpoint<N: Rem>(dir: &std::path::Path, frame: u32, wave: &crate::storage::
 
 impl<N: Rem> ForwardState<N> {
     /// Frame 0: `initial` into an empty visited set and checkpointed, each
-    /// with the start's hull; the tree is filtered by `minus_one` and
-    /// widened at `level` (both recorded, with the settings `s`).
-    pub(crate) fn start(initial: Vec<Rt2<N>>, dir: &std::path::Path, minus_one: Option<MinusOne>, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
+    /// with the start's hull; the tree is filtered by `minus_one`, cut for
+    /// the horizon `to` (`OrbCut`) and widened at `level` (each recorded,
+    /// with the settings `s`).
+    pub(crate) fn start(initial: Vec<Rt2<N>>, dir: &std::path::Path, to: u32, minus_one: Option<MinusOne>, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
         // A fresh tree keeps nothing a killed run left (stale edge files, a
         // table, a trust marker); of its record, only a ladder level's
         // `filtered_for` (the driver's, written before).
@@ -511,6 +578,7 @@ impl<N: Rem> ForwardState<N> {
         rec.write(dir)?;
         s.write(dir, level)?;
         let l1 = TreeL1::start(minus_one, dir, s)?;
+        let orb = OrbCut::start(to, dir, s)?;
         // The start has no player yet (`rem::start_point`'s premise):
         // `seed` keys it as it is, so a player's remainder would be stored
         // exact where every other state holds it widened, beside its hull.
@@ -520,7 +588,7 @@ impl<N: Rem> ForwardState<N> {
         checkpoint(dir, 0, &seeded, &[], s, &mut Stats::default())?;
         let won = !seeded.wins.is_empty();
         crate::storage::record::set_done(dir, 0, 0)?;
-        Ok(ForwardState { frontier: seeded.frontier, visited, xfers: Default::default(), edges: Default::default(), skeletons: Default::default(), persisted: Default::default(), frames: 0, win_frame: won.then_some(0), l1 })
+        Ok(ForwardState { frontier: seeded.frontier, visited, xfers: Default::default(), edges: Default::default(), skeletons: Default::default(), persisted: Default::default(), frames: 0, win_frame: won.then_some(0), l1, orb })
     }
 
     /// The forward as its checkpoint tree left it (`None`: no tree); extending
@@ -564,11 +632,12 @@ impl<N: Rem> ForwardState<N> {
         s.check(dir, level)?;
         let edges_dir = dir.join("edges");
         let l1 = TreeL1::read(dir)?;
+        let orb = OrbCut::recorded(dir)?;
         let (visited, win_frame, frontier, skeletons) = restore_visited::<N>(dir, last, s.room, s.threads())?;
         let persisted = skeletons.shapes().into_iter().collect();
         let xfers = crate::storage::edges::XferTable::<N>::load(dir)?;
         let edges = std::sync::Arc::new(crate::storage::edges::EdgeFiles::open(&edges_dir, last)?);
-        Ok(ForwardState { frontier, visited, xfers, edges, skeletons: std::sync::Arc::new(skeletons), persisted, frames: last, win_frame, l1 })
+        Ok(ForwardState { frontier, visited, xfers, edges, skeletons: std::sync::Arc::new(skeletons), persisted, frames: last, win_frame, l1, orb })
     }
 
     pub fn visited_len(&self) -> usize {
@@ -598,7 +667,7 @@ impl<N: Rem> ForwardState<N> {
         let cx = crate::storage::wave::WaveCtx {
             visited: &mut self.visited,
             xfers: &mut self.xfers,
-            filters: Filters { marks, l1: self.l1 },
+            filters: Filters { marks, l1: self.l1, orb: self.orb },
             frame,
             edges_dir,
             edges: Some(&self.edges),
@@ -698,6 +767,16 @@ pub fn grow_tree<N: Rem>(
                 );
             }
         }
+        if let Some(cut) = OrbCut::recorded(dir)? {
+            anyhow::ensure!(
+                to <= cut.h,
+                "{}: the tree's orb cut is for step {}, below this run's step {to}: its frames left unexpanded the rows whose big chest was closed too late for step {} - delete it, or run at most to step {}",
+                dir.display(),
+                cut.h,
+                cut.h,
+                cut.h
+            );
+        }
     }
     if let Some(first_win) = complete {
         eprintln!("[forward] {}: the tree reaches step {to}", dir.display());
@@ -708,7 +787,7 @@ pub fn grow_tree<N: Rem>(
     anyhow::ensure!(*engine.settings() == *s, "the forward's engine runs under other settings than the tree's");
     let mut st = match ForwardState::<N>::resume(dir, level, s)? {
         Some(st) => st,
-        None => ForwardState::start(initial()?, dir, want, level, s)?,
+        None => ForwardState::start(initial()?, dir, to, want, level, s)?,
     };
     st.extend(engine.as_ref(), dir, to, marks)?;
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames })
@@ -722,7 +801,7 @@ pub(crate) fn forward_run<N: Rem>(
     dir: &std::path::Path,
     max_frames: u32,
 ) -> Result<ForwardResult> {
-    let mut st = ForwardState::start(initial, dir, None, engine.level(), &engine.settings())?;
+    let mut st = ForwardState::start(initial, dir, max_frames, None, engine.level(), &engine.settings())?;
     st.extend(engine, dir, max_frames, None)?;
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames })
 }
@@ -1148,7 +1227,7 @@ mod tests {
             std::fs::create_dir_all(f.parent().unwrap()).expect("mkdir");
             std::fs::write(f, b"stale").expect("write");
         }
-        ForwardState::start(init, dir, None, Level::EXACT, &s).expect("start");
+        ForwardState::start(init, dir, 0, None, Level::EXACT, &s).expect("start");
         for f in &stale {
             assert!(!f.exists(), "{} survived a fresh start", f.display());
         }
@@ -1183,9 +1262,9 @@ mod tests {
         };
         let (wide, hull) = (base.join("widened"), base.join("hull"));
         WIDEN.store(true, Ordering::Relaxed);
-        ForwardState::start(init(), &wide, None, level, &s).expect("start").extend(&e, &wide, to, None).expect("widened");
+        ForwardState::start(init(), &wide, to, None, level, &s).expect("start").extend(&e, &wide, to, None).expect("widened");
         WIDEN.store(false, Ordering::Relaxed);
-        ForwardState::start(init(), &hull, None, level, &s).expect("start").extend(&e, &hull, to, None).expect("hull");
+        ForwardState::start(init(), &hull, to, None, level, &s).expect("start").extend(&e, &hull, to, None).expect("hull");
         let t = crate::storage::layer::Tree::<P8>::open(&wide, to).expect("tree");
         let lines: Vec<String> = (0..=to).map(|f| { let (n, acc) = t.layer(f, None, 4).expect("layer").0.content_fingerprint(&t.space, &t.shapes).expect("fp"); format!("f{f:03} {n} {acc:016x}") }).collect();
         let pinned = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/gates/ckhash_room10_f000-044_widened.txt")).expect("the gate");
@@ -1288,7 +1367,7 @@ mod tests {
         let init = start_blocks(&s);
         let e = RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines");
         let frontier = |st: &ForwardState| -> (Vec<(u32, (u64, u64), u64)>, Vec<Hull>, crate::storage::wave::ByLayer) { (st.frontier.new.iter().collect(), st.frontier.hulls.clone(), st.frontier.old.clone()) };
-        let mut st = ForwardState::start(init, &dir, None, Level::EXACT, &s).expect("start");
+        let mut st = ForwardState::start(init, &dir, 3, None, Level::EXACT, &s).expect("start");
         for b in crate::storage::layer::decode_states(&st.frontier.new, &st.visited.keys, st.visited.shapes(), usize::MAX, &|_| true).expect("decode") {
             assert!(not_expanded(&b.1, 0, None, &s).expect("not expanded").iter().all(|&x| x), "frame 0: the berry is lost");
         }
@@ -1317,8 +1396,8 @@ mod tests {
         let start = RefEngine::new(&s).expect("engine").initial().expect("init");
         let init = || vec![start.clone_block().canonicalized()];
         let ends = 30;
-        ForwardState::start(init(), &a, None, level, &s).expect("start").extend(&e, &a, ends, None).expect("extend");
-        let mut st = ForwardState::start(init(), &b, None, level, &s).expect("start");
+        ForwardState::start(init(), &a, ends, None, level, &s).expect("start").extend(&e, &a, ends, None).expect("extend");
+        let mut st = ForwardState::start(init(), &b, ends, None, level, &s).expect("start");
         st.extend(&e, &b, ends - 1, None).expect("extend");
         let record = crate::storage::record::path(&b);
         let marker = std::fs::read_to_string(&record).expect("the record");
@@ -1363,7 +1442,7 @@ mod tests {
         // The same run extended one frame at a time.
         {
             let e = RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines");
-            let mut st = ForwardState::start(start_blocks(&s), dir, None, Level::EXACT, &s).expect("start");
+            let mut st = ForwardState::start(start_blocks(&s), dir, 4, None, Level::EXACT, &s).expect("start");
             for to in 1..=4 {
                 st.extend(&e, dir, to, None).expect("extend");
                 assert_eq!(st.frames, to);
@@ -1483,6 +1562,134 @@ mod tests {
         assert!(!runs(&with(x, add(path_lo, px(-1)), path_hi)), "x before the path declines");
         assert!(!runs(&with(rem, half.wrapping_neg(), half)), "a remainder reaching 0.5 declines");
         assert!(!runs(&with(spd, add(speed, px(1)), add(speed, px(1)))), "spd.x past its worlds' range declines");
+    }
+
+    /// A DYING EXIT IS NO WIN (plans/correctness.md C8). Room (2,2)'s top
+    /// row holds a right-facing spike (tile 59) at tile 8, beside the exit. A
+    /// player at x 64 rising from y -3 at 2 px a frame is in its kill zone
+    /// after its move (not moving left) and above y -4: the one update kills
+    /// it and, on its table, loads room (3,2) with the restart pending. The
+    /// same rise at x 40, clear of the spike, is the room's clean exit.
+    #[test]
+    fn a_dying_exit_is_no_win() {
+        let s = Settings { room: (2, 2), ..Default::default() };
+        let mut reference = RefEngine::new(&s).expect("ref engine");
+        let mut st = reference.initial().expect("initial state");
+        while st.player_objects().is_empty() {
+            st = reference.step_one(&st, 0).expect("the spawn");
+        }
+        let ids = crate::compiled::ids();
+        let num = |v: i16| Col::U(AV::Num(P8::from_i16(v)));
+        let mut rise = |x: i16| {
+            let mut b = st.clone_block();
+            let p = b.player_objects()[0];
+            for (f, v) in [(ids.f_x, x), (ids.f_y, -3)] {
+                let c = b.obj_field_cell(p, f).expect("a position field");
+                b.cols[c as usize] = num(v);
+            }
+            for (f, (vx, vy)) in [(ids.f_spd, (0, -2)), (ids.f_rem, (0, 0))] {
+                let (cx, cy) = b.player_xy_cells(f).expect("a vector field");
+                (b.cols[cx], b.cols[cy]) = (num(vx), num(vy));
+            }
+            reference.step_one(&b, 0).expect("one concrete successor")
+        };
+        let dying = rise(64);
+        assert_eq!(exits_of(&dying, &s).expect("exits"), [true], "it leaves the room");
+        assert_eq!(died(&dying).expect("died"), [true], "it died in that update");
+        assert_eq!(wins_of(&dying, &s).expect("wins"), [false], "a dying exit is no win");
+        assert_eq!(not_expanded(&dying, 1, None, &s).expect("not expanded"), [true], "nor is it expanded");
+        let clean = rise(40);
+        assert_eq!(died(&clean).expect("died"), [false]);
+        assert_eq!(wins_of(&clean, &s).expect("wins"), [true], "the clean exit wins");
+    }
+
+    /// THE ORB DEADLINE AGAINST THE CART (plans/correctness.md C2), in
+    /// frames, unsplit and split: from the big chest's opening to the first
+    /// update a player with the orb runs is at least
+    /// `ORB_MIN_FRAMES_AFTER_CHEST`. Room (5,2)'s any% witness is replayed to
+    /// the frame its chest opens; from there, with no input (nothing
+    /// freezes, so every draw ticks the chest's timer and the orb's rise:
+    /// the shortest), to the frame the orb is collectable (`spd.y` 0: its
+    /// draw takes it from then on). The witness's own collection gives the
+    /// freeze: its frames to the first update that runs. A win (the exit, in
+    /// the player's update) comes no sooner than the two together.
+    #[test]
+    fn the_orb_deadline_is_below_the_carts_chest_to_orb_time() {
+        let ids = crate::compiled::ids();
+        let num = |b: &Rt2, c: u32| match b.cols[c as usize].at(0) {
+            AV::Num(n) => n,
+            other => panic!("not a number: {other:?}"),
+        };
+        let global = |b: &Rt2, name: &str| num(b, b.globals[celeste_names::global(name) as usize]);
+        let chest_state = |b: &Rt2| b.objects_of_type(ids.g_big_chest).first().map(|&o| num(b, b.obj_field_cell(o, ids.f_state).expect("a state")));
+        let orb_still = |b: &Rt2| {
+            b.objects_of_type(celeste_names::global("orb")).iter().any(|&o| {
+                let AV::Ptr(spd) = b.cols[b.obj_field_cell(o, ids.f_spd).expect("spd") as usize].at(0) else { panic!("the orb's spd is no table") };
+                num(b, b.obj_field_cell(spd, ids.f_y).expect("spd.y")) == P8::from_i16(0)
+            })
+        };
+        let inputs = crate::concrete::read_inputs("tas/room_5_2_exit_frame_150.txt").expect("the witness");
+        let mut bounds = Vec::new();
+        for split_frame in [false, true] {
+            let s = Settings { room: (5, 2), split_frame, ..Default::default() };
+            let mut eng = RefEngine::new(&s).expect("ref engine");
+            let frame = |eng: &mut RefEngine, b: &Rt2, input: u8| {
+                let mut leaves = eng.frame(b, input).expect("a frame");
+                assert_eq!(leaves.len(), 1, "one leaf");
+                leaves.remove(0)
+            };
+            let (mut st, mut opened, mut taken, mut exit) = (eng.initial().expect("the start"), None, None, None);
+            let mut frozen_to = None;
+            for (i, &b) in inputs.iter().enumerate() {
+                let f = i as u32 + 1;
+                st = frame(&mut eng, &st, b);
+                if opened.is_none() && chest_state(&st) == Some(P8::from_i16(1)) {
+                    opened = Some((f, st.clone_block()));
+                }
+                if taken.is_none() && global(&st, "max_djump") == P8::from_i16(2) {
+                    taken = Some(f);
+                }
+                // The last frame the collection's freeze holds.
+                if taken.is_some() && frozen_to.is_none() && global(&st, "freeze") == P8::from_i16(0) {
+                    frozen_to = Some(f);
+                }
+                if exits_of(&st, &s).expect("exits")[0] {
+                    exit = Some(f);
+                    break;
+                }
+            }
+            let (open, mut st) = opened.expect("the chest opens");
+            let (taken, frozen_to, exit) = (taken.expect("the orb is taken"), frozen_to.expect("the freeze ends"), exit.expect("the witness exits"));
+            let mut still = 0;
+            while !orb_still(&st) {
+                st = frame(&mut eng, &st, 0);
+                still += 1;
+                assert!(still < 200, "no orb comes to rest");
+            }
+            // The first update after the freeze is frame `frozen_to + 1`.
+            let bound = still + (frozen_to + 1 - taken);
+            assert!(exit - open >= bound, "split {split_frame}: the witness exits {} frames after the opening, under the cart's {bound}", exit - open);
+            assert!(ORB_MIN_FRAMES_AFTER_CHEST <= bound, "split {split_frame}: the deadline's {ORB_MIN_FRAMES_AFTER_CHEST} frames exceed the cart's {bound}: UNSOUND");
+            bounds.push((still, frozen_to + 1 - taken));
+        }
+        // The orb appears in the chest's 61st draw after its opening and
+        // rests in its own 8th draw, the first in that same frame (68); then
+        // 10 frozen frames and the update after them (11): 79, the same
+        // split and unsplit.
+        assert_eq!(bounds, [(68, 11), (68, 11)]);
+    }
+
+    /// THE ORB CUT COUNTS FRAMES (plans/correctness.md C2): a closed chest
+    /// after step k opens at the earliest in frame `frame_of(k + 1)`, so at
+    /// horizon f100 the last closed state expanded is f29's unsplit (opening
+    /// in f30, 30 + 70 = 100); split, its frame boundary (step 58) and the
+    /// mid-frame step 59 inside f30 (still opening in f30), not step 60.
+    #[test]
+    fn the_orb_cut_counts_frames_under_the_split_frame() {
+        let closed = RefEngine::new(&Settings { room: (5, 2), ..Default::default() }).expect("ref engine").initial().expect("the start");
+        let skip = |step: u32, h: u32, per_frame: u32| orb_deadline_skip(&closed, step, h, crate::settings::Clock { per_frame })[0];
+        assert!(!skip(29, 100, 1) && skip(30, 100, 1));
+        assert!(!skip(58, 200, 2) && !skip(59, 200, 2) && skip(60, 200, 2));
     }
 
     /// The summit wins at the flag: the TAS31 reference wins at frame 55, not before.
