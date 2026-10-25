@@ -2091,6 +2091,10 @@ fn compare_with_tree<N: Arithmetic>(opts: &Opts, by_hash: &HashMap<u64, usize>, 
     let xy_of = |c: u32| -> (i16, i16) { if c == NO_CELL { (NONE, NONE) } else { cell_xy(c).map(|(x, y)| (x as i16, y as i16)).expect("a grid cell") } };
     let marks = match &opts.marks {
         Some(p) => {
+            // A marks file loads in 16.16 alone (`Visited::load`): a float
+            // tree's would decode as another key space (plans/correctness.md
+            // C14, the `= P8` defaults).
+            ensure!(N::NAME == celeste_core::arith::Fixed::NAME, "--marks on a {} tree: a marks file loads as 16.16 only", N::NAME);
             let v = crate::frame::Visited::load(p)?;
             say!(rep, "\n{} marked states in {}", v.len(), p.display())?;
             Some(v)

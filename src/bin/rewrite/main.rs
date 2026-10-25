@@ -218,7 +218,7 @@ enum Command {
 impl Command {
     /// A command that reads finished trees: their records give the settings.
     fn reads_trees(&self) -> bool {
-        matches!(self, Command::Ckhash(_) | Command::Check(_) | Command::Bench(_) | Command::Census(_) | Command::ExportUi(_))
+        matches!(self, Command::Ckhash(_) | Command::Check(_) | Command::Bench(_) | Command::Census(_) | Command::ExportUi(_) | Command::L1(l1::Command::Probe(_)))
     }
 }
 
@@ -546,5 +546,16 @@ mod tests {
         assert_eq!(celeste_rust::settings::duplicate_flags(&cmd), Vec::<String>::new(), "flags defined twice");
         cmd.debug_assert();
     }
-}
 
+    /// `l1 probe` reads a finished tree: its settings are the tree's
+    /// record, and one given on its command line (a wrong `--room` would
+    /// probe another room's table against the tree) is refused.
+    #[test]
+    fn the_level_minus_one_probe_takes_the_trees_settings() {
+        use clap::{CommandFactory, FromArgMatches};
+        let m = super::Cli::command().try_get_matches_from(["rewrite", "l1", "probe", "--room", "2,0", "--tree", "T", "--steps", "9", "--from-step", "1", "--to-step", "2"]).expect("the line parses");
+        let cli = super::Cli::from_arg_matches(&m).expect("the line parses");
+        assert!(cli.command.reads_trees());
+        assert_eq!(super::tree_flags_given(&m), ["--room"]);
+    }
+}
