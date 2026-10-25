@@ -62,17 +62,17 @@ pub fn search_lines(search_dir: &Path, run: &Settings) -> Result<Vec<String>> {
     // The backward's scratch: on disk, never inside a tree.
     let scratch = std::path::PathBuf::from(format!("/var/tmp/celeste-gate-{}", std::process::id()));
     let mut out = Vec::new();
-    for (dir, s, level) in &trees {
-        let steps = s.clock().steps(res.horizon);
-        let lines = crate::with_arith!(s.arith, N => level_lines::<N>(dir, *level, steps, s, &scratch));
+    for (dir, tree) in &trees {
+        let steps = tree.settings.clock().steps(res.horizon);
+        let lines = crate::with_arith!(tree.settings.arith, N => level_lines::<N>(dir, tree, steps, &scratch));
         let _ = std::fs::remove_dir_all(&scratch);
         out.extend(lines?);
     }
     let inputs = crate::search::concrete::inputs_text;
-    if let (Verdict::Optimal, Some(w), Some((_, s, _))) = (res.verdict, &res.witness, trees.last()) {
+    if let (Verdict::Optimal, Some(w), Some((_, tree))) = (res.verdict, &res.witness, trees.last()) {
         match &res.dual {
             None => {
-                let steps = s.clock().steps(res.horizon);
+                let steps = tree.settings.clock().steps(res.horizon);
                 out.push(format!("[gate] h{steps} concrete optimum {} inputs {}", w.len(), inputs(w)));
             }
             Some(d) => {
@@ -88,11 +88,12 @@ pub fn search_lines(search_dir: &Path, run: &Settings) -> Result<Vec<String>> {
 /// `horizon`, W's support, W per frame and the optimum. Each span is added
 /// at its first frame and taken off past its last (the sums commute, so the
 /// nodes go in parallel).
-fn level_lines<N: Rem>(dir: &Path, level: crate::abstraction::Level, horizon: u32, s: &Settings, scratch: &Path) -> Result<Vec<String>>
+fn level_lines<N: Rem>(dir: &Path, tree: &crate::settings::Run, horizon: u32, scratch: &Path) -> Result<Vec<String>>
 where
     N::C: GateWord,
 {
-    let ap = ArcPhase::<N>::of(dir, level, horizon, s, scratch)?;
+    let s = &*tree.settings;
+    let ap = ArcPhase::<N>::of(dir, tree, horizon, scratch)?;
     let w = &ap.arcs.w;
     let content = ap.arcs.space.content_hash();
     let parts = crate::par::Pool::new(s.threads()).chunks(w.len().div_ceil(BLOCK), 4096, |lo, hi| {

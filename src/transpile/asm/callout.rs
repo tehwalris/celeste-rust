@@ -51,7 +51,7 @@ fn not_whole16(v: P8, what: &str) -> ! {
 /// behind `AsmCtx::env`.
 #[repr(C)]
 pub struct CollisionEnv<'a> {
-    pub cache: &'a Room,
+    pub room: &'a Room,
 }
 
 impl CollisionEnv<'_> {
@@ -59,8 +59,8 @@ impl CollisionEnv<'_> {
     /// map where there is one (`Room::map`), picked once, else the scan
     /// (`Room::flag_at`). Bit `l` of the mask is lane `l`'s answer.
     fn tile_flags(&self, w: i16, h: i16, flag: i16, lanes: impl Iterator<Item = (i16, i16)>) -> u16 {
-        let map = self.cache.map(w, h, flag);
-        let scan = |x: i16, y: i16| self.cache.flag_at(x, y, w, h, flag).expect("tile_flag_at");
+        let map = self.room.map(w, h, flag);
+        let scan = |x: i16, y: i16| self.room.flag_at(x, y, w, h, flag).expect("tile_flag_at");
         lanes.enumerate().fold(0u16, |m, (l, (x, y))| {
             let hit = map.and_then(|map| map.get(x, y)).unwrap_or_else(|| scan(x, y));
             m | (hit as u16) << l
@@ -119,7 +119,7 @@ pub unsafe extern "C" fn co_tile_flag_lanes<L: CallLanes>(env: *const c_void, ou
     for i in 0..L::N {
         let (xi, yi) = (L::whole_lane(x, i, "tile_flag_at: x"), L::whole_lane(y, i, "tile_flag_at: y"));
         let (wi, hi) = (L::whole_lane(w, i, "tile_flag_at: w"), L::whole_lane(h, i, "tile_flag_at: h"));
-        if env.cache.flag_at(xi, yi, wi, hi, flag as i16).expect("tile_flag_at") {
+        if env.room.flag_at(xi, yi, wi, hi, flag as i16).expect("tile_flag_at") {
             m |= 1 << i;
         }
     }

@@ -32,7 +32,7 @@ use super::asm_kernel::Recipe;
 use super::KernelLanes;
 
 /// The entries' format: a change of `Recipe` or of this layout bumps it.
-pub(crate) const KERNEL_CACHE_FORMAT: u32 = 3;
+pub(crate) const KERNEL_CACHE_FORMAT: u32 = 5;
 
 /// The entries' total size past which the least recently used go.
 const CAP_BYTES: u64 = 4 << 30;
@@ -79,8 +79,9 @@ fn toolchain() -> &'static str {
     })
 }
 
-/// Level `level`'s kernel set under `s`, in `N`'s arithmetic: its key.
-pub(crate) fn key<N: KernelLanes>(level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Key> {
+/// `run`'s kernel set, in `N`'s arithmetic: its key.
+pub(crate) fn key<N: KernelLanes>(run: &crate::settings::Run) -> Result<Key> {
+    let (level, s) = (run.level, &*run.settings);
     // The settings but those that change no kernel: the threads and the
     // diagnostics.
     let settings = crate::settings::Settings { threads: None, phases: false, ..s.clone() };
@@ -232,7 +233,7 @@ mod tests {
     use celeste_core::pico8_num::Pico8Num;
 
     use crate::abstraction::Level;
-    use crate::settings::{Category, Settings};
+    use crate::settings::{Category, Run, Settings};
 
     /// A MISS FOR EVERY INPUT CHANGED: the key moves with each setting that
     /// shapes a kernel set (and with the arithmetic and the level), not
@@ -242,7 +243,7 @@ mod tests {
     fn a_kernel_cache_key_moves_with_every_input() {
         let level = Level::parse("r0sx").expect("level");
         let base = Settings::default();
-        let k = |s: &Settings, l: Level| super::key::<Pico8Num>(l, s).expect("key").name;
+        let k = |s: &Settings, l: Level| super::key::<Pico8Num>(&Run::new(s, l)).expect("key").name;
         let at = k(&base, level);
         assert_eq!(at, k(&Settings { threads: Some(3), ..base.clone() }, level), "the threads change no kernel");
         assert_eq!(at, k(&Settings { phases: true, ..base.clone() }, level), "--phases changes no kernel");
@@ -259,8 +260,8 @@ mod tests {
             assert_ne!(at, k(s, level), "{what}: the key did not move");
         }
         assert_ne!(at, k(&base, Level::parse("r0sxn").expect("level")), "the level");
-        assert_ne!(at, super::key::<LuaF64>(level, &base).expect("key").name, "the arithmetic");
-        let text = super::key::<Pico8Num>(level, &base).expect("key").text;
+        assert_ne!(at, super::key::<LuaF64>(&Run::new(&base, level)).expect("key").name, "the arithmetic");
+        let text = super::key::<Pico8Num>(&Run::new(&base, level)).expect("key").text;
         assert!(text.contains(super::SOURCES) && text.contains("gcc ") && text.contains("glibc "), "{text}");
     }
 
@@ -277,23 +278,23 @@ mod tests {
         use super::super::asm_kernel::Registry;
         let cases = [("r0sx", Settings::default()), ("r0sxf", Settings { room: (6, 0), split_frame: true, ..Settings::default() })];
         for (case, (level, s)) in cases.iter().enumerate() {
-            let level = Level::parse(level).expect("level");
+            let run = Run::new(s, Level::parse(level).expect("level"));
             let roots: Vec<std::path::PathBuf> = (0..2).map(|i| std::env::temp_dir().join(format!("celeste-kernel-cache-{}-{case}-{i}", std::process::id()))).collect();
             for r in &roots {
                 let _ = std::fs::remove_dir_all(r);
             }
             let stores: Vec<super::Store> = roots.iter().map(|r| super::Store::at(r)).collect();
-            let key = super::key::<Pico8Num>(level, s).expect("key");
+            let key = super::key::<Pico8Num>(&run).expect("key");
             let entry = |i: usize| -> Vec<(String, Vec<u8>)> {
                 let dir = stores[i].dir.join(&key.name);
                 let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&dir).expect("the entry").flatten().map(|f| (f.file_name().to_string_lossy().into_owned(), std::fs::read(f.path()).expect("read"))).collect();
                 files.sort();
                 files
             };
-            let fresh: Vec<Registry<Pico8Num>> = stores.iter().map(|st| Registry::build_with(level, s, Some(st), false).expect("a fresh build")).collect();
+            let fresh: Vec<Registry<Pico8Num>> = stores.iter().map(|st| Registry::build_with(&run, Some(st), false).expect("a fresh build")).collect();
             assert_eq!(entry(0), entry(1), "room {:?}: two fresh builds store the same entry", s.room);
             assert!(entry(0).iter().filter(|(n, _)| n.ends_with(".so")).count() == fresh[0].len(), "an entry holds every kernel's code");
-            let cached = Registry::<Pico8Num>::build_with(level, s, Some(&stores[0]), false).expect("a cached build");
+            let cached = Registry::<Pico8Num>::build_with(&run, Some(&stores[0]), false).expect("a cached build");
             assert_eq!(cached.text_digest(), fresh[0].text_digest(), "room {:?}: the cached kernels are the fresh ones", s.room);
             let layouts = cached.key_layouts();
             assert!(layouts == fresh[0].key_layouts(), "room {:?}: the cached kernels' key layouts are the fresh ones'", s.room);

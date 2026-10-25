@@ -336,20 +336,20 @@ pub(super) struct Side<'a, N: Rem> {
     pub(crate) w: &'a Winning<N::C>,
     pub(crate) node: NodeKeys<'a, N::C>,
     pub(crate) keys: &'a KeySpace<N>,
-    pub(crate) level: Level,
-    pub(crate) s: &'a Settings,
+    /// The level's run (its settings, its level).
+    pub(crate) run: &'a crate::settings::Run,
     pub(crate) seeded: bool,
 }
 
 impl<N: Rem> Side<'_, N> {
     /// Does `b` win (the room's win, `wins_of`)?
     pub(crate) fn wins(&self, b: &Rt2<N>) -> Result<bool> {
-        Ok(wins_of(b, self.s)?.iter().any(|&x| x))
+        Ok(wins_of(b, &self.run.settings)?.iter().any(|&x| x))
     }
 
     /// Is `b` a node whose W at step `t` holds its exact remainder?
     pub(crate) fn inside(&self, b: &Rt2<N>, t: u32) -> Result<bool> {
-        let (shape, nk, cells) = lookup_keys(b, self.level, self.seeded, self.keys)?;
+        let (shape, nk, cells) = lookup_keys(b, self.run.level, self.seeded, self.keys)?;
         let Some(i) = self.node.get(shape, nk[0], cells[0]) else { return Ok(false) };
         let q = rem_of::<N>(b)?;
         Ok(self.w.at(t, i).is_some_and(|r| r.contains(q.0, q.1)))
@@ -368,7 +368,7 @@ impl<N: Rem> Concrete for Single<'_, '_, N> {
     const NAME: &'static str = "concrete";
 
     fn engines(&self, n: usize) -> Result<Vec<Self::Engine>> {
-        Ok(concrete_engines::<N>(n, self.0.s)?.0)
+        Ok(concrete_engines::<N>(n, &self.0.run.settings)?.0)
     }
 
     fn start(&self, eng: &mut Self::Engine) -> Result<(Rt2<N>, u32)> {
@@ -388,7 +388,7 @@ impl<N: Rem> Concrete for Single<'_, '_, N> {
                 continue;
             }
             let exact = exact_state(&b, cell);
-            if known(&exact) || !self.0.inside(&b, self.0.s.clock().steps(t))? {
+            if known(&exact) || !self.0.inside(&b, self.0.run.settings.clock().steps(t))? {
                 continue;
             }
             out.push(Next::State(b, exact, cell));
@@ -415,7 +415,7 @@ pub(crate) fn inputs_text(inputs: &[u8]) -> String {
 /// THE CONCRETE SEARCH of one level (`search` over `Single`): `horizon` in
 /// search steps (W's index), `bound` the arc optimum in frames.
 pub(super) fn concrete_search<N: Rem>(side: &Side<'_, N>, horizon: u32, bound: u32, prefer: Option<&[u8]>) -> Result<Option<Witness>> {
-    let (s, clock) = (side.s, side.s.clock());
+    let (s, clock) = (&*side.run.settings, side.run.settings.clock());
     ensure!(clock.boundary(horizon), "the horizon {horizon} is not a whole number of frames ({} steps each)", clock.per_frame);
     eprintln!("[concrete] {} nodes; {} workers; the arc bound f{bound}", side.w.len(), s.threads().max(1));
     let path = search(&Single(side), clock.frame_of(horizon), bound, prefer, s.threads())?;
@@ -489,7 +489,8 @@ pub(super) fn lookup_view<N: Arithmetic>(row: &Rt2<N>, seeded: bool) -> Result<R
 pub(crate) fn rem_raw<N: Rem>(rt2: &Rt2<N>) -> Result<Option<(N, N)>> {
     use celeste_engine::runtime2::AV;
     let ids = crate::compiled::ids();
-    let Some((cx, cy)) = rt2.player_xy_cells(ids.f_rem) else { return Ok(None) };
+    let Some((cx, cy)) = celeste_engine::shape::Anchors::of(rt2).player_xy(rt2, ids.f_rem) else { return Ok(None) };
+    let (cx, cy) = (cx as usize, cy as usize);
     let num = |c: usize| match rt2.cols[c].at(0) {
         AV::Num(n) => Ok(n),
         other => Err(anyhow::anyhow!("a concrete remainder expected, got {other:?}")),

@@ -94,8 +94,9 @@ latter.
   nothing. Write a `rewrite` subcommand, or assert the finding.
 - **Make misuse loud, keep knobs few.** Settings are command-line flags,
   never environment variables: a binary refuses any `CELESTE_*` variable.
-  They are parsed once into `settings::Settings` and PASSED (no globals). A
-  tree records the settings that change it (`<level>/tree.txt`) and
+  They are parsed once into `settings::Settings` and PASSED (no globals);
+  a tree's settings and its level are one value, `settings::Run`, that the
+  tree, its engines and its arc phase are checked against. A tree records the settings that change it (`<level>/tree.txt`) and
   refuses a run under others; a run's flags never default to the record. A command that
   only READS a finished tree takes its settings from the record and refuses
   them as flags. A new tree setting is a field of `Settings` (its flag) and
@@ -111,8 +112,9 @@ latter.
   or upload): those live outside the repo.
 - `crates/celeste-names/src/gen.rs` is FROZEN, not generated, and
   APPEND-ONLY. A shape's identity is the names it holds
-  (`Rt2::shape_words`: fields, functions and builtins by name, the globals
-  present), so appending a name moves no hash; but `GLOBAL_NAMES`' order is
+  (`shape::sig::write`: fields, functions and builtins by name, the
+  globals present; interned process-wide, a second structure under one hash
+  is FATAL), so appending a name moves no hash; but `GLOBAL_NAMES`' order is
   the canonical cell order (the walk from the globals), so a reordering or
   an insertion is a different search. Its `GLOBAL_NAMES` include
   `cart::NATIVE`'s unimplemented builtins (`__widen_rem`, `__new_vector`,
@@ -219,8 +221,9 @@ same-length variant valid in both.
 
 A cargo workspace; the dependency order is load-bearing: `celeste-core`
 (numbers, the arithmetic trait, cart, the room's tiles `room::Room`) and
-`celeste-names` (frozen tables) <- `celeste-engine` (`Rt2` blocks, exact
-keys, the shape's signature `shape`, the widening table) <- `celeste-rust` (`src/frame.rs` the
+`celeste-names` (frozen tables) <- `celeste-engine` (`Rt2` blocks and
+`Template`s, exact keys, the shape `shape`: interned structure, signature,
+`Anchors`, key `Layout`; the widening table) <- `celeste-rust` (`src/frame.rs` the
 forward, `src/storage/`, `src/search/` the backward, the concrete search
 and level -1, `src/trace/` the tracer, `src/engines/` the reference
 engine, `src/transpile/` graph IR and assembler, `src/compiled/` the kernel

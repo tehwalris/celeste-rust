@@ -355,7 +355,7 @@ fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<
     // shapes have none.
     if !sc.live.is_empty() {
         let t_unit = sink.stats.tick_start();
-        engine.run(&block, &sc.cells, &sc.live, sink)?;
+        engine.step(&block, &sc.cells, &sc.live, sink)?;
         sink.stats.tick(S::PhUnit, t_unit);
     }
     sink.end()
@@ -509,7 +509,7 @@ struct Piped<N: Rem> {
 /// one sink each (`UnitSink`), no barrier but its end; then the workers'
 /// transfers and stats collected.
 fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, cx: &WaveCtx<N>, front: &Frontier<N>, plan: &Plan, prov: &Provisional<N>, spool: Option<&super::scratch::Scratch>) -> Result<Piped<N>> {
-    let s = &engine.settings();
+    let s = &*engine.run().settings;
     let (visited, base): (&VisitedSet<N>, &XferTable<N>) = (cx.visited, cx.xfers);
     let workers = s.threads();
     let routes = Routes::default();
@@ -728,7 +728,7 @@ fn next_layer<N: Rem>(new: Vec<super::route::Sealed<N>>, frame: u32, threads: us
 pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveCtx<N>) -> Result<Wave<N>> {
     use std::time::Instant;
     let frame = cx.frame;
-    let s = &engine.settings();
+    let s = &*engine.run().settings;
     ensure!(frame > 0, "a wave makes frame 1 on");
     ensure!(front.hulls.len() as u64 == front.new.states(), "frame {frame}: {} hulls for the frontier's {} new states", front.hulls.len(), front.new.states());
     ensure!(cx.edges.is_some() || front.old.is_empty(), "frame {frame}: old states to re-push without the tree's edge files");
@@ -1270,8 +1270,8 @@ fn finalize_keys<N: Rem>(visited: &mut VisitedSet<N>, states: &[RouteState<N>], 
     new_shapes.sort_unstable();
     new_shapes.dedup();
     for s in new_shapes {
-        let r = prov.shape_record(s).unwrap_or_else(|| panic!("exact keys: the new shape {s:#x} was not noted"));
-        visited.keys.add_shape(&r, adds);
+        let l = prov.shape_layout(s).unwrap_or_else(|| panic!("exact keys: the new shape {s:#x} was not noted"));
+        visited.keys.add_shape(&l, adds);
     }
     visited.keys.add_misses(&contents, adds);
     keys.iter().zip(&contents).map(|(&k, m)| (k, visited.keys.complete(m))).collect()
@@ -1297,7 +1297,7 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start
         canon.push(r);
     }
     let keys_added = visited.keys.absorb(&canon.iter().collect::<Vec<_>>());
-    let mut shapes: Vec<u64> = canon.iter().map(|r| r.shape_hash).filter(|s| visited.shape_index(*s).is_none()).collect();
+    let mut shapes: Vec<u64> = canon.iter().map(|r| r.shape_hash()).filter(|s| visited.shape_index(*s).is_none()).collect();
     shapes.sort_unstable();
     shapes.dedup();
     let mut numbered = Vec::new();
@@ -1313,10 +1313,10 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start
         let cells = crate::storage::cells::block_cells(r)?;
         r.row_keys = keys.clone();
         super::decode::check_piece(&visited.keys, r, &cells).map_err(|e| e.context("frame 0"))?;
-        let rec = super::layer::SkelRecord::of(r)?;
-        ensure!(skels.get(&r.shape_hash).is_none_or(|x| *x == rec), "two initial blocks of shape {:016x} with other skeletons", r.shape_hash);
-        skels.insert(r.shape_hash, rec);
-        let si = visited.shape_index(r.shape_hash).expect("numbered above");
+        let rec = super::layer::SkelRecord::of(&celeste_engine::Template::of_block(r))?;
+        ensure!(skels.get(&r.shape_hash()).is_none_or(|x| *x == rec), "two initial blocks of shape {:016x} with other skeletons", r.shape_hash());
+        skels.insert(r.shape_hash(), rec);
+        let si = visited.shape_index(r.shape_hash()).expect("numbered above");
         for ((&k, &c), w) in keys.iter().zip(&cells).zip(crate::frame::wins_of(r, s)?) {
             states.push((Sk::at(si, k, c), w));
         }
@@ -1359,7 +1359,7 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start
     drop(parts);
     ensure!(held == 0, "frame 0 into a visited set that held {held} of its states");
     for (h, rec) in skels {
-        next.skeletons.insert(h, std::sync::Arc::new(rec.rt2(canon[0].cache.clone())));
+        next.skeletons.insert(h, std::sync::Arc::new(rec.template(canon[0].room)?));
     }
     let n = next.states() as usize;
     let mut stats = Stats::default();
@@ -1377,7 +1377,7 @@ pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Rt2<N>>, frame: u3
     let mut visited = VisitedSet::<N>::new();
     let mut xfers = XferTable::<N>::default();
     let skeletons = Skeletons::<N>::default();
-    let s = engine.settings();
+    let s = &*engine.run().settings;
     let start = seed(&mut visited, &rows, HullOf::<N>::full(), &s)?.frontier;
     visited.forget_states();
     let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, filters: Filters::default(), frame, edges_dir: None, edges: None, skeletons: &skeletons, check: None };
@@ -1467,7 +1467,7 @@ mod tests {
         assert!(rest.followers.len() >= 10 * 3, "every platform's `x`, `rem.x` and `last` at least: {rest:?}");
         let mut visited = VisitedSet::new();
         seed(&mut visited, std::slice::from_ref(&start), Hull::full(), &s).expect("frame 0 decodes with its followers");
-        let sk = visited.keys.shape(start.shape_hash).expect("the start's shape");
+        let sk = visited.keys.shape(start.shape_hash()).expect("the start's shape");
         assert_eq!(sk.follows().iter().map(|f| f.cells().to_vec()).collect::<Vec<_>>(), deps.iter().map(|d| d.followers.clone()).collect::<Vec<_>>());
         assert!(deps.iter().flat_map(|d| &d.followers).all(|&c| sk.field(c as usize).is_none()), "no follower is keyed");
         let s21 = Settings { room: (2, 1), ..Default::default() };

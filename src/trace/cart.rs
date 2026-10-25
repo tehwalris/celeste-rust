@@ -433,11 +433,11 @@ impl Chunks {
     }
 }
 
-/// Room `room`'s START in `it`: the room's collision cache in place, the
+/// Room `room`'s START in `it`: the room's tiles in place, the
 /// toplevel run, the native `tile_flag_at` in place of the Lua one,
 /// `_init()` run.
 pub fn boot<'a, D: Domain>(it: &mut Interp<'a, D>, chunks: &'a Chunks, room: (i16, i16)) -> Result<State<D>> {
-    it.cache = Some(crate::compiled::collision_cache(room));
+    it.room = Some(celeste_core::room::Room::of(room));
     let st = fresh_state(&mut it.d);
     let mut st = run_one(it, &chunks.top, st)?;
     inject_tile_flag_at(&mut st);

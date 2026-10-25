@@ -57,18 +57,14 @@ fn summit_flag((rx, ry): (i16, i16)) -> Option<(i16, i16, i16, i16)> {
 
 /// Per lane: has it left the start room, or met the `win_rect`?
 pub(crate) fn exits_of<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Result<Vec<bool>> {
-    let ids = crate::compiled::ids();
     let lanes = rt2.width;
     if let Some((txl, txh, tyl, tyh)) = win_rect(s) {
-        let Some(obj) = rt2.position_object() else {
+        let Some(p) = celeste_engine::shape::Anchors::of(rt2).position else {
             return Ok(vec![false; lanes]);
         };
         // An interval position wins where it meets the target.
-        let axis = |f: u32| {
-            rt2.obj_field_cell(obj, f)
-                .and_then(|c| crate::storage::cells::whole_range_col(rt2, c))
-        };
-        return Ok(match (axis(ids.f_x), axis(ids.f_y)) {
+        let axis = |c: u32| crate::storage::cells::whole_range_col(rt2, c);
+        return Ok(match (axis(p.x), axis(p.y)) {
             (Some(xs), Some(ys)) => xs
                 .iter()
                 .zip(&ys)
@@ -84,14 +80,10 @@ pub(crate) fn exits_of<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Setting
 /// Per lane: is the `room` global (`room.x`, `room.y`) = `(wx, wy)`?
 fn room_is<N: Arithmetic>(rt2: &Rt2<N>, (wx, wy): (i16, i16)) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{Col, AV};
-    let ids = crate::compiled::ids();
     let lanes = rt2.width;
-    let room = rt2
-        .global_target(ids.g_room)
-        .ok_or_else(|| anyhow::anyhow!("wins: no `room` global"))?;
-    let is = |f: u32, name: &str, want: i16| -> Result<Vec<bool>> {
+    let [rx, ry] = celeste_engine::shape::Anchors::room_of(rt2).ok_or_else(|| anyhow::anyhow!("wins: no `room` global with `x` and `y`"))?;
+    let is = |c: u32, name: &str, want: i16| -> Result<Vec<bool>> {
         let want = N::from_i16(want);
-        let c = rt2.obj_field_cell(room, f).ok_or_else(|| anyhow::anyhow!("wins: room table has no {name} field"))?;
         Ok(match &rt2.cols[c as usize] {
             Col::U(AV::Num(n)) => vec![*n == want; lanes],
             Col::N(vs) => vs.iter().map(|n| *n == want).collect(),
@@ -99,7 +91,7 @@ fn room_is<N: Arithmetic>(rt2: &Rt2<N>, (wx, wy): (i16, i16)) -> Result<Vec<bool
             other => anyhow::bail!("wins: room.{name} is not a number column: {:?}", other),
         })
     };
-    let (xs, ys) = (is(ids.f_x, "x", wx)?, is(ids.f_y, "y", wy)?);
+    let (xs, ys) = (is(rx, "x", wx)?, is(ry, "y", wy)?);
     Ok(xs.iter().zip(&ys).map(|(a, b)| *a && *b).collect())
 }
 
@@ -131,7 +123,7 @@ pub fn wins_of<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Re
 /// over-approximates; the concrete search runs it exact).
 pub(crate) fn died<N: Arithmetic>(rt2: &Rt2<N>) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{NONE, AV};
-    let c = rt2.globals[celeste_names::global("will_restart") as usize];
+    let c = rt2.shape.globals()[celeste_names::global("will_restart") as usize];
     anyhow::ensure!(c != NONE, "wins: no `will_restart` global");
     Ok((0..rt2.width).map(|l| rt2.cols[c as usize].at(l) == AV::Bool(true)).collect())
 }
@@ -145,7 +137,7 @@ fn reaches_win<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Re
     }
     let (ids, lanes) = (crate::compiled::ids(), rt2.width);
     let has_orb: Vec<bool> = {
-        let c = rt2.globals[ids.g_max_djump as usize];
+        let c = rt2.shape.globals()[ids.g_max_djump as usize];
         anyhow::ensure!(c != celeste_engine::runtime2::NONE, "wins: no `max_djump` global");
         let two = N::from_i16(2);
         (0..lanes).map(|l| rt2.cols[c as usize].at(l) == AV::Num(two)).collect()
@@ -157,12 +149,13 @@ fn reaches_win<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Re
 /// level_index()]`, nil-padded)? An unknown (a coarse level) counts as
 /// taken: a win there over-approximates, and the exact level decides.
 pub(crate) fn got_fruit<N: Arithmetic>(rt2: &Rt2<N>, (x, y): (i16, i16)) -> Result<Vec<bool>> {
-    use celeste_engine::runtime2::{Cell2, Col, AV};
+    use celeste_engine::runtime2::{Col, AV};
+    use celeste_engine::shape::Cell;
     let lanes = rt2.width;
     let g = celeste_names::global("got_fruit");
     let i = crate::game_runner::level_index(x, y) as usize;
     let Some(arr) = rt2.global_target(g) else { return Ok(vec![false; lanes]) };
-    let Cell2::Arr(items) = &rt2.structure[arr as usize] else { return Ok(vec![false; lanes]) };
+    let Cell::Arr(items) = &rt2.cells()[arr as usize] else { return Ok(vec![false; lanes]) };
     let Some(&c) = items.get(i) else { return Ok(vec![false; lanes]) };
     Ok((0..lanes)
         .map(|l| match &rt2.cols[c as usize] {
@@ -494,7 +487,7 @@ pub(crate) fn widened_keys<N: Arithmetic>(
         keys.len() == rt2.width && cells.len() == rt2.width,
         "the widening changed the lane count"
     );
-    Ok((w.shape_hash, keys, cells))
+    Ok((w.shape_hash(), keys, cells))
 }
 
 /// The interface between the loop and the engines (kernels or reference):
@@ -502,18 +495,16 @@ pub(crate) fn widened_keys<N: Arithmetic>(
 pub trait FrameStep<N: Rem = P8>: Sync {
     /// One frame of `lanes` of `block` into `sink`; called concurrently on
     /// disjoint ranges (scratch in the sink or behind a lock).
-    fn run(&self, block: &Rt2<N>, cell_in: &[u32], lanes: &[usize], sink: &mut crate::storage::unit::UnitSink<N>) -> Result<()>;
+    fn step(&self, block: &Rt2<N>, cell_in: &[u32], lanes: &[usize], sink: &mut crate::storage::unit::UnitSink<N>) -> Result<()>;
 
     /// Build what the engine builds on first use (the kernels) before a
     /// wave's clock starts: inside the wave every worker would wait on the
     /// build's lock, and a one-frame bench would time the build.
     fn warm(&self) {}
 
-    /// The level its rows widen and key to.
-    fn level(&self) -> crate::abstraction::Level;
-
-    /// The settings it runs under (the wave's: threads, the win, the category).
-    fn settings(&self) -> std::sync::Arc<crate::settings::Settings>;
+    /// The run it steps: the level its rows widen and key to, the settings
+    /// (the wave's: threads, the win, the category).
+    fn run(&self) -> &crate::settings::Run;
 }
 
 /// The forward's in-memory state, EXTENDED frame by frame (each checkpointed).
@@ -569,9 +560,10 @@ fn checkpoint<N: Rem>(dir: &std::path::Path, frame: u32, wave: &crate::storage::
 impl<N: Rem> ForwardState<N> {
     /// Frame 0: `initial` into an empty visited set and checkpointed, each
     /// with the start's hull; the tree is filtered by `minus_one`, cut for
-    /// the horizon `to` (`OrbCut`) and widened at `level` (each recorded,
-    /// with the settings `s`).
-    pub(crate) fn start(initial: Vec<Rt2<N>>, dir: &std::path::Path, to: u32, minus_one: Option<MinusOne>, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
+    /// the horizon `to` (`OrbCut`) and widened at `run`'s level (each
+    /// recorded, with the run).
+    pub(crate) fn start(initial: Vec<Rt2<N>>, dir: &std::path::Path, to: u32, minus_one: Option<MinusOne>, run: &crate::settings::Run) -> Result<Self> {
+        let s = &*run.settings;
         // A fresh tree keeps nothing a killed run left (stale edge files, a
         // table, a trust marker); of its record, only a ladder level's
         // `filtered_for` (the driver's, written before).
@@ -588,7 +580,7 @@ impl<N: Rem> ForwardState<N> {
         let mut rec = crate::storage::record::Record::read(dir)?.unwrap_or_default();
         rec.retain(|k| k == "filtered_for");
         rec.write(dir)?;
-        s.write(dir, level)?;
+        run.write(dir)?;
         let l1 = TreeL1::start(minus_one, dir, s)?;
         let orb = OrbCut::start(to, dir, s)?;
         // The start has no player yet (`rem::start_point`'s premise):
@@ -604,9 +596,9 @@ impl<N: Rem> ForwardState<N> {
     }
 
     /// The forward as its checkpoint tree left it (`None`: no tree); extending
-    /// it matches extending the original. Refused at another `level` than
-    /// the tree's, or under other settings `s` than its.
-    pub(crate) fn resume(dir: &std::path::Path, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Option<Self>> {
+    /// it matches extending the original. Refused under another run (level,
+    /// settings) than the tree's.
+    pub(crate) fn resume(dir: &std::path::Path, run: &crate::settings::Run) -> Result<Option<Self>> {
         let Some(mut last) = crate::storage::layer::last_frame(dir) else { return Ok(None) };
         let t = std::time::Instant::now();
         // Trust only frames whose files are complete (at most one lost).
@@ -620,7 +612,7 @@ impl<N: Rem> ForwardState<N> {
             last = done;
         }
         crate::storage::edges::discard_after(&edges_dir, last)?;
-        let st = Self::at(dir, last, level, s)?;
+        let st = Self::at(dir, last, run)?;
         eprintln!(
             "[resume] {}: f{last} ({} new states in {} entries, {} old), visited {} states in {} entries, first win {:?}, level -1 {}, {:.1} s",
             dir.display(),
@@ -639,9 +631,10 @@ impl<N: Rem> ForwardState<N> {
     /// The forward as it stood after frame `last` of the tree in `dir`,
     /// READ-ONLY: later frames are ignored, not discarded (`resume` discards
     /// them first), so `step` from here is the real forward's frame
-    /// `last + 1`. Refused under other settings or at another `level`.
-    pub fn at(dir: &std::path::Path, last: u32, level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Self> {
-        s.check(dir, level)?;
+    /// `last + 1`. Refused under another run than the tree's.
+    pub fn at(dir: &std::path::Path, last: u32, run: &crate::settings::Run) -> Result<Self> {
+        run.check(dir)?;
+        let s = &*run.settings;
         let edges_dir = dir.join("edges");
         let l1 = TreeL1::read(dir)?;
         let orb = OrbCut::recorded(dir)?;
@@ -700,7 +693,7 @@ impl<N: Rem> ForwardState<N> {
 
     /// `step` with its rows shown to `check` (a tool's, `RowCheck`).
     pub(crate) fn step_with(&mut self, engine: &dyn FrameStep<N>, edges_dir: Option<&std::path::Path>, ckpt: Option<&std::path::Path>, marks: Option<&MarkFilter<N>>, check: Option<&dyn RowCheck<N>>) -> Result<Stats> {
-        let (s, t) = (&engine.settings(), std::time::Instant::now());
+        let (s, t) = (&*engine.run().settings, std::time::Instant::now());
         let frame = self.frames + 1;
         let cx = crate::storage::wave::WaveCtx {
             visited: &mut self.visited,
@@ -765,21 +758,19 @@ impl<N: Rem> ForwardState<N> {
 /// filter, or started under `want`. A tree filtered below `to` is REFUSED:
 /// its frames depend on the horizon through level -1's dropped pushes, so
 /// it cannot be raised exactly. `marks`: the coarser level's filter.
-/// `engine` is built only when frames are computed, at `level` under `s`
-/// (the tree's, checked).
-#[allow(clippy::too_many_arguments)]
+/// `engine` is built only when frames are computed, of `run` (the tree's,
+/// checked).
 pub fn grow_tree<N: Rem>(
     dir: &std::path::Path,
     to: u32,
     want: Option<MinusOne>,
     marks: Option<&MarkFilter<N>>,
-    level: crate::abstraction::Level,
+    run: &crate::settings::Run,
     engine: impl FnOnce() -> Result<Box<dyn FrameStep<N>>>,
     initial: impl FnOnce() -> Result<Vec<Rt2<N>>>,
-    s: &crate::settings::Settings,
 ) -> Result<ForwardResult> {
     if crate::storage::layer::frame_exists(dir, 0) {
-        s.check(dir, level)?;
+        run.check(dir)?;
     }
     if let Some(w) = want {
         anyhow::ensure!(to <= w.h, "--level-minus-one at step {} is below the horizon, step {to}", w.h);
@@ -821,11 +812,11 @@ pub fn grow_tree<N: Rem>(
         return Ok(ForwardResult { win_frame: first_win, frames: to });
     }
     let engine = engine()?;
-    anyhow::ensure!(engine.level() == level, "the forward's engine is at {}, the tree at {level}", engine.level());
-    anyhow::ensure!(*engine.settings() == *s, "the forward's engine runs under other settings than the tree's");
-    let mut st = match ForwardState::<N>::resume(dir, level, s)? {
+    anyhow::ensure!(engine.run().level == run.level, "the forward's engine is at {}, the tree at {}", engine.run().level, run.level);
+    anyhow::ensure!(engine.run() == run, "the forward's engine runs under other settings than the tree's");
+    let mut st = match ForwardState::<N>::resume(dir, run)? {
         Some(st) => st,
-        None => ForwardState::start(initial()?, dir, to, want, level, s)?,
+        None => ForwardState::start(initial()?, dir, to, want, run)?,
     };
     st.extend(engine.as_ref(), dir, to, marks)?;
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames })
@@ -839,7 +830,7 @@ pub(crate) fn forward_run<N: Rem>(
     dir: &std::path::Path,
     max_frames: u32,
 ) -> Result<ForwardResult> {
-    let mut st = ForwardState::start(initial, dir, max_frames, None, engine.level(), &engine.settings())?;
+    let mut st = ForwardState::start(initial, dir, max_frames, None, engine.run())?;
     st.extend(engine, dir, max_frames, None)?;
     Ok(ForwardResult { win_frame: st.win_frame, frames: st.frames })
 }
@@ -978,7 +969,7 @@ pub(crate) fn restore_visited<N: Rem>(dir: &std::path::Path, last: u32, room: (i
     let mut batch: Vec<FrameIn<N>> = Vec::new();
     for f in 0..=last {
         for r in tree.file(f).filter(|_| f > 0).iter().flat_map(|x| x.header.skeletons.iter().chain(&x.header.emitted)) {
-            skeletons.register(&r.rt2_in(room))?;
+            skeletons.register(&r.template(celeste_core::room::Room::of(room))?)?;
         }
         // Past a frontier that died: no frame.
         let Some(file) = tree.file(f) else { continue };
@@ -1185,6 +1176,7 @@ pub(crate) fn tree_first_win_through<N: Arithmetic>(dir: &std::path::Path, horiz
 
 #[cfg(test)]
 mod tests {
+    use crate::settings::Run;
     use super::*;
     use crate::abstraction::Level;
     use crate::compiled::asm_kernel::Registry;
@@ -1201,9 +1193,9 @@ mod tests {
     }
 
     /// The start's row a few frames after the player appears (standing, at
-    /// rest), widened to `level`.
-    fn standing_row(s: &Settings, level: Level) -> Rt2 {
-        let mut reference = RefEngine::new(s).expect("ref engine");
+    /// rest), widened to `run`'s level.
+    fn standing_row(run: &crate::settings::Run) -> Rt2 {
+        let mut reference = RefEngine::new(&run.settings).expect("ref engine");
         let mut row = reference.initial().expect("initial state");
         let mut after = 0;
         while after < 3 {
@@ -1212,7 +1204,7 @@ mod tests {
                 after += 1;
             }
         }
-        row.widen_to(level);
+        row.widen_to(run.level);
         row
     }
 
@@ -1266,7 +1258,7 @@ mod tests {
             std::fs::create_dir_all(f.parent().unwrap()).expect("mkdir");
             std::fs::write(f, b"stale").expect("write");
         }
-        ForwardState::start(init, dir, 0, None, Level::EXACT, &s).expect("start");
+        ForwardState::start(init, dir, 0, None, &Run::new(&s, Level::EXACT)).expect("start");
         for f in &stale {
             assert!(!f.exists(), "{} survived a fresh start", f.display());
         }
@@ -1290,7 +1282,8 @@ mod tests {
         let s = Settings { threads: Some(8), ..Default::default() };
         let base = crate::testutil::TestDir::new("hull-between");
         let level = Level::parse("r0sx").expect("level");
-        let e = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
+        let run = Run::new(&s, level);
+        let e = crate::compiled::FrameEngine::new(&run).expect("kernels");
         let init = || start_blocks(&s);
         let to = 34;
         // Per frame, its states by content.
@@ -1301,9 +1294,9 @@ mod tests {
         };
         let (wide, hull) = (base.join("widened"), base.join("hull"));
         WIDEN.store(true, Ordering::Relaxed);
-        ForwardState::start(init(), &wide, to, None, level, &s).expect("start").extend(&e, &wide, to, None).expect("widened");
+        ForwardState::start(init(), &wide, to, None, &run).expect("start").extend(&e, &wide, to, None).expect("widened");
         WIDEN.store(false, Ordering::Relaxed);
-        ForwardState::start(init(), &hull, to, None, level, &s).expect("start").extend(&e, &hull, to, None).expect("hull");
+        ForwardState::start(init(), &hull, to, None, &run).expect("start").extend(&e, &hull, to, None).expect("hull");
         let t = crate::storage::layer::Tree::<P8>::open(&wide, to).expect("tree");
         let lines: Vec<String> = (0..=to).map(|f| { let (n, acc) = t.layer(f, None, 4).expect("layer").0.content_fingerprint(&t.space, &t.shapes).expect("fp"); format!("f{f:03} {n} {acc:016x}") }).collect();
         let pin = concat!(env!("CARGO_MANIFEST_DIR"), "/gates/ckhash_room10_f000-034_widened.txt");
@@ -1325,7 +1318,7 @@ mod tests {
         }
         assert!(n_hull < n_wide, "{n_hull} hull states, {n_wide} widened: the hulls cut nothing");
         // The exact reach, inside the hull tree's states and hulls.
-        let st = ForwardState::<P8>::at(&hull, to, level, &s).expect("at");
+        let st = ForwardState::<P8>::at(&hull, to, &run).expect("at");
         let tree = crate::storage::layer::Tree::<P8>::open(&hull, to).expect("tree");
         let layers: Vec<Layer> = (0..=to).map(|f| tree.layer(f, None, 4).expect("layer").0).collect();
         let p0 = crate::search::rem::start_point::<P8>();
@@ -1384,7 +1377,8 @@ mod tests {
         let mut space = celeste_engine::exact::KeySpace::<P8>::new();
         let mut adds = Default::default();
         for shape in [1, 9] {
-            space.add_shape(&celeste_engine::exact::ShapeRecord { hash: shape, sig: vec![1, u32::MAX], pos: None, deps: Vec::new() }, &mut adds);
+            let rec = celeste_engine::exact::ShapeRecord { hash: shape, sig: vec![1, u32::MAX], pos: None, deps: Vec::new() };
+            space.add_shape(&std::sync::Arc::new(celeste_engine::shape::Layout::from_record(&rec).expect("a layout")), &mut adds);
             space.add_codes(shape, 0, &[celeste_engine::exact::Code::num(0, 0), celeste_engine::exact::Code::num(1, 1)], &mut adds);
         }
         let mut v = Visited::new(space);
@@ -1411,7 +1405,8 @@ mod tests {
         let path = std::env::temp_dir().join(format!("celeste-marks-arith-{}.bin", std::process::id()));
         let mut space = KeySpace::<Float>::new();
         let mut adds = Default::default();
-        space.add_shape(&ShapeRecord { hash: 1, sig: vec![1, u32::MAX], pos: None, deps: Vec::new() }, &mut adds);
+        let rec = ShapeRecord { hash: 1, sig: vec![1, u32::MAX], pos: None, deps: Vec::new() };
+        space.add_shape(&std::sync::Arc::new(celeste_engine::shape::Layout::from_record(&rec).expect("a layout")), &mut adds);
         space.add_codes(1, 0, &[Code::<Float>::num(0, 0), Code::<Float>::num(1.5f64.to_bits(), 2.5f64.to_bits())], &mut adds);
         let mut v = Visited::<Float>::new(space);
         v.insert_until(1, (0, 1), 4, 7);
@@ -1434,15 +1429,15 @@ mod tests {
         let s = Settings { category: crate::settings::Category::Hundred, ..Default::default() };
         let dir = crate::testutil::TestDir::new("resume-frontier");
         let init = start_blocks(&s);
-        let e = RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines");
+        let e = RefFrameStep::<P8>::new(&Run::new(&s, Level::EXACT)).expect("engines");
         let frontier = |st: &ForwardState| -> (Vec<(u32, (u64, u64), u64)>, Vec<Hull>, crate::storage::wave::ByLayer) { (st.frontier.new.iter().collect(), st.frontier.hulls.clone(), st.frontier.old.clone()) };
-        let mut st = ForwardState::start(init, &dir, 3, None, Level::EXACT, &s).expect("start");
+        let mut st = ForwardState::start(init, &dir, 3, None, &Run::new(&s, Level::EXACT)).expect("start");
         for b in crate::storage::layer::decode_states(&st.frontier.new, &st.visited.keys, st.visited.shapes(), usize::MAX, &|_| true).expect("decode") {
             assert!(not_expanded(&b.1, 0, None, &s).expect("not expanded").iter().all(|&x| x), "frame 0: the berry is lost");
         }
         for to in 0..=3 {
             st.extend(&e, &dir, to, None).expect("extend");
-            let resumed = ForwardState::at(&dir, st.frames, Level::EXACT, &s).expect("at");
+            let resumed = ForwardState::at(&dir, st.frames, &Run::new(&s, Level::EXACT)).expect("at");
             assert_eq!(frontier(&st), frontier(&resumed), "f{}: the resume's frontier is not the forward's", st.frames);
             assert_eq!(st.win_frame, resumed.win_frame, "f{}: the first win", st.frames);
         }
@@ -1461,12 +1456,13 @@ mod tests {
         let (a, b) = (base.join("uninterrupted"), base.join("killed"));
         // The kernels (they record transfers), past the spawn.
         let level = Level::parse("r0sx").expect("level");
-        let e = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
+        let run = Run::new(&s, level);
+        let e = crate::compiled::FrameEngine::new(&run).expect("kernels");
         let start = RefEngine::new(&s).expect("engine").initial().expect("init");
         let init = || vec![start.clone_block().canonicalized()];
         let ends = 30;
-        ForwardState::start(init(), &a, ends, None, level, &s).expect("start").extend(&e, &a, ends, None).expect("extend");
-        let mut st = ForwardState::start(init(), &b, ends, None, level, &s).expect("start");
+        ForwardState::start(init(), &a, ends, None, &run).expect("start").extend(&e, &a, ends, None).expect("extend");
+        let mut st = ForwardState::start(init(), &b, ends, None, &run).expect("start");
         st.extend(&e, &b, ends - 1, None).expect("extend");
         let record = crate::storage::record::path(&b);
         let marker = std::fs::read_to_string(&record).expect("the record");
@@ -1477,7 +1473,7 @@ mod tests {
         for d in [&a, &b] {
             assert!(!d.join("edges/xfer.len").exists(), "a second marker");
         }
-        let mut st = ForwardState::resume(&b, level, &s).expect("resume").expect("a tree");
+        let mut st = ForwardState::resume(&b, &run).expect("resume").expect("a tree");
         assert_eq!(st.frames, ends - 1, "the untrusted frame is discarded");
         st.extend(&e, &b, ends, None).expect("rerun");
         for f in 0..=ends {
@@ -1504,14 +1500,14 @@ mod tests {
         };
         let keyset = |frame: u32| content(dir, frame);
 
-        forward_run(&RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines"), start_blocks(&s), dir, 4).expect("fresh");
+        forward_run(&RefFrameStep::<P8>::new(&Run::new(&s, Level::EXACT)).expect("engines"), start_blocks(&s), dir, 4).expect("fresh");
         let fresh4 = keyset(4);
         assert!(fresh4.0 > 0, "fresh frame 4 empty");
 
         // The same run extended one frame at a time.
         {
-            let e = RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines");
-            let mut st = ForwardState::start(start_blocks(&s), dir, 4, None, Level::EXACT, &s).expect("start");
+            let e = RefFrameStep::<P8>::new(&Run::new(&s, Level::EXACT)).expect("engines");
+            let mut st = ForwardState::start(start_blocks(&s), dir, 4, None, &Run::new(&s, Level::EXACT)).expect("start");
             for to in 1..=4 {
                 st.extend(&e, dir, to, None).expect("extend");
                 assert_eq!(st.frames, to);
@@ -1526,10 +1522,10 @@ mod tests {
         let fresh_dir = &std::path::PathBuf::from(format!("/var/tmp/celeste-frame-rebuild-resume-test-fresh6-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(fresh_dir);
         std::fs::create_dir_all(fresh_dir).expect("mkdir");
-        forward_run(&RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines"), start_blocks(&s), fresh_dir, 6).expect("fresh 6");
+        forward_run(&RefFrameStep::<P8>::new(&Run::new(&s, Level::EXACT)).expect("engines"), start_blocks(&s), fresh_dir, 6).expect("fresh 6");
         {
-            let e = RefFrameStep::<P8>::new(&s, Level::EXACT).expect("engines");
-            let mut st = ForwardState::resume(dir, Level::EXACT, &s).expect("resume").expect("a tree to resume");
+            let e = RefFrameStep::<P8>::new(&Run::new(&s, Level::EXACT)).expect("engines");
+            let mut st = ForwardState::resume(dir, &Run::new(&s, Level::EXACT)).expect("resume").expect("a tree to resume");
             assert_eq!(st.frames, 4);
             let visited_before = st.visited_len();
             st.extend(&e, dir, 6, None).expect("extend resumed");
@@ -1550,10 +1546,10 @@ mod tests {
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels, ~20 CPU-s"]
     fn a_lane_outside_its_kernels_bounds_declines() {
         let s = Settings::default();
-        let level = Level::parse("r0sx").expect("level");
+        let run = crate::settings::Run::new(&s, Level::parse("r0sx").expect("level"));
         let grid = s.region_grid().expect("the default region grid");
-        let registry = crate::compiled::asm_kernel::registry(level, &s, false);
-        let row = standing_row(&s, level);
+        let registry = crate::compiled::asm_kernel::registry(&run, false);
+        let row = standing_row(&run);
         let ids = crate::compiled::ids();
         let with = |f: u32, axis: u32, v: P8| with_player_field(&row, f, axis, v);
         let runs = |r: &Rt2| -> bool {
@@ -1596,15 +1592,15 @@ mod tests {
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels rebuilt twice, ~30 CPU-s"]
     fn a_decline_is_explained_by_the_bound_it_fails() {
         let s = Settings::default();
-        let level = Level::parse("r0sx").expect("level");
+        let run = crate::settings::Run::new(&s, Level::parse("r0sx").expect("level"));
         let grid = s.region_grid().expect("the default region grid");
-        let (row, ids) = (standing_row(&s, level), crate::compiled::ids());
+        let (row, ids) = (standing_row(&run), crate::compiled::ids());
         let at = P8::from_i16(grid.speed as i16);
         let past = at.checked_add(P8::from_parts(0, 0x8000)).expect("small");
-        let text = crate::check::explain::explain_row::<P8>(level, &s, &with_player_field(&row, ids.f_spd, ids.f_x, past)).expect("explained");
+        let text = crate::check::explain::explain_row::<P8>(&run, &with_player_field(&row, ids.f_spd, ids.f_x, past)).expect("explained");
         assert!(text.contains("declines the row") && text.contains("failing premise"), "{text}");
         assert!(text.lines().any(|l| l.contains("the bound it checks") && l.contains("Restrict")), "no Restrict premise named:\n{text}");
-        let fine = crate::check::explain::explain_row::<P8>(level, &s, &with_player_field(&row, ids.f_spd, ids.f_x, at)).expect("explained");
+        let fine = crate::check::explain::explain_row::<P8>(&run, &with_player_field(&row, ids.f_spd, ids.f_x, at)).expect("explained");
         assert!(fine.contains("no body declines the row"), "{fine}");
     }
 
@@ -1619,7 +1615,7 @@ mod tests {
     fn the_kernels_emission_checks_the_followers() {
         let s = Settings { room: (6, 0), split_frame: true, ..Default::default() };
         let level = Level::parse("r0sxf").expect("level");
-        let registry = crate::compiled::asm_kernel::registry(level, &s, false);
+        let registry = crate::compiled::asm_kernel::registry(&crate::settings::Run::new(&s, level), false);
         let mut reference = RefEngine::new(&s).expect("ref engine");
         let start = reference.initial().expect("start");
         let one = reference.step_one(&start, 0).expect("step 1");
@@ -1642,7 +1638,7 @@ mod tests {
             let x = r.obj_field_cell(platforms[1], celeste_names::field("x")).expect("the second platform's x");
             let deps = celeste_engine::widening::key_deps(r);
             assert!(deps.len() == 2 && deps[1].followers.contains(&x), "the second platform's x follows the first one's rem.x: {deps:?}");
-            for code in adds.codes.iter_mut().filter(|c| c.0 == r.shape_hash && c.1 == x) {
+            for code in adds.codes.iter_mut().filter(|c| c.0 == r.shape_hash() && c.1 == x) {
                 code.3 = celeste_engine::exact::Code::of(AV::Num(P8::from_i16(1000)));
                 corrupted += 1;
             }
@@ -1679,8 +1675,8 @@ mod tests {
                 b.cols[c as usize] = num(v);
             }
             for (f, (vx, vy)) in [(ids.f_spd, (0, -2)), (ids.f_rem, (0, 0))] {
-                let (cx, cy) = b.player_xy_cells(f).expect("a vector field");
-                (b.cols[cx], b.cols[cy]) = (num(vx), num(vy));
+                let (cx, cy) = b.xy_cells(p, f).expect("a vector field");
+                (b.cols[cx as usize], b.cols[cy as usize]) = (num(vx), num(vy));
             }
             reference.step_one(&b, 0).expect("one concrete successor")
         };
@@ -1714,7 +1710,7 @@ mod tests {
             AV::Num(n) => n,
             other => panic!("not a number: {other:?}"),
         };
-        let global = |b: &Rt2, name: &str| num(b, b.globals[celeste_names::global(name) as usize]);
+        let global = |b: &Rt2, name: &str| num(b, b.shape.globals()[celeste_names::global(name) as usize]);
         let chest_state = |b: &Rt2| b.objects_of_type(ids.g_big_chest).first().map(|&o| num(b, b.obj_field_cell(o, ids.f_state).expect("a state")));
         let orb_still = |b: &Rt2| {
             b.objects_of_type(celeste_names::global("orb")).iter().any(|&o| {
@@ -1818,10 +1814,11 @@ mod tests {
     fn split_frame_reaches_the_unsplit_frontier_at_a_near_level() {
         let s = Settings { room: (2, 1), split_frame: true, ..Default::default() };
         let level = Level::parse("r0sxn").expect("level");
+        let run = Run::new(&s, level);
         let dir = &std::path::PathBuf::from(format!("/var/tmp/celeste-frame-split-near-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("checkpoint dir");
-        let engine = crate::compiled::FrameEngine::new(&s, level).expect("engine");
+        let engine = crate::compiled::FrameEngine::new(&run).expect("engine");
         let init = start_blocks(&s);
         // Unsplit, frame by frame: 1 state a frame through the spawn, then these.
         let unsplit: Vec<(u32, usize)> = (0..24).map(|f| (f, 1)).chain([(24, 27), (25, 191), (26, 676), (27, 1883), (28, 4514)]).collect();

@@ -13,38 +13,37 @@ use std::fmt::Write as _;
 use anyhow::{Context, Result};
 use celeste_engine::runtime2::{Rt2, AV};
 
-use crate::abstraction::Level;
 use crate::compiled::{KernelLanes, Kernels};
 use crate::search::tree::TreeDir;
-use crate::settings::Settings;
+use crate::settings::Run;
 use crate::storage::layer::Tree;
 use crate::storage::Sk;
-use crate::transpile::graph::{Eval, Graph, NodeId, Op, Room, Val};
+use crate::transpile::graph::{Eval, Graph, NodeId, Op, Val};
 
 /// State `state` of the tree `t` (a state of its layers through step
 /// `step`, where the forward ran it) explained: `explain_row` of its row.
 pub fn explain<N: KernelLanes>(t: &TreeDir, step: u32, state: Sk) -> Result<String> {
     let tree = Tree::<N>::open(&t.dir, step)?;
     let f = tree.layer_of(state, step)?.ok_or_else(|| anyhow::anyhow!("state {}: in no layer of {} through step {step}", state.show(), t.dir.display()))?;
-    let row = tree.row(f, state, t.settings.room)?;
-    explain_row::<N>(t.level, &t.settings, &row)
+    let row = tree.row(f, state, t.run.settings.room)?;
+    explain_row::<N>(&t.run, &row)
 }
 
-/// Why the kernels of `level` under `s` decline the one-row block `row`
-/// (as the forward decodes it), as text: per declining body its error's
-/// disjuncts and failing premises; that none declines, if none does.
-pub fn explain_row<N: KernelLanes>(level: Level, s: &Settings, row: &Rt2<N>) -> Result<String> {
+/// Why `run`'s kernels decline the one-row block `row` (as the forward
+/// decodes it), as text: per declining body its error's disjuncts and
+/// failing premises; that none declines, if none does.
+pub fn explain_row<N: KernelLanes>(run: &Run, row: &Rt2<N>) -> Result<String> {
     anyhow::ensure!(row.width == 1, "explain one row, not {}", row.width);
     let cell = crate::storage::cells::block_cells(row)?[0];
-    let region = s.region_grid().filter(|_| !row.player_objects().is_empty()).and_then(|g| g.of_cell(cell));
-    let key = (row.shape_hash, region);
-    let kernels = Kernels::<N>::new(s, level)?;
-    let digest = kernels.digest_of(key).ok_or_else(|| anyhow::anyhow!("shape {:#x} region {region:?}: no kernel of the set ({level}) takes the row: a miss, not a decline", row.shape_hash))?;
+    let region = run.settings.region_grid().filter(|_| !row.player_objects().is_empty()).and_then(|g| g.of_cell(cell));
+    let key = (row.shape_hash(), region);
+    let kernels = Kernels::<N>::new(run)?;
+    let digest = kernels.digest_of(key).ok_or_else(|| anyhow::anyhow!("shape {:#x} region {region:?}: no kernel of the set ({}) takes the row: a miss, not a decline", row.shape_hash(), run.level))?;
     // The walk recurses deeply (as the kernel build does).
     std::thread::scope(|sc| {
         std::thread::Builder::new()
             .stack_size(256 << 20)
-            .spawn_scoped(sc, || rebuilt_explains::<N>(level, s, row, key, digest))
+            .spawn_scoped(sc, || rebuilt_explains::<N>(run, row, key, digest))
             .context("spawn the explanation")?
             .join()
             .map_err(|_| anyhow::anyhow!("the explanation panicked"))?
@@ -52,9 +51,9 @@ pub fn explain_row<N: KernelLanes>(level: Level, s: &Settings, row: &Rt2<N>) -> 
 }
 
 /// `explain_row`'s rebuild and evaluation (a big-stack thread).
-fn rebuilt_explains<N: KernelLanes>(level: Level, s: &Settings, row: &Rt2<N>, key: (u64, Option<crate::trace::walk::Region>), digest: u64) -> Result<String> {
-    let refs = crate::trace::lower::lattice_kernel_refs::<N>(level, s).context("retracing the start room for the explanation")?;
-    let si = refs.iter().position(|(region, r)| (r.frame.in_rt2.shape_hash_of(), *region) == key).ok_or_else(|| anyhow::anyhow!("the walk traced no frame of shape {:#x} region {:?}", key.0, key.1))?;
+fn rebuilt_explains<N: KernelLanes>(run: &Run, row: &Rt2<N>, key: (u64, Option<crate::trace::walk::Region>), digest: u64) -> Result<String> {
+    let refs = crate::trace::lower::lattice_kernel_refs::<N>(run).context("retracing the start room for the explanation")?;
+    let si = refs.iter().position(|(region, r)| (r.frame.in_rt2.shape_hash(), *region) == key).ok_or_else(|| anyhow::anyhow!("the walk traced no frame of shape {:#x} region {:?}", key.0, key.1))?;
     let r = &refs[si].1;
     let (fused, bodies) = (&r.lowered.fused, &r.lowered.bodies);
     let (flat_roots, _) = crate::compiled::asm_kernel::root_slots(bodies);
@@ -72,7 +71,7 @@ fn rebuilt_explains<N: KernelLanes>(level: Level, s: &Settings, row: &Rt2<N>, ke
         };
         cells.insert(c, v);
     }
-    let vals = fused.eval(&cells, Eval::NarrowTop, Some(&Room { cache: row.cache.clone() })).with_context(|| format!("{sym}: evaluating its graph on the row"))?;
+    let vals = fused.eval(&cells, Eval::NarrowTop, Some(row.room)).with_context(|| format!("{sym}: evaluating its graph on the row"))?;
     // As the kernel reads the masks: where they MAY hold.
     let may = |n: NodeId| vals[n as usize] != Val::Bool(Some(false));
     let mut out = String::new();

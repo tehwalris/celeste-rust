@@ -184,7 +184,7 @@ pub struct Closure {
     pub body: BodyId,
     pub env: ScopeId,
     /// This function's index in `celeste_names::gen::FN_NAMES` (what
-    /// `Cell2::Clo` carries), resolved AT CREATION, where the naming declaration
+    /// `shape::Cell::Clo` carries), resolved AT CREATION, where the naming declaration
     /// is in hand. `None`: an anonymous function (the cart's `foreach`
     /// callbacks), refused in a block.
     pub fn_id: Option<u32>,

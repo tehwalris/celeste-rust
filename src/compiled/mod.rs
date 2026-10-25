@@ -4,7 +4,6 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use celeste_core::room::Room;
 use celeste_engine::runtime2;
 
 use celeste_names as gen;
@@ -92,26 +91,10 @@ pub fn ids() -> &'static BoundaryIds {
     IDS.get_or_init(boundary_ids)
 }
 
-/// Room `(room_x, room_y)`'s collision cache, built once per room (a cache
-/// keyed on the room). Every block carries it (the kernels read tiles
-/// through it; the map itself is `cart_data::CART`); anything that builds a
-/// block outside an engine attaches the same one.
-pub fn collision_cache((room_x, room_y): (i16, i16)) -> Arc<Room> {
-    static CACHES: std::sync::Mutex<Vec<((i16, i16), Arc<Room>)>> = std::sync::Mutex::new(Vec::new());
-    let mut all = CACHES.lock().unwrap();
-    if let Some((_, c)) = all.iter().find(|(r, _)| *r == (room_x, room_y)) {
-        return c.clone();
-    }
-    let cache = Arc::new(Room::new(room_x, room_y));
-    all.push(((room_x, room_y), cache.clone()));
-    cache
-}
-
 /// The kernels of one LEVEL under the run's settings
 /// (`asm_kernel::registry`, built on first use), in the arithmetic of `N`.
 pub struct Kernels<N: KernelLanes = celeste_core::pico8_num::Pico8Num> {
-    level: crate::abstraction::Level,
-    settings: Arc<crate::settings::Settings>,
+    run: crate::settings::Run,
     /// Each kernel counts the slices it runs (`counting`).
     counting: bool,
     registry: std::sync::OnceLock<Arc<asm_kernel::Registry<N>>>,
@@ -121,20 +104,20 @@ pub struct Kernels<N: KernelLanes = celeste_core::pico8_num::Pico8Num> {
 pub type FrameEngine = Kernels<celeste_core::pico8_num::Pico8Num>;
 
 impl<N: KernelLanes> Kernels<N> {
-    /// The engine for the start room of `settings`, its frames at `level`.
-    pub fn new(settings: &crate::settings::Settings, level: crate::abstraction::Level) -> Result<Self> {
-        Ok(Kernels { level, settings: Arc::new(settings.clone()), counting: false, registry: std::sync::OnceLock::new() })
+    /// The engine of `run` (its start room, its frames at its level).
+    pub fn new(run: &crate::settings::Run) -> Result<Self> {
+        Ok(Kernels { run: run.clone(), counting: false, registry: std::sync::OnceLock::new() })
     }
 
     /// The same kernels, each COUNTING the slices it runs (`slice_counts`:
     /// the census's dynamic instructions, `check::census`). The same code
     /// and cache entry as `new`'s; the counters are attached at load.
-    pub fn counting(settings: &crate::settings::Settings, level: crate::abstraction::Level) -> Result<Self> {
-        Ok(Kernels { counting: true, ..Kernels::new(settings, level)? })
+    pub fn counting(run: &crate::settings::Run) -> Result<Self> {
+        Ok(Kernels { counting: true, ..Kernels::new(run)? })
     }
 
     fn registry(&self) -> &asm_kernel::Registry<N> {
-        self.registry.get_or_init(|| asm_kernel::registry::<N>(self.level, &self.settings, self.counting))
+        self.registry.get_or_init(|| asm_kernel::registry::<N>(&self.run, self.counting))
     }
 
     /// Per kernel its (shape, region), symbol and the slices it ran since
@@ -171,7 +154,7 @@ impl<N: KernelLanes> Kernels<N> {
                  (the reasons above); trace the missing shape and resume from the last checkpoint",
                 lanes.len(),
                 bucket.width,
-                bucket.shape_hash,
+                bucket.shape_hash(),
             );
         }
     }
@@ -209,7 +192,7 @@ pub fn print_kernel_stats(st: &crate::storage::stats::Stats) -> Result<()> {
 
 /// The compiled `FrameStep` (the reference's: `RefEngine`).
 impl<N: KernelLanes> crate::frame::FrameStep<N> for Kernels<N> {
-    fn run(
+    fn step(
         &self,
         block: &runtime2::Rt2<N>,
         cell_in: &[u32],
@@ -225,11 +208,7 @@ impl<N: KernelLanes> crate::frame::FrameStep<N> for Kernels<N> {
         let _ = self.registry();
     }
 
-    fn level(&self) -> crate::abstraction::Level {
-        self.level
-    }
-
-    fn settings(&self) -> Arc<crate::settings::Settings> {
-        self.settings.clone()
+    fn run(&self) -> &crate::settings::Run {
+        &self.run
     }
 }

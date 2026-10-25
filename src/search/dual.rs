@@ -82,8 +82,8 @@ impl<X: Rem, F: Rem> Concrete for Pairs<'_, X, F> {
     const NAME: &'static str = "dual";
 
     fn engines(&self, n: usize) -> Result<Vec<Self::Engine>> {
-        let (ex, _) = concrete_engines::<X>(n, self.sx.s)?;
-        let (ef, _) = concrete_engines::<F>(n, self.sf.s)?;
+        let (ex, _) = concrete_engines::<X>(n, &self.sx.run.settings)?;
+        let (ef, _) = concrete_engines::<F>(n, &self.sf.run.settings)?;
         Ok(ex.into_iter().zip(ef).collect())
     }
 
@@ -104,7 +104,7 @@ impl<X: Rem, F: Rem> Concrete for Pairs<'_, X, F> {
                 let (succ, read) = ex.frame_reads(row, byte)?;
                 for b in succ {
                     *steps += 1;
-                    match fate(&self.sx, &b, self.sx.s.clock().steps(t))? {
+                    match fate(&self.sx, &b, self.sx.run.settings.clock().steps(t))? {
                         // Exited: one entry, whichever leaf.
                         Fate::Win if fixed.iter().any(|(x, _)| x.is_none()) => {}
                         Fate::Win => fixed.push((None, true)),
@@ -125,7 +125,7 @@ impl<X: Rem, F: Rem> Concrete for Pairs<'_, X, F> {
         }
         for b in fl {
             *steps += 1;
-            match fate(&self.sf, &b, self.sf.s.clock().steps(t))? {
+            match fate(&self.sf, &b, self.sf.run.settings.clock().steps(t))? {
                 Fate::Out => {}
                 Fate::Win => {
                     // Rule (b): the float exit counts only after real play's.
@@ -177,7 +177,7 @@ pub(crate) fn search<X: Rem, F: Rem>(fixed: &Half<X>, float: &Half<F>, bound: u3
     ensure!(clock.boundary(horizon), "the horizon {horizon} is not a whole number of frames ({} steps each)", clock.per_frame);
     let workers = fixed.settings.threads().max(1);
     eprintln!("[dual] W {} fixed and {} float nodes; {workers} workers; the bound f{bound}", fixed.arcs.w.len(), float.arcs.w.len());
-    let Some(path) = super::concrete::search(&Pairs { sx: fixed.arcs.side(fixed.settings)?, sf: float.arcs.side(float.settings)? }, clock.frame_of(horizon), bound, prefer, workers)? else { return Ok(None) };
+    let Some(path) = super::concrete::search(&Pairs { sx: fixed.arcs.side()?, sf: float.arcs.side()? }, clock.frame_of(horizon), bound, prefer, workers)? else { return Ok(None) };
     // Real play leaves at the first edge that says so (one does at most).
     let fixed_exit = path.labels.iter().position(|&w| w).ok_or_else(|| anyhow!("a dual win whose fixed half never exited"))? as u32;
     Ok(Some(DualWitness { inputs: path.inputs, fixed_exit }))

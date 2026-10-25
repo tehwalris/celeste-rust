@@ -1,5 +1,5 @@
 //! The builtin ABI: `BUILTIN_NAMES` is index-to-name, and the index is what
-//! `Cell2::Bi` stores (`trace::block::to_rt2` writes it), so
+//! `shape::Cell::Bi` stores (`trace::block::to_rt2` writes it), so
 //! the ORDER is load-bearing in exactly the way `FIELD_NAMES`' order is.
 
 pub const BUILTIN_NAMES: [&str; 19] = [

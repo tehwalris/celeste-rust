@@ -85,7 +85,7 @@ pub fn run(cfg: &Settings, c: Command) -> Result<()> {
             // tree read in its arithmetic: both from its record.
             let t = celeste_rust::search::tree::TreeDir::open(&a.tree, cfg)?;
             let opts = level_minus_one::Opts { spd_px: a.spd, level_dir: a.tree, ceiling: a.steps, from: a.from_step, to: a.to_step, marks: a.marks, threads: cfg.threads() };
-            let cfg = t.settings;
+            let cfg = t.run.settings;
             // The tracer recurses through the cart's AST: a big stack.
             let report = std::thread::Builder::new()
                 .stack_size(256 * 1024 * 1024)

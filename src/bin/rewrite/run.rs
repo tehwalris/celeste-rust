@@ -80,12 +80,12 @@ pub fn witness(cfg: &Settings, a: WitnessArgs) -> Result<()> {
 /// One value as the PICO-8 replay's dump prints it (`tools::pico8`); a
 /// table of numbers inline.
 fn dump_value(st: &Rt2, c: u32) -> Option<String> {
-    use celeste_engine::runtime2::Cell2;
+    use celeste_engine::shape::Cell;
     Some(match st.cols[c as usize].at(0) {
         AV::Num(n) => Arithmetic::hex(n),
         AV::Bool(b) => b.to_string(),
         AV::Ptr(t) => {
-            let Cell2::Obj(fields) = &st.structure[t as usize] else { return None };
+            let Cell::Obj(fields) = &st.cells()[t as usize] else { return None };
             let mut s = String::new();
             for k in ["x", "y", "w", "h"] {
                 if let Some(&(_, fc)) = fields.iter().find(|(f, _)| Some(*f) == celeste_names::field_id(k)) {
@@ -104,7 +104,7 @@ fn dump_value(st: &Rt2, c: u32) -> Option<String> {
 
 /// `obj I TYPE k=v ...` per object in `objects` order, keys sorted.
 fn dump_start_state(st: &Rt2) {
-    use celeste_engine::runtime2::Cell2;
+    use celeste_engine::shape::Cell;
     let mut names = std::collections::HashMap::new();
     for t in celeste_rust::tools::pico8::TYPES {
         for o in objects_of_type(st, t) {
@@ -112,10 +112,10 @@ fn dump_start_state(st: &Rt2) {
         }
     }
     let Some(arr) = celeste_names::global_id("objects").and_then(|g| st.global_target(g)) else { return };
-    let Cell2::Arr(items) = &st.structure[arr as usize] else { return };
+    let Cell::Arr(items) = &st.cells()[arr as usize] else { return };
     for (i, &item) in items.iter().enumerate() {
         let AV::Ptr(o) = st.cols[item as usize].at(0) else { continue };
-        let Cell2::Obj(fields) = &st.structure[o as usize] else { continue };
+        let Cell::Obj(fields) = &st.cells()[o as usize] else { continue };
         let mut kv: Vec<(String, String)> = fields
             .iter()
             .filter_map(|&(f, c)| {
@@ -173,7 +173,7 @@ fn print_object(st: &Rt2, type_name: &str) {
 }
 
 fn freeze(st: &Rt2) -> Option<P8> {
-    let cell = st.globals[celeste_names::global_id("freeze")? as usize];
+    let cell = st.shape.globals()[celeste_names::global_id("freeze")? as usize];
     match (cell != NONE).then(|| st.cols[cell as usize].at(0))? {
         AV::Num(n) => Some(n),
         _ => None,

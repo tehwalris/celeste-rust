@@ -22,7 +22,7 @@ fn decided_roots<A: GraphArith>(
     graph: &Graph<A>,
     cfgs: &[Vec<u8>],
     (need, want): (&[bool], &[NodeId]),
-    room: Option<&crate::transpile::graph::Room>,
+    room: Option<&celeste_core::room::Room>,
 ) -> Vec<Vec<NodeId>> {
     let mut probe = graph.like();
     let mut decided = graph.like();
@@ -45,7 +45,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
     graph: &Graph<A>,
     outs: &[Roots],
     forks: u8,
-    room: Option<&crate::transpile::graph::Room>,
+    room: Option<&celeste_core::room::Room>,
 ) -> (Graph<A>, Vec<Body>) {
     let mut sp = graph.like();
     let mut cands = Vec::new();
@@ -74,7 +74,7 @@ fn configurations<A: GraphArith>(
     oi: usize,
     out: &Roots,
     forks: u8,
-    room: Option<&crate::transpile::graph::Room>,
+    room: Option<&celeste_core::room::Room>,
     sp: &mut Graph<A>,
 ) -> Vec<Body> {
     let mut cands = Vec::new();
@@ -200,7 +200,7 @@ fn configurations<A: GraphArith>(
 /// DECIDE the boolean layer of the candidates, on the RESOLVED graph: the
 /// interval fold, the local BDD (`bdd::simplify_local`), the interval fold
 /// again; the candidates' roots follow into the result.
-fn decide<A: GraphArith>(sp: &Graph<A>, cands: &mut [Body], room: Option<&crate::transpile::graph::Room>) -> Graph<A> {
+fn decide<A: GraphArith>(sp: &Graph<A>, cands: &mut [Body], room: Option<&celeste_core::room::Room>) -> Graph<A> {
     let all: Vec<NodeId> = cands.iter().flat_map(|c| c.roots.flat()).collect();
     let (g1, m1, _) = crate::transpile::ival::fold(sp, &all, room).expect("interval fold");
     let r1: Vec<NodeId> = all.iter().map(|x| m1[*x as usize]).collect();

@@ -5,7 +5,7 @@
 //! because `celeste-engine` needs `FIELD_NAMES` below it.
 //!
 //! The ORDER is load-bearing: `FIELD_NAMES`' order is the field ordering
-//! `Cell2::Obj` interns against, so it feeds the shape hash and the row key
+//! `shape::Cell::Obj` interns against, so it feeds the shape hash and the row key
 //! the search dedups on. A reorder is a different search.
 
 pub mod gen;

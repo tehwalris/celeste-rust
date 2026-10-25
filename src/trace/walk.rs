@@ -69,8 +69,8 @@ pub type ShapeKey = u64;
 pub type WalkNode = (ShapeKey, Option<Region>);
 
 /// The shape key of a state (its skeleton's shape hash).
-pub fn shape_key<A: GraphArith>(st: &super::state::State<super::domain::Symbolic<A>>, cache: std::sync::Arc<celeste_core::room::Room>) -> Result<ShapeKey> {
-    Ok(super::block::skeleton::<_, A>(st, cache)?.shape_hash)
+pub fn shape_key<A: GraphArith>(st: &super::state::State<super::domain::Symbolic<A>>, room: &'static celeste_core::room::Room) -> Result<ShapeKey> {
+    Ok(super::block::skeleton::<_, A>(st, room)?.shape_hash())
 }
 
 /// The walk's REPRESENTATIVES: a shape's state as a one-lane block
@@ -82,13 +82,13 @@ struct Reps<A: GraphArith> {
     fn_info: super::block::FnInfo,
     /// The boot state: the builtins a block drops.
     base: super::state::State<super::domain::Symbolic<A>>,
-    cache: std::sync::Arc<celeste_core::room::Room>,
+    room: &'static celeste_core::room::Room,
     blocks: std::collections::BTreeMap<ShapeKey, celeste_engine::runtime2::Rt2<A>>,
 }
 
 impl<A: GraphArith> Reps<A> {
-    fn new(start: &super::state::State<super::domain::Symbolic<A>>, cache: std::sync::Arc<celeste_core::room::Room>) -> Result<Self> {
-        Ok(Reps { fn_info: super::block::fn_info_of(start)?, base: start.clone(), cache, blocks: Default::default() })
+    fn new(start: &super::state::State<super::domain::Symbolic<A>>, room: &'static celeste_core::room::Room) -> Result<Self> {
+        Ok(Reps { fn_info: super::block::fn_info_of(start)?, base: start.clone(), room, blocks: Default::default() })
     }
 
     /// `st` as a representative (`blanked`: its state paths 0 or false).
@@ -102,7 +102,7 @@ impl<A: GraphArith> Reps<A> {
         let d = &*d;
         super::block::to_rt2(
             &st,
-            self.cache.clone(),
+            self.room,
             |n| d.as_const(n).map(AV::Num).ok_or_else(|| anyhow::anyhow!("a representative holds a number that is no constant")),
             |b| d.decide(b).map(AV::Bool).ok_or_else(|| anyhow::anyhow!("a representative holds a boolean that is no constant")),
         )
@@ -191,7 +191,7 @@ fn no_player_ranges<A: GraphArith>(
             return Ok(false);
         }
         let mut st = start.clone();
-        let mut key = shape_key(start, reps.cache.clone())?;
+        let mut key = shape_key(start, reps.room)?;
         // Read before the representative blanks them; the next trace pins them back.
         let mut consts = shapes::field_constants(start, &it.d, &chain_opts)?;
         for k in 0..NO_PLAYER_FRAMES {
@@ -220,7 +220,7 @@ fn no_player_ranges<A: GraphArith>(
     }
     np.on = true;
     let c = shapes::field_constants(start, &it.d, &opts)?;
-    let key = shape_key(start, reps.cache.clone())?;
+    let key = shape_key(start, reps.room)?;
     let (n, followed, ended) = explore_no_player(it, chunks, reps, (key, start.clone(), c), opts, &mut np, "the start's")?;
     eprintln!("[walk] the start explored: {n} states explored, {followed} outcomes followed, {ended} reach the player");
     Ok(np)
@@ -320,7 +320,7 @@ fn state_id<A: GraphArith>(shape: ShapeKey, consts: &std::collections::BTreeMap<
 fn next_entry<A: GraphArith>(reps: &Reps<A>, d: &mut super::domain::Symbolic<A>, st: &super::state::State<super::domain::Symbolic<A>>, opts: &crate::abstraction::Level) -> Result<Entry<A>> {
     let consts = super::shapes::field_constants(st, d, opts)?;
     let rep = reps.block(st, d, true)?;
-    Ok((rep.shape_hash, reps.state(&rep, d)?, consts))
+    Ok((rep.shape_hash(), reps.state(&rep, d)?, consts))
 }
 
 /// A numeric field's hull per path (raw 16.16, inclusive).
@@ -439,9 +439,9 @@ mod tests {
         use crate::settings::Settings;
         let level = crate::abstraction::Level::parse("r0sx").expect("level");
         let chain = |s: Settings, max_nodes: Option<usize>| {
-            let (mut tr, start) = super::boot::<celeste_core::arith::Fixed>(&s, level).expect("boot");
+            let (mut tr, start) = super::boot::<celeste_core::arith::Fixed>(&crate::settings::Run::new(&s, level)).expect("boot");
             tr.it.max_nodes = max_nodes.unwrap_or(tr.it.max_nodes);
-            let reps = super::Reps::new(&start, tr.it.cache.clone().expect("boot loads the collision cache")).expect("the start's functions");
+            let reps = super::Reps::new(&start, tr.it.room.expect("boot loads the room")).expect("the start's functions");
             super::no_player_ranges(&mut tr.it, tr.chunks, &reps, &start, level)
         };
         let unseeded = chain(Settings { room: (5, 0), ..Default::default() }, None).expect("an `rnd` draw ends the chain quietly");
@@ -463,7 +463,7 @@ mod tests {
         let s = crate::settings::Settings { room: (6, 1), ..Default::default() };
         let opts = crate::abstraction::Level { floors_near: true, ..crate::abstraction::Level::EXACT };
         let only = [super::Region { ix: 3, iy: 6 }, super::Region { ix: 4, iy: 6 }];
-        let lw: super::LatticeWalk = super::room_constant_lattice(opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
+        let lw: super::LatticeWalk = super::room_constant_lattice(&super::Walk { run: &crate::settings::Run::new(&s, opts), only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
         let mut traced = 0;
         for ((shape, region), f) in &lw.frames {
             let Some(r) = region else { continue };
@@ -486,7 +486,7 @@ mod tests {
         let s = crate::settings::Settings { room: (0, 3), category: crate::settings::Category::Gemskip100, loading_jank: Some(1), ..Default::default() };
         let opts = crate::abstraction::Level::parse("r0sx").expect("level");
         let only: Vec<super::Region> = (0..8).flat_map(|ix| (5..8).map(move |iy| super::Region { ix, iy })).collect();
-        let lw: super::LatticeWalk = super::room_constant_lattice(opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
+        let lw: super::LatticeWalk = super::room_constant_lattice(&super::Walk { run: &crate::settings::Run::new(&s, opts), only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
         let mut bounded = 0;
         for ((shape, region), f) in &lw.frames {
             let rep = &lw.reps[shape];
@@ -506,12 +506,12 @@ mod tests {
     }
 }
 
-/// The walk's tracer at room `s.room`'s start, every frame traced at `opts`.
-fn boot<A: GraphArith>(s: &crate::settings::Settings, opts: crate::abstraction::Level) -> Result<(Tracer<A>, super::state::State<super::domain::Symbolic<A>>)> {
-    let chunks = super::cart::Chunks::parse(s)?.leak();
+/// The walk's tracer at `run`'s start room, every frame traced at its level.
+fn boot<A: GraphArith>(run: &crate::settings::Run) -> Result<(Tracer<A>, super::state::State<super::domain::Symbolic<A>>)> {
+    let chunks = super::cart::Chunks::parse(&run.settings)?.leak();
     let mut it = super::interp::Interp::new(super::domain::Symbolic::<A>::default());
-    it.d.level = opts;
-    let start = super::cart::boot(&mut it, chunks, s.room)?;
+    it.d.level = run.level;
+    let start = super::cart::boot(&mut it, chunks, run.settings.room)?;
     Ok((Tracer { it, chunks }, start))
 }
 
@@ -519,14 +519,11 @@ fn boot<A: GraphArith>(s: &crate::settings::Settings, opts: crate::abstraction::
 /// trace forward from the spawn with each shape's known constants PINNED,
 /// INTERSECT each outcome's constants into its shape's lattice, re-trace a
 /// shape that shrinks. Monotone (constant -> abstract only), so it
-/// terminates. Every frame is traced under `opts`, the kernels' level.
-pub fn room_constant_lattice<A: GraphArith>(
-    opts: crate::abstraction::Level,
-    walk: &Walk,
-) -> Result<LatticeWalk<A>> {
-    let s = walk.settings;
-    let (Tracer { mut it, chunks }, start) = boot::<A>(s, opts)?;
-    let (mut w, mut frontier) = WalkState::start(&mut it, chunks, &start, opts, walk)?;
+/// terminates. Every frame is traced at the run's level, the kernels'.
+pub fn room_constant_lattice<A: GraphArith>(walk: &Walk) -> Result<LatticeWalk<A>> {
+    let opts = walk.run.level;
+    let (Tracer { mut it, chunks }, start) = boot::<A>(walk.run)?;
+    let (mut w, mut frontier) = WalkState::start(&mut it, chunks, &start, walk)?;
     // THE ROUNDS: each traces its frontier in parallel against a lattice
     // snapshot; results apply in node order between rounds. Each frame is
     // bound in the worker arena it was traced in.
@@ -601,14 +598,12 @@ impl<A: GraphArith> WalkState<A> {
         it: &mut super::interp::Interp<'static, super::domain::Symbolic<A>>,
         chunks: &'static super::cart::Chunks,
         start: &super::state::State<super::domain::Symbolic<A>>,
-        opts: crate::abstraction::Level,
         walk: &Walk,
     ) -> Result<(Self, Vec<WalkNode>)> {
         use super::domain::Domain as _;
         use super::shapes;
-        let s = walk.settings;
-        let cache = it.cache.clone().expect("boot loads the collision cache");
-        let mut reps = Reps::new(start, cache)?;
+        let (s, opts) = (&*walk.run.settings, walk.run.level);
+        let mut reps = Reps::new(start, it.room.expect("boot loads the room"))?;
         let no_player = match s.region_grid() {
             Some(_) => no_player_ranges(it, chunks, &reps, start, opts)?,
             None => NoPlayer::default(),
@@ -638,7 +633,7 @@ impl<A: GraphArith> WalkState<A> {
             }
         }
         let start_rep = reps.block(&start_rep, &mut it.d, false)?;
-        let sk = start_rep.shape_hash;
+        let sk = start_rep.shape_hash();
         let mut ival_extra: std::collections::BTreeMap<ShapeKey, std::collections::BTreeSet<super::iface::Path>> = Default::default();
         if !start_ivals.is_empty() {
             ival_extra.insert(sk, start_ivals.keys().cloned().collect());
@@ -734,7 +729,7 @@ impl<A: GraphArith> WalkState<A> {
                         respawned |= self.outcome(it, chunks, (k, region), o, &mut next)?;
                     }
                     // The frame binds the block its representative is.
-                    anyhow::ensure!(frame.in_rt2.shape_hash_of() == k, "shape {k:#x} region {region:?}: the traced frame's input block has shape {:#x}", frame.in_rt2.shape_hash_of());
+                    anyhow::ensure!(frame.in_rt2.shape_hash() == k, "shape {k:#x} region {region:?}: the traced frame's input block has shape {:#x}", frame.in_rt2.shape_hash());
                     self.frames.insert(job.node, WalkFrame { frame, bounds: job.bounds.clone(), bound });
                 }
             }
@@ -854,8 +849,7 @@ impl<A: GraphArith> WalkState<A> {
                 nodes.len()
             );
         }
-        let cache = self.reps.cache.clone();
-        Ok(LatticeWalk { lattice: self.lattice, reps: self.states, frames: self.frames, cache, tracer, start_key: self.start_key, ival_extra: self.ival_extra, start_ivals: self.start_ivals })
+        Ok(LatticeWalk { lattice: self.lattice, reps: self.states, frames: self.frames, room: self.reps.room, tracer, start_key: self.start_key, ival_extra: self.ival_extra, start_ivals: self.start_ivals })
     }
 }
 
@@ -967,7 +961,7 @@ fn walk_trace<A: GraphArith>(
         let spawn_phase = shapes::player_path(&o.st).is_none() && !super::widen::objects_of_type(&o.st, super::game::PLAYER_SPAWN).is_empty();
         let respawn = if grid.is_some() && spawn_phase && !job.spawn { Some(shapes::field_constants(&o.st, &tr.it.d, &opts)?) } else { None };
         let rep = reps.block(&o.st, &mut tr.it.d, true)?;
-        outs.push(WalkOutcome { key: rep.shape_hash, constants, ival, regions, rep, respawn });
+        outs.push(WalkOutcome { key: rep.shape_hash(), constants, ival, regions, rep, respawn });
     }
     let bound = super::lower::bind(&f, &tr.it.d.graph).map_err(|e| format!("{:#}", e));
     let illegal = std::mem::take(&mut tr.it.illegal);
@@ -986,7 +980,8 @@ pub struct Tracer<A: GraphArith = Fixed> {
 /// What a lattice walk runs under: the run's settings and, for a test,
 /// `only` the player regions it traces (`None`: every region).
 pub struct Walk<'a> {
-    pub settings: &'a crate::settings::Settings,
+    /// The run whose start room is walked, every frame traced at its level.
+    pub run: &'a crate::settings::Run,
     pub only: Option<&'a [Region]>,
 }
 
@@ -998,7 +993,8 @@ pub struct LatticeWalk<A: GraphArith = Fixed> {
     pub reps: std::collections::BTreeMap<ShapeKey, super::state::State<super::domain::Symbolic<A>>>,
     /// Per (shape, region), its converged frame, bounds and binding.
     pub frames: std::collections::BTreeMap<WalkNode, WalkFrame<A>>,
-    pub cache: std::sync::Arc<celeste_core::room::Room>,
+    /// The start room's tiles.
+    pub room: &'static celeste_core::room::Room,
     /// Per shape, input slots a reachable frame wrote an `rnd`-derived interval
     /// to, typed as interval inputs.
     pub ival_extra: std::collections::BTreeMap<ShapeKey, std::collections::BTreeSet<super::iface::Path>>,

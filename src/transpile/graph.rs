@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 
-use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 
@@ -14,6 +13,7 @@ use celeste_core::cart_data::CART;
 
 use celeste_core::arith::{Arithmetic, Fixed};
 use celeste_core::pico8_num::Pico8Num;
+use celeste_core::room::Room;
 
 pub use super::garith::GraphArith;
 
@@ -83,12 +83,6 @@ pub const UNBUILT: NodeId = NodeId::MAX;
 /// a DEAD fork whose fragments all give the same row (the OR of their
 /// validities is the lane covered).
 pub const ANY_VALID: u8 = 0x80;
-
-/// The room's collision cache, for the evaluator (the map is `CART`'s).
-#[derive(Clone)]
-pub struct Room {
-    pub cache: Arc<celeste_core::room::Room>,
-}
 
 /// What a `Pin` reads its input as: a number (a point, or a literal
 /// interval `[lo, hi]`, as literals: `Arithmetic::Lit`) or a boolean.
@@ -1076,7 +1070,7 @@ impl<A: GraphArith> Graph<A> {
         let (dx, dy) = (xhi - xlo, yhi - ylo);
         let solid = |px: i32, py: i32, pw: i32, ph: i32| -> Result<bool> {
             let ((px, pw), (py, ph)) = (edges(px, pw), edges(py, ph));
-            room.cache.flag_at(px, py, pw, ph, flag)
+            room.flag_at(px, py, pw, ph, flag)
         };
         if !solid(xlo, ylo, w + dx, h + dy)? {
             return Ok(Val::Bool(Some(false)));

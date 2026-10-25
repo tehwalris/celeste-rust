@@ -17,7 +17,8 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use super::garith::GraphArith;
-use super::graph::{Eval, Graph, NodeId, Op, Room, Val};
+use super::graph::{Eval, Graph, NodeId, Op, Val};
+use celeste_core::room::Room;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
@@ -137,8 +138,7 @@ mod tests {
     #[test]
     fn a_collision_test_is_decided_at_a_known_position_and_not_at_an_unknown_one() {
         let (rx, ry) = crate::settings::Settings::default().room;
-        let cache = std::sync::Arc::new(celeste_core::room::Room::new(rx, ry));
-        let room = Room { cache: cache.clone() };
+        let room = Room::of((rx, ry));
 
         let at = |x: i16, y: i16| -> Option<bool> {
             let mut g = Graph::new();
@@ -150,7 +150,7 @@ mod tests {
             let (w, h) = (n(&mut g, 8), n(&mut g, 8));
             let f = n(&mut g, 0);
             let t = g.fold(Op::TileFlagAt, vec![px, py, w, h, f]);
-            let (out, map, _) = fold(&g, &[t], Some(&room)).expect("folds");
+            let (out, map, _) = fold(&g, &[t], Some(room)).expect("folds");
             match out.get(map[t as usize]).op {
                 Op::ConstBool(b) => Some(b),
                 _ => None,
@@ -162,7 +162,7 @@ mod tests {
         let mut open_seen = false;
         for y in (0..128).step_by(8) {
             for x in (0..128).step_by(8) {
-                let want = cache.flag_at(x, y, 8, 8, 0).expect("tile_flag_at");
+                let want = room.flag_at(x, y, 8, 8, 0).expect("tile_flag_at");
                 assert_eq!(at(x, y), Some(want), "at ({}, {})", x, y);
                 solid_seen |= want;
                 open_seen |= !want;
@@ -180,7 +180,7 @@ mod tests {
         let (w, h) = (n(&mut g, 8), n(&mut g, 8));
         let f = n(&mut g, 0);
         let t = g.fold(Op::TileFlagAt, vec![cell, cell, w, h, f]);
-        let (out, map, _) = fold(&g, &[t], Some(&room)).expect("folds");
+        let (out, map, _) = fold(&g, &[t], Some(room)).expect("folds");
         assert_eq!(out.get(map[t as usize]).op, Op::TileFlagAt, "unknown stays unknown");
     }
 
@@ -195,8 +195,7 @@ mod tests {
                 if (rx, ry) == (7, 3) {
                     continue; // the summit: no level room
                 }
-                let cache = std::sync::Arc::new(celeste_core::room::Room::new(rx, ry));
-                let room = Room { cache: cache.clone() };
+                let room = Room::of((rx, ry));
                 // The player's hitbox (6x5) and a whole tile.
                 for (w, h) in [(6i16, 5i16), (8, 8)] {
                     for at in -8..136i16 {
@@ -207,7 +206,7 @@ mod tests {
                             let (px, py) = if top_is_y { (exact, top) } else { (top, exact) };
                             let (gw, gh, f) = (g.leaf(Op::Const(raw(w), raw(w))), g.leaf(Op::Const(raw(h), raw(h))), g.leaf(Op::Const(0, 0)));
                             let t = g.fold(Op::TileFlagAt, vec![px, py, gw, gh, f]);
-                            let (out, map, _) = fold(&g, &[t], Some(&room)).expect("folds");
+                            let (out, map, _) = fold(&g, &[t], Some(room)).expect("folds");
                             let got = match out.get(map[t as usize]).op {
                                 Op::ConstBool(b) => Some(b),
                                 _ => None,
@@ -216,7 +215,7 @@ mod tests {
                             // (beyond [-16, 144] every rectangle misses the room).
                             let any_solid = (-16..=144i16).any(|v| {
                                 let (x, y) = if top_is_y { (at, v) } else { (v, at) };
-                                cache.flag_at(x, y, w, h, 0).expect("tile_flag_at")
+                                room.flag_at(x, y, w, h, 0).expect("tile_flag_at")
                             });
                             checked += 1;
                             decided += got.is_some() as usize;
@@ -247,8 +246,7 @@ mod tests {
         let (mut decided_false, mut kept) = (0usize, 0usize);
         for ry in 0..4i16 {
             for rx in 0..8i16 {
-                let cache = std::sync::Arc::new(celeste_core::room::Room::new(rx, ry));
-                let room = Room { cache };
+                let room = Room::of((rx, ry));
                 let tile = |i: i16, j: i16| cart.mget_whole(rx * 16 + i, ry * 16 + j) as i16;
                 for (i0, j0) in [(0i16, 0i16), (3, 1), (7, 12), (13, 13), (-1, 14), (14, -1)] {
                     for (w, h) in [(1i16, 1i16), (2, 2), (3, 2), (3, 3)] {
@@ -265,7 +263,7 @@ mod tests {
                             roots.push((k, g.fold(Op::Eq, vec![m, kn])));
                         }
                         let rs: Vec<NodeId> = roots.iter().map(|r| r.1).collect();
-                        let (out, map, _) = fold(&g, &rs, Some(&room)).expect("folds");
+                        let (out, map, _) = fold(&g, &rs, Some(room)).expect("folds");
                         for &(k, r) in &roots {
                             let lanes: Vec<bool> = (i0..i0 + w).flat_map(|i| (j0..j0 + h).map(move |j| (i, j))).map(|(i, j)| tile(i, j) == k).collect();
                             match out.get(map[r as usize]).op {
@@ -283,8 +281,8 @@ mod tests {
                             for i in i0..i0 + w {
                                 for j in j0..j0 + h {
                                     let cells = HashMap::from([(0u32, Val::exact_num(Pico8Num::from_i16(i))), (1u32, Val::exact_num(Pico8Num::from_i16(j)))]);
-                                    let before = g.eval(&cells, Eval::Lenient, Some(&room)).expect("before")[r as usize];
-                                    let after = out.eval(&cells, Eval::Lenient, Some(&room)).expect("after")[map[r as usize] as usize];
+                                    let before = g.eval(&cells, Eval::Lenient, Some(room)).expect("before")[r as usize];
+                                    let after = out.eval(&cells, Eval::Lenient, Some(room)).expect("after")[map[r as usize] as usize];
                                     assert_eq!(before, after, "room ({rx},{ry}) tile {k} lane ({i},{j})");
                                     assert_eq!(before, Val::Bool(Some(tile(i, j) == k)));
                                 }

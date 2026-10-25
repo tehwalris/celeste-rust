@@ -7,7 +7,7 @@ use crate::search::hull::{AccOf, HullOf};
 use anyhow::Result;
 use celeste_core::arith::Arithmetic;
 use celeste_core::pico8_num::Pico8Num as P8;
-use celeste_engine::runtime2::{Col, Rt2, AV};
+use celeste_engine::runtime2::{Col, ColRepr, Rt2, Template, AV};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::decode::Skeletons;
@@ -25,11 +25,11 @@ pub(crate) enum TCol<N: Arithmetic = P8> {
     Bool(Vec<u8>),
 }
 
-/// Rows of one shape, columnar over its skeleton, buffered only to be looked
-/// at: the coarser level's verdicts, the key check, the decode guard.
+/// Rows of one shape, columnar over its template, buffered only to be
+/// looked at: the coarser level's verdicts, the key check, the decode guard.
 pub(crate) struct RowBuf<N: Arithmetic = P8> {
     pub(crate) shape: u64,
-    skeleton: Rt2<N>,
+    template: Template<N>,
     /// `(cell, column)` per varying cell, in the kernel's order.
     pub(crate) cols: Vec<(usize, TCol<N>)>,
     pub(crate) keys: Vec<Key>,
@@ -37,19 +37,22 @@ pub(crate) struct RowBuf<N: Arithmetic = P8> {
 }
 
 impl<N: Arithmetic> RowBuf<N> {
-    pub(crate) fn new(skeleton: Rt2<N>) -> Self {
-        let cols = skeleton
+    /// A buffer of `template`'s rows (a kernel outcome's, or a reference
+    /// row's: a number, an interval or a boolean per row, else uniform).
+    pub(crate) fn new(template: &Template<N>) -> Self {
+        let cols = template
             .cols
             .iter()
             .enumerate()
             .filter_map(|(cell, c)| match c {
-                Col::N(_) => Some((cell, TCol::Num(Vec::new()))),
-                Col::I(_) => Some((cell, TCol::Ival(Vec::new()))),
-                Col::V(_) => Some((cell, TCol::Bool(Vec::new()))),
-                Col::U(_) => None,
+                ColRepr::Num => Some((cell, TCol::Num(Vec::new()))),
+                ColRepr::Ival => Some((cell, TCol::Ival(Vec::new()))),
+                ColRepr::Bool => Some((cell, TCol::Bool(Vec::new()))),
+                ColRepr::Uniform(_) => None,
+                ColRepr::Other => panic!("a row buffer of shape {:016x}: cell {cell} holds any value, no buffer's kind", template.shape_hash()),
             })
             .collect::<Vec<_>>();
-        RowBuf { shape: skeleton.shape_hash, skeleton, cols, keys: Vec::new(), cells: Vec::new() }
+        RowBuf { shape: template.shape_hash(), template: template.clone(), cols, keys: Vec::new(), cells: Vec::new() }
     }
 
     pub(crate) fn rows(&self) -> usize {
@@ -70,19 +73,7 @@ impl<N: Arithmetic> RowBuf<N> {
     }
 
     pub(crate) fn to_rt2(&self) -> Rt2<N> {
-        let mut b = celeste_engine::slots::reshape(&self.skeleton, 0);
-        b.cols = self
-            .skeleton
-            .cols
-            .iter()
-            .map(|c| match c {
-                Col::N(_) => Col::N(Vec::new()),
-                Col::I(_) => Col::I(Vec::new()),
-                Col::V(_) => Col::V(Vec::new()),
-                u => u.clone(),
-            })
-            .collect();
-        b.shape_hash = self.shape;
+        let mut b = self.template.empty();
         for (cell, col) in &self.cols {
             b.cols[*cell] = match col {
                 TCol::Num(v) => Col::N(v.iter().map(|&x| num::<N>(x)).collect()),
@@ -646,9 +637,9 @@ impl<'a, N: Rem> UnitSink<'a, N> {
 
     /// A shape the key space lacks, emitted (`Provisional::note_shape`,
     /// once a worker).
-    pub(crate) fn note_shape(&mut self, r: &celeste_engine::exact::ShapeRecord) {
-        if self.guards.noted.insert(r.hash) {
-            self.prov.note_shape(r);
+    pub(crate) fn note_shape(&mut self, l: &std::sync::Arc<celeste_engine::shape::Layout>) {
+        if self.guards.noted.insert(l.hash()) {
+            self.prov.note_shape(l);
         }
     }
 
@@ -733,13 +724,13 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         self.routes.id(shape, slot)
     }
 
-    /// The buffer of `shape` in `bufs` (made over `init()`'s skeleton).
+    /// The buffer of `shape` in `bufs` (made over `template`).
     #[inline]
-    fn buf_of(bufs: &mut Vec<RowBuf<N>>, shape: u64, init: impl FnOnce() -> Rt2<N>) -> usize {
+    fn buf_of(bufs: &mut Vec<RowBuf<N>>, shape: u64, template: &Template<N>) -> usize {
         match bufs.iter().position(|b| b.shape == shape) {
             Some(i) => i,
             None => {
-                bufs.push(RowBuf::new(init()));
+                bufs.push(RowBuf::new(template));
                 bufs.len() - 1
             }
         }
@@ -760,10 +751,10 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         }
     }
 
-    /// A BODY'S EMISSIONS into their routes' bundles. `init`: the shape's
-    /// skeleton (`Skeletons`); `push(buf, i)` appends lane `i`'s row to a
-    /// buffer when one is looked at (a verdict, the key check, the guard).
-    pub(crate) fn emit_body(&mut self, e: &BodyEmits, init: impl Fn() -> Rt2<N>, mut push: impl FnMut(&mut RowBuf<N>, usize)) -> Result<()> {
+    /// A BODY'S EMISSIONS into their routes' bundles. `template`: its rows'
+    /// (`Skeletons`); `push(buf, i)` appends lane `i`'s row to a buffer when
+    /// one is looked at (a verdict, the key check, the guard).
+    pub(crate) fn emit_body(&mut self, e: &BodyEmits, template: &Template<N>, mut push: impl FnMut(&mut RowBuf<N>, usize)) -> Result<()> {
         let (shape, t) = (e.shape, e.targets);
         let mut take = e.take;
         if take == 0 {
@@ -776,14 +767,14 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         let g = &mut self.guards;
         if shape != g.last_shape {
             if !g.registered.contains(&shape) {
-                self.skeletons.register(&init())?;
+                self.skeletons.register(template)?;
                 g.registered.insert(shape);
             }
             g.last_shape = if g.guarded.contains(&shape) { shape } else { 0 };
         }
         if g.last_shape != shape && !g.reference {
             if let Some(i) = lanes_of(take).find(|&i| !is_provisional(e.keys[i])) {
-                let mut b = RowBuf::new(init());
+                let mut b = RowBuf::new(template);
                 push(&mut b, i);
                 self.skeletons.check_decodes(self.keys, &b.to_rt2(), &[t.cells[i]])?;
                 g.guarded.insert(shape);
@@ -791,7 +782,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             }
         }
         if g.observer.is_some() && !g.reference {
-            let b = Self::buf_of(&mut g.observed, shape, &init);
+            let b = Self::buf_of(&mut g.observed, shape, template);
             for i in lanes_of(take) {
                 push(&mut self.guards.observed[b], i);
                 if self.guards.observed[b].rows() >= 256 {
@@ -809,7 +800,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
                     Some(_) => {}
                     None => {
                         let v = &mut self.verdicts;
-                        let b = Self::buf_of(&mut v.bufs, shape, &init);
+                        let b = Self::buf_of(&mut v.bufs, shape, template);
                         if v.at.len() <= b {
                             v.at.resize_with(b + 1, Vec::new);
                         }
@@ -871,8 +862,8 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         let mut w = row.clone_block();
         w.widen_to(crate::abstraction::Level::EXACT);
         w.canonical();
-        if self.keys.shape(w.shape_hash).is_none() {
-            self.note_shape(&celeste_engine::exact::ShapeRecord::of(&w));
+        if self.keys.shape(w.shape_hash()).is_none() {
+            self.note_shape(&std::sync::Arc::new(celeste_engine::shape::Layout::of(&w)));
         }
         let key = match self.keys.row_keys(&w).swap_remove(0) {
             RowKey::Hit(k) => k,
@@ -887,38 +878,24 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     /// columns follow its values, not a kernel's template.
     pub(crate) fn emit_row(&mut self, row: &Rt2<N>, lane: usize, cell: u32, pair: Pair<N>) -> Result<()> {
         debug_assert_eq!(row.width, 1);
-        if self.minus_one_drop(row.shape_hash, cell) {
+        if self.minus_one_drop(row.shape_hash(), cell) {
             return Ok(());
         }
         let (w, key) = self.row_key(row);
-        anyhow::ensure!(w.shape_hash == row.shape_hash, "a reference row's widening changed its shape ({:016x} -> {:016x})", row.shape_hash, w.shape_hash);
-        if !self.guards.registered.contains(&w.shape_hash) {
+        anyhow::ensure!(w.shape_hash() == row.shape_hash(), "a reference row's widening changed its shape ({:016x} -> {:016x})", row.shape_hash(), w.shape_hash());
+        if !self.guards.registered.contains(&w.shape_hash()) {
             self.skeletons.register(&super::decode::reference_skeleton(&w))?;
-            self.guards.registered.insert(w.shape_hash);
+            self.guards.registered.insert(w.shape_hash());
         }
         // Its buffers (verdicts, the key check) hold the row as it is.
-        let init = || {
-            let mut b = celeste_engine::slots::reshape(&w, 0);
-            b.cols = w
-                .cols
-                .iter()
-                .map(|c| match c.at(0) {
-                    AV::Num(_) => Col::N(Vec::new()),
-                    AV::Ival(..) => Col::I(Vec::new()),
-                    AV::Bool(_) | AV::UBool => Col::V(Vec::new()),
-                    v => Col::U(v),
-                })
-                .collect();
-            b.shape_hash = w.shape_hash;
-            b
-        };
+        let template = Template::of_row(&w);
         // One lane's `emit_body`: the state reached from unit lane `lane`.
         let xfer = self.xfers.id(self.worker, pair);
         let mut targets = Targets::default();
-        self.targets(w.shape_hash, &[cell; 16], 1, &[lane], &mut targets);
-        let e = BodyEmits { shape: w.shape_hash, take: 1, keys: &[key; 16], targets: &targets, xfers: &[xfer; 16] };
+        self.targets(w.shape_hash(), &[cell; 16], 1, &[lane], &mut targets);
+        let e = BodyEmits { shape: w.shape_hash(), take: 1, keys: &[key; 16], targets: &targets, xfers: &[xfer; 16] };
         self.guards.reference = true;
-        let r = self.emit_body(&e, init, |b, _| b.push_row(&w, key, cell));
+        let r = self.emit_body(&e, &template, |b, _| b.push_row(&w, key, cell));
         self.guards.reference = false;
         r
     }
