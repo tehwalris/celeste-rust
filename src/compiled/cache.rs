@@ -83,7 +83,7 @@ fn toolchain() -> &'static str {
 pub(crate) fn key<N: KernelLanes>(level: crate::abstraction::Level, s: &crate::settings::Settings) -> Result<Key> {
     // The settings but those that change no kernel: the threads and the
     // diagnostics.
-    let settings = crate::settings::Settings { threads: None, diag: Default::default(), ..s.clone() };
+    let settings = crate::settings::Settings { threads: None, phases: false, ..s.clone() };
     let program = crate::trace::cart::sources(s)?;
     let text = format!(
         "kernel cache format {KERNEL_CACHE_FORMAT}\nsources {SOURCES}, debug assertions {}\n{}\narithmetic {}, level {level}\nsettings {settings:?}\nprogram {:016x} ({} bytes)\n",
@@ -245,7 +245,7 @@ mod tests {
         let k = |s: &Settings, l: Level| super::key::<Pico8Num>(l, s).expect("key").name;
         let at = k(&base, level);
         assert_eq!(at, k(&Settings { threads: Some(3), ..base.clone() }, level), "the threads change no kernel");
-        assert_eq!(at, k(&Settings { diag: crate::settings::Diagnostics { phases: true, ..Default::default() }, ..base.clone() }, level), "the diagnostics change no kernel");
+        assert_eq!(at, k(&Settings { phases: true, ..base.clone() }, level), "--phases changes no kernel");
         let changed: Vec<(&str, Settings)> = vec![
             ("room", Settings { room: (4, 2), ..base.clone() }),
             ("region", Settings { region: Some((8, 6)), ..base.clone() }),

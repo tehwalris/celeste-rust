@@ -497,14 +497,14 @@ fn main() -> Result<()> {
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     if cli.command.reads_trees() {
         let given = tree_flags_given(&matches);
-        anyhow::ensure!(given.is_empty(), "{}: this command reads a finished tree and takes its settings from the tree's record (tree.txt); give only the run's own (--threads, the diagnostics)", given.join(" "));
+        anyhow::ensure!(given.is_empty(), "{}: this command reads a finished tree and takes its settings from the tree's record (tree.txt); give only the run's own (--threads, --phases)", given.join(" "));
     }
     // The commands that run in float (a tree's arithmetic is its record's).
     let float = cli.command.reads_trees() || matches!(cli.command, Command::Search(_) | Command::Forward(_) | Command::Robust(_) | Command::L1(_));
     let cfg = celeste_rust::settings::startup(&cli.settings, float, |s| {
         // `bench frame` times the workers' phases.
         if let Command::Bench(bench::Command::Frame(_)) = &cli.command {
-            s.diag.phases = true;
+            s.phases = true;
         }
     })?;
     match cli.command {

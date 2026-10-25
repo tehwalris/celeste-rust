@@ -623,7 +623,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             src_regions: Vec::new(),
             src_seen: Vec::new(),
             outbox: Vec::new(),
-            stats: super::stats::Stats::new(s.diag.phases),
+            stats: super::stats::Stats::new(s.phases),
         }
     }
 

@@ -559,7 +559,7 @@ fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, cx: &WaveCtx<N>, front: &Frontier
         }
     })?;
     collect_freed();
-    if s.diag.phases {
+    if s.phases {
         // The wave's anonymous peak (sampled) apart from the frame end's.
         crate::metrics::mem_phase(&format!("f{} units and region jobs", cx.frame));
     }
@@ -740,7 +740,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     // What the last frame's end and checkpoint freed back to the OS before
     // the wave's threads (new heaps) allocate: kept, it adds to the peak.
     collect_freed();
-    let mut st = Stats::new(s.diag.phases);
+    let mut st = Stats::new(s.phases);
     let workers = s.threads();
     st.set(S::EntriesIn, front.new.entries() as u64);
     st.set(S::LanesIn, front.new.states());
@@ -756,7 +756,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     };
     let plan = Plan::of(&front, cx.edges);
     let prov = Provisional::default();
-    if s.diag.phases {
+    if s.phases {
         crate::metrics::mem_phase(&format!("f{frame} start"));
     }
     let t_pipeline = Instant::now();
@@ -792,7 +792,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     let mut new = seal(&mut states, &regions, &finals, visited, frame, workers)?;
     // The routes' touched tables, freed off their (exited) threads: back now.
     collect_freed();
-    if s.diag.phases {
+    if s.phases {
         crate::metrics::mem_phase(&format!("f{frame} the routes sealed (keys final, new and grown states)"));
     }
     for sl in &new {
@@ -846,7 +846,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     st.lap(S::EndLayer, &mut lap);
     let wins = layer_wins(visited, &next.new, frame, s, check)?;
     st.lap(S::EndWins, &mut lap);
-    if s.diag.phases {
+    if s.phases {
         crate::metrics::mem_phase(&format!("f{frame} the next layer's wins decoded"));
     }
     st.set(S::Kept, next.new.states());
@@ -858,7 +858,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     }
     st.tick(S::PhEnd, tl);
     collect_freed();
-    if s.diag.phases {
+    if s.phases {
         crate::metrics::mem_phase(&format!("f{frame} the frame's end"));
     }
     st.add_time(S::Layer, t.elapsed());
