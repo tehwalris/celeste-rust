@@ -431,7 +431,7 @@ fn lane_value<A: TestArith>(g: &Graph<A>, out: &[Option<V<A>>], id: NodeId, row:
         Op::TileFlagAt => {
             let env = env.expect("tile_flag_at needs the map");
             let w: Vec<i16> = (0..5).map(|k| arg(k).and_then(|v| A::as_i16(as_point(v)))).collect::<Option<_>>()?;
-            V::B(env.cache.flag_at(w[0], w[1], w[2], w[3], w[4]).expect("flag_at"), true)
+            V::B(env.room.flag_at(w[0], w[1], w[2], w[3], w[4]).expect("flag_at"), true)
         }
         other => panic!("node {id}: {other:?} never reaches a kernel"),
     })
@@ -801,11 +801,10 @@ fn a_literals_split_ok_folds_to_the_kernels<A: TestArith>() {
 both!(a_literals_split_ok_folds_to_the_kernels, a_literals_split_ok_folds_to_the_kernels_fixed, a_literals_split_ok_folds_to_the_kernels_float);
 
 /// The map: `mget` (0 off the map) and `tile_flag_at` with a uniform box
-/// and a per-lane one, call-outs into the real collision cache, a result
+/// and a per-lane one, call-outs into the real room, a result
 /// feeding arithmetic.
 fn collision_lookups<A: TestArith>() {
-    let cache = Room::new(1, 0);
-    let env = CollisionEnv { cache: &cache };
+    let env = CollisionEnv { room: Room::of((1, 0)) };
     let mut g = Graph::<A>::default();
     let c = cells(&mut g, &[Ty::Num; 4]);
     let (w8, h6, flag0) = (lit(&mut g, A::from_i16(8)), lit(&mut g, A::from_i16(6)), lit(&mut g, A::from_i16(0)));
@@ -827,8 +826,7 @@ both!(collision_lookups, collision_lookups_fixed, collision_lookups_float);
 /// map answers the tile scan at every position of an ice room ((3,1)), and
 /// is true somewhere.
 fn the_ice_map_is_the_tile_scan<A: TestArith>() {
-    let cache = Room::new(3, 1);
-    let env = CollisionEnv { cache: &cache };
+    let env = CollisionEnv { room: Room::of((3, 1)) };
     let p = |v: i16| P8::from_i16(v);
     let scan = |x: i16, y: i16, w: i16, h: i16| -> bool {
         (y.max(0) / 8..=((y + h - 1).div_euclid(8)).min(15)).any(|ty| {

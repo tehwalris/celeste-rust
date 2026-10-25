@@ -378,7 +378,7 @@ impl Rows {
     pub(crate) fn states<N: celeste_core::arith::Arithmetic>(&self, t: &TreeDir) -> Result<(Tree<N>, u32, Vec<Sk>)> {
         let (frame, cell) = self.of(t)?;
         let tree = Tree::<N>::open(&t.dir, frame)?;
-        let all: Vec<Sk> = tree.layer(frame, None, t.settings.threads())?.0.states_iter().filter(|s| cell.is_none_or(|c| s.cell() == c)).collect();
+        let all: Vec<Sk> = tree.layer(frame, None, t.run.settings.threads())?.0.states_iter().filter(|s| cell.is_none_or(|c| s.cell() == c)).collect();
         anyhow::ensure!(!all.is_empty(), "{}: no states at step {frame}{}", t.dir.display(), self.cell.map_or(String::new(), |(x, y)| format!(" at ({x}, {y})")));
         Ok((tree, frame, all))
     }
@@ -445,17 +445,11 @@ fn report(res: &celeste_rust::search::result::SearchResult, dir: &std::path::Pat
 /// `rewrite forward` in arithmetic `N`: the tree at `dir` grown (or
 /// resumed) to step `to` by `engine` from `initial`; its first win, wall
 /// time and position graph printed.
-fn forward<N: celeste_rust::search::rem::Rem>(
-    dir: &std::path::Path,
-    to: u32,
-    level: Level,
-    cfg: &celeste_rust::settings::Settings,
-    engine: Box<dyn FrameStep<N>>,
-    initial: impl FnOnce() -> Result<Vec<Rt2<N>>>,
-) -> Result<()> {
+fn forward<N: celeste_rust::search::rem::Rem>(dir: &std::path::Path, to: u32, engine: Box<dyn FrameStep<N>>, initial: impl FnOnce() -> Result<Vec<Rt2<N>>>) -> Result<()> {
     let t = std::time::Instant::now();
     // Resumed or started (`grow_tree`).
-    let fwd = celeste_rust::frame::grow_tree(dir, to, cfg.minus_one(), None, level, || Ok(engine), initial, cfg)?;
+    let run = engine.run().clone();
+    let fwd = celeste_rust::frame::grow_tree(dir, to, run.settings.minus_one(), None, &run, || Ok(engine), initial)?;
     let wall = t.elapsed().as_secs_f64();
     match fwd.win_frame {
         Some(h) => println!("win at f{h} ({wall:.2} s)"),
@@ -509,12 +503,13 @@ fn main() -> Result<()> {
         Command::Forward(a) => {
             let t = std::time::Instant::now();
             let (dir, level, reference) = (std::path::Path::new(&a.tree), a.level, a.reference);
+            let run = celeste_rust::settings::Run::new(&cfg, level);
             let what = if reference { ", REFERENCE engine" } else { "" };
             let arith = if cfg.arith == Arith::Fixed { String::new() } else { format!(", {}", cfg.arith) };
             celeste_rust::with_arith!(cfg.arith, N => {
-                let engine: Box<dyn FrameStep<N>> = if reference { Box::new(celeste_rust::engines::reference::RefFrameStep::<N>::new(&cfg, level)?) } else { Box::new(celeste_rust::compiled::Kernels::<N>::new(&cfg, level)?) };
+                let engine: Box<dyn FrameStep<N>> = if reference { Box::new(celeste_rust::engines::reference::RefFrameStep::<N>::new(&run)?) } else { Box::new(celeste_rust::compiled::Kernels::<N>::new(&run)?) };
                 eprintln!("[fwd] engine up in {:.2} s ({level}{what}{arith})", t.elapsed().as_secs_f64());
-                forward(dir, a.steps, level, &cfg, engine, || Ok(vec![celeste_rust::engines::reference::ReferenceEngine::<N>::new(&cfg)?.initial()?.canonicalized()]))
+                forward(dir, a.steps, engine, || Ok(vec![celeste_rust::engines::reference::ReferenceEngine::<N>::new(&cfg)?.initial()?.canonicalized()]))
             })
         }
         Command::Run(a) => run::run(&cfg, a),
@@ -528,7 +523,7 @@ fn main() -> Result<()> {
         Command::Bench(c) => bench::run(&cfg, c),
         Command::Explain(a) => {
             let t = a.tree.open(&cfg)?;
-            print!("{}", celeste_rust::with_arith!(t.settings.arith, N => celeste_rust::check::explain::explain::<N>(&t, a.step, a.state)?));
+            print!("{}", celeste_rust::with_arith!(t.run.settings.arith, N => celeste_rust::check::explain::explain::<N>(&t, a.step, a.state)?));
             Ok(())
         }
         Command::Census(a) => diag::census(&cfg, a),

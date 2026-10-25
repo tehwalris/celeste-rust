@@ -1,19 +1,18 @@
-//! A FINISHED TREE as the commands that read one open it: its settings and
-//! level from its record (`Settings::of_tree`, never the command line), its
+//! A FINISHED TREE as the commands that read one open it: its run (settings
+//! and level) from its record (`Run::of_tree`, never the command line), its
 //! last finished frame (the record's trust marker, `record::done`).
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::abstraction::Level;
-use crate::settings::Settings;
+use crate::settings::{Run, Settings};
 
 pub struct TreeDir {
     pub dir: PathBuf,
-    /// The tree's settings, with the run's own (threads, diagnostics).
-    pub settings: Settings,
-    pub level: Level,
+    /// The tree's settings and level, with the run's own settings
+    /// (threads, diagnostics).
+    pub run: Run,
     /// The last finished frame (search step).
     pub(crate) last: u32,
 }
@@ -21,9 +20,9 @@ pub struct TreeDir {
 impl TreeDir {
     /// The tree in `dir`, the run's own settings from `run`.
     pub fn open(dir: &Path, run: &Settings) -> Result<TreeDir> {
-        let (settings, level) = Settings::of_tree(dir, run)?;
+        let tree = Run::of_tree(dir, run)?;
         let last = crate::storage::record::done_frame(dir).ok_or_else(|| anyhow::anyhow!("{}: no finished frame", dir.display()))?;
-        Ok(TreeDir { dir: dir.to_path_buf(), settings, level, last })
+        Ok(TreeDir { dir: dir.to_path_buf(), run: tree, last })
     }
 
     /// Frame `f` of the tree (`None`: its last); past the last is refused.
@@ -34,6 +33,6 @@ impl TreeDir {
     }
 
     pub fn float(&self) -> bool {
-        self.settings.arith != crate::settings::Arith::Fixed
+        self.run.settings.arith != crate::settings::Arith::Fixed
     }
 }

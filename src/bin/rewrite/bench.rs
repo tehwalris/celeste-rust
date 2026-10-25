@@ -97,15 +97,15 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
     match c {
         Command::Frame(a) => {
             let t = a.tree.open(run)?;
-            if t.settings.arith != Arith::Fixed {
+            if t.run.settings.arith != Arith::Fixed {
                 anyhow::ensure!(a.metrics.is_none(), "a float tree: bench frame --metrics (the kernel census) is 16.16's");
             }
-            celeste_rust::with_arith!(t.settings.arith, N => bench_frame::<N>(&t, &a))
+            celeste_rust::with_arith!(t.run.settings.arith, N => bench_frame::<N>(&t, &a))
         }
         Command::Backward(a) => {
             let t = a.tree.open(run)?;
             let horizon = t.frame(a.steps)?;
-            celeste_rust::with_arith!(t.settings.arith, N => bench_backward::<N>(&t, horizon, a.step, a.reps))
+            celeste_rust::with_arith!(t.run.settings.arith, N => bench_backward::<N>(&t, horizon, a.step, a.reps))
         }
     }
 }
@@ -113,7 +113,8 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
 /// `bench frame` in the arithmetic of `N` (`--metrics`, the kernel census,
 /// is 16.16's).
 fn bench_frame<N: Rem + celeste_rust::compiled::KernelLanes>(t: &TreeDir, a: &FrameArgs) -> Result<()> {
-    let (cfg, level, dir) = (&t.settings, t.level, &t.dir);
+    let (run, dir) = (&t.run, &t.dir);
+    let (cfg, level) = (&*run.settings, run.level);
     let (edges, checkpoint, reps) = (a.edges, a.checkpoint, a.reps);
     anyhow::ensure!(!checkpoint || edges, "--checkpoint needs --edges (the frame's files as the forward writes them)");
     anyhow::ensure!(!a.pin || (a.expect.is_some() || a.metrics.is_some()), "--pin writes --expect and --metrics: give one");
@@ -121,13 +122,13 @@ fn bench_frame<N: Rem + celeste_rust::compiled::KernelLanes>(t: &TreeDir, a: &Fr
     let frame = t.frame(a.step)?;
     // `--metrics`: the kernels count the slices they run (the census's
     // dynamic instructions, `check::census`).
-    let engine = if a.metrics.is_some() { celeste_rust::compiled::Kernels::<N>::counting(cfg, level)? } else { celeste_rust::compiled::Kernels::<N>::new(cfg, level)? };
+    let engine = if a.metrics.is_some() { celeste_rust::compiled::Kernels::<N>::counting(run)? } else { celeste_rust::compiled::Kernels::<N>::new(run)? };
     let t = std::time::Instant::now();
     engine.warm();
     let t_kernels = t.elapsed().as_secs_f64();
     eprintln!("[bench] kernels built: rss {:.2} GB", celeste_rust::metrics::current_rss_gb());
     let t = std::time::Instant::now();
-    let mut st = celeste_rust::frame::ForwardState::<N>::at(dir, frame, level, cfg)?;
+    let mut st = celeste_rust::frame::ForwardState::<N>::at(dir, frame, run)?;
     eprintln!(
         "[bench] kernels built in {t_kernels:.2} s; f{frame} loaded in {:.2} s: {} lanes in {} entries ({:.3} GB, {:.2} B a state) and {} old states, visited {} states in {} entries ({:.3} GB, {:.2} B a state); {} threads; rss {:.2} GB",
         t.elapsed().as_secs_f64(),
@@ -189,7 +190,7 @@ fn bench_frame<N: Rem + celeste_rust::compiled::KernelLanes>(t: &TreeDir, a: &Fr
         if rep == 0 {
             celeste_rust::compiled::print_kernel_stats(&costs[0].stats)?;
             if let Some(path) = &a.metrics {
-                let kernels = celeste_rust::check::census::counted(&engine, level, cfg)?;
+                let kernels = celeste_rust::check::census::counted(&engine)?;
                 let slices: u64 = kernels.iter().map(|k| k.1).sum();
                 let insts: u64 = kernels.iter().map(|(_, n, c)| n * c.get("insts").copied().unwrap_or(0)).sum();
                 eprintln!("[bench] kernels: {insts} dynamic instructions over {slices} slices ({} a slice; call-outs' callees aside)", insts.checked_div(slices).unwrap_or(0));
@@ -313,7 +314,7 @@ impl Drop for Scratch {
 /// `bench backward` of `frame` in the arithmetic of `N`, the winning sets
 /// for `horizon`.
 fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize) -> Result<()> {
-    let cfg = &tree.settings;
+    let cfg = &tree.run.settings;
     anyhow::ensure!(frame < horizon, "--step {frame}: below the horizon {horizon}");
     let t = std::time::Instant::now();
     let seeds = celeste_rust::search::backward::Seeds::<N>::load(&tree.dir, horizon)?;

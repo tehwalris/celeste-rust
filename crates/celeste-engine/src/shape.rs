@@ -70,7 +70,7 @@ mod tests {
     /// Every kind, as `shape_words` writes it, reads back as its cell's.
     #[test]
     fn the_signature_reads_back_its_cells_kinds() {
-        let room = std::sync::Arc::new(celeste_core::room::Room::new(1, 0));
+        let room = celeste_core::room::Room::of((1, 0));
         let mut b = Rt2::<P8>::empty(1, celeste_names::GLOBAL_NAMES.len(), celeste_names::STRINGS, room);
         let x = celeste_names::field("x");
         b.structure = vec![

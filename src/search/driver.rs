@@ -19,7 +19,7 @@ use super::result::{DualResult, LevelResult, SearchResult, Verdict};
 use crate::abstraction::Level;
 use crate::compiled::KernelLanes;
 use crate::frame::{MarkFilter, Visited};
-use crate::settings::Settings;
+use crate::settings::{Run, Settings};
 
 pub struct SearchSpec<'a> {
     /// The run's settings (a dual search's fixed half: real play).
@@ -252,9 +252,10 @@ fn run_levels<N: KernelLanes>(
                 crate::storage::record::update(&dir, "filtered_for", key)?;
             }
         }
-        let engine = || -> Result<Box<dyn crate::frame::FrameStep<N>>> { Ok(Box::new(crate::compiled::Kernels::<N>::new(cfg, lvl)?)) };
+        let run = Run::new(cfg, lvl);
+        let engine = || -> Result<Box<dyn crate::frame::FrameStep<N>>> { Ok(Box::new(crate::compiled::Kernels::<N>::new(&run)?)) };
         let initial = || -> Result<Vec<Rt2<N>>> { Ok(vec![crate::engines::reference::ReferenceEngine::<N>::new(cfg)?.initial()?.canonicalized()]) };
-        let first_win = crate::frame::grow_tree(&dir, steps, want, filter, lvl, engine, initial, cfg)?.win_frame;
+        let first_win = crate::frame::grow_tree(&dir, steps, want, filter, &run, engine, initial)?.win_frame;
         let forward_s = t.elapsed().as_secs_f64();
         // `f` counts search steps.
         eprintln!("[search] level {li} ({lvl}): forward to f{steps} in {forward_s:.1} s; first win {first_win:?}");
@@ -264,10 +265,10 @@ fn run_levels<N: KernelLanes>(
         // bound is loose wherever its objects are (a try at it can cost most
         // of a search), and the finer level decides anyway.
         let known = prefer.map(|inputs| super::known::Route { inputs, filter, hulls: false });
-        let (arcs, marks, _) = arc_level::<N>(&dir, lvl, steps, cfg, !last, save_marks, known.as_ref())?;
+        let (arcs, marks, _) = arc_level::<N>(&dir, &run, steps, !last, save_marks, known.as_ref())?;
         let bound = arcs.bound(cfg.clock());
         let concrete = match bound {
-            Some(b) if last && finish == Finish::Concrete => concrete_level(&arcs, b, prefer, save_marks, cfg)?,
+            Some(b) if last && finish == Finish::Concrete => concrete_level(&arcs, b, prefer, save_marks)?,
             _ => None,
         };
         res.levels.push(LevelResult { spec: lvl.to_string(), dir: format!("{prefix}level{li:02}"), forward_s, first_win, arc_bound: bound });
@@ -298,8 +299,9 @@ pub(crate) struct Arcs<N: Rem = P8> {
     pub(crate) w: Winning<N::C>,
     pub(crate) shapes: Vec<u64>,
     pub(crate) space: celeste_engine::exact::KeySpace<N>,
-    /// The level its nodes key at, and the horizon in search steps.
-    pub(crate) level: crate::abstraction::Level,
+    /// The run its nodes key at (its tree's), and the horizon in search
+    /// steps.
+    pub(crate) run: Run,
     pub(crate) horizon: u32,
     /// The start's node (`None`: no winning set at any step; not looked up
     /// by its projection: the tree holds the start unwidened), and the
@@ -317,8 +319,8 @@ impl<N: Rem> Arcs<N> {
     }
 
     /// The level's states as the concrete searches admit them under `s`.
-    pub(super) fn side<'a>(&'a self, s: &'a Settings) -> Result<Side<'a, N>> {
-        Ok(Side { w: &self.w, node: NodeKeys::new(&self.w, &self.shapes)?, keys: &self.space, level: self.level, s, seeded: s.concrete().1 })
+    pub(super) fn side(&self) -> Result<Side<'_, N>> {
+        Ok(Side { w: &self.w, node: NodeKeys::new(&self.w, &self.shapes)?, keys: &self.space, run: &self.run, seeded: self.run.settings.concrete().1 })
     }
 }
 
@@ -330,12 +332,12 @@ struct ArcPhase<N: Rem> {
 }
 
 impl<N: Rem> ArcPhase<N> {
-    /// `backward` and `optimum` over the tree in `dir` (at `level` under
-    /// `s`) to step `horizon`; its `[gate]` fingerprints printed (W's
-    /// support, W per frame, the optimum; over content, independent of
-    /// scheduling).
-    fn of(dir: &Path, level: Level, horizon: u32, s: &Settings) -> Result<Self> {
-        s.check(dir, level)?;
+    /// `backward` and `optimum` over the tree in `dir` (of `run`) to step
+    /// `horizon`; its `[gate]` fingerprints printed (W's support, W per
+    /// frame, the optimum; over content, independent of scheduling).
+    fn of(dir: &Path, run: &Run, horizon: u32) -> Result<Self> {
+        run.check(dir)?;
+        let s = &*run.settings;
         crate::metrics::mem_phase("arc: start");
         let seeds = Seeds::<N>::load(dir, horizon)?;
         crate::metrics::mem_phase("arc: edge files opened");
@@ -352,7 +354,7 @@ impl<N: Rem> ArcPhase<N> {
         let start = w.index(seeds.start);
         let steps = optimum(&w, start, start_point::<N>(), horizon);
         eprintln!("[arc] backward {tb:.2} s; optimum {steps:?} (steps)");
-        let arcs = Arcs { w, shapes: seeds.shapes.clone(), space: seeds.space.clone(), level, horizon, start, steps };
+        let arcs = Arcs { w, shapes: seeds.shapes.clone(), space: seeds.space.clone(), run: run.clone(), horizon, start, steps };
         let ap = ArcPhase { seeds, arcs };
         ap.gate_lines(s.threads())?;
         crate::metrics::mem_phase("arc: fingerprints");
@@ -443,9 +445,10 @@ impl<N: Rem> ArcPhase<N> {
 /// every pruning step (an error if one drops it; `Some(f)`: it exits in
 /// frame `f` and survives). The edge files closed.
 #[allow(clippy::type_complexity)]
-fn arc_level<N: KernelLanes>(dir: &Path, level: Level, horizon: u32, s: &Settings, next: bool, save: Option<&Path>, known: Option<&super::known::Route<N>>) -> Result<(Arcs<N>, Option<Visited<N>>, Option<u32>)> {
+fn arc_level<N: KernelLanes>(dir: &Path, run: &Run, horizon: u32, next: bool, save: Option<&Path>, known: Option<&super::known::Route<N>>) -> Result<(Arcs<N>, Option<Visited<N>>, Option<u32>)> {
     use crate::frame::{mark_row, save_marks};
-    let ap = ArcPhase::<N>::of(dir, level, horizon, s)?;
+    let s = &*run.settings;
+    let ap = ArcPhase::<N>::of(dir, run, horizon)?;
     let space = &ap.seeds.space;
     if let Some(out) = save {
         std::fs::create_dir_all(out)?;
@@ -470,7 +473,7 @@ fn arc_level<N: KernelLanes>(dir: &Path, level: Level, horizon: u32, s: &Setting
     drop(ap.seeds);
     crate::metrics::mem_phase("arc: marks for the next level, edge files closed");
     let exit = match known {
-        Some(route) => super::known::check_level(route, &arcs.side(s)?, &arcs, marks.as_ref(), dir)?,
+        Some(route) => super::known::check_level(route, &arcs.side()?, &arcs, marks.as_ref(), dir)?,
         None => None,
     };
     Ok((arcs, marks, exit))
@@ -479,8 +482,8 @@ fn arc_level<N: KernelLanes>(dir: &Path, level: Level, horizon: u32, s: &Setting
 /// THE CONCRETE SEARCH of a search's last level (inside its W, from the arc
 /// bound `bound`): its witness, its `[gate]` line printed and, with `save`,
 /// the UI's `witness.txt`.
-fn concrete_level<N: KernelLanes>(arcs: &Arcs<N>, bound: u32, prefer: Option<&[u8]>, save: Option<&Path>, s: &Settings) -> Result<Option<Witness>> {
-    let found = concrete_search(&arcs.side(s)?, arcs.horizon, bound, prefer)?;
+fn concrete_level<N: KernelLanes>(arcs: &Arcs<N>, bound: u32, prefer: Option<&[u8]>, save: Option<&Path>) -> Result<Option<Witness>> {
+    let found = concrete_search(&arcs.side()?, arcs.horizon, bound, prefer)?;
     if let Some(wt) = &found {
         println!("[gate] h{} concrete optimum {} inputs {}", arcs.horizon, wt.inputs.len(), inputs_text(&wt.inputs));
         if let Some(out) = save {
@@ -504,22 +507,23 @@ pub fn check_known(dir: &Path, inputs: &[u8], horizon: Option<u32>, run: &Settin
     let mut trees = Vec::new();
     for (li, spec) in res.level.split(',').enumerate() {
         let d = dir.join(format!("level{li:02}"));
-        let (s, lvl) = Settings::of_tree(&d, run)?;
-        anyhow::ensure!(lvl.to_string() == Level::parse(spec).map_err(|e| anyhow::anyhow!(e))?.to_string(), "{}: level {lvl}, the search's record says {spec}", d.display());
-        trees.push((d, s, lvl));
+        let tree = Run::of_tree(&d, run)?;
+        anyhow::ensure!(tree.level.to_string() == Level::parse(spec).map_err(|e| anyhow::anyhow!(e))?.to_string(), "{}: level {}, the search's record says {spec}", d.display(), tree.level);
+        trees.push((d, tree));
     }
-    crate::with_arith!(trees[0].1.arith, N => check_known_in::<N>(&trees, inputs, horizon))
+    crate::with_arith!(trees[0].1.settings.arith, N => check_known_in::<N>(&trees, inputs, horizon))
 }
 
-fn check_known_in<N: KernelLanes>(trees: &[(std::path::PathBuf, Settings, Level)], inputs: &[u8], horizon: u32) -> Result<()> {
+fn check_known_in<N: KernelLanes>(trees: &[(std::path::PathBuf, Run)], inputs: &[u8], horizon: u32) -> Result<()> {
     let t0 = std::time::Instant::now();
-    let clocked: Vec<(Level, crate::settings::Clock)> = trees.iter().map(|(_, cfg, lvl)| (*lvl, cfg.clock())).collect();
+    let clocked: Vec<(Level, crate::settings::Clock)> = trees.iter().map(|(_, r)| (r.level, r.settings.clock())).collect();
     for_levels::<N>(&clocked, |li, last, filter| {
-        let (dir, cfg, lvl) = &trees[li];
+        let (dir, tree) = &trees[li];
+        let (cfg, lvl) = (&*tree.settings, tree.level);
         let steps = cfg.clock().steps(horizon);
         anyhow::ensure!(crate::frame::tree_first_win_through::<N>(dir, steps)?.is_some(), "{}: no tree through step {steps} (run the search first)", dir.display());
         let route = super::known::Route { inputs, filter, hulls: true };
-        let (arcs, marks, known) = arc_level::<N>(dir, *lvl, steps, cfg, !last, None, Some(&route))?;
+        let (arcs, marks, known) = arc_level::<N>(dir, tree, steps, !last, None, Some(&route))?;
         let f = known.ok_or_else(|| anyhow::anyhow!("the known route does not exit by f{horizon}: nothing to check"))?;
         println!("[check known] level {li} ({lvl}): the known route (exit f{f}) survives (arc bound {:?})", arcs.bound(cfg.clock()));
         Ok(marks)

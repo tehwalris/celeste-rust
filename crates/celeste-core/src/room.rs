@@ -99,7 +99,20 @@ pub struct Room {
 }
 
 impl Room {
-    pub fn new(x: i16, y: i16) -> Room {
+    /// Room `(x, y)`'s tiles, built once in the process: every block,
+    /// kernel and interpreter of a room reads the one `Room`.
+    pub fn of((x, y): (i16, i16)) -> &'static Room {
+        static ROOMS: std::sync::Mutex<Vec<&'static Room>> = std::sync::Mutex::new(Vec::new());
+        let mut all = ROOMS.lock().expect("the rooms");
+        if let Some(r) = all.iter().find(|r| (r.x, r.y) == (x, y)) {
+            return r;
+        }
+        let r: &'static Room = Box::leak(Box::new(Room::new(x, y)));
+        all.push(r);
+        r
+    }
+
+    fn new(x: i16, y: i16) -> Room {
         // The room plus a margin.
         let range = PosMapRange { min_x: -32, max_x: 160, min_y: -32, max_y: 160 };
         let maps = MAPPED.map(|(w, h, flag)| {

@@ -120,7 +120,7 @@ pub fn reshape<N: Arithmetic>(src: &Rt2<N>, width: usize) -> Rt2<N> {
         width,
         src.globals.len(),
         celeste_names::STRINGS,
-        src.cache.clone(),
+        src.room,
     );
     b.globals = src.globals.clone();
     b.structure = src.structure.clone();

@@ -12,7 +12,6 @@ use celeste_engine::runtime2::{Col, Rt2, AV};
 
 use crate::search::arcs::{Act, Circle, Doubles, Fixed16, Seg, Transfer, CIRCLE, POINTS};
 use crate::search::rem::{Point, Rem, Xfer};
-use crate::abstraction::Level;
 use crate::frame::widened_keys;
 use crate::storage::edges::EdgeStore;
 use crate::storage::layer::Tree;
@@ -67,14 +66,14 @@ pub struct Opts<'a> {
     pub from: u32,
     pub to: u32,
     pub samples: usize,
-    pub level: Level,
     /// Check the CHECK: corrupt every decoded x transfer (`action`: its
     /// image moved; `guard`: its lowest point dropped), which must fail.
     pub fault: Option<&'a str>,
     /// At most this many reference fork paths a step (a sample past it is
     /// SKIPPED and counted).
     pub path_cap: Option<usize>,
-    pub settings: &'a crate::settings::Settings,
+    /// The tree's run.
+    pub run: &'a crate::settings::Run,
 }
 
 struct Rec<N: Rem> {
@@ -119,8 +118,8 @@ pub fn run<N: Rem>(o: &Opts) -> Result<()>
 where
     N::C: Faulty,
 {
-    let (dir, to, level, cfg) = (o.dir, o.to, o.level, o.settings);
-    cfg.check(dir, level)?;
+    let (dir, to, level, cfg) = (o.dir, o.to, o.run.level, &*o.run.settings);
+    o.run.check(dir)?;
     let ids = crate::compiled::ids();
     let graph = EdgeStore::<N>::open(&dir, to)?;
     let rem_cells = |rt2: &Rt2<N>| rt2.player_xy_cells(ids.f_rem);

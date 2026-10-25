@@ -74,6 +74,11 @@ impl<A: Arithmetic> ReferenceEngine<A> {
         &self.base
     }
 
+    /// The start room (`cart::boot` loaded it).
+    pub fn room(&self) -> &'static celeste_core::room::Room {
+        self.it.room.expect("boot loads the room")
+    }
+
     /// One whole GAME frame of a CONCRETE state under input `byte` (bit 0
     /// left, ... 5 dash): every leaf (it forks only where no input decides,
     /// `rnd`), over the split frame's two steps where it is on.
@@ -95,7 +100,7 @@ impl<A: Arithmetic> ReferenceEngine<A> {
 impl<A: Arithmetic> ReferenceEngine<A> {
     /// The room's start as a one-row block, without keys.
     pub fn initial(&self) -> Result<Rt2<A>> {
-        to_block(&self.base, self.settings.room)
+        to_block(&self.base, self.room())
     }
 
     /// One CONCRETE frame of row 0 of `row` under input `byte`: every leaf,
@@ -127,7 +132,7 @@ impl<A: Arithmetic> ReferenceEngine<A> {
     }
 
     fn blocks(&self, leaves: &[State<RefDomain<A>>]) -> Result<Vec<Rt2<A>>> {
-        leaves.iter().map(|l| Ok(to_block(l, self.settings.room)?.canonicalized())).collect()
+        leaves.iter().map(|l| Ok(to_block(l, self.room())?.canonicalized())).collect()
     }
 
     /// One whole GAME frame: `step` once, or under the split frame
@@ -234,7 +239,7 @@ where
             .iter()
             .map(|l| {
                 let pair = transfer_of::<A>(l).map_err(|e| e.context(ran_from(&st, None)))?;
-                Ok((to_block(l, self.settings.room)?.canonicalized(), pair))
+                Ok((to_block(l, self.room())?.canonicalized(), pair))
             })
             .collect()
     }
@@ -243,7 +248,7 @@ where
 impl<A: crate::transpile::garith::GraphArith> ReferenceEngine<A> {
     /// The one converter agrees across the two sides on every lane of `row`.
     pub fn check_agreement(&self, row: &Rt2<A>) -> Result<()> {
-        check_agreement::<A>(row, &self.fn_info, &self.base, self.settings.room)
+        check_agreement::<A>(row, &self.fn_info, &self.base)
     }
 }
 
@@ -439,15 +444,15 @@ where
 /// source lane's cell and its transfer - so its tree is the kernels'.
 pub struct RefFrameStep<N: Rem = Pico8Num> {
     engines: Vec<std::sync::Mutex<ReferenceEngine<N>>>,
-    level: Level,
-    settings: std::sync::Arc<crate::settings::Settings>,
+    run: crate::settings::Run,
 }
 
 impl<N: Rem> RefFrameStep<N> {
-    /// `s.threads()` engines at `level`.
-    pub fn new(s: &crate::settings::Settings, level: Level) -> Result<Self> {
-        let engines = (0..s.threads().max(1)).map(|_| Ok(std::sync::Mutex::new(ReferenceEngine::<N>::new(s)?.at_level(level)))).collect::<Result<_>>()?;
-        Ok(RefFrameStep { engines, level, settings: std::sync::Arc::new(s.clone()) })
+    /// `run`'s threads' worth of engines at its level.
+    pub fn new(run: &crate::settings::Run) -> Result<Self> {
+        let s = &*run.settings;
+        let engines = (0..s.threads().max(1)).map(|_| Ok(std::sync::Mutex::new(ReferenceEngine::<N>::new(s)?.at_level(run.level)))).collect::<Result<_>>()?;
+        Ok(RefFrameStep { engines, run: run.clone() })
     }
 
     /// An engine no other worker holds (there are as many as workers; a
@@ -467,7 +472,7 @@ impl<N: Rem> RefFrameStep<N> {
 }
 
 impl<N: Rem> crate::frame::FrameStep<N> for RefFrameStep<N> {
-    fn run(
+    fn step(
         &self,
         block: &Rt2<N>,
         _cell_in: &[u32],
@@ -489,12 +494,8 @@ impl<N: Rem> crate::frame::FrameStep<N> for RefFrameStep<N> {
         Ok(())
     }
 
-    fn level(&self) -> Level {
-        self.level
-    }
-
-    fn settings(&self) -> std::sync::Arc<crate::settings::Settings> {
-        self.settings.clone()
+    fn run(&self) -> &crate::settings::Run {
+        &self.run
     }
 }
 
@@ -615,12 +616,12 @@ pub fn set_buttons<A: celeste_core::arith::Arithmetic>(st: &mut State<RefDomain<
     Ok(t)
 }
 
-/// A reference state as a one-lane block (no row keys); `room`: the search's
-/// start room (the block's collision cache).
-pub fn to_block<N: Arithmetic>(st: &State<RefDomain<N>>, room: (i16, i16)) -> Result<Rt2<N>> {
+/// A reference state as a one-lane block (no row keys) in a search from
+/// `room`.
+pub fn to_block<N: Arithmetic>(st: &State<RefDomain<N>>, room: &'static celeste_core::room::Room) -> Result<Rt2<N>> {
     block::to_rt2(
         st,
-        crate::compiled::collision_cache(room),
+        room,
         |iv| {
             Ok(match N::as_point(*iv) {
                 Some(n) => AV::Num(n),
@@ -638,16 +639,15 @@ pub fn to_block<N: Arithmetic>(st: &State<RefDomain<N>>, room: (i16, i16)) -> Re
 /// reference's domain and into the tracer's, converts back to ONE block -
 /// the same structure, shape, values and exact key - and the tracer's
 /// skeleton of it (what its kernels bind) has that shape.
-fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A>, fn_info: &FnInfo, base: &State<RefDomain<A>>, room: (i16, i16)) -> Result<()> {
+fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A>, fn_info: &FnInfo, base: &State<RefDomain<A>>) -> Result<()> {
     use crate::trace::block::{skeleton, to_rt2};
     use crate::trace::domain::Symbolic;
     use crate::transpile::graph::{NodeId, Op};
     use celeste_engine::exact::exact_rows;
     use celeste_engine::runtime2::Col;
-    let cache = crate::compiled::collision_cache(room);
     for lane in 0..rt2.width {
         let (reference, _) = from_block(rt2, lane, fn_info, base)?;
-        let mut a: Rt2<A> = to_block(&reference, room)?;
+        let mut a: Rt2<A> = to_block(&reference, rt2.room)?;
         let mut d = Symbolic::<A>::default();
         let (traced, _) = block::from_block(&mut d, rt2, lane, fn_info, base)?;
         let g = &d.graph;
@@ -660,8 +660,8 @@ fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A>, fn_inf
             Op::ConstBool(v) => Ok(AV::Bool(v)),
             ref other => bail!("lane {lane}: a traced boolean {other:?}, not a constant"),
         };
-        let mut b = to_rt2(&traced, cache.clone(), num, boolean)?;
-        let s = skeleton::<_, A>(&traced, cache.clone())?;
+        let mut b = to_rt2(&traced, rt2.room, num, boolean)?;
+        let s = skeleton::<_, A>(&traced, rt2.room)?;
         let first = |x: &Rt2<A>, y: &Rt2<A>| (0..x.structure.len().max(y.structure.len())).find(|&c| x.structure.get(c) != y.structure.get(c) || x.cols.get(c) != y.cols.get(c));
         ensure!(
             a.structure == b.structure && a.cols == b.cols && a.globals == b.globals && a.strings == b.strings,
@@ -720,7 +720,7 @@ mod tests {
         globals.insert("flr".to_string(), Value::Builtin("abs"));
         let Some(Value::Table(room)) = globals.get("room").cloned() else { panic!("no room table") };
         st.heap.tables.get_mut(&room).expect("room").hash.insert("x".to_string(), Value::Builtin("abs"));
-        let row = to_block(&st, eng.settings.room).expect("block");
+        let row = to_block(&st, eng.room()).expect("block");
         let abs = crate::builtins::BUILTIN_NAMES.iter().position(|n| *n == "abs").expect("abs") as u32;
         assert_eq!(row.structure.iter().filter(|c| **c == Cell2::Bi(abs)).count(), 3, "a Bi cell at each of the three slots");
         let points_at_builtin = |c: &Col| matches!(c, Col::U(AV::Ptr(p)) if matches!(row.structure[*p as usize], Cell2::Bi(_)));

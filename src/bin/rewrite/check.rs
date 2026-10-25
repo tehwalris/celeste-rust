@@ -196,17 +196,17 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
     match c {
         Command::Ref(a) => {
             let t = a.tree.open(run)?;
-            celeste_rust::with_arith!(t.settings.arith, N => ref_check::<N>(&t, &a))
+            celeste_rust::with_arith!(t.run.settings.arith, N => ref_check::<N>(&t, &a))
         }
         Command::Arcs(a) => {
             let t = a.tree.open(run)?;
-            let o = celeste_rust::check::arcs::Opts { dir: &t.dir, from: a.from_step, to: t.frame(a.to_step)?, samples: a.samples, level: t.level, fault: a.fault.as_deref(), path_cap: a.path_cap, settings: &t.settings };
-            celeste_rust::with_arith!(t.settings.arith, N => celeste_rust::check::arcs::run::<N>(&o))
+            let o = celeste_rust::check::arcs::Opts { dir: &t.dir, from: a.from_step, to: t.frame(a.to_step)?, samples: a.samples, fault: a.fault.as_deref(), path_cap: a.path_cap, run: &t.run };
+            celeste_rust::with_arith!(t.run.settings.arith, N => celeste_rust::check::arcs::run::<N>(&o))
         }
         Command::Widen(a) => {
             let t = a.tree.open(run)?;
             let frame = t.frame(a.step)?;
-            celeste_rust::with_arith!(t.settings.arith, N => widen_check::<N>(&t, frame, a.emitted))
+            celeste_rust::with_arith!(t.run.settings.arith, N => widen_check::<N>(&t, frame, a.emitted))
         }
         Command::Known(a) => {
             let inputs = celeste_rust::concrete::read_inputs(&a.inputs)?;
@@ -217,7 +217,7 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
             let to = t.frame(a.steps)?;
             let scratch = PathBuf::from(format!("/var/tmp/celeste-check-reference-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&scratch);
-            let res = celeste_rust::with_arith!(t.settings.arith, N => reference_check::<N>(&t, to, &scratch));
+            let res = celeste_rust::with_arith!(t.run.settings.arith, N => reference_check::<N>(&t, to, &scratch));
             let _ = std::fs::remove_dir_all(&scratch);
             res
         }
@@ -226,7 +226,7 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
             let t = a.tree.open(run)?;
             let to = t.frame(a.steps)?;
             let tm = std::time::Instant::now();
-            let frames = celeste_rust::with_arith!(t.settings.arith, N => replay::<N>(&t.dir, to, t.settings.threads())?);
+            let frames = celeste_rust::with_arith!(t.run.settings.arith, N => replay::<N>(&t.dir, to, t.run.settings.threads())?);
             println!("frame states edges");
             for (f, x) in frames.iter().enumerate() {
                 println!("f{f:03} {} {}", x.states, x.edges);
@@ -243,8 +243,8 @@ fn ref_check<A>(t: &TreeDir, a: &RefArgs) -> Result<()>
 where
     A: celeste_rust::transpile::garith::GraphArith + Rem + KernelLanes,
 {
-    let (cfg, level) = (&t.settings, t.level);
-    let kernels = Kernels::<A>::new(cfg, level)?;
+    let (cfg, level) = (&*t.run.settings, t.run.level);
+    let kernels = Kernels::<A>::new(&t.run)?;
     kernels.warm();
     // Every candidate state, then `samples` evenly spaced.
     let (tree, frame, all) = a.rows.states::<A>(t)?;
@@ -359,7 +359,7 @@ where
 
 /// `check widen` of `frame` in the arithmetic of `N`.
 fn widen_check<N: Rem + KernelLanes>(t: &TreeDir, frame: u32, emitted: usize) -> Result<()> {
-    let (cfg, level): (&Settings, Level) = (&t.settings, t.level);
+    let (cfg, level): (&Settings, Level) = (&*t.run.settings, t.run.level);
     anyhow::ensure!(
         !(level.floors_near && !cfg.clock().boundary(frame)),
         "step {frame} is mid split frame at a near level: the graph side keeps a floor's computed `collideable` there, the block side does not"
@@ -394,7 +394,7 @@ fn widen_check<N: Rem + KernelLanes>(t: &TreeDir, frame: u32, emitted: usize) ->
         moved += check(rt2, "stored", moved);
     }
     if emitted > 0 {
-        let kernels = Kernels::<N>::new(cfg, level)?;
+        let kernels = Kernels::<N>::new(&t.run)?;
         kernels.warm();
         let all: Vec<(usize, u32)> = blocks.iter().enumerate().flat_map(|(bi, (_, rt2))| (0..rt2.width as u32).map(move |r| (bi, r))).collect();
         for k in differential::spread(all.len(), emitted) {
@@ -415,10 +415,10 @@ fn widen_check<N: Rem + KernelLanes>(t: &TreeDir, frame: u32, emitted: usize) ->
 /// engine's tree grown in `scratch`.
 fn reference_check<N: Rem>(t: &TreeDir, to: u32, scratch: &std::path::Path) -> Result<()> {
     use celeste_rust::engines::reference::{RefFrameStep, ReferenceEngine};
-    let (cfg, level) = (&t.settings, t.level);
+    let cfg = &*t.run.settings;
     let tm = std::time::Instant::now();
-    let engine: Box<dyn FrameStep<N>> = Box::new(RefFrameStep::<N>::new(cfg, level)?);
-    celeste_rust::frame::grow_tree(scratch, to, cfg.minus_one(), None, level, || Ok(engine), || Ok(vec![ReferenceEngine::<N>::new(cfg)?.initial()?.canonicalized()]), cfg)?;
+    let engine: Box<dyn FrameStep<N>> = Box::new(RefFrameStep::<N>::new(&t.run)?);
+    celeste_rust::frame::grow_tree(scratch, to, cfg.minus_one(), None, &t.run, || Ok(engine), || Ok(vec![ReferenceEngine::<N>::new(cfg)?.initial()?.canonicalized()]))?;
     let kernels = celeste_rust::storage::fingerprint::<N>(&t.dir, to, true, true, cfg.threads())?;
     let reference = celeste_rust::storage::fingerprint::<N>(scratch, to, true, true, cfg.threads())?;
     let mut bad = 0;
@@ -429,6 +429,6 @@ fn reference_check<N: Rem>(t: &TreeDir, to: u32, scratch: &std::path::Path) -> R
         }
     }
     bad += kernels.len().abs_diff(reference.len());
-    println!("[check reference] {}: steps 0-{to} at {level}, {} fingerprint lines, {bad} differ ({:.1} s)", t.dir.display(), kernels.len(), tm.elapsed().as_secs_f64());
+    println!("[check reference] {}: steps 0-{to} at {}, {} fingerprint lines, {bad} differ ({:.1} s)", t.dir.display(), t.run.level, kernels.len(), tm.elapsed().as_secs_f64());
     differential::verdict(kernels.len(), bad, || format!("check reference: {bad} of the kernels' fingerprint lines are not the reference engine's"))
 }

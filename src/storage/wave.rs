@@ -352,7 +352,7 @@ fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<
     // shapes have none.
     if !sc.live.is_empty() {
         let t_unit = sink.stats.tick_start();
-        engine.run(&block, &sc.cells, &sc.live, sink)?;
+        engine.step(&block, &sc.cells, &sc.live, sink)?;
         sink.stats.tick(S::PhUnit, t_unit);
     }
     sink.end()
@@ -506,7 +506,7 @@ struct Piped<N: Rem> {
 /// one sink each (`UnitSink`), no barrier but its end; then the workers'
 /// transfers and stats collected.
 fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, cx: &WaveCtx<N>, front: &Frontier<N>, plan: &Plan, prov: &Provisional<N>, spool: Option<&super::scratch::Scratch>) -> Result<Piped<N>> {
-    let s = &engine.settings();
+    let s = &*engine.run().settings;
     let (visited, base): (&VisitedSet<N>, &XferTable<N>) = (cx.visited, cx.xfers);
     let workers = s.threads();
     let routes = Routes::default();
@@ -725,7 +725,7 @@ fn next_layer<N: Rem>(new: Vec<super::route::Sealed<N>>, frame: u32, threads: us
 pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx: WaveCtx<N>) -> Result<Wave<N>> {
     use std::time::Instant;
     let frame = cx.frame;
-    let s = &engine.settings();
+    let s = &*engine.run().settings;
     ensure!(frame > 0, "a wave makes frame 1 on");
     ensure!(front.hulls.len() as u64 == front.new.states(), "frame {frame}: {} hulls for the frontier's {} new states", front.hulls.len(), front.new.states());
     ensure!(cx.edges.is_some() || front.old.is_empty(), "frame {frame}: old states to re-push without the tree's edge files");
@@ -1358,7 +1358,7 @@ pub(crate) fn seed<N: Rem>(visited: &mut VisitedSet<N>, blocks: &[Rt2<N>], start
     drop(parts);
     ensure!(held == 0, "frame 0 into a visited set that held {held} of its states");
     for (h, rec) in skels {
-        next.skeletons.insert(h, std::sync::Arc::new(rec.rt2(canon[0].cache.clone())));
+        next.skeletons.insert(h, std::sync::Arc::new(rec.rt2(canon[0].room)));
     }
     let n = next.states() as usize;
     let mut stats = Stats::default();
@@ -1376,7 +1376,7 @@ pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Rt2<N>>, frame: u3
     let mut visited = VisitedSet::<N>::new();
     let mut xfers = XferTable::<N>::default();
     let skeletons = Skeletons::<N>::default();
-    let s = engine.settings();
+    let s = &*engine.run().settings;
     let start = seed(&mut visited, &rows, HullOf::<N>::full(), &s)?.frontier;
     visited.forget_states();
     let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, filters: Filters::default(), frame, edges_dir: None, edges: None, skeletons: &skeletons };

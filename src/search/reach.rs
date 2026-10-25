@@ -387,8 +387,8 @@ mod tests {
         use crate::engines::reference::RefEngine;
         let s = crate::settings::Settings { win_at: Some((9, 9, 101, 101)), threads: Some(4), ..Default::default() };
         let dir = crate::testutil::TestDir::new("reach");
-        let level = crate::abstraction::Level::parse("r0sx").expect("level");
-        crate::frame::grow_tree(&dir, 35, None, None, level, || Ok(Box::new(crate::compiled::FrameEngine::new(&s, level)?)), || Ok(vec![RefEngine::new(&s)?.initial()?.canonicalized()]), &s).expect("forward");
+        let run = crate::settings::Run::new(&s, crate::abstraction::Level::parse("r0sx").expect("level"));
+        crate::frame::grow_tree(&dir, 35, None, None, &run, || Ok(Box::new(crate::compiled::FrameEngine::new(&run)?)), || Ok(vec![RefEngine::new(&s)?.initial()?.canonicalized()])).expect("forward");
         let p0 = (super::super::arcs::point(0), super::super::arcs::point(0));
         let tree = crate::storage::layer::Tree::open(&dir, 35).expect("tree");
         let mut per_frame: Vec<Vec<crate::storage::Sk>> = Vec::new();
@@ -414,7 +414,7 @@ mod tests {
         for (i, &b) in known.iter().enumerate().take(33) {
             row = eng.step_one(&row, b).expect("one successor");
             let t = i + 1;
-            let (shape, keys, cells) = crate::frame::widened_keys(&row, level, &tree.space).expect("keys");
+            let (shape, keys, cells) = crate::frame::widened_keys(&row, run.level, &tree.space).expect("keys");
             let si = tree.shapes.iter().position(|&h| h == shape).expect("a tree shape") as u32;
             let sk = crate::storage::Sk::at(si, keys[0].expect("a tree key"), cells[0]);
             let q = super::super::concrete::rem_of(&row).expect("rem");

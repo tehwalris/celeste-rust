@@ -223,8 +223,8 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
         iface::set(&mut st, p, Value::Num(r))?;
     }
     // The engine numbering for the INPUT shape.
-    let Some(cache) = it.cache.clone() else { bail!("tracing a frame needs the room's collision cache") };
-    let in_rt2 = super::block::skeleton(&st, cache.clone())?;
+    let Some(room) = it.room else { bail!("tracing a frame needs the room's tiles") };
+    let in_rt2 = super::block::skeleton(&st, room)?;
     // The canonical cell of each `Op::Cell(i)`. Inputs only: outputs bind
     // against their own shape.
     let in_cells = super::bind::resolve_all(&in_rt2, &iface.slots)?;
@@ -253,7 +253,7 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     let mut outs = Vec::new();
     for (s, f) in finished {
         anyhow::ensure!(!matches!(f, Flow::Break), "break at frame toplevel");
-        outs.push(finish_outcome(it, s, widen, global, &cache)?);
+        outs.push(finish_outcome(it, s, widen, global, room)?);
     }
     // Split selects on conditions a lane can hold undecided, until none is.
     if !it.d.no_known_forks {
@@ -309,7 +309,7 @@ fn finish_outcome<A: GraphArith>(
     mut s: State<Symbolic<A>>,
     widen: bool,
     global: NodeId,
-    cache: &std::sync::Arc<celeste_core::room::Room>,
+    room: &'static celeste_core::room::Room,
 ) -> Result<FrameOut<A>> {
     s.gc();
     // Integer keys as a block holds them: a state traced from the outcome's
@@ -337,7 +337,7 @@ fn finish_outcome<A: GraphArith>(
         .iter()
         .filter(|(p, _)| fields.iter().any(|(q, _, _)| q == p))
         .fold(it.d.graph.fold(crate::transpile::graph::Op::Or, vec![global, s.ended]), |e, (_, w)| it.d.graph.fold(crate::transpile::graph::Op::Or, vec![e, *w]));
-    let rt2 = super::block::skeleton(&s, cache.clone())?;
+    let rt2 = super::block::skeleton(&s, room)?;
     let paths: Vec<Path> =
         fields.iter().map(|(p, _, _)| p.clone()).chain(ubool.iter().cloned()).collect();
     let all = super::bind::resolve_all(&rt2, &paths)?;
@@ -471,9 +471,9 @@ mod tests {
 
         // No error in whichever outcome claims this assignment.
         let (g, map) = at_buttons(&it.d.graph, &f, &[false; 6]).expect("the six buttons");
-        let room = crate::transpile::graph::Room { cache: it.cache.clone().expect("cache") };
+        let room = it.room.expect("the room");
         let ok_at = |cells: &[Conc]| -> bool {
-            let v = g.eval(&exact(cells), Eval::Exact, Some(&room)).expect("the frame at a point");
+            let v = g.eval(&exact(cells), Eval::Exact, Some(room)).expect("the frame at a point");
             let live: Vec<&FrameOut> = f.outs.iter().filter(|o| v[map[o.guard as usize] as usize] == Val::Bool(Some(true))).collect();
             assert!(!live.is_empty(), "an outcome claims the lane");
             let ok: Vec<bool> = live.iter().map(|o| v[map[o.error as usize] as usize] == Val::Bool(Some(false))).collect();
@@ -538,7 +538,7 @@ mod tests {
                 },
                 |(it, st), r| {
                     let (rx, ry) = rooms[r];
-                    it.cache = Some(crate::compiled::collision_cache((rx, ry)));
+                    it.room = Some(celeste_core::room::Room::of((rx, ry)));
                     let mut o = st.clone();
                     for (k, v) in [("x", rx), ("y", ry)] {
                         let n = it.d.num(crate::pico8_num::Pico8Num::from_i16(v));
@@ -608,7 +608,7 @@ end
         )
         .expect("parse probe");
         let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-        it.cache = Some(crate::compiled::collision_cache(s.room));
+        it.room = Some(celeste_core::room::Room::of(s.room));
         // `cart::boot`, with the Lua `tile_flag_at` kept under another name.
         let st = cart::fresh_state::<Symbolic>(&mut it.d);
         let st = cart::run_one(&mut it, &chunks.top, st).expect("toplevel");
@@ -627,7 +627,7 @@ end
                 },
                 |(it, st), r| {
                     let (rx, ry) = rooms[r];
-                    it.cache = Some(crate::compiled::collision_cache((rx, ry)));
+                    it.room = Some(celeste_core::room::Room::of((rx, ry)));
                     let mut o = st.clone();
                     for (k, v) in [("x", rx), ("y", ry)] {
                         let n = it.d.num(crate::pico8_num::Pico8Num::from_i16(v));

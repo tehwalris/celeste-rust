@@ -51,7 +51,7 @@ pub(crate) fn decode_rows<N: Arithmetic>(keys: &KeySpace<N>, skel: &Rt2<N>, rows
         cols: Vec::with_capacity(skel.cols.len()),
         globals: skel.globals.clone(),
         strings: skel.strings.clone(),
-        cache: skel.cache.clone(),
+        room: skel.room,
         shape_hash: skel.shape_hash,
         row_keys: rows.iter().map(|r| r.0).collect(),
     };
@@ -98,7 +98,7 @@ pub(crate) fn decode_rows<N: Arithmetic>(keys: &KeySpace<N>, skel: &Rt2<N>, rows
     };
     // Position: the cell's pixels less the room offset, plus the fraction.
     let ids = crate::compiled::ids();
-    let start = (skel.cache.x, skel.cache.y);
+    let start = (skel.room.x, skel.room.y);
     let room = out.global_target(ids.g_room).ok_or_else(|| anyhow!("decode: no `room` global"))?;
     let room_field = |fid: u32| -> Result<(usize, &FieldDict<N>)> {
         let c = out.obj_field_cell(room, fid).ok_or_else(|| anyhow!("decode: no room field {fid}"))? as usize;
@@ -277,7 +277,7 @@ impl<N: Arithmetic> Skeletons<N> {
             ensure!(a.0 == rec, "ROWS FROM KEYS: two skeletons of shape {:016x} (another structure, non-value cell or column kind): its rows would decode as the first's", skel.shape_hash);
             return Ok(());
         }
-        let rt2 = std::sync::Arc::new(rec.rt2(skel.cache.clone()));
+        let rt2 = std::sync::Arc::new(rec.rt2(skel.room));
         self.0.write().expect("skeletons").entry(skel.shape_hash).or_insert((rec, rt2));
         Ok(())
     }

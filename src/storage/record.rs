@@ -2,8 +2,7 @@
 //! how far it is trusted, a `key value` line each, the file rewritten whole
 //! and atomically (a `.tmp` renamed into place):
 //! * the settings that change the tree, its level included
-//!   (`Settings::write`; read back by `Settings::of_tree`, checked by
-//!   `Settings::check`);
+//!   (`Run::write`; read back by `Run::of_tree`, checked by `Run::check`);
 //! * `level_minus_one`: the level -1 filter its frames were built under,
 //!   with its table's fingerprint (`frame::TreeL1`; the table itself is
 //!   `l1-table.bin` beside the record: `level_minus_one::TABLE_FILE`);

@@ -39,7 +39,7 @@ use crate::trace::state::State;
 /// no row keys.
 pub fn to_rt2<D: Domain, N: Arithmetic>(
     st: &State<D>,
-    cache: Arc<Room>,
+    room: &'static Room,
     num: impl Fn(&D::Num) -> Result<AV<N>>,
     boolean: impl Fn(&D::Bool) -> Result<AV<N>>,
 ) -> Result<Rt2<N>> {
@@ -48,7 +48,7 @@ pub fn to_rt2<D: Domain, N: Arithmetic>(
         Some(Value::Table(t)) => Some(*t),
         _ => None,
     };
-    let rt2 = Rt2::empty(1, gen::GLOBAL_NAMES.len(), gen::STRINGS, cache);
+    let rt2 = Rt2::empty(1, gen::GLOBAL_NAMES.len(), gen::STRINGS, room);
     let mut cx = ToRt2 { st, rt2, tables: HashMap::new(), closures: HashMap::new(), buttons, num, boolean };
     for (g, name) in gen::GLOBAL_NAMES.iter().enumerate() {
         if let Some(v) = globals.get(*name) {
@@ -126,8 +126,8 @@ fn the_topology_is_the_shapes<N: Arithmetic>(rt2: &Rt2<N>) {
 /// The tracer's block of `st`: its shape, every number and boolean `Nil`
 /// (the kernels compute them). What a traced frame's input and outcomes bind
 /// against.
-pub fn skeleton<D: Domain, N: Arithmetic>(st: &State<D>, cache: Arc<Room>) -> Result<Rt2<N>> {
-    to_rt2(st, cache, |_| Ok(AV::Nil), |_| Ok(AV::Nil))
+pub fn skeleton<D: Domain, N: Arithmetic>(st: &State<D>, room: &'static Room) -> Result<Rt2<N>> {
+    to_rt2(st, room, |_| Ok(AV::Nil), |_| Ok(AV::Nil))
 }
 
 /// A table's array part as a block holds it: integer keys past it
@@ -478,7 +478,7 @@ mod tests {
         use crate::trace::heap::Value;
         let eng = crate::engines::reference::RefEngine::new(&Default::default()).expect("ref engine");
         let start = eng.start_state();
-        let b = crate::engines::reference::to_block(start, (1, 0)).expect("the start converts");
+        let b = crate::engines::reference::to_block(start, eng.room()).expect("the start converts");
         let mut st = start.clone();
         let global = |name: &str| match st.heap.tables[&st.globals].hash.get(name) {
             Some(Value::Table(t)) => *t,
@@ -488,7 +488,7 @@ mod tests {
         let items: Vec<_> = st.heap.tables[&objects].arr.iter().filter_map(|v| if let Value::Table(t) = v { Some(*t) } else { None }).collect();
         let obj = *items.iter().find(|o| st.heap.tables[o].hash.get("type") == Some(&Value::Table(spawn))).expect("the start holds a player_spawn");
         st.heap.tables.get_mut(&obj).expect("the spawn").hash.insert("type".into(), Value::Table(player));
-        let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::engines::reference::to_block(&st, (1, 0)))) else { panic!("a retargeted pointer converted") };
+        let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::engines::reference::to_block(&st, eng.room()))) else { panic!("a retargeted pointer converted") };
         let msg = e.downcast_ref::<String>().map_or("(not a formatted panic)", |m| m.as_str()).to_string();
         assert!(msg.contains("POINTER TOPOLOGY") && msg.contains(&format!("{:#x}", b.shape_hash)), "{msg}");
     }
@@ -503,7 +503,7 @@ mod tests {
         let s = crate::settings::Settings::default();
         let eng = crate::engines::reference::RefEngine::new(&s).expect("ref engine");
         let start = eng.start_state();
-        crate::engines::reference::to_block(start, s.room).expect("the start converts");
+        crate::engines::reference::to_block(start, eng.room()).expect("the start converts");
         let mut st = start.clone();
         let rebind: Vec<(crate::trace::heap::ScopeId, String)> = st.heap.closures.values().flat_map(|cl| cl.captures.iter().map(move |c| (cl.env, c.clone()))).collect();
         assert!(!rebind.is_empty(), "the start's objects hold closures with captures");
@@ -511,7 +511,7 @@ mod tests {
         for (env, cap) in &rebind {
             assert!(st.heap.assign(*env, cap, Value::Table(globals)), "the capture's binding");
         }
-        let Err(e) = crate::engines::reference::to_block(&st, s.room) else { panic!("a capture that is not the owner converted") };
+        let Err(e) = crate::engines::reference::to_block(&st, eng.room()) else { panic!("a capture that is not the owner converted") };
         let e = e.to_string();
         assert!(e.starts_with("closure ") && e.contains("not its owner"), "{e}");
     }

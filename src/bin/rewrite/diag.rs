@@ -72,7 +72,7 @@ pub struct RobustArgs {
 
 pub fn ckhash(run: &Settings, a: CkhashArgs) -> Result<()> {
     let t = a.tree.open(run)?;
-    let (dir, to, cfg) = (&t.dir, t.frame(a.steps)?, &t.settings);
+    let (dir, to, cfg) = (&t.dir, t.frame(a.steps)?, &*t.run.settings);
     let (edges, hulls) = (a.edges, a.hulls);
     let lines = celeste_rust::with_arith!(cfg.arith, N => celeste_rust::storage::fingerprint::<N>(dir, to, edges, hulls, cfg.threads())?);
     for line in lines {
@@ -86,7 +86,7 @@ pub fn census(run: &Settings, a: CensusArgs) -> Result<()> {
     use celeste_engine::runtime2::{Cell2, Col, AV};
     let t = a.tree.open(run)?;
     anyhow::ensure!(!t.float(), "census: a 16.16 tree only so far");
-    let cfg = &t.settings;
+    let cfg = &*t.run.settings;
     let (frame, only) = a.rows.of(&t)?;
     let tree = Tree::<P8>::open(&t.dir, frame)?;
     let ids = celeste_rust::compiled::ids();

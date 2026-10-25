@@ -78,7 +78,7 @@ struct Pruning<'a, N: Rem = P8> {
 /// the next) and the tree in `dir`'s level -1 filter (`TreeL1::read`); with
 /// `Route::hulls` (whole frames only), against the hull forward's claim.
 pub(super) fn check_level<N: KernelLanes>(route: &Route<N>, side: &Side<N>, arcs: &super::driver::Arcs<N>, reached: Option<&Visited<N>>, dir: &std::path::Path) -> anyhow::Result<Option<u32>> {
-    let s = side.s;
+    let s = &*side.run.settings;
     let l1 = crate::frame::TreeL1::read(dir)?;
     // The hull forward's claim keys every step's state: whole frames only.
     if route.hulls && s.split_frame {
@@ -93,8 +93,8 @@ pub(super) fn check_level<N: KernelLanes>(route: &Route<N>, side: &Side<N>, arcs
 /// horizon; `Ok(Some(f))`: it wins in frame `f` and survives; an error: PRUNED.
 fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Option<u32>> {
     let t0 = std::time::Instant::now();
-    let clock = p.side.s.clock();
-    let run = super::replay::Replay::<N>::of(route.inputs, Some(p.horizon), p.side.s)?;
+    let clock = p.side.run.settings.clock();
+    let run = super::replay::Replay::<N>::of(route.inputs, Some(p.horizon), &p.side.run.settings)?;
     let seeded = run.seeded;
     let Some((exit, winners)) = &run.exit else {
         eprintln!("[known] the known route does not exit by f{} ({} inputs): not checked", clock.frame_of(p.horizon), route.inputs.len());
@@ -127,7 +127,7 @@ fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Opt
     if winners.iter().any(|&(w, _)| good[last][w as usize]) {
         eprintln!(
             "[known] level {}: the known route (exit f{frame}) survives every pruning step at h{}: {states} states over {} steps, {}; {:.2} s",
-            p.side.level,
+            p.side.run.level,
             p.horizon,
             exit,
             [
@@ -162,7 +162,7 @@ fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Opt
             None => ((0..=last).find(|&s| miss(s).is_some()).expect("a pruned lineage fails somewhere"), "is dropped by the arc phase"),
         };
         first = first.min(s as u32);
-        eprintln!("[known] PRUNED at level {}: the known route (exit f{frame}) {what} at step {s} ({}):", p.side.level, clock.show(s as u32));
+        eprintln!("[known] PRUNED at level {}: the known route (exit f{frame}) {what} at step {s} ({}):", p.side.run.level, clock.show(s as u32));
         let per_frame = clock.per_frame as usize;
         for t in s.saturating_sub(per_frame)..=(s + per_frame).min(last) {
             let (_, b) = &run.layers[t][idx[t]];
@@ -183,7 +183,7 @@ fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Opt
     }
     anyhow::bail!(
         "the known route (exit f{frame}) is PRUNED at level {} by step {first} ({}): a real winner the search drops - the [known] report above names the check",
-        p.side.level,
+        p.side.run.level,
         clock.show(first)
     )
 }
@@ -194,23 +194,23 @@ fn check<N: KernelLanes>(route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<Opt
 /// SOUNDNESS gap in the kernels), and the nearest ones.
 fn explain<N: KernelLanes>(run: &super::replay::Replay<N>, idx: &[usize], s: usize, seeded: bool, p: &Pruning<N>) -> anyhow::Result<Vec<String>> {
     use crate::search::inspect::{brief, project_onto, Proj};
-    let per_frame = p.side.s.clock().per_frame as usize;
+    let per_frame = p.side.run.settings.clock().per_frame as usize;
     let s0 = s.checked_sub(per_frame).ok_or_else(|| anyhow::anyhow!("the start is the tree's"))?;
     let tree = crate::storage::layer::Tree::<N>::open(p.dir, s as u32)?;
     let (sk, layer) = if s0 == 0 {
         (tree.layer(0, None, 1)?.0.states_iter().next().ok_or_else(|| anyhow::anyhow!("no frame-0 state"))?, 0)
     } else {
-        let (shape, keys, cells) = lookup_keys(&run.layers[s0][idx[s0]].1, p.side.level, seeded, p.side.keys)?;
+        let (shape, keys, cells) = lookup_keys(&run.layers[s0][idx[s0]].1, p.side.run.level, seeded, p.side.keys)?;
         let sk = keys[0].and_then(|k| tree.sk(shape, k, cells[0])).ok_or_else(|| anyhow::anyhow!("its state at step {s0} is not in the tree either"))?;
         (sk, tree.layer_of(sk, s0 as u32)?.ok_or_else(|| anyhow::anyhow!("its state at step {s0} is not in the tree by then"))?)
     };
-    let kernels = crate::compiled::Kernels::<N>::new(p.side.s, p.side.level)?;
-    let mut blocks = vec![tree.row(layer, sk, p.side.s.room)?];
+    let kernels = crate::compiled::Kernels::<N>::new(p.side.run)?;
+    let mut blocks = vec![tree.row(layer, sk, p.side.run.settings.room)?];
     for k in 0..per_frame {
         blocks = crate::storage::wave::one_frame(&kernels, blocks, layer + 1 + k as u32)?.0;
     }
-    let kset: std::collections::BTreeSet<Proj> = blocks.into_iter().flat_map(|mut b| project_onto(&mut b, p.side.level)).collect();
-    let want = project_onto(&mut lookup_view(&run.layers[s][idx[s]].1, seeded)?, p.side.level).remove(0);
+    let kset: std::collections::BTreeSet<Proj> = blocks.into_iter().flat_map(|mut b| project_onto(&mut b, p.side.run.level)).collect();
+    let want = project_onto(&mut lookup_view(&run.layers[s][idx[s]].1, seeded)?, p.side.run.level).remove(0);
     let made = kset.contains(&want);
     let mut out = vec![format!(
         "the kernels from its state at step {s0} (the tree's row, layer {layer}, state {}): {} successors at step {s}; the route's state is {}",
@@ -294,7 +294,7 @@ fn hull_claim<N: Rem>(b: &Rt2<N>, s: u32, sk: Option<Sk>, from: Option<Held<N>>,
 /// The first check state `b` at step `s` (its parent held at `from`) fails,
 /// and where the tree holds it (with `hulls`).
 fn verdict<N: Rem>(b: &Rt2<N>, s: u32, from: Option<Held<N>>, seeded: bool, route: &Route<N>, p: &Pruning<N>) -> anyhow::Result<(Option<Miss>, Option<Held<N>>)> {
-    let (shape, keys, cells) = lookup_keys(b, p.side.level, seeded, p.side.keys)?;
+    let (shape, keys, cells) = lookup_keys(b, p.side.run.level, seeded, p.side.keys)?;
     // Level -1 looks a state up by its SHAPE, which no widening moves (it
     // writes number and boolean columns only, never the structure): the
     // forward's lookup (the widened row's) is then `l1 check`'s (the
@@ -315,7 +315,7 @@ fn verdict<N: Rem>(b: &Rt2<N>, s: u32, from: Option<Held<N>>, seeded: bool, rout
         }
         if let Some(f) = route.filter {
             let mut row = lookup_view(b, seeded)?;
-            row.widen_to(p.side.level);
+            row.widen_to(p.side.run.level);
             if !f.allowed(&row, s)?[0] {
                 return Ok((
                     forward(format!(
@@ -337,7 +337,7 @@ fn verdict<N: Rem>(b: &Rt2<N>, s: u32, from: Option<Held<N>>, seeded: bool, rout
             Err(m) => return Ok((Some(m), None)),
         }
     }
-    if !p.side.s.clock().boundary(s) {
+    if !p.side.run.settings.clock().boundary(s) {
         return Ok((None, held));
     }
     let Some(i) = (if s == 0 { p.start } else { p.side.node.get(shape, key, cell) }) else {

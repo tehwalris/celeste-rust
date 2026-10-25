@@ -99,8 +99,8 @@ mod tests {
         let text = std::fs::read_to_string(path).expect("witness");
         let w: serde_json::Value = serde_json::from_str(&text).expect("json");
         let cells = w["cells"].as_array().expect("cells");
-        let cache = crate::compiled::collision_cache(crate::settings::Settings::default().room);
-        let mut rt2 = Rt2::empty(1, gen::GLOBAL_NAMES.len(), gen::STRINGS, cache);
+        let room = celeste_core::room::Room::of(crate::settings::Settings::default().room);
+        let mut rt2 = Rt2::empty(1, gen::GLOBAL_NAMES.len(), gen::STRINGS, room);
         rt2.structure = Vec::with_capacity(cells.len());
         rt2.cols = Vec::with_capacity(cells.len());
         for c in cells {
@@ -206,9 +206,7 @@ mod tests {
         for _ in 0..12 {
             st = cart::run_one(&mut it, &chunks.frame, st).expect("warm-up");
         }
-        let cache = it.cache.clone().expect("cache");
-
-        let rt2: Rt2 = crate::trace::block::skeleton(&st, cache).expect("structure");
+        let rt2: Rt2 = crate::trace::block::skeleton(&st, it.room.expect("the room")).expect("structure");
         let mut seen: std::collections::HashMap<u32, Path> = Default::default();
         let (mut ok, mut unnameable) = (0usize, 0usize);
         for p in crate::trace::iface::scalars(&st, &[]).expect("scalars") {

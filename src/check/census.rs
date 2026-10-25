@@ -30,9 +30,8 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use celeste_core::arith::Fixed;
 
-use crate::abstraction::Level;
 use crate::compiled::{KernelLanes, Kernels};
-use crate::settings::{Arith, Settings};
+use crate::settings::{Arith, Run};
 use crate::trace::walk::Region;
 use crate::transpile::asm::Compiled;
 use crate::transpile::graph::{Graph, NodeId, Op};
@@ -56,17 +55,17 @@ pub struct KernelCensus {
     pub census: Census,
 }
 
-/// THE CENSUS of `level`'s kernels under `s` (16.16's alone): from the kernel
-/// cache (`<key>-census`, beside the set's own entry), else rebuilt and
-/// kept there.
-pub fn census(level: Level, s: &Settings) -> Result<Vec<KernelCensus>> {
-    census_in(level, s, &crate::compiled::cache::Store::default())
+/// THE CENSUS of `run`'s kernels (16.16's alone): from the kernel cache
+/// (`<key>-census`, beside the set's own entry), else rebuilt and kept
+/// there.
+pub fn census(run: &Run) -> Result<Vec<KernelCensus>> {
+    census_in(run, &crate::compiled::cache::Store::default())
 }
 
 /// `census` in the kernel cache `store`.
-fn census_in(level: Level, s: &Settings, store: &crate::compiled::cache::Store) -> Result<Vec<KernelCensus>> {
-    anyhow::ensure!(s.arith == Arith::Fixed, "the kernel census is 16.16's: not under --arith {}", s.arith);
-    let key = crate::compiled::cache::key::<Fixed>(level, s)?;
+fn census_in(run: &Run, store: &crate::compiled::cache::Store) -> Result<Vec<KernelCensus>> {
+    anyhow::ensure!(run.settings.arith == Arith::Fixed, "the kernel census is 16.16's: not under --arith {}", run.settings.arith);
+    let key = crate::compiled::cache::key::<Fixed>(run)?;
     let name = format!("{}-census", key.name);
     if let Some(files) = store.get(&name, &key)? {
         let bytes = files.get("census.bin").ok_or_else(|| anyhow::anyhow!("the census entry {name} holds no census.bin"))?;
@@ -74,10 +73,10 @@ fn census_in(level: Level, s: &Settings, store: &crate::compiled::cache::Store) 
     }
     let t0 = std::time::Instant::now();
     // The walk and the lowering recurse deeply (as the kernel build does).
-    let s2 = s.clone();
+    let run2 = run.clone();
     let out = std::thread::Builder::new()
         .stack_size(256 << 20)
-        .spawn(move || rebuild(level, &s2))
+        .spawn(move || rebuild(&run2))
         .context("spawn the census")?
         .join()
         .map_err(|_| anyhow::anyhow!("the census panicked"))??;
@@ -89,8 +88,8 @@ fn census_in(level: Level, s: &Settings, store: &crate::compiled::cache::Store) 
 /// Every kernel of the set rebuilt as the registry builds it
 /// (`asm_kernel::build_one_shape`: the same frames in the same order, the
 /// same slots and symbols), its text with provenance, censused.
-fn rebuild(level: Level, s: &Settings) -> Result<Vec<KernelCensus>> {
-    let refs = crate::trace::lower::lattice_kernel_refs::<Fixed>(level, s).context("retracing the start room for the census")?;
+fn rebuild(run: &Run) -> Result<Vec<KernelCensus>> {
+    let refs = crate::trace::lower::lattice_kernel_refs::<Fixed>(run).context("retracing the start room for the census")?;
     crate::par::Pool::per_core().stack(128 << 20).map(refs.len(), |si| {
         let (region, r) = &refs[si];
         let shape = r.frame.in_rt2.shape_hash_of();
@@ -120,8 +119,9 @@ fn rebuild(level: Level, s: &Settings) -> Result<Vec<KernelCensus>> {
 /// slices it ran (`Kernels::counting`'s counters) and its census, the
 /// rebuilt kernel's text the running one's. A set that is not counting, or
 /// a kernel without its census, fails.
-pub fn counted<N: KernelLanes>(k: &Kernels<N>, level: Level, s: &Settings) -> Result<Vec<(String, u64, Census)>> {
-    let mut by_key: std::collections::HashMap<(u64, Option<Region>), KernelCensus> = census(level, s)?.into_iter().map(|c| (c.key, c)).collect();
+pub fn counted<N: KernelLanes>(k: &Kernels<N>) -> Result<Vec<(String, u64, Census)>> {
+    use crate::frame::FrameStep as _;
+    let mut by_key: std::collections::HashMap<(u64, Option<Region>), KernelCensus> = census(k.run())?.into_iter().map(|c| (c.key, c)).collect();
     let counts = k.slice_counts();
     anyhow::ensure!(counts.len() == by_key.len(), "the census holds {} kernels, the running set counts slices of {} (a set without `Kernels::counting` counts none)", by_key.len(), counts.len());
     let mut out = Vec::with_capacity(counts.len());
@@ -334,7 +334,7 @@ fn report(inp: &Input) -> Result<Census> {
 mod tests {
     use crate::abstraction::Level;
     use crate::compiled::cache::Store;
-    use crate::settings::Settings;
+    use crate::settings::{Run, Settings};
 
     /// THE CACHED CENSUS IS THE FRESH ONE: room (1,0) r0sx's census rebuilt
     /// into two empty kernel caches is the same twice (a function of the
@@ -343,20 +343,20 @@ mod tests {
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels rebuilt twice for their census, ~30 CPU-s"]
     fn the_cached_census_is_the_fresh_one() {
-        let (level, s) = (Level::parse("r0sx").expect("level"), Settings::default());
+        let run = Run::new(&Settings::default(), Level::parse("r0sx").expect("level"));
         let roots: Vec<std::path::PathBuf> = (0..2).map(|i| std::env::temp_dir().join(format!("celeste-census-{}-{i}", std::process::id()))).collect();
         for r in &roots {
             let _ = std::fs::remove_dir_all(r);
         }
         let stores: Vec<Store> = roots.iter().map(|r| Store::at(r)).collect();
-        let fresh: Vec<Vec<super::KernelCensus>> = stores.iter().map(|st| super::census_in(level, &s, st).expect("a fresh census")).collect();
+        let fresh: Vec<Vec<super::KernelCensus>> = stores.iter().map(|st| super::census_in(&run, st).expect("a fresh census")).collect();
         assert!(fresh[0] == fresh[1], "two fresh censuses differ");
         assert!(!fresh[0].is_empty() && fresh[0].iter().all(|c| c.census.get("insts").is_some_and(|&n| n > 0)), "every kernel has instructions");
-        let key = crate::compiled::cache::key::<celeste_core::arith::Fixed>(level, &s).expect("key");
+        let key = crate::compiled::cache::key::<celeste_core::arith::Fixed>(&run).expect("key");
         assert!(stores[0].get(&format!("{}-census", key.name), &key).expect("get").is_some(), "the census is kept beside the set");
-        assert!(super::census_in(level, &s, &stores[0]).expect("the cached census") == fresh[0], "the cached census is not the fresh one");
-        let float = Settings { arith: crate::settings::Arith::Float(crate::settings::FloatTool::Celia), ..s.clone() };
-        assert!(super::census_in(level, &float, &stores[0]).is_err(), "a float census");
+        assert!(super::census_in(&run, &stores[0]).expect("the cached census") == fresh[0], "the cached census is not the fresh one");
+        let float = Settings { arith: crate::settings::Arith::Float(crate::settings::FloatTool::Celia), ..Settings::default() };
+        assert!(super::census_in(&Run::new(&float, run.level), &stores[0]).is_err(), "a float census");
         for r in &roots {
             let _ = std::fs::remove_dir_all(r);
         }

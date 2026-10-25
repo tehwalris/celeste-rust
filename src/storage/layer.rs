@@ -147,9 +147,9 @@ impl<N: Arithmetic> SkelRecord<N> {
         Ok(SkelRecord { shape_hash: rt2.shape_hash, structure: rt2.structure.clone(), globals: rt2.globals.clone(), strings: rt2.strings.clone(), others, numeric })
     }
 
-    /// The skeleton as an empty block over `cache` (a room's).
-    pub(crate) fn rt2(&self, cache: Arc<celeste_core::room::Room>) -> Rt2<N> {
-        let mut rt2 = Rt2::empty(0, self.globals.len(), &[], cache);
+    /// The skeleton as an empty block in a search from `room`.
+    pub(crate) fn rt2(&self, room: &'static celeste_core::room::Room) -> Rt2<N> {
+        let mut rt2 = Rt2::empty(0, self.globals.len(), &[], room);
         rt2.structure = self.structure.clone();
         rt2.globals = self.globals.clone();
         rt2.strings = self.strings.clone();
@@ -162,11 +162,6 @@ impl<N: Arithmetic> SkelRecord<N> {
             rt2.cols[c as usize] = if r == 0 { Repr::Num.empty() } else { Repr::Ival.empty() };
         }
         rt2
-    }
-
-    /// The skeleton in a search from `room` (its collision cache).
-    pub(crate) fn rt2_in(&self, room: (i16, i16)) -> Rt2<N> {
-        self.rt2(crate::compiled::collision_cache(room))
     }
 }
 
@@ -404,7 +399,7 @@ impl<N: Arithmetic> FrameFile<N> {
         ensure!(layer.set.tables().len() == n, "{}: an empty region", self.path().display());
         if let Some(room) = room {
             for s in &self.header.skeletons {
-                layer.skeletons.insert(s.shape_hash, Arc::new(s.rt2_in(room)));
+                layer.skeletons.insert(s.shape_hash, Arc::new(s.rt2(celeste_core::room::Room::of(room))));
             }
         }
         Ok((layer, wins))
@@ -575,7 +570,7 @@ impl<N: Arithmetic> Tree<N> {
     /// The skeleton of `shape` in frame `f`'s files, in a search from `room`.
     pub(crate) fn skeleton(&self, f: u32, shape: u64, room: (i16, i16)) -> Result<Rt2<N>> {
         let r = self.file(f).into_iter().flat_map(|x| x.header.skeletons.iter()).find(|r| r.shape_hash == shape).ok_or_else(|| anyhow!("{}: frame {f} has no skeleton of shape {shape:016x}", self.dir.display()))?;
-        Ok(r.rt2_in(room))
+        Ok(r.rt2(celeste_core::room::Room::of(room)))
     }
 
     /// Frame `f`'s ROWS in a search from `room` (`decode_states`; keys set).

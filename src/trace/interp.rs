@@ -58,8 +58,9 @@ pub struct Interp<'a, D: Domain> {
     /// Each poisoned path's guard and reason; their OR is the raise row's
     /// liveness. Reset per trace by `frame::trace_frame`.
     pub raised: Vec<(D::Bool, String)>,
-    /// The room's collision cache (`cart::boot`; none in unit tests).
-    pub cache: Option<std::sync::Arc<celeste_core::room::Room>>,
+    /// The room whose tiles `tile_flag_at` reads (`cart::boot`; none in
+    /// unit tests).
+    pub room: Option<&'static celeste_core::room::Room>,
     /// Budgets, so a blow-up is a DIAGNOSIS naming the construct, not a hang.
     pub max_states: usize,
     pub max_nodes: usize,
@@ -99,7 +100,7 @@ impl<'a, D: Domain> Interp<'a, D> {
             hint: Vec::new(),
             illegal: Default::default(),
             raised: Vec::new(),
-            cache: None,
+            room: None,
             max_states: 256,
             max_nodes: 2_000_000,
             trace_start_nodes: 0,
@@ -1536,11 +1537,8 @@ impl<'a, D: Domain> Interp<'a, D> {
                         self.d.as_const(&h),
                     ) {
                         (Some(x), Some(y), Some(w), Some(h)) => {
-                            let cache = self
-                                .cache
-                                .clone()
-                                .ok_or_else(|| anyhow!("tile_flag_at: no collision cache"))?;
-                            let r = cache.flag_at(gi(x)?, gi(y)?, gi(w)?, gi(h)?, fi)?;
+                            let room = self.room.ok_or_else(|| anyhow!("tile_flag_at: no room"))?;
+                            let r = room.flag_at(gi(x)?, gi(y)?, gi(w)?, gi(h)?, fi)?;
                             (st, Value::Bool(self.d.boolean(r)))
                         }
                         _ => {

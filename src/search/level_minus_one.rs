@@ -38,7 +38,8 @@ use crate::trace::walk::{LatticeWalk, ShapeKey, Tracer};
 use crate::trace::state::State;
 use crate::trace::widen::field;
 use crate::transpile::garith::{value_box, GraphArith};
-use crate::transpile::graph::{Cut, Eval, Graph, NodeId, Op, Room, Val};
+use crate::transpile::graph::{Cut, Eval, Graph, NodeId, Op, Val};
+use celeste_core::room::Room;
 
 /// A report line, to the report and at once to stderr (a run is minutes).
 macro_rules! say {
@@ -305,7 +306,6 @@ struct Acc<A: GraphArith> {
 
 struct Table<'a, A: GraphArith> {
     lw: &'a LatticeWalk<A>,
-    room: Room,
     room0: (i16, i16),
     /// 100% (`Category::hundred`): a successor that leaves the berry behind is no exit.
     hundred: bool,
@@ -463,7 +463,7 @@ impl<A: GraphArith> Table<'_, A> {
                 roots_old.push(Roots { live: o.guard, error: o.error, xy: None, fields: Vec::new() });
                 continue;
             }
-            let tid = self.shape_id(crate::trace::walk::shape_key(&o.st, self.lw.cache.clone())?)?;
+            let tid = self.shape_id(crate::trace::walk::shape_key(&o.st, self.lw.room)?)?;
             let tloc = located_object(&o.st);
             let node_of = |p: &Path| o.fields.iter().find(|(q, _, _)| q == p).map(|(_, n, _)| *n);
             let xy = match &tloc {
@@ -1633,13 +1633,12 @@ fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate
     let t_all = std::time::Instant::now();
     let room0 = s.room;
     let spd_px = i16::try_from(spd_px).map_err(|_| anyhow!("the speed bound {spd_px} px is out of range"))?;
-    let walk = crate::trace::walk::Walk { settings: s, only: None };
-    let lw = crate::trace::walk::room_constant_lattice::<A>(crate::abstraction::Level::EXACT, &walk)?;
+    let run = crate::settings::Run::new(s, crate::abstraction::Level::EXACT);
+    let lw = crate::trace::walk::room_constant_lattice::<A>(&crate::trace::walk::Walk { run: &run, only: None })?;
     say!(rep, "room {room0:?}: lattice walk {} shapes, {:.1} s", lw.lattice.len(), t_all.elapsed().as_secs_f64())?;
     let mut tr = lw.tracer.clone();
     let mut table = Table {
         lw: &lw,
-        room: Room { cache: lw.cache.clone() },
         room0,
         hundred: s.category.hundred(),
         spd_px,
@@ -1670,7 +1669,7 @@ fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate
         table.shapes[id].traced = None;
         table.trace(&mut tr, id)?;
         let mut acc = Acc { obs: vec![None; table.obs_keys.len()], clipped: vec![0; table.shapes.len()], violations: Vec::new(), n_violations: 0, precise: 0 };
-        let out = eval_node(&table.shapes, &table.room, id, xy, &mut acc)?;
+        let out = eval_node(&table.shapes, table.lw.room, id, xy, &mut acc)?;
         let f = chain.len() - 1;
         ensure!(acc.n_violations == 0 && acc.clipped.iter().all(|c| *c == 0), "the spawn prefix at frame {f} {xy:?}: {:?} (clipped {:?})", acc.violations, acc.clipped);
         let succ: BTreeSet<(usize, Option<(i16, i16, i16, i16)>)> = out.succ.into_iter().collect();
@@ -1730,7 +1729,7 @@ fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate
         memo.keep(&sigs);
         let mut ex = Explore::new(pack((end_id, end_xy.0, end_xy.1)));
         loop {
-            ex.run(&table.shapes, &table.room, &memo, threads, table.obs_keys.len())?;
+            ex.run(&table.shapes, table.lw.room, &memo, threads, table.obs_keys.len())?;
             // Nodes of shapes not traced yet wait for their trace.
             let pending = std::mem::take(&mut ex.pending);
             if pending.is_empty() {
@@ -1767,7 +1766,7 @@ fn build<A: GraphArith>(spd_px: i32, threads: usize, rep: &mut String, s: &crate
                 reobserved += again.len();
                 let keep: HashSet<u64> = reached[s].iter().copied().collect();
                 memo.nodes.retain(|k, _| unpack(*k).0 != s || keep.contains(k));
-                observe(&table.shapes, &table.room, &again, threads, n_obs)?
+                observe(&table.shapes, table.lw.room, &again, threads, n_obs)?
             };
             agg.resize(n_obs, None);
             if let Some(o) = ex.fresh_obs.get_mut(s).and_then(|o| o.take()) {

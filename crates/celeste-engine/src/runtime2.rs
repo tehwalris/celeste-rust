@@ -4,8 +4,6 @@
 //! `widening` table on blocks), canonical renumbering and the shape hash.
 //! Row keys are the storage's (`exact::KeySpace`).
 
-use std::sync::Arc;
-
 use celeste_core::arith::Arithmetic;
 use celeste_core::room::Room;
 use celeste_core::pico8_num::Pico8Num;
@@ -144,7 +142,9 @@ pub struct Rt2<N = P8> {
     pub cols: Vec<Col<N>>,
     pub globals: Vec<u32>,
     pub strings: Vec<String>,
-    pub cache: Arc<Room>,
+    /// The search's start room (the kernels read its tiles; a row's cell
+    /// is relative to it).
+    pub room: &'static Room,
     /// Set by `boundary`: the canonical structure hash (the shape key).
     pub shape_hash: u64,
     /// A stored piece's per-lane EXACT keys (its tree's `exact::KeySpace`);
@@ -241,7 +241,7 @@ impl<N: Arithmetic> Rt2<N> {
         width: usize,
         globals_len: usize,
         static_strings: &[&str],
-        cache: Arc<Room>,
+        room: &'static Room,
     ) -> Rt2<N> {
         Rt2 {
             width,
@@ -249,7 +249,7 @@ impl<N: Arithmetic> Rt2<N> {
             cols: Vec::new(),
             globals: vec![NONE; globals_len],
             strings: static_strings.iter().map(|s| s.to_string()).collect(),
-            cache,
+            room,
             shape_hash: 0,
             row_keys: Vec::new(),
         }
@@ -617,7 +617,7 @@ impl<N: Arithmetic> Rt2<N> {
         self.width = keep.len();
     }
 
-    /// A clone that shares the immutable context (the collision cache's `Arc`).
+    /// A clone (its room shared).
     pub fn clone_block(&self) -> Rt2<N> {
         Rt2 {
             width: self.width,
@@ -625,7 +625,7 @@ impl<N: Arithmetic> Rt2<N> {
             cols: self.cols.clone(),
             globals: self.globals.clone(),
             strings: self.strings.clone(),
-            cache: self.cache.clone(),
+            room: self.room,
             shape_hash: self.shape_hash,
             row_keys: self.row_keys.clone(),
         }
