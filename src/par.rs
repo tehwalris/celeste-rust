@@ -1,7 +1,9 @@
 //! One scoped worker pool: `n` items pulled by index from an atomic cursor,
 //! each worker with its own state (a reference engine, a scratch buffer),
-//! the results in index order. The first error stops the pulling and is
-//! returned; a worker's panic is resumed in the caller with its own message.
+//! the results in index order (`map`, `map_with`), or an unordered fold
+//! into per-worker accumulators (`drain`). The first error stops the
+//! pulling and is returned; a worker's panic is resumed in the caller with
+//! its own message.
 #![warn(unreachable_pub)]
 
 use anyhow::Result;
@@ -50,39 +52,104 @@ impl Pool {
     /// `init` (built in the worker), results by index.
     pub fn map_with<S, T: Send>(&self, n: usize, init: impl Fn() -> Result<S> + Sync, f: impl Fn(&mut S, usize) -> Result<T> + Sync) -> Result<Vec<T>> {
         let next = AtomicUsize::new(0);
-        // One slot per item, allocated HERE, before any worker runs: a worker
-        // keeps nothing live between items (a result vector growing in its
-        // glibc arena pins the memory earlier items freed: +6 GB, 16 workers).
-        let slots: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
-        let work = || -> Result<()> {
-            let mut state = init()?;
-            loop {
+        let slots = slots(n);
+        self.spawn(vec![(); self.workers(n)], |()| pull(&next, n, &slots, &mut init()?, &f))?;
+        Ok(results(slots))
+    }
+
+    /// AN UNORDERED FOLD: each worker builds its accumulator (`init`),
+    /// pulls items `from..n` IN ORDER into it (`f`) while `more()`, and
+    /// finishes it (`done`, in the worker: a sort runs in parallel). The
+    /// finished accumulators (one a worker) and the first item not taken
+    /// (every one before it was). WHICH accumulator holds an item depends on
+    /// the scheduling, and so does where `more()` stops: callers join the
+    /// accumulators commutatively and associatively only.
+    pub(crate) fn drain<S, T: Send>(
+        &self,
+        from: usize,
+        n: usize,
+        init: impl Fn() -> S + Sync,
+        f: impl Fn(&mut S, usize) -> Result<()> + Sync,
+        more: impl Fn() -> bool + Sync,
+        done: impl Fn(S) -> T + Sync,
+    ) -> Result<(Vec<T>, usize)> {
+        let next = AtomicUsize::new(from);
+        let out = self.spawn(vec![(); self.workers(n.saturating_sub(from))], |()| {
+            let mut acc = init();
+            while more() {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= n {
-                    return Ok(());
+                    break;
                 }
-                match f(&mut state, i) {
-                    Ok(v) => *slots[i].lock().expect("a result slot") = Some(v),
-                    Err(e) => {
-                        next.store(n, Ordering::Relaxed);
-                        return Err(e);
-                    }
+                if let Err(e) = f(&mut acc, i) {
+                    next.store(n, Ordering::Relaxed);
+                    return Err(e);
                 }
             }
-        };
-        std::thread::scope(|s| {
-            let handles: Vec<_> = (0..self.workers(n))
-                .map(|_| {
+            Ok(done(acc))
+        })?;
+        Ok((out, next.into_inner().min(n)))
+    }
+
+    /// `work(w)` for each of `per` on its own scoped worker (with this
+    /// pool's stack), results in `per`'s order. Every worker is joined; a
+    /// panic is resumed here with its own message, else the first error
+    /// (in worker order) returned.
+    fn spawn<W: Send, R: Send>(&self, per: Vec<W>, work: impl Fn(W) -> Result<R> + Sync) -> Result<Vec<R>> {
+        let work = &work;
+        let joined: Vec<std::thread::Result<Result<R>>> = std::thread::scope(|s| {
+            let handles: Vec<_> = per
+                .into_iter()
+                .map(|w| {
                     let mut b = std::thread::Builder::new();
                     if let Some(bytes) = self.stack {
                         b = b.stack_size(bytes);
                     }
-                    b.spawn_scoped(s, &work).expect("spawn a pool worker")
+                    b.spawn_scoped(s, move || work(w)).expect("spawn a pool worker")
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).collect::<Result<Vec<()>>>()
-        })?;
-        Ok(slots.into_iter().map(|m| m.into_inner().expect("a result slot").expect("every item ran")).collect())
+            handles.into_iter().map(|h| h.join()).collect()
+        });
+        let mut out = Vec::with_capacity(joined.len());
+        let mut first_err = None;
+        for r in joined {
+            match r {
+                Err(p) => std::panic::resume_unwind(p),
+                Ok(Ok(v)) => out.push(v),
+                Ok(Err(e)) => first_err = first_err.or(Some(e)),
+            }
+        }
+        first_err.map_or(Ok(out), Err)
+    }
+}
+
+/// One result slot per item, allocated by the CALLER before any worker
+/// runs: a worker keeps nothing live between items (a result vector
+/// growing in its glibc arena pins the memory earlier items freed: +6 GB,
+/// 16 workers).
+fn slots<T>(n: usize) -> Vec<Mutex<Option<T>>> {
+    (0..n).map(|_| Mutex::new(None)).collect()
+}
+
+fn results<T>(slots: Vec<Mutex<Option<T>>>) -> Vec<T> {
+    slots.into_iter().map(|m| m.into_inner().expect("a result slot").expect("every item ran")).collect()
+}
+
+/// A worker's loop: items pulled from `next` below `n` into their slots
+/// with `f(state, i)`; an error stops every worker's pulling.
+fn pull<S, T>(next: &AtomicUsize, n: usize, slots: &[Mutex<Option<T>>], state: &mut S, f: &impl Fn(&mut S, usize) -> Result<T>) -> Result<()> {
+    loop {
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        if i >= n {
+            return Ok(());
+        }
+        match f(state, i) {
+            Ok(v) => *slots[i].lock().expect("a result slot") = Some(v),
+            Err(e) => {
+                next.store(n, Ordering::Relaxed);
+                return Err(e);
+            }
+        }
     }
 }
 
@@ -112,5 +179,45 @@ mod tests {
         let err = Pool::new(2).map(50, |i| if i == 7 { anyhow::bail!("item {i}") } else { Ok(i) });
         assert_eq!(err.unwrap_err().to_string(), "item 7");
         assert!(Pool::new(8).map(0, Ok).unwrap().is_empty());
+    }
+
+    /// The panic's message, from a payload.
+    fn message(p: Box<dyn std::any::Any + Send>) -> String {
+        p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default()
+    }
+
+    /// A drain takes each item of `from..n` exactly once into some
+    /// accumulator, at 1, 3 and 32 workers; with `more()` false it stops,
+    /// every item before the one it returns taken; an item's error is
+    /// returned; a worker's panic is resumed with its message.
+    #[test]
+    fn a_drain_takes_each_item_once_and_stops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for workers in [1, 3, 32] {
+            let pool = Pool::new(workers);
+            let (accs, end) = pool.drain(5, 1000, Vec::new, |a: &mut Vec<usize>, i| Ok(a.push(i)), || true, |a| a).unwrap();
+            assert_eq!(end, 1000);
+            assert!(accs.len() <= workers);
+            let mut all: Vec<usize> = accs.concat();
+            all.sort_unstable();
+            assert_eq!(all, (5..1000).collect::<Vec<_>>(), "{workers} workers");
+            // Early stop: past 10 items taken, no worker takes another.
+            let taken = AtomicUsize::new(0);
+            let (accs, end) = pool
+                .drain(5, 1000, Vec::new, |a: &mut Vec<usize>, i| {
+                    taken.fetch_add(1, Ordering::Relaxed);
+                    Ok(a.push(i))
+                }, || taken.load(Ordering::Relaxed) < 10, |a| a)
+                .unwrap();
+            let mut all: Vec<usize> = accs.concat();
+            all.sort_unstable();
+            assert_eq!(all, (5..end).collect::<Vec<_>>(), "{workers} workers: what was taken is what came before the end");
+            assert!((15..15 + workers).contains(&end), "{workers} workers: stopped at {end}");
+            let err = pool.drain(0, 100, || (), |_, i| if i == 7 { anyhow::bail!("item {i}") } else { Ok(()) }, || true, |a| a);
+            assert_eq!(err.unwrap_err().to_string(), "item 7");
+            let p = std::panic::catch_unwind(|| pool.drain(0, 100, || (), |_, i| if i == 5 { panic!("boom {i}") } else { Ok(()) }, || true, |a| a));
+            assert_eq!(message(p.expect_err("a panic")), "boom 5");
+        }
+        assert_eq!(Pool::new(4).drain(9, 9, || 0, |_, _| Ok(()), || true, |a| a).unwrap().1, 9);
     }
 }
