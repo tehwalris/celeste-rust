@@ -177,21 +177,23 @@ other categories in runs.json order, each in game order. The switch shows
 names (`exit at frame 85` -> `85 f`).
 
 Each run's subdirectory (`id`) is produced by `rewrite export-ui`
-(`src/search/ui_export.rs`) from a `rewrite search` checkpoint dir: the
+(`src/ui_export.rs`) from a `rewrite search` checkpoint dir: the
 search's record (`result.json`: the levels, their first wins and arc bounds,
-the optimum, the wall time) and each level's tree. It reads only the
+the optimum, the witness and its path, the wall time), each level's tree and
+the search's marks record (`support.marks.bin`, `arc.marks.bin`: what its
+final level's arc phase wrote). It reads only the
 frame files' region blocks (keys, cell masks, win masks), the tree's
 forward record (`forward.tsv`: the per-frame sizes and timings) and the
 marks files, streamed - region by region, the marks files mapped and
 merged with each region's keys - so its memory does not grow with the tree
 (an 82 GB tree: 1.6 GB of heap). A run is one horizon: one level per `--level` of
-the search, and with `--arc DIR` (what `search --save-marks DIR` wrote) the
-last level gets the remainder-free backward's marks and one more level is
-the remainder-exact ARC backward over the same tree (`forward_of` in
-`run.json`: no forward pass of its own; a node is marked when its winning
-set W_t is non-empty at some frame t, drawn at its first-reach layer). With
-a concrete witness, `witness.txt` (the inputs and the player's position per
-frame) is drawn over the room as a path (below). `--witness FILE` replaces
+the search, and with the marks record the last level gets the
+remainder-free backward's marks and one more level is the remainder-exact
+ARC backward over the same tree (`forward_of` in `run.json`: no forward pass
+of its own; a node is marked when its winning set W_t is non-empty at some
+frame t, drawn at its first-reach layer). With a concrete witness, its
+inputs and the player's position per frame (`result.json`) are drawn over
+the room as a path (below). `--witness FILE` replaces
 it and `--reference FILE` adds a second one to compare with, in the same
 format plus an optional `label` line and `dashes F:DIR ...`:
 `rewrite pico8 align --room X,Y --category CAT --name 2900m --prologue P
@@ -234,10 +236,9 @@ Room (3,3) at h172:
 
 ```bash
 ./safe-run.sh -- ./target/quick/rewrite search --level-minus-one 172,5 \
-    --search-dir /var/tmp/arc33-172 --frames 172 --room 3,3 --level r0sxhn \
-    --save-marks /var/tmp/arc33-172-ui
+    --search-dir /var/tmp/arc33-172 --frames 172 --room 3,3 --level r0sxn
 ./safe-run.sh -- ./target/quick/rewrite export-ui --search-dir /var/tmp/arc33-172 \
-    --arc /var/tmp/arc33-172-ui --out /var/tmp/celeste-ui/data/room33arc172
+    --out /var/tmp/celeste-ui/data/room33arc172
 # then list it in /var/tmp/celeste-ui/data/runs.json (above)
 ```
 

@@ -54,7 +54,7 @@ export interface LevelRun {
   marks_by_dist: number[];
   mlayers_file: string | null;
   marks_by_layer: number[];
-  /** A backward over ANOTHER level's forward (`export-ui --arc`: the
+  /** A backward over ANOTHER level's forward (the search's marks record: the
    *  remainder-exact arc backward over level 0's tree): that level's
    *  index. Its frames are that level's; it has no forward pass. Absent in
    *  older exports. */
@@ -65,7 +65,7 @@ export interface HorizonRun {
   h: number;
   levels: LevelRun[];
   refuted_at: number | null;
-  /** Exported without the arc pass (`export-ui` without `--arc`): the
+  /** Exported without the arc pass (a search without its marks record): the
    *  forward levels' frames up to `h`, no verdict. Absent in older exports. */
   partial?: boolean;
 }

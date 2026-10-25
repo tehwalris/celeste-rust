@@ -169,19 +169,7 @@ fn bench_frame<N: Rem + celeste_rust::compiled::KernelLanes>(t: &TreeDir, a: &Fr
         let counts = counters.as_ref().zip(at).map(|(c, at)| c.stop(at));
         eprintln!("[bench] rep {rep}: {} | rep {:.0} ms", stats.line(), ms(t_all));
         costs.push(celeste_rust::storage::bench::Rep { stats, workers: cfg.threads(), load, counts });
-        let (visited, front) = (s.visited(), s.frontier());
-        let (n, acc) = front.new.content_fingerprint(&visited.keys, visited.shapes())?;
-        let mut out = format!("f{:03} {n} {acc:016x}\n", frame + 1);
-        let (nh, ah) = celeste_rust::storage::hulls::fingerprint(front.states(frame + 1), &visited.keys, visited.shapes())?;
-        out += &format!("h{:03} {nh} {ah:016x}\n", frame + 1);
-        if edges {
-            let (n, acc) = celeste_rust::storage::bench::edge_fingerprint(scratch, frame + 1, s.xfers(), visited, cfg.threads())?;
-            out += &format!("e{:03} {n} {acc:016x}\n", frame + 1);
-        }
-        if checkpoint {
-            let (files, bytes, acc) = celeste_rust::storage::bench::dir_fingerprint(scratch)?;
-            out += &format!("b{:03} {files} {bytes} {acc:016x}\n", frame + 1);
-        }
+        let out = s.lines(edges.then_some(scratch), checkpoint.then_some(scratch), cfg.threads())?;
         match &lines {
             None => print!("{out}"),
             Some(first) => anyhow::ensure!(*first == out, "rep {rep} differs from rep 0:\n{out}against\n{first}"),
@@ -208,7 +196,7 @@ fn bench_frame<N: Rem + celeste_rust::compiled::KernelLanes>(t: &TreeDir, a: &Fr
 
 /// A PIN: `got` against the file at `path` (`moves`: every difference, as
 /// lines; none passes), or written there (`pin`).
-fn pinned(path: &std::path::Path, got: &str, pin: bool, moves: fn(&str, &str) -> Vec<String>) -> Result<()> {
+pub(crate) fn pinned(path: &std::path::Path, got: &str, pin: bool, moves: fn(&str, &str) -> Vec<String>) -> Result<()> {
     if pin {
         std::fs::write(path, got).with_context(|| path.display().to_string())?;
         eprintln!("[bench] re-pinned {}", path.display());
@@ -222,7 +210,7 @@ fn pinned(path: &std::path::Path, got: &str, pin: bool, moves: fn(&str, &str) ->
 
 /// The printed lines against the pinned ones of their kinds (a line's
 /// first letter: `f`, `h`, `e`, `b`).
-fn line_moves(want: &str, got: &str) -> Vec<String> {
+pub(crate) fn line_moves(want: &str, got: &str) -> Vec<String> {
     let kinds: Vec<char> = got.lines().filter_map(|l| l.chars().next()).collect();
     let want: Vec<&str> = want.lines().filter(|l| l.chars().next().is_some_and(|c| kinds.contains(&c))).collect();
     let got: Vec<&str> = got.lines().collect();
@@ -312,7 +300,10 @@ impl Drop for Scratch {
 
 /// `bench backward` of `frame` in the arithmetic of `N`, the winning sets
 /// for `horizon`.
-fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize) -> Result<()> {
+fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize) -> Result<()>
+where
+    N::C: celeste_rust::check::gate::GateWord,
+{
     let cfg = &tree.settings;
     anyhow::ensure!(frame < horizon, "--step {frame}: below the horizon {horizon}");
     let t = std::time::Instant::now();
@@ -340,7 +331,7 @@ fn bench_backward<N: Rem>(tree: &TreeDir, horizon: u32, frame: u32, reps: usize)
         for (id, r) in c.current() {
             let (shape, key, cell) = seeds.state(id);
             n += 1;
-            acc = acc.wrapping_add(celeste_rust::search::backward::gate_w_hash(content.state(shape, key, cell), r));
+            acc = acc.wrapping_add(celeste_rust::check::gate::w_hash(content.state(shape, key, cell), r));
         }
         let ms = |k: usize| (after[k] - before[k]).as_secs_f64() * 1e3;
         eprintln!("[bench backward] rep {rep}: W f{frame} in {:.1} ms (read {:.1}, pull {:.1}, merge {:.1} ms)", wall.as_secs_f64() * 1e3, ms(0), ms(1), ms(2));

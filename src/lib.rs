@@ -15,6 +15,7 @@ pub mod storage;
 pub mod tools;
 pub mod trace;
 pub mod transpile;
+pub mod ui_export;
 
 #[cfg(test)]
 mod conventions;

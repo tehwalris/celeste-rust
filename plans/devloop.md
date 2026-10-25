@@ -19,14 +19,15 @@ byte-identical, or re-pins them on evidence.
   their pins by `./check.sh fixtures`.
 - **The room (1,0) gates** (t2): the f0-f44 `ckhash` (states, edges and
   hulls), and the arc gate. The arc gate pins the marks, W at every frame
-  f0-f35, the optimum, the concrete witness and the known route
-  (`--prefer`, `search::known`).
+  f0-f35, the optimum, the concrete witness (its `[gate]` lines: `rewrite
+  gate --search-dir`, the arc phase rerun over the finished search) and the
+  known route (`--prefer`, `search::known`).
 - **The objects-ladder search** (t2): room (4,2) `r0sxn,r0sx`, every
   `[gate]` line, and its UI export.
 - **The float and dual gates** (t2), and the float twins' frames (t1).
 - **The differential checks against the reference engine**:
   - t1: `check ref`, `check arcs` (and `check arcs --fault action` must fail),
-    `--key-check` and `check widen`; `keycheck-r60s`, the one fixture whose
+    `check keys` and `check widen`; `keycheck-r60s`, the one fixture whose
     keys have FOLLOWERS (room (6,0)'s ten platforms, `exact::Deps`), every
     row's key recomputed at the boundary with its followers checked;
   - t2: `reference10[f]`, the reference engine's forward tree equal to the
@@ -102,7 +103,7 @@ them from its records (and refuse them as flags).
 |---|---|
 | frame-r10, -r62h, -r42n | `bench frame --edges --checkpoint --expect --metrics` of r10 f55, r62h f50, r42n f60: the f/h/e/b lines and the exact metrics against their pins |
 | frame-f10, -f42n | the same in float (no metrics) |
-| keycheck-r10, -r42n, -f42n | `--key-check`: every emitted row's key recomputed from its fields, and decoded back |
+| keycheck-r10, -r42n, -f42n | `check keys`: every emitted row's key recomputed from its fields, and decoded back; every stored row's key the boundary's; the f/h/e lines against the frame pins |
 | refcheck-r10, -r42x, -f10, -f42x | `check ref`: 32 rows through the kernels and the reference engine; the converters agree |
 | arccheck-, arcfault- (r10, f10; arccheck also r42x, f42x) | `check arcs`: 32 recorded transfers against the reference; with `--fault action` it must fail |
 | widen-r10, -r62h, -r42n, -f10, -f42n | `check widen`: the widening table's two sides agree on every stored row and 64 rows' emissions |
@@ -287,7 +288,7 @@ then the tiers' `--pin`.
 - **The n level against the reference.** `check ref` and `check arcs` at
   `r0sxn` fork the widened objects into thousands of paths a row. t1
   checks the object room at `r0sx`, and the n kernels end to end
-  (search42) and by key-check.
+  (search42) and by `check keys`.
 - **Every build of the sources builds its kernels once** (the kernel
   cache, `compiled::cache`: a set is keyed on the sources, so a commit's
   first check builds every set; a hit loads in 0.1-2 s against room

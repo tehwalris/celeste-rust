@@ -130,6 +130,16 @@ enum Command {
     /// THE BENCHMARKS of a finished tree: one forward or backward frame.
     #[command(subcommand)]
     Bench(bench::Command),
+    /// THE ARC GATE'S FINGERPRINTS of a finished search (`check::gate`;
+    /// CLAUDE.md "Gates"): its `[gate]` lines, on stdout.
+    ///
+    /// Per level the search ran (a dual search's halves in its order), the
+    /// arc phase rerun over its tree as the search ran it: W's support (its
+    /// nodes and a content hash), per frame the nodes with a set and a hash
+    /// of their (node, set), the arc optimum in steps; then the concrete
+    /// optimum and witness from `result.json` (a dual search's: its exit and
+    /// real play's). Content only: the same at every thread count.
+    Gate(GateArgs),
     /// WHY A KERNEL DECLINES A STATE (`check::explain`; the decline report
     /// prints this command).
     ///
@@ -173,11 +183,13 @@ enum Command {
     /// a tree, checked against a known solution.
     #[command(subcommand)]
     L1(l1::Command),
-    /// Export a finished search for the web UI (`ui/`, `search::ui_export`).
+    /// Export a finished search for the web UI (`ui/`, `ui_export`).
     ///
-    /// Reads its record (`result.json`), the trees' checkpoint headers and
-    /// forward records (`forward.tsv`) and the marks files; its room is the
-    /// search's record's.
+    /// Reads its record (`result.json`: the levels, the witness and its
+    /// path), the trees' checkpoint headers and forward records
+    /// (`forward.tsv`) and its marks record (W's support and the arc-marked
+    /// nodes over its final level's tree, `search::result::marks_path`); its
+    /// room is the search's record's.
     ExportUi(ExportUiArgs),
     /// The room (`--room`) as the tools need it, as JSON on stdout.
     ///
@@ -226,7 +238,7 @@ enum Command {
 impl Command {
     /// A command that reads finished trees: their records give the settings.
     fn reads_trees(&self) -> bool {
-        matches!(self, Command::Ckhash(_) | Command::Check(_) | Command::Bench(_) | Command::Explain(_) | Command::Census(_) | Command::ExportUi(_) | Command::L1(l1::Command::Probe(_)))
+        matches!(self, Command::Ckhash(_) | Command::Check(_) | Command::Bench(_) | Command::Gate(_) | Command::Explain(_) | Command::Census(_) | Command::ExportUi(_) | Command::L1(l1::Command::Probe(_)))
     }
 }
 
@@ -253,14 +265,6 @@ pub struct SearchArgs {
     /// Stop at the arc bound (`dual`: the dual bound), no concrete search.
     #[arg(long)]
     no_witness: bool,
-    /// Write the web UI's arc pass into this directory (`export-ui --arc
-    /// DIR`): the winning sets' support (`level0.marks.bin`) and the
-    /// ARC-MARKED nodes (`arc.marks.bin`) as `(shape, cell, key, dist)` rows,
-    /// `dist` the horizon less the last frame the node still wins from; and
-    /// `witness.txt` (inputs and player position per frame). `dual`: the
-    /// FLOAT half's arc pass (the count) and the dual witness.
-    #[arg(long)]
-    save_marks: Option<String>,
     /// A known solution (a `tas/` file or a comma list of input bytes, the
     /// spawn prologue included): the concrete search tries its input first
     /// at every frame, so the witness is the optimum closest to it (every
@@ -309,11 +313,7 @@ pub struct ExportUiArgs {
     /// Output directory (the UI serves it as `data/`).
     #[arg(long, default_value = "/var/tmp/celeste-ui/data")]
     out: String,
-    /// The search's `--save-marks` directory: the winning sets' support
-    /// and the arc-marked nodes over the last level's tree (and the witness).
-    #[arg(long)]
-    arc: Option<String>,
-    /// A concrete run to draw instead of the arc directory's witness:
+    /// A concrete run to draw instead of the search's witness:
     /// `[label TEXT]`, `inputs a,b,..`, `[dashes F:DIR ..]`, then `f x y`
     /// per frame from 0 (`rewrite pico8 align --out DIR` writes one).
     #[arg(long)]
@@ -326,6 +326,13 @@ pub struct ExportUiArgs {
     /// byte (the tasdatabase upload the category runner verified).
     #[arg(long)]
     download: Option<String>,
+}
+
+#[derive(clap::Args)]
+pub struct GateArgs {
+    /// The search's directory (its `result.json` and levels' trees).
+    #[arg(long)]
+    search_dir: std::path::PathBuf,
 }
 
 #[derive(clap::Args)]
@@ -404,7 +411,7 @@ pub(crate) fn where_(c: u32) -> String {
 fn search(cfg: &Settings, float: Option<&Settings>, a: &SearchArgs) -> Result<()> {
     let prefer = a.prefer.as_deref().map(celeste_rust::concrete::read_inputs).transpose()?;
     let dir = std::path::Path::new(&a.search_dir);
-    let spec = celeste_rust::search::SearchSpec { settings: cfg, level: &a.level, horizon: a.frames, ceiling: a.ceiling, dir, bound_only: a.no_witness, save_marks: a.save_marks.as_deref().map(std::path::Path::new), prefer: prefer.as_deref(), dual: float };
+    let spec = celeste_rust::search::SearchSpec { settings: cfg, level: &a.level, horizon: a.frames, ceiling: a.ceiling, dir, bound_only: a.no_witness, prefer: prefer.as_deref(), dual: float };
     report(&celeste_rust::search::run(&spec)?, dir)
 }
 /// A search's verdict (`search::run`'s record), printed; an error where it
@@ -490,14 +497,14 @@ fn main() -> Result<()> {
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     if cli.command.reads_trees() {
         let given = tree_flags_given(&matches);
-        anyhow::ensure!(given.is_empty(), "{}: this command reads a finished tree and takes its settings from the tree's record (tree.txt); give only the run's own (--threads, the diagnostics)", given.join(" "));
+        anyhow::ensure!(given.is_empty(), "{}: this command reads a finished tree and takes its settings from the tree's record (tree.txt); give only the run's own (--threads, --phases)", given.join(" "));
     }
     // The commands that run in float (a tree's arithmetic is its record's).
     let float = cli.command.reads_trees() || matches!(cli.command, Command::Search(_) | Command::Forward(_) | Command::Robust(_) | Command::L1(_));
     let cfg = celeste_rust::settings::startup(&cli.settings, float, |s| {
         // `bench frame` times the workers' phases.
         if let Command::Bench(bench::Command::Frame(_)) = &cli.command {
-            s.diag.phases = true;
+            s.phases = true;
         }
     })?;
     match cli.command {
@@ -526,6 +533,12 @@ fn main() -> Result<()> {
         Command::Ckhash(a) => diag::ckhash(&cfg, a),
         Command::Check(c) => check::run(&cfg, c),
         Command::Bench(c) => bench::run(&cfg, c),
+        Command::Gate(a) => {
+            for l in celeste_rust::check::gate::search_lines(&a.search_dir, &cfg)? {
+                println!("{l}");
+            }
+            Ok(())
+        }
         Command::Explain(a) => {
             let t = a.tree.open(&cfg)?;
             print!("{}", celeste_rust::with_arith!(t.settings.arith, N => celeste_rust::check::explain::explain::<N>(&t, a.step, a.state)?));
@@ -535,12 +548,11 @@ fn main() -> Result<()> {
         Command::Trajectory(a) => diag::trajectory(&cfg, a),
         Command::Robust(a) => diag::robust(&cfg, a),
         Command::L1(c) => l1::run(&cfg, c),
-        Command::ExportUi(a) => celeste_rust::search::ui_export::export(
+        Command::ExportUi(a) => celeste_rust::ui_export::export(
             std::path::Path::new(&a.search_dir),
             std::path::Path::new(&a.out),
             cfg.threads(),
-            a.arc.as_deref().map(std::path::Path::new),
-            celeste_rust::search::ui_export::Paths {
+            celeste_rust::ui_export::Paths {
                 witness: a.witness.as_deref().map(std::path::Path::new),
                 reference: a.reference.as_deref().map(std::path::Path::new),
                 download: a.download.as_deref().map(std::path::Path::new),

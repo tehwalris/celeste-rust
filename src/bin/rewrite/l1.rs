@@ -50,7 +50,9 @@ pub struct ProbeArgs {
     /// The last step checked.
     #[arg(long)]
     to_step: u32,
-    /// The backward's marks at that horizon (`search --save-marks`).
+    /// The backward's marks at that horizon: a marks file in the tree's key
+    /// space (a search's marks record, `<search-dir>/arc.marks.bin` or
+    /// `support.marks.bin`, over its final level's tree).
     #[arg(long)]
     marks: Option<std::path::PathBuf>,
 }

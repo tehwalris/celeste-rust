@@ -209,19 +209,9 @@ pub struct Settings {
     /// refuses it).
     #[arg(skip)]
     pub seed_chests: bool,
-    #[command(flatten)]
-    pub diag: Diagnostics,
-}
-
-/// Self-checks, logs and dumps: none changes a result.
-#[derive(clap::Args, Clone, Debug, Default, PartialEq, Eq)]
-pub struct Diagnostics {
-    /// DIAGNOSTIC: every emitted row's key recomputed by the boundary, and
-    /// the row decoded back from its key and cell (the new layer is
-    /// decoded so) and compared.
-    #[arg(long, global = true)]
-    pub key_check: bool,
-    /// DIAGNOSTIC: the wave workers' phase timings.
+    /// DIAGNOSTIC: the wave workers' phase timings and the `[mem]` lines
+    /// (no result changes; `bench frame` turns it on). The other checks are
+    /// tools, not flags: `rewrite check ...`, `explain`, `gate`, the census.
     #[arg(long, global = true)]
     pub phases: bool,
 }
@@ -282,8 +272,7 @@ impl Settings {
             row("level_minus_one", none(self.level_minus_one.map(|(h, s)| format!("{h},{s}"))), false),
             row("concrete_balloon_seeds", none(self.concrete_balloon_seeds.clone()), false),
             row("threads", none(self.threads.map(|t| t.to_string())), false),
-            switch("key_check", self.diag.key_check, false),
-            switch("phases", self.diag.phases, false),
+            switch("phases", self.phases, false),
         ]
     }
 
@@ -405,7 +394,7 @@ impl Settings {
     /// THE SETTINGS OF A FINISHED TREE, for a command that reads it: its
     /// record read back (each line its flag's text) and its level -1 filter
     /// (`frame::TreeL1`), with the run's own settings from `run` (the
-    /// threads, the concrete phase's seeds, the diagnostics). The tree's
+    /// threads, the concrete phase's seeds, `--phases`). The tree's
     /// level with them.
     pub fn of_tree(dir: &Path, run: &Settings) -> Result<(Settings, crate::abstraction::Level)> {
         let rec = read_record(dir)?;
@@ -436,7 +425,7 @@ impl Settings {
             concrete_balloon_seeds: run.concrete_balloon_seeds.clone(),
             threads: run.threads,
             region: run.region,
-            diag: run.diag.clone(),
+            phases: run.phases,
             ..flags.s
         };
         s.check(dir, level)?;
@@ -756,7 +745,7 @@ mod tests {
     fn a_record_reads_back() {
         let dir = std::env::temp_dir().join(format!("celeste-settings-back-{}", std::process::id()));
         let lvl = crate::abstraction::Level::parse("r0sxf").expect("a level");
-        let run = Settings { threads: Some(3), region: Some((8, 6)), diag: Diagnostics { key_check: true, ..Default::default() }, ..Settings::default() };
+        let run = Settings { threads: Some(3), region: Some((8, 6)), phases: true, ..Settings::default() };
         let all = Settings { room: (6, 2), win_at: Some((8, 10, 64, 64)), split_frame: true, category: Category::GemskipNodiag, loading_jank: Some(2), balloon_seeds: Some("0,1".into()), ..run.clone() };
         let float = Settings { arith: Arith::Float(FloatTool::Uct), loading_jank: None, category: Category::Onlydiag, ..all.clone() };
         for s in [Settings { threads: Some(3), ..run.clone() }, all, float] {
@@ -813,8 +802,8 @@ mod tests {
         assert!(e.to_string().contains("has no record"), "{e}");
         sample.write(&dir, lvl("r0sxf")).expect("write");
         sample.check(&dir, lvl("r0sxf")).expect("the same settings");
-        let harmless = Settings { threads: Some(3), level_minus_one: Some((94, 5)), diag: Diagnostics { key_check: true, ..Default::default() }, ..sample.clone() };
-        harmless.check(&dir, lvl("r0sxf")).expect("threads, level -1 and diagnostics are not a tree's settings");
+        let harmless = Settings { threads: Some(3), level_minus_one: Some((94, 5)), phases: true, ..sample.clone() };
+        harmless.check(&dir, lvl("r0sxf")).expect("threads, level -1 and --phases are not a tree's settings");
         let other = Settings { category: Category::Any, split_frame: true, win_at: Some((8, 8, 64, 64)), ..sample.clone() };
         let e = other.check(&dir, lvl("r0sx")).expect_err("other settings").to_string();
         for k in ["category: the tree's 100, this run's any", "split_frame: the tree's 0, this run's 1", "win_at: the tree's none, this run's 8..8,64..64", "level: the tree's r0sxf, this run's r0sx"] {

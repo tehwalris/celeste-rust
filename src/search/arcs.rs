@@ -61,8 +61,6 @@ pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + PartialOrd
     /// The points of guard `g` that `m` maps into `s`, EXACTLY (`m` is
     /// monotone: one segment).
     fn pull_mono(m: &Self::Mono, g: Seg<Self::P>, s: Seg<Self::P>) -> Option<Seg<Self::P>>;
-    /// A segment as one word of the gate's fingerprints (`backward::gate_w_hash`).
-    fn seg_word(s: Seg<Self::P>) -> u64;
     /// A point in the middle of `s` (a probe).
     fn mid(s: Seg<Self::P>) -> Self::P;
 }
@@ -170,10 +168,6 @@ impl Circle for Fixed16 {
         let hi = (s.hi as i64 - *d as i64).min(g.hi as i64);
         (lo < hi).then(|| Seg { lo: lo as u32, hi: hi as u32 })
     }
-    #[inline]
-    fn seg_word(s: Seg) -> u64 {
-        (s.lo as u64) << 32 | s.hi as u64
-    }
     fn mid(s: Seg) -> u32 {
         (s.lo + s.hi) / 2
     }
@@ -280,10 +274,6 @@ impl Circle for Doubles {
         let lo = first_in(g.lo, g.hi, |r| Self::apply(m, r) >= s.lo);
         let hi = first_in(lo, g.hi, |r| Self::apply(m, r) >= s.hi);
         (lo < hi).then_some(Seg { lo, hi })
-    }
-    #[inline]
-    fn seg_word(s: Seg<u64>) -> u64 {
-        celeste_engine::runtime2::mix64(s.lo) ^ s.hi.rotate_left(32)
     }
     fn mid(s: Seg<u64>) -> u64 {
         s.lo + (s.hi - s.lo) / 2

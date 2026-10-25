@@ -70,8 +70,11 @@ celeste-rust (src/)
                         them (`conventions`): differential (the checks'
                         one harness and verdict), arcs (the transfers
                         against the reference), replay (the tree from its
-                        recorded graph), census (the kernel census,
-                        rebuilt), explain (a kernel's decline, rebuilt)
+                        recorded graph), keys (the keys against the
+                        boundary, through `frame::RowCheck`), gate (the arc
+                        gate's fingerprints, the arc phase rerun), census
+                        (the kernel census, rebuilt), explain (a kernel's
+                        decline, rebuilt)
   settings.rs           the run's settings (flags), the tree's record
   starts.rs             the feasible loading-jank J's and their classes
   par.rs, metrics.rs, concrete.rs, game_runner.rs
@@ -218,7 +221,8 @@ code), each field's index in append-only bit runs of a 127-bit key that
 never moves as dictionaries grow. A shape needing more bits is fatal. The
 append step looks keys up read-only during a wave; a code they lack makes
 the key PROVISIONAL until the frame's end appends the new codes sorted.
-`--key-check` compares every row's key with `Rt2::boundary_canonicalize`.
+`check keys` compares every row's key with `Rt2::boundary_canonicalize`
+(`check::keys`, through the forward's one observer seam `frame::RowCheck`).
 
 The key holds NO POSITION: the position object's x/y contribute only their
 part past the cell's whole pixel (`Code::pos`). States sharing all but the
@@ -456,7 +460,11 @@ act" distributes over unions, so the union over all paths is exact.
    With `--ceiling` a refutation or no witness is an error. Its cost is
    the number of concrete states inside W.
 
-The outcome goes to `<dir>/result.json` (levels, bounds, verdict, witness).
+The outcome goes to `<dir>/result.json` (levels, bounds, verdict, witness
+and its path), and the final level's MARKS RECORD to `<dir>/support.marks.bin`
+(W's support) and `arc.marks.bin` (the nodes reached inside W from the
+start): what `export-ui` draws, always written (a rerun of the backward over a
+big tree costs what the search's arc phase did).
 
 **When to use the ladder.** One level where the bound is tight; the
 objects ladder (`--level r0sxn,r0sx`) where the level-0 bound is well
@@ -497,12 +505,19 @@ own W, for the shortest run valid in both (plans/float.md).
 ## Checks
 
 The check ladder is `./check.sh t0 t1 t2 big` (plans/devloop.md). The
-verification surface behind it:
+verification surface behind it. Every check is a TOOL (`src/check/`,
+`rewrite check ...`, `gate`, `explain`, `bench frame --metrics`' census): it
+reads trees and records or rebuilds through the core's entry points, and the
+core names none (`conventions`); the core keeps only its guards (fatal,
+always on) and the seams a tool asks for: `--phases`' timers, the kernels'
+slice counters (`Kernels::counting`, the census) and the forward's row
+observer (`frame::RowCheck`, `check keys`).
 
 - **The pinned room (1,0) gates** (`gates/`): each frame's states, edges
   (with their transfers) and hulls f0-f44 (`ckhash --edges --hulls`), the
   arc search at a synthetic win (W's support and fingerprint per frame,
-  optimum 33, the witness), their float twins and the dual gate.
+  optimum 33, the witness: `rewrite gate --search-dir`, the arc phase rerun
+  over the finished search), their float twins and the dual gate.
 - **The known-route check** (`search::known`): `search --prefer FILE` and
   `rewrite check known` step a known solution through the reference engine
   and FAIL at the first pruning step that drops it: level -1, the ladder's
@@ -510,7 +525,7 @@ verification surface behind it:
   errors produce a wrong optimum or a false tie, never a fake improvement,
   so nothing else notices them.
 - **Kernels against the reference**: `check ref` (row by row),
-  `--key-check` (keys against the boundary), `check widen` (the widening
+  `check keys` (keys against the boundary), `check widen` (the widening
   table's two sides agree), `check arcs` (every edge has a transfer;
   sampled transfers probed with the reference inside and outside their
   guards). `kernel lanes: missed 0` in every log.
