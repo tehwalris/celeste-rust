@@ -264,7 +264,7 @@ fn apply_loading_frame(game: &str, j: usize, (rx, ry): (i16, i16)) -> Result<Str
     let call = format!("load_room({}, {})", rx, ry);
     anyhow::ensure!(game.matches(&call).count() == 1, "--loading-jank: the start room's `{call}` was not found exactly once");
     let frame = format!(
-        "{call} for i={first},#objects do local o=objects[i] if o.spd.x ~= 0 or o.spd.y ~= 0 then o.move(o.spd.x,o.spd.y) end if o.type.update~=nil then o.type.update(o) end end _draw()"
+        "{call} for i={first},#objects do local o=objects[i] if o.type == player or o.spd.x ~= 0 or o.spd.y ~= 0 then o.move(o.spd.x,o.spd.y) end if o.type.update~=nil then o.type.update(o) end end _draw()"
     );
     Ok(game.replacen(&call, &frame, 1))
 }

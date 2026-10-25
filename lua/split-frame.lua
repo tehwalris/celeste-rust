@@ -51,7 +51,7 @@ function _update()
 		-- update each object, up to the player's move
 		foreach(objects,function(obj)
 			if __phase ~= nil then return end
-			if obj.spd.x ~= 0 or obj.spd.y ~= 0 then
+			if obj.type == player or obj.spd.x ~= 0 or obj.spd.y ~= 0 then
 				obj.move(obj.spd.x,obj.spd.y)
 			end
 			if obj.type == player then __phase = {} return end
@@ -77,7 +77,7 @@ function _update()
 			end
 			return
 		end
-		if obj.spd.x ~= 0 or obj.spd.y ~= 0 then
+		if obj.type == player or obj.spd.x ~= 0 or obj.spd.y ~= 0 then
 			obj.move(obj.spd.x,obj.spd.y)
 		end
 		if obj.type.update~=nil then

@@ -48,9 +48,9 @@ pub enum LoadingMove {
     /// `o.move(o.spd.x, o.spd.y)` always, as the original cart's `_update`
     /// does (celeste.lua:1195): this replay's, always.
     Unguarded,
-    /// Only with a nonzero speed, as the traced cart's loading frame
-    /// (`trace::cart::apply_loading_frame`) and every frame of the minimal
-    /// cart.
+    /// Only with a nonzero speed, as the traced cart moves every object but
+    /// the player (`trace::cart::apply_loading_frame` and every frame of the
+    /// minimal cart; a loading frame holds no player).
     Guarded,
 }
 

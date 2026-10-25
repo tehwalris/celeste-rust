@@ -921,7 +921,7 @@ function _update()
 
 	-- update each object
 	foreach(objects,function(obj)
-		if obj.spd.x ~= 0 or obj.spd.y ~= 0 then
+		if obj.type == player or obj.spd.x ~= 0 or obj.spd.y ~= 0 then
 			obj.move(obj.spd.x,obj.spd.y)
 		end
 		if obj.type.update~=nil then
