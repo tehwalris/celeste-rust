@@ -59,9 +59,12 @@ A compile-time choice: `celeste_core::arith::Arithmetic`, on the number
 type itself (`Fixed` is `Pico8Num`, `Float` is `LuaF64`; a code is the raw
 bits, `u64` for a double), the graph's rules `transpile::garith::GraphArith`,
 the kernels' lanes `compiled::KernelLanes`, the remainder model
-`search::rem::Rem` (`P8`, `LuaF64`: the transfers), the circle its points
-are `search::arcs::Circle` (`Fixed16`, `rem_f64::Doubles`: the hulls, the
-arcs' sets). Fixed is every default type parameter.
+`search::rem::Rem` (`P8`, `LuaF64`: the points, the transfers' records),
+the circle its points are `search::arcs::Circle` (`Fixed16`, `Doubles`:
+the hulls, the arcs' sets). A frame's captures become a transfer by ONE
+decoder for both (`rem::decode`: the arithmetic's own operations, every
+comparison by value, `-0` is `0`; 16.16's floor split shifted back by
+1/2 first). Fixed is every default type parameter.
 
 ## The remainder model and the round fork
 
@@ -78,9 +81,11 @@ One axis, one frame: `r1 = fl(r + ox)`, `k = floor(fl(r1 + 0.5))`,
   `Fork`/`Frag`/`ForkOk` of `Cut::Rounds`, the kernels' `round_cut`). A literal splits
   into trace states (`Domain::literal_fragments`), as a literal floor fork.
 - A transfer is `Mono(ox, k)` (`r -> fl(fl(r + ox) - k)`) or `Const`, on a
-  guard (an order-interval of doubles) found exactly by bisection with the
-  operation. It is monotone, as 16.16's translations are (`arcs::Transfer`:
-  one model, `Circle::Mono` the arithmetic's). A point is a double's
+  guard (an order-interval of doubles) found exactly by a search with the
+  operation (`rem::first`: from the point of `v - ox`, galloping, then
+  bisecting; 16.16's by its closed form). It is monotone, as 16.16's
+  translations are (`arcs::Transfer`: one model, `Circle::Mono` the
+  arithmetic's). A point is a double's
   total-order key; W is exact in the remainder, as in fixed: the PULL of a
   segment is a segment, computed exactly.
 - The forward is the HULL forward (option (b)): a state's remainders as an

@@ -8,6 +8,21 @@
 //! W_{t+1}(p) ∪ U pull_e(W_{t+1}(m))`: no graph is held, and a node no
 //! winning set reaches is never touched. Exact: "intersect with the guard,
 //! then act" distributes over unions.
+//!
+//! THE SAME AT ANY THREAD COUNT, though a step's reads are an UNORDERED
+//! fold (`Pool::drain`): which worker reads which (region, frame), where a
+//! round's budget cuts the reads, and the ranges the fold and the merge
+//! split the nodes into (sampled from what was read) all depend on the
+//! scheduling; W does not. A source's in-edges are a SET (each range's,
+//! sorted and deduplicated whoever read them), its set the UNION of its
+//! base and their pulls (commutative and associative: rounds fold in any
+//! partition). The step's own sets (`local`) are numbered as they are made,
+//! by the scheduling, but a `local` code is only compared by content
+//! (`set_of`, `Interner::find`), and equal codes are equal sets; they enter
+//! the arena by content (`Interner::intern`) in id order (the merge's ranges
+//! are joined in id order, each in id order), so the arena's codes do not
+//! depend on it either; `finish` numbers the sets by use, ties by arena
+//! code. Only `A::Rounds`, `A::MaxRound` and the walls do (unpinned).
 
 use super::arcs::{region_hash, Circle, Fixed16, Interner, Region, RegionArena, RegionRef};
 use super::rem::{Rem, Xfer};
@@ -504,83 +519,85 @@ impl<'a, N: Rem> Backward<'a, N> {
     }
 
     /// One ROUND of reads from item `start` until it holds `round_emits`
-    /// in-edges (at step t, frames <= t + 1: sources of layer <= t). Per
-    /// worker its in-edges sorted and distinct; and the item it stopped at
-    /// (between items: one region bounds it by its in-edges at one frame).
+    /// in-edges (at step t, frames <= t + 1: sources of layer <= t), an
+    /// UNORDERED fold (`Pool::drain`; why that is sound: the module doc).
+    /// Per worker its in-edges sorted and distinct; and the item it stopped
+    /// at (between items: one region bounds it by its in-edges at one frame).
     fn read_round(&self, items: &[(usize, u32, usize, usize)], start: usize) -> anyhow::Result<(Vec<(Vec<Emit>, ArcStats)>, usize)> {
         use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
         let (cur, changed, store, budget) = (&self.cur, &self.changed, self.store, self.round_emits);
         let total = items.last().map_or(0, |x| x.0);
-        let (next, held) = (AtomicUsize::new(start), AtomicUsize::new(0));
-        let parts: Vec<anyhow::Result<(Vec<Emit>, ArcStats)>> = std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..self.threads)
-                .map(|_| {
-                    sc.spawn(|| -> anyhow::Result<(Vec<Emit>, ArcStats)> {
-                        let (mut emits, mut stats) = (Vec::new(), ArcStats::default());
-                        let mut dec = crate::storage::edges::Decoder::default();
-                        // The group's targets by (key, cell); per block
-                        // target rank, its changed cells and first target.
-                        let mut targets: Vec<((u64, u64), u8, u32)> = Vec::new();
-                        let mut ranks: Vec<(u64, u32)> = Vec::new();
-                        while held.load(Relaxed) < budget {
-                            let k = next.fetch_add(1, Relaxed);
-                            if k >= total {
-                                break;
-                            }
-                            let g = items.partition_point(|x| x.0 <= k) - 1;
-                            let (first_item, first_frame, a, b) = items[g];
-                            let f = first_frame + (k - first_item) as u32;
-                            let region = cur[changed[a] as usize].id.region;
-                            targets.clear();
-                            for &n in &changed[a..b] {
-                                let n = &cur[n as usize];
-                                targets.push((n.id.key, n.id.local, n.set));
-                            }
-                            let before = emits.len();
-                            let slot = region % crate::storage::cells::SLOTS;
-                            stats.add(A::Opens, 1);
-                            for seg in store.segments(f, region) {
-                                stats.add(A::Segments, 1);
-                                stats.add(A::Stored, seg.bytes.len() as u64);
-                                stats.add(A::Raw, seg.raw as u64);
-                                let blk = dec.open(&seg)?;
-                                // The block's targets against the group's (both sorted).
-                                ranks.clear();
-                                let mut j = 0usize;
-                                for &tk in &blk.t_keys {
-                                    j = seek(&targets, j, tk);
-                                    let mut m = 0u64;
-                                    let mut e = j;
-                                    while e < targets.len() && targets[e].0 == tk {
-                                        m |= 1u64 << targets[e].1;
-                                        e += 1;
-                                    }
-                                    ranks.push((m, j as u32));
-                                }
-                                stats.add(A::Bundles, seg.bundles as u64);
-                                let sources = &blk.sources;
-                                blk.records(|r| {
-                                    let (m, at) = ranks[r.t as usize];
-                                    crate::storage::bundle::edges(m & r.mask, slot, r.o, |c, _, s_cell| {
-                                        let set = targets[at as usize..].iter().find(|x| x.1 as u32 == c).expect("a changed cell").2;
-                                        let (s_shape, s_key) = sources[r.s as usize];
-                                        emits.push(Emit { p: Sk::at(s_shape, s_key, s_cell), set, xfer: r.x, layer: (f - 1) as u16 });
-                                    });
-                                })?;
-                            }
-                            stats.add(A::InEdges, (emits.len() - before) as u64);
-                            held.fetch_add(emits.len() - before, Relaxed);
+        let held = AtomicUsize::new(0);
+        /// A reader's in-edges and stats, and its scratch.
+        #[derive(Default)]
+        struct Reader {
+            emits: Vec<Emit>,
+            stats: ArcStats,
+            dec: crate::storage::edges::Decoder,
+            // The group's targets by (key, cell); per block target rank,
+            // its changed cells and first target.
+            targets: Vec<((u64, u64), u8, u32)>,
+            ranks: Vec<(u64, u32)>,
+        }
+        crate::par::Pool::new(self.threads).drain(
+            start,
+            total,
+            Reader::default,
+            |reader, k| {
+                let Reader { emits, stats, dec, targets, ranks } = reader;
+                let g = items.partition_point(|x| x.0 <= k) - 1;
+                let (first_item, first_frame, a, b) = items[g];
+                let f = first_frame + (k - first_item) as u32;
+                let region = cur[changed[a] as usize].id.region;
+                targets.clear();
+                for &n in &changed[a..b] {
+                    let n = &cur[n as usize];
+                    targets.push((n.id.key, n.id.local, n.set));
+                }
+                let before = emits.len();
+                let slot = region % crate::storage::cells::SLOTS;
+                stats.add(A::Opens, 1);
+                for seg in store.segments(f, region) {
+                    stats.add(A::Segments, 1);
+                    stats.add(A::Stored, seg.bytes.len() as u64);
+                    stats.add(A::Raw, seg.raw as u64);
+                    let blk = dec.open(&seg)?;
+                    // The block's targets against the group's (both sorted).
+                    ranks.clear();
+                    let mut j = 0usize;
+                    for &tk in &blk.t_keys {
+                        j = seek(targets, j, tk);
+                        let mut m = 0u64;
+                        let mut e = j;
+                        while e < targets.len() && targets[e].0 == tk {
+                            m |= 1u64 << targets[e].1;
+                            e += 1;
                         }
-                        emits.sort_unstable();
-                        emits.dedup();
-                        emits.shrink_to_fit();
-                        Ok((emits, stats))
-                    })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().expect("a backward reader panicked")).collect()
-        });
-        Ok((parts.into_iter().collect::<anyhow::Result<Vec<_>>>()?, next.into_inner().min(total)))
+                        ranks.push((m, j as u32));
+                    }
+                    stats.add(A::Bundles, seg.bundles as u64);
+                    let sources = &blk.sources;
+                    blk.records(|r| {
+                        let (m, at) = ranks[r.t as usize];
+                        crate::storage::bundle::edges(m & r.mask, slot, r.o, |c, _, s_cell| {
+                            let set = targets[at as usize..].iter().find(|x| x.1 as u32 == c).expect("a changed cell").2;
+                            let (s_shape, s_key) = sources[r.s as usize];
+                            emits.push(Emit { p: Sk::at(s_shape, s_key, s_cell), set, xfer: r.x, layer: (f - 1) as u16 });
+                        });
+                    })?;
+                }
+                stats.add(A::InEdges, (emits.len() - before) as u64);
+                held.fetch_add(emits.len() - before, Relaxed);
+                Ok(())
+            },
+            || held.load(Relaxed) < budget,
+            |mut r| {
+                r.emits.sort_unstable();
+                r.emits.dedup();
+                r.emits.shrink_to_fit();
+                (r.emits, r.stats)
+            },
+        )
     }
 
     /// A set code's set (`local`: the step's own sets).
@@ -1025,7 +1042,7 @@ pub fn gate_w_hash<C: Circle>(node: u64, r: RegionRef<C>) -> u64 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::search::arc_edges::AxisXfer;
+    use crate::search::rem::{AxisXfer, Pair};
     use crate::search::arcs::{point, Act, Seg, Transfer, CIRCLE};
 
     /// `seek` is the linear walk: from every start and for every key, over
@@ -1089,7 +1106,7 @@ pub(crate) mod tests {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SEQ: AtomicU32 = AtomicU32::new(0);
             let dir = crate::testutil::TestDir::new(&format!("arcdp-{name}-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
-            let mut pairs: Vec<crate::search::arc_edges::Pair> = edges.iter().map(|e| (axis(e.2), axis(e.3))).collect();
+            let mut pairs: Vec<Pair<celeste_core::pico8_num::Pico8Num>> = edges.iter().map(|e| (axis(e.2), axis(e.3))).collect();
             pairs.sort_unstable();
             pairs.dedup();
             let mut frames: std::collections::BTreeMap<u32, Vec<(Sk, Sk, u32)>> = Default::default();
@@ -1109,7 +1126,7 @@ pub(crate) mod tests {
         /// The store up to `horizon`, its transfers, and its win seeds.
         pub(crate) fn open(&self, horizon: u32) -> (EdgeStore, Vec<(Transfer, Transfer)>, Vec<(Sk, u32)>) {
             let store = EdgeStore::<celeste_core::pico8_num::Pico8Num>::open(&self.dir, horizon).expect("open");
-            let pairs = store.pairs().iter().map(|p| (p.0.transfer(), p.1.transfer())).collect();
+            let pairs = store.pairs().iter().map(<celeste_core::pico8_num::Pico8Num as Rem>::xfer).collect();
             let wins = self.wins.iter().map(|&k| (sid(k), self.layers[k as usize])).collect();
             (store, pairs, wins)
         }

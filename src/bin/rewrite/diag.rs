@@ -32,10 +32,6 @@ pub struct CkhashArgs {
     /// its (shape, key, cell), layer and hull.
     #[arg(long)]
     hulls: bool,
-    /// With `--edges`: print step S's edges (target, source, transfer) on
-    /// stderr, to diff two trees' edges at the step whose line differs.
-    #[arg(long)]
-    dump_edges: Option<u32>,
 }
 
 #[derive(clap::Args)]
@@ -77,22 +73,10 @@ pub struct RobustArgs {
 pub fn ckhash(run: &Settings, a: CkhashArgs) -> Result<()> {
     let t = a.tree.open(run)?;
     let (dir, to, cfg) = (&t.dir, t.frame(a.steps)?, &t.settings);
-    let (edges, hulls, dump_edges) = (a.edges, a.hulls, a.dump_edges);
-    if cfg.arith != Arith::Fixed {
-        anyhow::ensure!(dump_edges.is_none(), "--dump-edges: fixed trees only so far");
-    }
+    let (edges, hulls) = (a.edges, a.hulls);
     let lines = celeste_rust::with_arith!(cfg.arith, N => celeste_rust::storage::fingerprint::<N>(dir, to, edges, hulls, cfg.threads())?);
     for line in lines {
         println!("{line}");
-    }
-    if let Some(frame) = dump_edges {
-        let tree = Tree::<P8>::open(dir, to)?;
-        let content = tree.space.content_hash();
-        let eg = celeste_rust::storage::edges::EdgeStore::<P8>::open(&dir, to)?;
-        let node = |s: Sk| content.state(tree.shapes[s.shape() as usize], s.key, s.cell());
-        for e in eg.edges_at(frame, cfg.threads())? {
-            eprintln!("edge {:016x} {:016x} {:?}", node(e.dst), node(e.src), eg.pair(e.xfer));
-        }
     }
     Ok(())
 }

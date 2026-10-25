@@ -21,7 +21,7 @@ use super::visited::{Key, VisitedSet};
 use super::Sk;
 use super::stats::{Lap, Stats, S};
 use crate::frame::{Filters, FrameStep};
-use crate::search::rem::Rem;
+use crate::search::rem::{Pair, Rem};
 use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::exact::{KeyAdditions, MissKey, Provisional};
 
@@ -512,7 +512,7 @@ fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, cx: &WaveCtx<N>, front: &Frontier
     let routes = Routes::default();
     // The visited set and the tree's transfer table are read only until the
     // frame's end; the gather numbers the workers' new pairs (`Gather::fresh`).
-    let xtabs: Vec<std::sync::RwLock<Vec<N::Pair>>> = (0..workers).map(|_| Default::default()).collect();
+    let xtabs: Vec<std::sync::RwLock<Vec<Pair<N>>>> = (0..workers).map(|_| Default::default()).collect();
     let xfers_before = base.pairs.len();
     let mut sinks: Vec<UnitSink<N>> = (0..workers).map(|w| UnitSink::new(visited, &routes, cx.skeletons, prov, cx.filters, cx.frame, w as u32, base, &xtabs[w], s)).collect();
     let mut scratch: Vec<super::route::JobScratch> = (0..workers).map(|_| super::route::JobScratch::default()).collect();
@@ -1159,7 +1159,7 @@ struct Gather<N: Rem> {
 /// The wave's pipeline: per slice its units left and chunks, the slices
 /// gathered, the routes, the jobs (by slice, heaviest first within one).
 struct Pipe<'a, N: Rem> {
-    xtabs: &'a [std::sync::RwLock<Vec<N::Pair>>],
+    xtabs: &'a [std::sync::RwLock<Vec<Pair<N>>>],
     next_unit: AtomicUsize,
     left: Vec<AtomicUsize>,
     /// Per slice, per worker its transfer table's length after its units of
@@ -1206,8 +1206,8 @@ impl<N: Rem> Pipe<'_, N> {
             let mut chunks = std::mem::take(&mut *self.chunks[k].lock().expect("a slice's chunks"));
             let g = &mut *g;
             let upto: Vec<usize> = self.upto[k].iter().zip(&g.merged).map(|(u, &m)| u.load(Ordering::Acquire).max(m)).collect();
-            let tabs: Vec<std::sync::RwLockReadGuard<Vec<N::Pair>>> = (0..g.merged.len()).map(|w| self.xtab(w)).collect();
-            let tails: Vec<&[N::Pair]> = tabs.iter().enumerate().map(|(w, t)| &t[g.merged[w]..upto[w]]).collect();
+            let tabs: Vec<std::sync::RwLockReadGuard<Vec<Pair<N>>>> = (0..g.merged.len()).map(|w| self.xtab(w)).collect();
+            let tails: Vec<&[Pair<N>]> = tabs.iter().enumerate().map(|(w, t)| &t[g.merged[w]..upto[w]]).collect();
             let first = g.first;
             for (w, ids) in g.fresh.merge(&tails).into_iter().enumerate() {
                 g.remaps[w].extend(ids.into_iter().map(|i| first + i));
@@ -1249,7 +1249,7 @@ impl<N: Rem> Pipe<'_, N> {
         }
     }
 
-    fn xtab(&self, w: usize) -> std::sync::RwLockReadGuard<'_, Vec<N::Pair>> {
+    fn xtab(&self, w: usize) -> std::sync::RwLockReadGuard<'_, Vec<Pair<N>>> {
         self.xtabs[w].read().expect("a transfer table")
     }
 }

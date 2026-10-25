@@ -43,7 +43,7 @@ pub struct State<D: Domain> {
     /// fragment)`, innermost last: states of different fragments never merge in
     /// `collapse`, and rejoin when the call that split them returns.
     pub frag: Vec<(usize, usize, u16)>,
-    /// THE ARC CAPTURE (`search::arc_edges`): per axis, what this path's split
+    /// THE ARC CAPTURE (`search::rem::decode`): per axis, what this path's split
     /// of the PLAYER's own remainder did. `None` unless the trace captures. Not
     /// in the heap, so no shape, key or fingerprint sees it; merged per case.
     pub arc: Option<Box<[ArcAxis<D>; 2]>>,
@@ -51,7 +51,7 @@ pub struct State<D: Domain> {
 
 /// One axis of the arc capture: whether the path took the player's split on
 /// it, and if so the split's argument (`rem + ox + 1/2`), the fragment it
-/// took, and the move's `ox` (`search::arc_edges::RawAxis`).
+/// took, and the move's `ox` (`search::rem::Capture`).
 #[derive(Clone)]
 pub struct ArcAxis<D: Domain> {
     pub took: D::Bool,

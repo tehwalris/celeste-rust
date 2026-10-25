@@ -4,9 +4,8 @@
 //! the point `r + 32768` of `0..CIRCLE`; a set is sorted, disjoint,
 //! non-adjacent half-open segments (an arc across the wrap is two). The
 //! two-axis `Region` is generic over the `Circle` (16.16's `Fixed16`, the
-//! doubles' `rem_f64::Doubles`), and so is an edge's `Transfer`, one model
-//! for both: a guard and a MONOTONE action or a constant; the pull is
-//! exact on both.
+//! doubles' `Doubles`), and so is an edge's `Transfer`, one model for both:
+//! a guard and a MONOTONE action or a constant; the pull is exact on both.
 
 use super::rem::Word;
 
@@ -62,9 +61,6 @@ pub trait Circle: Copy + std::fmt::Debug + Default + PartialEq + Eq + PartialOrd
     /// The points of guard `g` that `m` maps into `s`, EXACTLY (`m` is
     /// monotone: one segment).
     fn pull_mono(m: &Self::Mono, g: Seg<Self::P>, s: Seg<Self::P>) -> Option<Seg<Self::P>>;
-    /// `a` CORRUPTED, to check a check (`rewrite check arcs --fault
-    /// action`): its images moved (guard `g`).
-    fn fault(a: &Act<Self>, g: Seg<Self::P>) -> Act<Self>;
     /// A segment as one word of the gate's fingerprints (`backward::gate_w_hash`).
     fn seg_word(s: Seg<Self::P>) -> u64;
     /// A point in the middle of `s` (a probe).
@@ -134,20 +130,6 @@ impl<C: Circle> Transfer<C> {
             Act::Const(_) => "const",
         }
     }
-
-    /// CORRUPTED, to check a check (`rewrite check arcs --fault`): its
-    /// guard's lowest point dropped (`guard`), or its images moved.
-    pub(crate) fn faulty(&self, guard: bool) -> Self {
-        let mut t = *self;
-        if guard {
-            if C::next(t.guard.lo) < t.guard.hi {
-                t.guard.lo = C::next(t.guard.lo);
-            }
-        } else {
-            t.act = C::fault(&t.act, t.guard);
-        }
-        t
-    }
 }
 
 /// 16.16's circle: 65536 points, its transfers translations (`rem += ox`
@@ -188,20 +170,123 @@ impl Circle for Fixed16 {
         let hi = (s.hi as i64 - *d as i64).min(g.hi as i64);
         (lo < hi).then(|| Seg { lo: lo as u32, hi: hi as u32 })
     }
-    /// A translation by one more point (one less at the circle's top), a
-    /// constant moved by one point.
-    fn fault(a: &Act<Fixed16>, g: Seg) -> Act<Fixed16> {
-        match *a {
-            Act::Mono(d) => Act::Mono(if g.hi as i64 + d as i64 + 1 <= CIRCLE as i64 { d + 1 } else { d - 1 }),
-            Act::Const(c) => Act::Const((c + 1) % CIRCLE),
-        }
-    }
     #[inline]
     fn seg_word(s: Seg) -> u64 {
         (s.lo as u64) << 32 | s.hi as u64
     }
     fn mid(s: Seg) -> u32 {
         (s.lo + s.hi) / 2
+    }
+}
+
+/// The index of `0` among the doubles' points (and the count of doubles in
+/// `[-1/2, 0)`): `1/2`'s bits.
+pub(crate) const ZERO: u64 = 0x3FE0_0000_0000_0000;
+/// The doubles' points: the doubles of `[-1/2, 1/2)` by value.
+pub(crate) const POINTS: u64 = 2 * ZERO;
+
+/// The doubles' point of remainder `v`, its INDEX in value order among the
+/// doubles of `[-1/2, 1/2)` (`0` is `-1/2`, `ZERO` is `0` and `-0.0` too: no
+/// read of a remainder tells the zeros apart, `POINTS - 1` is
+/// `1/2 - 2^-54`); `None` outside `[-1/2, 1/2)`.
+#[inline]
+pub(crate) fn index(v: f64) -> Option<u64> {
+    if !(-0.5..0.5).contains(&v) {
+        return None;
+    }
+    let b = v.abs().to_bits();
+    Some(if v > 0.0 { ZERO + b } else { ZERO - b })
+}
+
+/// The remainder of the doubles' point `i` (`+0.0` at `ZERO`).
+#[inline]
+pub(crate) fn value(i: u64) -> f64 {
+    debug_assert!(i < POINTS);
+    if i >= ZERO {
+        f64::from_bits(i - ZERO)
+    } else {
+        -f64::from_bits(ZERO - i)
+    }
+}
+
+/// The doubles' monotone action `r -> fl(fl(r + ox) - k)` (`ox` its bits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Shift {
+    pub(crate) ox: u64,
+    pub(crate) k: i32,
+}
+
+/// `move` on one axis after the round split: `fl(fl(r + ox) - k)`.
+#[inline]
+fn shift(r: f64, ox: f64, k: f64) -> f64 {
+    (r + ox) - k
+}
+
+/// The first point of `lo..hi` from which `p` (false, then true) holds
+/// (`hi`: none).
+fn first_in(mut lo: u64, mut hi: u64, p: impl Fn(u64) -> bool) -> u64 {
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if p(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+/// The DOUBLES' circle (plans/float.md "The remainder model and the round
+/// fork"): `POINTS` points (`index`) as `u64` words, monotone maps `Shift`:
+/// the PULL of a segment is the guard's points between two bisections,
+/// exactly; the image the interval between its ends' images.
+///
+/// THE TOP SLIVER: at an integer speed the doubles `{1/2 - 2^-54,
+/// 1/2 - 2^-53}` round onto the cut (`fl(r - 2) = -3/2`), a piece no 16.16
+/// remainder takes; the hull forward pushes it only where a hull reaches it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Doubles;
+
+impl Circle for Doubles {
+    type P = u64;
+    type W = u64;
+    type Mono = Shift;
+    const SIZE: u64 = POINTS;
+    const MAX_SEGS: usize = 1 << 20;
+    #[inline]
+    fn next(p: u64) -> u64 {
+        p + 1
+    }
+    #[inline]
+    fn prev(p: u64) -> u64 {
+        p - 1
+    }
+    #[inline]
+    fn wide(p: u64) -> u64 {
+        p
+    }
+    #[inline]
+    fn narrow(v: u64) -> u64 {
+        v
+    }
+    #[inline]
+    fn apply(m: &Shift, i: u64) -> u64 {
+        let v = shift(value(i), f64::from_bits(m.ox), m.k as f64);
+        index(v).unwrap_or_else(|| panic!("transfer {m:?}: the image {v:?} of {:?} is not a remainder", value(i)))
+    }
+    /// The guard's points whose image is in `s`: past every point whose
+    /// image is below `s.lo`, before the first whose image reaches `s.hi`.
+    fn pull_mono(m: &Shift, g: Seg<u64>, s: Seg<u64>) -> Option<Seg<u64>> {
+        let lo = first_in(g.lo, g.hi, |r| Self::apply(m, r) >= s.lo);
+        let hi = first_in(lo, g.hi, |r| Self::apply(m, r) >= s.hi);
+        (lo < hi).then_some(Seg { lo, hi })
+    }
+    #[inline]
+    fn seg_word(s: Seg<u64>) -> u64 {
+        celeste_engine::runtime2::mix64(s.lo) ^ s.hi.rotate_left(32)
+    }
+    fn mid(s: Seg<u64>) -> u64 {
+        s.lo + (s.hi - s.lo) / 2
     }
 }
 
@@ -639,6 +724,26 @@ mod tests {
 
     fn lcg(s: &mut u64) -> u32 {
         (crate::testutil::lcg(s) >> 33) as u32
+    }
+
+    /// The doubles' points are the remainders in value order, neighbours
+    /// neighbours, the zeros one point.
+    #[test]
+    fn the_doubles_points_are_the_remainders_in_order() {
+        assert_eq!(value(0), -0.5);
+        assert_eq!(value(ZERO).to_bits(), 0);
+        assert_eq!(value(POINTS - 1), 0.5 - f64::EPSILON / 4.0);
+        assert_eq!((index(-0.0), index(0.0)), (Some(ZERO), Some(ZERO)));
+        assert_eq!((index(0.5), index((-0.5f64).next_down())), (None, None));
+        let mut s = 7u64;
+        for _ in 0..10_000 {
+            let (i, j) = ((crate::testutil::lcg(&mut s) >> 1) % POINTS, (crate::testutil::lcg(&mut s) >> 1) % POINTS);
+            assert_eq!(index(value(i)), Some(i));
+            assert_eq!(i < j, value(i) < value(j));
+            if i + 1 < POINTS {
+                assert_eq!(value(i + 1), value(i).next_up(), "{i}: neighbours are neighbours");
+            }
+        }
     }
 
     /// The canonical sweep against the plain union of pieces, and `pull`

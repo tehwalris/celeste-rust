@@ -68,17 +68,17 @@ pub(super) struct Path<L> {
 pub(super) fn search<C: Concrete>(c: &C, frames: u32, bound: u32, prefer: Option<&[u8]>, workers: usize) -> Result<Option<Path<C::Label>>> {
     let name = C::NAME;
     ensure!(bound <= frames, "the bound f{bound} is past the horizon f{frames}");
-    let engines: Vec<std::sync::Mutex<C::Engine>> = c.engines(workers.max(1))?.into_iter().map(std::sync::Mutex::new).collect();
-    let (start, start_label) = c.start(&mut engines[0].lock().expect("an engine"))?;
+    let mut engines: Vec<C::Engine> = c.engines(workers.max(1))?;
+    let (start, start_label) = c.start(&mut engines[0])?;
     let t0 = std::time::Instant::now();
     crate::metrics::mem_phase(&format!("{name}: engines up"));
-    if let Some(path) = dfs_at_bound(c, &mut engines[0].lock().expect("an engine"), &start, frames, bound, prefer)? {
+    if let Some(path) = dfs_at_bound(c, &mut engines[0], &start, frames, bound, prefer)? {
         let (inputs, labels) = path.into_iter().unzip::<_, _, Vec<u8>, Vec<C::Label>>();
         return Ok(Some(Path { inputs, labels: std::iter::once(start_label).chain(labels).collect() }));
     }
     // BREADTH-FIRST: the first layer with a win is the optimum.
     let mut t = std::time::Instant::now();
-    let ls = layers(c, &engines, start, frames, &Policy { inputs: &|k| Some(input_order(prefer, k).collect()), replay: false }, |k, before, next, won, steps| {
+    let ls = layers(c, &mut engines, start, frames, &Policy { inputs: &|k| Some(input_order(prefer, k).collect()), replay: false }, |k, before, next, won, steps| {
         eprintln!(
             "[{name}] layer {:3}: {before} states -> {} inside W{}{}; {steps} steps so far, {:.1} s, rss {:.1} GB",
             k + 1,
@@ -221,11 +221,11 @@ pub(super) struct Layers<C: Concrete> {
 
 /// THE LAYERED SEARCH of `c` from `start` for at most `n` layers: per layer
 /// each state's successors under the policy's inputs (chunks of states in
-/// parallel, a free engine each, merged in order: the same at any thread
-/// count), each state once (by its key, the first in order), to the first
+/// parallel on the workers' `engines`, one a worker, merged in order: the
+/// same at any thread count), each state once (by its key, the first in order), to the first
 /// layer with a win. `note(k, states, next layer's, won, steps)` after
 /// each layer.
-pub(super) fn layers<C: Concrete>(c: &C, engines: &[std::sync::Mutex<C::Engine>], start: C::State, n: u32, how: &Policy, mut note: impl FnMut(u32, usize, &[C::State], bool, u64)) -> Result<Layers<C>> {
+pub(super) fn layers<C: Concrete>(c: &C, engines: &mut [C::Engine], start: C::State, n: u32, how: &Policy, mut note: impl FnMut(u32, usize, &[C::State], bool, u64)) -> Result<Layers<C>> {
     /// A successor in (parent, input, leaf) order; `Err`: a win's leaf.
     struct Succ<C: Concrete> {
         parent: u32,
@@ -243,9 +243,9 @@ pub(super) fn layers<C: Concrete>(c: &C, engines: &[std::sync::Mutex<C::Engine>]
     for k in 0..n {
         let Some(inputs) = (how.inputs)(k) else { break };
         let cur_ref = &cur;
-        let parts: Vec<(Vec<Succ<C>>, u64)> = crate::par::Pool::new(engines.len()).map_with(
+        let parts: Vec<(Vec<Succ<C>>, u64)> = crate::par::Pool::new(engines.len()).map_on(
+            engines,
             cur.len().div_ceil(CHUNK),
-            || engines.iter().find_map(|e| e.try_lock().ok()).ok_or_else(|| anyhow::anyhow!("no free {} engine", C::NAME)),
             |eng, ch| {
                 let (mut got, mut steps) = (Vec::new(), 0u64);
                 // A search dedups within the chunk already (the first in

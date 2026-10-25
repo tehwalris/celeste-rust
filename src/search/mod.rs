@@ -2,7 +2,6 @@
 //! modules: plans/architecture.md "Code layout".
 #![warn(unreachable_pub)]
 pub mod arc_check;
-pub(crate) mod arc_edges;
 pub(crate) mod arcs;
 pub mod backward;
 pub(crate) mod concrete;
@@ -16,7 +15,6 @@ pub mod level_minus_one;
 pub(crate) mod reach;
 pub(crate) mod replay;
 pub mod rem;
-pub(crate) mod rem_f64;
 pub mod result;
 pub mod robust;
 pub mod tree;

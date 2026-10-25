@@ -304,11 +304,10 @@ impl ArcSlots {
         m
     }
 
-    /// The record's pair of the transfer `words` (`Rem::transfer`: 16.16's
-    /// is `arc_edges::decode_axis`). An undecided `took` is FATAL: the
-    /// record would be an unchecked claim about the remainder; so is a
-    /// refused transfer.
-    fn decode<N: KernelLanes>(&self, words: &RawWords<N>, chunk: &Rt2<N>, lane: usize, outcome: usize) -> N::Pair {
+    /// The record's pair of the transfer `words` (`rem::decode`). An
+    /// undecided `took` is FATAL: the record would be an unchecked claim
+    /// about the remainder; so is a refused transfer.
+    fn decode<N: KernelLanes>(&self, words: &RawWords<N>, chunk: &Rt2<N>, lane: usize, outcome: usize) -> crate::search::rem::Pair<N> {
         let one = N::Raw::from(1u32);
         let num = |r: N::Raw| N::from_raw(r).unwrap_or_else(|| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: a transfer root {r:?} is no number", chunk.shape_hash));
         let axis = |a: usize| -> Capture<N> {
@@ -321,7 +320,7 @@ impl ArcSlots {
             );
             Capture { took: words[2 * base] == one, pre: pair(1), frag: pair(2), ox: pair(3), fin: self.fin.then(|| pair(AxisRoots::FIN)) }
         };
-        N::transfer(&axis(0), &axis(1)).unwrap_or_else(|e| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: {e}", chunk.shape_hash))
+        crate::search::rem::decode(&axis(0), &axis(1)).unwrap_or_else(|e| panic!("arc edges: shape {:#x} outcome {outcome} lane {lane}: {e}", chunk.shape_hash))
     }
 }
 

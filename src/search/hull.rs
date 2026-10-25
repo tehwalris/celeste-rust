@@ -373,143 +373,201 @@ impl<C: Circle> HullAcc<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::search::arcs::{Act, Transfer, CIRCLE};
+    use crate::search::arcs::{Act, Doubles, Transfer, CIRCLE};
+    use crate::search::rem::tests::{lcg, pieces};
 
-    fn lcg(s: &mut u64) -> u32 {
-        (crate::testutil::lcg(s) >> 33) as u32
+    /// What the circle suites draw: points (often near the ends and the
+    /// middle) and transfers (16.16: any translation keeping its guard
+    /// inside the circle, or a constant; doubles: the decoder's pieces of
+    /// real speeds, or a constant).
+    trait Draw: Circle {
+        fn transfers() -> Box<dyn Fn(&mut u64) -> Transfer<Self>>;
     }
 
-    fn arc(s: &mut u64) -> Arc {
+    impl Draw for Fixed16 {
+        fn transfers() -> Box<dyn Fn(&mut u64) -> Transfer<Fixed16>> {
+            Box::new(|s| {
+                let (a, b) = ((lcg(s) % CIRCLE as u64) as u32, (lcg(s) % CIRCLE as u64) as u32);
+                let guard = match lcg(s) % 4 {
+                    0 => Seg { lo: 0, hi: CIRCLE },
+                    1 => Seg { lo: 0, hi: a.max(1) },
+                    2 => Seg { lo: a, hi: CIRCLE },
+                    _ => Seg { lo: a.min(b), hi: a.max(b) + 1 },
+                };
+                let room = (CIRCLE - guard.hi + guard.lo) as i64 + 1;
+                let act = if lcg(s) % 4 == 0 { Act::Const((lcg(s) % CIRCLE as u64) as u32) } else { Act::Mono((lcg(s) as i64 % room - guard.lo as i64) as i32) };
+                Transfer { guard, act }
+            })
+        }
+    }
+
+    impl Draw for Doubles {
+        fn transfers() -> Box<dyn Fn(&mut u64) -> Transfer<Doubles>> {
+            let ps = pieces::<celeste_core::lua_f64::LuaF64>();
+            Box::new(move |s| match lcg(s) % 8 {
+                0 => Transfer { guard: Seg { lo: 0, hi: Doubles::SIZE }, act: Act::Const(near::<Doubles>(s)) },
+                _ => ps[(lcg(s) % ps.len() as u64) as usize],
+            })
+        }
+    }
+
+    fn near<C: Circle>(s: &mut u64) -> C::P {
+        let n = size::<C>();
+        C::narrow(match lcg(s) % 5 {
+            0 => lcg(s) % 64,
+            1 => n - 1 - lcg(s) % 64,
+            2 => n / 2 - 32 + lcg(s) % 64,
+            _ => lcg(s) % n,
+        })
+    }
+
+    fn arc<C: Circle>(s: &mut u64) -> Arc<C> {
         match lcg(s) % 6 {
-            0 => Arc::point(lcg(s) % CIRCLE),
+            0 => Arc::point(near::<C>(s)),
             1 => Arc::full(),
-            2 => Arc { start: (lcg(s) % CIRCLE) as u16, last: (lcg(s) % 256) as u16 },
-            _ => Arc { start: (lcg(s) % CIRCLE) as u16, last: (lcg(s) % CIRCLE) as u16 },
+            2 => Arc { start: C::store(near::<C>(s)), last: word::<C>(lcg(s) % 256) },
+            _ => Arc { start: C::store(near::<C>(s)), last: word::<C>(lcg(s) % size::<C>()) },
         }
     }
 
-    fn transfer(s: &mut u64) -> Transfer {
-        let (a, b) = (lcg(s) % CIRCLE, lcg(s) % CIRCLE);
-        let guard = match lcg(s) % 4 {
-            0 => Seg { lo: 0, hi: CIRCLE },
-            1 => Seg { lo: 0, hi: a.max(1) },
-            2 => Seg { lo: a, hi: CIRCLE },
-            _ => Seg { lo: a.min(b), hi: a.max(b) + 1 },
-        };
-        // A translation keeping the guard inside the circle.
-        let room = (CIRCLE - guard.hi + guard.lo) as i64 + 1;
-        let act = if lcg(s) % 4 == 0 { Act::Const(lcg(s) % CIRCLE) } else { Act::Mono((lcg(s) as i64 % room - guard.lo as i64) as i32) };
-        Transfer { guard, act }
+    fn hull<C: Circle>(s: &mut u64) -> Hull<C> {
+        Hull { x: arc(s), y: arc(s) }
     }
 
-    /// Probes: the arcs' ends and neighbours, and random points.
-    fn probes(arcs: &[Arc], s: &mut u64) -> Vec<u32> {
-        let mut v: Vec<u32> = (0..16).map(|_| lcg(s) % CIRCLE).collect();
-        for a in arcs {
-            let (lo, hi) = (a.start as u32, (a.start as u32 + a.last as u32) % CIRCLE);
-            for p in [lo, hi] {
-                v.extend([(p + CIRCLE - 1) % CIRCLE, p, (p + 1) % CIRCLE]);
+    /// A transfer's image of a point of its guard.
+    fn apply<C: Circle>(t: &Transfer<C>, p: C::P) -> C::P {
+        t.image(Seg { lo: p, hi: C::next(p) }).expect("a point of the guard").lo
+    }
+
+    /// Probes of arc `a` inside guard `g`: each piece's ends and a random point.
+    fn probes<C: Circle>(a: Arc<C>, g: Seg<C::P>, s: &mut u64) -> Vec<C::P> {
+        let mut ps = Vec::new();
+        a.segs(|seg| {
+            if let Some(c) = clip(seg, g) {
+                let (lo, hi) = (C::wide(c.lo), C::wide(c.hi));
+                ps.extend([lo, hi - 1, lo + lcg(s) % (hi - lo)].map(C::narrow));
             }
-        }
-        v.sort_unstable();
-        v.dedup();
-        v
+        });
+        ps
     }
 
-    /// A push is a superset of the exact image (`Region::push` of the
-    /// hull's box), empty exactly when the image is; the accumulated hull
-    /// does not depend on the order the pushes come in.
-    #[test]
-    fn a_push_holds_the_image_and_the_merge_is_order_free() {
+    /// THE PUSH IS SOUND: a push is a superset of the image (`Region::push`
+    /// of the hull's box, and the cart's image of probes inside the
+    /// guards), empty exactly when the image is; a grown hull's push skips
+    /// only what the smaller one's already held; the accumulated hull does
+    /// not depend on the order the pushes and hulls come in.
+    fn pushes<C: Draw>() {
+        let draw = C::transfers();
         let mut s = 11u64;
         for _ in 0..3000 {
-            let h = Hull { x: arc(&mut s), y: arc(&mut s) };
-            let (tx, ty) = (transfer(&mut s), transfer(&mut s));
+            let h = hull::<C>(&mut s);
+            let t = (draw(&mut s), draw(&mut s));
             let mut acc = HullAcc::default();
-            let pushed = h.push(&(tx, ty), &mut acc);
+            let pushed = h.push(&t, &mut acc);
             let mut img = Vec::new();
-            h.to_region().as_ref().push(tx, ty, &mut img);
-            let img = Region::<Fixed16>::from_pieces(&mut img, &mut Vec::new());
-            assert_eq!(pushed, !img.is_empty(), "{h:?} {tx:?} {ty:?}");
+            h.to_region().as_ref().push(t.0, t.1, &mut img);
+            let img = Region::<C>::from_pieces(&mut img, &mut Vec::new());
+            assert_eq!(pushed, !img.is_empty(), "{h:?} {t:?}");
             assert_eq!(acc.is_empty(), !pushed);
             let Some(got) = acc.hull() else { continue };
-            // Every point of the image is in the hull: probed at the image's
-            // slab and segment ends.
             for (ys, xs) in img.as_ref().slabs() {
                 for x in xs {
-                    for (px, py) in [(x.lo, ys.lo), (x.hi - 1, ys.hi - 1), (x.lo, ys.hi - 1), (x.hi - 1, ys.lo)] {
-                        assert!(got.contains(px, py), "{h:?} {tx:?} {ty:?}: ({px}, {py}) of the image is not in {got:?}");
+                    for (px, py) in [(x.lo, ys.lo), (C::prev(x.hi), C::prev(ys.hi)), (x.lo, C::prev(ys.hi)), (C::prev(x.hi), ys.lo)] {
+                        assert!(got.contains(px, py), "{h:?} {t:?}: ({px:?}, {py:?}) of the image is not in {got:?}");
                     }
                 }
+            }
+            for x in probes(h.x, t.0.guard, &mut s) {
+                assert!(got.x.contains(apply(&t.0, x)), "{h:?} {t:?}: x {x:?}");
+            }
+            for y in probes(h.y, t.1.guard, &mut s) {
+                assert!(got.y.contains(apply(&t.1, y)), "{h:?} {t:?}: y {y:?}");
             }
         }
         // A grown hull's push: nothing where the image did not grow; else
         // the whole push.
         for _ in 0..3000 {
-            let was = Hull { x: arc(&mut s), y: arc(&mut s) };
+            let was = hull::<C>(&mut s);
             let mut grow = HullAcc::default();
             grow.add_hull(&was);
-            grow.add_hull(&Hull { x: arc(&mut s), y: arc(&mut s) });
+            grow.add_hull(&hull(&mut s));
             let h = grow.hull().unwrap();
-            let (tx, ty) = (transfer(&mut s), transfer(&mut s));
+            let t = (draw(&mut s), draw(&mut s));
             let (mut a, mut b, mut old) = (HullAcc::default(), HullAcc::default(), HullAcc::default());
-            let full = h.push(&(tx, ty), &mut a);
-            let grown = h.push_grown(&was, &(tx, ty), &mut b);
-            if grown {
+            let full = h.push(&t, &mut a);
+            if h.push_grown(&was, &t, &mut b) {
                 assert_eq!(a, b, "a grown push is the whole push");
             } else if full {
                 // Skipped: the old push's image already holds the new one.
-                assert!(was.push(&(tx, ty), &mut old), "skipped a push whose old image was empty");
+                assert!(was.push(&t, &mut old), "skipped a push whose old image was empty");
                 let (mut img_new, mut img_old) = (Vec::new(), Vec::new());
-                h.to_region().as_ref().push(tx, ty, &mut img_new);
-                was.to_region().as_ref().push(tx, ty, &mut img_old);
-                assert_eq!(Region::<Fixed16>::from_pieces(&mut img_new, &mut Vec::new()), Region::<Fixed16>::from_pieces(&mut img_old, &mut Vec::new()), "{was:?} -> {h:?} {tx:?} {ty:?}: skipped a push whose image grew");
+                h.to_region().as_ref().push(t.0, t.1, &mut img_new);
+                was.to_region().as_ref().push(t.0, t.1, &mut img_old);
+                assert_eq!(Region::<C>::from_pieces(&mut img_new, &mut Vec::new()), Region::<C>::from_pieces(&mut img_old, &mut Vec::new()), "{was:?} -> {h:?} {t:?}: skipped a push whose image grew");
             }
         }
-        // Order: many pushes into one accumulator, forwards and backwards.
+        // Order: many pushes into one accumulator, forwards and backwards;
+        // hulls added in either order.
         for _ in 0..300 {
-            let pushes: Vec<(Hull, Transfer, Transfer)> = (0..1 + lcg(&mut s) % 9).map(|_| (Hull { x: arc(&mut s), y: arc(&mut s) }, transfer(&mut s), transfer(&mut s))).collect();
+            let pushes: Vec<(Hull<C>, (Transfer<C>, Transfer<C>))> = (0..1 + lcg(&mut s) % 9).map(|_| (hull(&mut s), (draw(&mut s), draw(&mut s)))).collect();
             let (mut a, mut b) = (HullAcc::default(), HullAcc::default());
             for p in &pushes {
-                p.0.push(&(p.1, p.2), &mut a);
+                p.0.push(&p.1, &mut a);
             }
             for p in pushes.iter().rev() {
                 let mut one = HullAcc::default();
-                p.0.push(&(p.1, p.2), &mut one);
+                p.0.push(&p.1, &mut one);
                 b.merge(&one);
             }
             assert_eq!(a, b);
             assert_eq!(a.hull(), b.hull());
+            let (mut a, mut b) = (HullAcc::default(), HullAcc::default());
+            pushes.iter().for_each(|p| a.add_hull(&p.0));
+            pushes.iter().rev().for_each(|p| b.add_hull(&p.0));
+            assert_eq!(a, b);
         }
+    }
+
+    #[test]
+    fn a_push_holds_the_image_and_the_merge_is_order_free() {
+        pushes::<Fixed16>();
+        pushes::<Doubles>();
     }
 
     /// The hull of a union of arcs holds every one of them; it is the
     /// smallest arc holding them where that is under half the circle; a
-    /// hull merged with arcs inside it stays itself.
-    #[test]
-    fn the_hull_of_arcs_is_the_smallest_under_half_the_circle() {
+    /// hull merged with arcs inside it stays itself. Hulls round-trip
+    /// through their bytes.
+    fn hulls_of_arcs<C: Circle>() {
+        let n = size::<C>();
         let mut s = 5u64;
         for _ in 0..3000 {
-            let n = 1 + lcg(&mut s) % 6;
+            let k = 1 + lcg(&mut s) % 6;
             // Arcs inside one window of random size, at a random place.
-            let w = 1 + lcg(&mut s) % (CIRCLE - 1);
-            let at = lcg(&mut s) % CIRCLE;
-            let arcs: Vec<Arc> = (0..n)
+            let w = 1 + lcg(&mut s) % (n - 1);
+            let at = lcg(&mut s) % n;
+            let arcs: Vec<Arc<C>> = (0..k)
                 .map(|_| {
                     let off = lcg(&mut s) % w;
                     let len = 1 + lcg(&mut s) % (w - off);
-                    Arc { start: ((at + off) % CIRCLE) as u16, last: (len - 1) as u16 }
+                    Arc { start: word::<C>((at + off) % n), last: word::<C>(len - 1) }
                 })
                 .collect();
-            let mut acc = HullAcc::<Fixed16>::default();
+            let mut acc = HullAcc::<C>::default();
             for a in &arcs {
                 a.segs(|g| acc.add_seg(0, g));
                 a.segs(|g| acc.add_seg(1, g));
             }
             let h = acc.hull().expect("points added");
-            for p in probes(&arcs, &mut s) {
+            let mut ps: Vec<u64> = (0..16).map(|_| lcg(&mut s) % n).collect();
+            for a in &arcs {
+                for p in [num::<C>(a.start), (num::<C>(a.start) + num::<C>(a.last)) % n] {
+                    ps.extend([(p + n - 1) % n, p, (p + 1) % n]);
+                }
+            }
+            for p in ps.into_iter().map(C::narrow) {
                 if arcs.iter().any(|a| a.contains(p)) {
-                    assert!(h.x.contains(p) && h.y.contains(p), "{arcs:?}: {p} not in {h:?}");
+                    assert!(h.x.contains(p) && h.y.contains(p), "{arcs:?}: {p:?} not in {h:?}");
                 }
             }
             // The smallest arc holding them: the complement of the largest
@@ -517,15 +575,15 @@ mod tests {
             let smallest = arcs
                 .iter()
                 .map(|a| {
-                    let st = a.start as u32;
-                    let end = arcs.iter().map(|b| (b.start as u32 + CIRCLE - st) % CIRCLE + b.last as u32).max().unwrap();
-                    end.min(CIRCLE - 1) + 1
+                    let st = num::<C>(a.start);
+                    let end = arcs.iter().map(|b| (num::<C>(b.start) + n - st) % n + num::<C>(b.last)).max().unwrap();
+                    end.min(n - 1) + 1
                 })
                 .min()
                 .unwrap();
-            assert!(h.x.len() >= smallest as u64);
-            if smallest < CIRCLE / 2 {
-                assert_eq!(h.x.len(), smallest as u64, "{arcs:?}: {h:?} is not the smallest ({smallest})");
+            assert!(h.x.len() >= smallest);
+            if smallest < n / 2 {
+                assert_eq!(h.x.len(), smallest, "{arcs:?}: {h:?} is not the smallest ({smallest})");
             }
             // Merged with arcs inside it, it stays itself (unless it holds
             // both cuts: then it may become the circle).
@@ -536,14 +594,20 @@ mod tests {
                 a.segs(|g| again.add_seg(1, g));
             }
             let h2 = again.hull().unwrap();
-            if !(h.x.contains(cut::<Fixed16>(0) as u32) && h.x.contains(cut::<Fixed16>(1) as u32)) {
+            if !(h.x.contains(C::narrow(cut::<C>(0))) && h.x.contains(C::narrow(cut::<C>(1)))) {
                 assert_eq!(h2, h, "{arcs:?}");
             } else {
                 assert!(h2 == h || h2.x.is_full());
             }
+            let mut b = Vec::new();
+            h.to_bytes(&mut b);
+            assert_eq!((b.len(), Hull::<C>::from_bytes(&b)), (Hull::<C>::BYTES, h));
         }
-        let mut b = Vec::new();
-        Hull::<Fixed16>::point(3, 70000 % CIRCLE).to_bytes(&mut b);
-        assert_eq!((b.len(), Hull::<Fixed16>::from_bytes(&b)), (Hull::<Fixed16>::BYTES, Hull::point(3, 70000 % CIRCLE)));
+    }
+
+    #[test]
+    fn the_hull_of_arcs_is_the_smallest_under_half_the_circle() {
+        hulls_of_arcs::<Fixed16>();
+        hulls_of_arcs::<Doubles>();
     }
 }

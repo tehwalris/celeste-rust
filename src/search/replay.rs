@@ -77,11 +77,11 @@ impl<N: Rem> Replay<N> {
         let route = Route::<N>(s, std::marker::PhantomData);
         let mut eng = route.engines(1)?.remove(0);
         let (start, ()) = route.start(&mut eng)?;
-        let engines = [std::sync::Mutex::new(eng)];
+        let mut engines = [eng];
         let last = horizon.unwrap_or(clock.steps(inputs.len() as u32));
         // The step to `k + 1` is in frame `frame_of(k + 1)`: its input.
         let policy = Policy { inputs: &|k| inputs.get(clock.frame_of(k + 1) as usize - 1).map(|&b| vec![b]), replay: true };
-        let ls = layers(&route, &engines, start, last, &policy, |_, _, _, _, _| {})?;
+        let ls = layers(&route, &mut engines, start, last, &policy, |_, _, _, _, _| {})?;
         let layers = ls.states.into_iter().enumerate().map(|(k, st)| st.into_iter().enumerate().map(|(i, b)| (if k == 0 { 0 } else { ls.back[k - 1][i].0 }, b)).collect()).collect();
         let exit = ls.won.map(|(step, wins)| (step, wins.into_iter().map(|(p, _, _, leaf)| (p, leaf)).collect()));
         Ok(Replay { layers, merged: ls.merged, exit, seeded: s.concrete().1 })

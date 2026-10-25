@@ -13,7 +13,7 @@ use celeste_engine::runtime2::{Rt2, AV};
 use full_moon::ast;
 
 use crate::abstraction::Level;
-use crate::search::rem::{Capture, Rem};
+use crate::search::rem::{Capture, Pair, Rem};
 use crate::trace::block::{self, fn_info_of, FnInfo};
 use crate::trace::game::{BUTTONS, PLAYER, PLAYER_SPAWN};
 use crate::trace::heap::{TableId, Value};
@@ -223,7 +223,7 @@ where
     /// its remainder TRANSFER - the interpreter's arc capture, as the tracer
     /// captures it for the kernels, decoded by the arithmetic's decoder
     /// (`Rem::transfer`; a refusal is fatal, as theirs).
-    pub fn run_lane(&mut self, block: &Rt2<A>, lane: usize) -> Result<Vec<(Rt2<A>, <A as Rem>::Pair)>> {
+    pub fn run_lane(&mut self, block: &Rt2<A>, lane: usize) -> Result<Vec<(Rt2<A>, Pair<A>)>> {
         let (mut st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
         st.arc = Some(Box::new([ArcAxis::none(&mut self.it.d), ArcAxis::none(&mut self.it.d)]));
         self.it.arc_capture = true;
@@ -248,8 +248,8 @@ impl<A: crate::transpile::garith::GraphArith> ReferenceEngine<A> {
 }
 
 /// A leaf's remainder transfer: its arc capture and the player's remainder
-/// at the frame's end (before any widening), decoded (`Rem::transfer`).
-fn transfer_of<N: Rem>(leaf: &State<RefDomain<N>>) -> Result<N::Pair> {
+/// at the frame's end (before any widening), decoded (`rem::decode`).
+fn transfer_of<N: Rem>(leaf: &State<RefDomain<N>>) -> Result<Pair<N>> {
     let axes = leaf.arc.as_deref().ok_or_else(|| anyhow::anyhow!("arc capture: a leaf without one"))?;
     let fins = crate::trace::state::arc_fins(leaf)?;
     let ends = |v: &N::Ival| N::bounds(*v);
@@ -257,7 +257,7 @@ fn transfer_of<N: Rem>(leaf: &State<RefDomain<N>>) -> Result<N::Pair> {
         let a = &axes[k];
         Capture { took: a.took, pre: ends(&a.pre), frag: ends(&a.frag), ox: ends(&a.ox), fin: fins.map(|f| ends(&f[k])) }
     };
-    N::transfer(&axis(0), &axis(1)).map_err(|e| anyhow::anyhow!("the reference's transfer is refused: {e}"))
+    crate::search::rem::decode(&axis(0), &axis(1)).map_err(|e| anyhow::anyhow!("the reference's transfer is refused: {e}"))
 }
 
 /// A fly fruit's `spd.y` and `rem.y` (at a fruit level the ranges
