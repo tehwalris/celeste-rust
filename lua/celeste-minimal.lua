@@ -1,6 +1,47 @@
 -- ~celeste~
 -- matt thorson + noel berry
 
+-- THE TRACED CART: the original (celeste_ocaml's celeste.lua) less what
+-- the tracer cannot or need not run. What differs from the original:
+-- - syntax: PICO-8's `+=`, `-=`, `*=`, `!=` and one-line `if (c) stmt`
+--   written as Lua 5.1 (the parser, full_moon, reads 5.1);
+-- - `_init` loads the search's start room, not the title screen (and
+--   `got_fruit` stays `{}`);
+-- - not here: smoke, hair, clouds, particles, dead particles, the lifeup,
+--   room title, message and flag objects (`rnd` draws, `..`, `#` of a
+--   string, `cos`), the player's animation (`spr_off`, `was_on_ground`),
+--   `balloon.draw` (`%` of an interval), the big chest's particles and the
+--   orb's ring; `maybe()` (the smoke's) and the wall slide's `rnd(10)`
+--   with them;
+-- - `move`'s `__split_by_round(rem)` hint, and `--@unroll N` on loops over
+--   symbolic bounds (tracer hooks: below);
+-- - `_update` moves an object only at a nonzero speed, but the player
+--   always, as the original moves every object (plans/correctness.md C4);
+-- - under `--split-frame` `_update` is lua/split-frame.lua's.
+-- Kept exactly: the buttons (`p_jump`, `p_dash`, the jump buffer
+-- `jbuffer`), sound, music, screen shake and the draws that only draw;
+-- their dead fields are the widening table's EXACT entries.
+--
+-- THE ANCHORS, each patched where its text is found exactly once (so
+-- this header names them, never quotes them):
+-- - `_init`'s `load_room` call: the start room (`game_runner::
+--   apply_start_room`; `max_djump=2` past the orb), its loading frame
+--   (`trace::cart::apply_loading_frame`, `--loading-jank`) and the PICO-8
+--   replay's start (`tools::pico8::cart`);
+-- - the definitions of `_update` and `_draw`: `trace::cart::split_frame`;
+-- - the balloon's phase (`offset`) at its init: its seed
+--   (`trace::cart::fix_balloon_seeds`, `tools::pico8::cart`); the chest's
+--   timer at its init and its shake (`x`): its seed (`trace::cart::
+--   tool_seeds`, `tools::pico8::cart`);
+-- - the dash's arms: `trace::cart::forbid_diagonal_dashes` (nodiag),
+--   `forbid_straight_dashes` (onlydiag); its `v_input` line: the PICO-8
+--   replay's dash report.
+-- TOOL HOOKS: `__split_by_round` (the integer fragments of a remainder;
+-- the identity on a number, a stub on PICO-8: `tools::pico8::HOOK_STUBS`);
+-- `--@unroll N` (a loop's bound for the tracer, a comment to Lua);
+-- `tile_flag_at`, replaced after the toplevel by the native
+-- (`trace::cart::inject_tile_flag_at`).
+
 -- globals --
 -------------
 
@@ -8,12 +49,16 @@ room = { x=0, y=0 }
 objects = {}
 types = {}
 freeze=0
+shake=0
 will_restart=false
 delay_restart=0
 got_fruit={}
 has_dashed=false
+sfx_timer=0
 has_key=false
 pause_player=false
+flash_bg=false
+music_timer=0
 
 k_left=0
 k_right=1
@@ -45,6 +90,7 @@ function title_screen()
 	max_djump=1
 	start_game=false
 	start_game_flash=0
+	music(40,0,7)
 
 	load_room(7,3)
 end
@@ -53,7 +99,9 @@ function begin_game()
 	frames=0
 	seconds=0
 	minutes=0
+	music_timer=0
 	start_game=false
+	music(0,0,7)
 	load_room(0,0)
 end
 
@@ -74,6 +122,7 @@ player =
 		this.p_jump=false
 		this.p_dash=false
 		this.grace=0
+		this.jbuffer=0
 		this.djump=max_djump
 		this.dash_time=0
 		this.dash_effect_time=0
@@ -99,15 +148,13 @@ player =
 		local on_ground=this.is_solid(0,1)
 		local on_ice=this.is_ice(0,1)
 
-		-- TODO: classic Celeste buffers a jump press for 4 frames (jbuffer);
-		-- this minimal version dropped it, so a press during dash frames or
-		-- before a wall comes in range is LOST instead of buffered. This is
-		-- NOT a no-op simplification: TAS inputs for classic must be re-timed
-		-- to the execution frame (see tas/room_1_0_exit_frame_100.txt).
-		-- Reachability and optimal frame counts are unaffected, since a
-		-- buffered jump executes identically to an exactly-timed press.
 		local jump = btn(k_jump) and not this.p_jump
 		this.p_jump = btn(k_jump)
+		if (jump) then
+			this.jbuffer=4
+		elseif this.jbuffer>0 then
+		 this.jbuffer = this.jbuffer - (1)
+		end
 
 		local dash = btn(k_dash) and not this.p_dash
 		this.p_dash = btn(k_dash)
@@ -115,6 +162,7 @@ player =
 		if on_ground then
 			this.grace=6
 			if this.djump<max_djump then
+			 psfx(54)
 			 this.djump=max_djump
 			end
 		elseif this.grace > 0 then
@@ -136,6 +184,9 @@ player =
 				accel=0.4
 			elseif on_ice then
 				accel=0.05
+				if input==(this.flip.x and -1 or 1) then
+					accel=0.05
+				end
 			end
 
 			if abs(this.spd.x) > maxrun then
@@ -167,15 +218,19 @@ player =
 			end
 
 			-- jump
-			if jump then
+			if this.jbuffer>0 then
 		 	if this.grace>0 then
 		  	-- normal jump
+		  	psfx(1)
+		  	this.jbuffer=0
 		  	this.grace=0
 					this.spd.y=-2
 				else
 					-- wall jump
 					local wall_dir=(this.is_solid(-3,0) and -1 or this.is_solid(3,0) and 1 or 0)
 					if wall_dir~=0 then
+			 		psfx(2)
+			 		this.jbuffer=0
 			 		this.spd.y=-2
 			 		this.spd.x=-wall_dir*(maxrun+1)
 					end
@@ -208,7 +263,9 @@ player =
 		  	this.spd.y=0
 		 	end
 
+		 	psfx(3)
 		 	freeze=2
+		 	shake=6
 		 	this.dash_target.x=2*sign(this.spd.x)
 		 	this.dash_target.y=2*sign(this.spd.y)
 		 	this.dash_accel.x=1.5
@@ -224,6 +281,8 @@ player =
 		 	if this.spd.x~=0 then
 		 	 this.dash_accel.y = this.dash_accel.y * (0.70710678118)
 		 	end
+			elseif dash and this.djump<=0 then
+			 psfx(9)
 			end
 		end
 
@@ -238,12 +297,21 @@ player =
 			this.x=clamp(this.x,-1,121)
 			this.spd.x=0
 		end
+
+		spr(this.spr,this.x,this.y,1,1,this.flip.x,this.flip.y)
 	end
 }
+
+psfx=function(num)
+ if sfx_timer<=0 then
+  sfx(num)
+ end
+end
 
 player_spawn = {
 	tile=1,
 	init=function(this)
+	 sfx(4)
 		this.spr=3
 		this.target= {x=this.x,y=this.y}
 		this.y=128
@@ -271,6 +339,8 @@ player_spawn = {
 				this.spd = {x=0,y=0}
 				this.state=2
 				this.delay=5
+				shake=5
+				sfx(5)
 			end
 		-- landing
 		elseif this.state==2 then
@@ -282,6 +352,9 @@ player_spawn = {
 			end
 		end
 	end,
+	draw=function(this)
+		spr(this.spr,this.x,this.y,1,1,this.flip.x,this.flip.y)
+	end
 }
 add(types,player_spawn)
 
@@ -314,6 +387,7 @@ spring = {
 					break_fall_floor(below)
 				end
 
+				psfx(8)
 			end
 		elseif this.delay>0 then
 			this.delay = this.delay - (1)
@@ -351,6 +425,7 @@ balloon = {
 			this.y=this.start+sin(this.offset)*2
 			local hit = this.collide(player,0,0)
 			if hit~=nil and hit.djump<max_djump then
+				psfx(6)
 				hit.djump=max_djump
 				this.spr=0
 				this.timer=60
@@ -358,6 +433,7 @@ balloon = {
 		elseif this.timer>0 then
 			this.timer = this.timer - (1)
 		else
+		 psfx(7)
 			this.spr=22
 		end
 	end,
@@ -388,16 +464,27 @@ fall_floor = {
 		elseif this.state==2 then
 			this.delay = this.delay - (1)
 			if this.delay<=0 and not this.check(player,0,0) then
+				psfx(7)
 				this.state=0
 				this.collideable=true
 			end
 		end
 	end,
+	draw=function(this)
+		if this.state~=2 then
+			if this.state~=1 then
+				spr(23,this.x,this.y)
+			else
+				spr(23+(15-this.delay)/5,this.x,this.y)
+			end
+		end
+	end
 }
 add(types,fall_floor)
 
 function break_fall_floor(obj)
  if obj.state==0 then
+ 	psfx(15)
 		obj.state=1
 		obj.delay=15--how long until it falls
 		local hit=obj.collide(spring,0,-1)
@@ -418,6 +505,8 @@ fruit={
 	 local hit=this.collide(player,0,0)
 		if hit~=nil then
 		 hit.djump=max_djump
+			sfx_timer=20
+			sfx(13)
 			got_fruit[1+level_index()] = true
 			destroy_object(this)
 		end
@@ -435,10 +524,18 @@ fly_fruit={
 		this.fly=false
 		this.step=0.5
 		this.solids=false
+		this.sfx_delay=8
 	end,
 	update=function(this)
 		--fly away
 		if this.fly then
+		 if this.sfx_delay>0 then
+		  this.sfx_delay = this.sfx_delay - (1)
+		  if this.sfx_delay<=0 then
+		   sfx_timer=20
+		   sfx(14)
+		  end
+		 end
 			this.spd.y=appr(this.spd.y,-3.5,0.25)
 			if this.y<-16 then
 				destroy_object(this)
@@ -455,10 +552,26 @@ fly_fruit={
 		local hit=this.collide(player,0,0)
 		if hit~=nil then
 		 hit.djump=max_djump
+			sfx_timer=20
+			sfx(13)
 			got_fruit[1+level_index()] = true
 			destroy_object(this)
 		end
 	end,
+	draw=function(this)
+		local off=0
+		if not this.fly then
+			local dir=sin(this.step)
+			if dir<0 then
+				off=1+max(0,sign(this.y-this.start))
+			end
+		else
+			off=(off+0.25)%3
+		end
+		spr(45+off,this.x-6,this.y-2,1,1,true,false)
+		spr(this.spr,this.x,this.y)
+		spr(45+off,this.x+6,this.y-2)
+	end
 }
 add(types,fly_fruit)
 
@@ -472,11 +585,19 @@ fake_wall = {
 			hit.spd.x=-sign(hit.spd.x)*1.5
 			hit.spd.y=-1.5
 			hit.dash_time=-1
+			sfx_timer=20
+			sfx(16)
 			destroy_object(this)
 			init_object(fruit,this.x+4,this.y+4)
 		end
 		this.hitbox={x=0,y=0,w=16,h=16}
 	end,
+	draw=function(this)
+		spr(64,this.x,this.y)
+		spr(65,this.x+8,this.y)
+		spr(80,this.x,this.y+8)
+		spr(81,this.x+8,this.y+8)
+	end
 }
 add(types,fake_wall)
 
@@ -491,6 +612,8 @@ key={
 			this.flip.x=not this.flip.x
 		end
 		if this.check(player,0,0) then
+			sfx(23)
+			sfx_timer=10
 			destroy_object(this)
 			has_key=true
 		end
@@ -511,6 +634,8 @@ chest={
 			this.timer = this.timer - (1)
 			this.x=this.start-1+rnd(3)
 			if this.timer<=0 then
+			 sfx_timer=20
+			 sfx(16)
 				init_object(fruit,this.x,this.y-4)
 				destroy_object(this)
 			end
@@ -538,6 +663,10 @@ platform={
 		end
 		this.last=this.x
 	end,
+	draw=function(this)
+		spr(11,this.x,this.y-1)
+		spr(12,this.x+8,this.y-1)
+	end
 }
 
 big_chest={
@@ -550,20 +679,30 @@ big_chest={
 		if this.state==0 then
 			local hit=this.collide(player,0,8)
 			if hit~=nil and hit.is_solid(0,1) then
+				music(-1,500,7)
+				sfx(37)
 				pause_player=true
 				hit.spd.x=0
 				hit.spd.y=0
 				this.state=1
 				this.timer=60
 			end
+			spr(96,this.x,this.y)
+			spr(97,this.x+8,this.y)
 		elseif this.state==1 then
 			this.timer = this.timer - (1)
+		 shake=5
+		 flash_bg=true
 			if this.timer<0 then
 				this.state=2
+				flash_bg=false
+				new_bg=true
 				init_object(orb,this.x+4,this.y+4)
 				pause_player=false
 			end
 		end
+		spr(112,this.x,this.y+8)
+		spr(113,this.x+8,this.y+8)
 	end
 }
 add(types,big_chest)
@@ -577,11 +716,16 @@ orb={
 		this.spd.y=appr(this.spd.y,0,0.5)
 		local hit=this.collide(player,0,0)
 		if this.spd.y==0 and hit~=nil then
+		 music_timer=45
+			sfx(51)
 			freeze=10
+			shake=10
 			destroy_object(this)
 			max_djump=2
 			hit.djump=2
 		end
+
+		spr(102,this.x,this.y)
 	end
 }
 
@@ -707,7 +851,10 @@ function destroy_object(obj)
 end
 
 function kill_player(obj)
+	sfx_timer=12
+	sfx(0)
 	deaths = deaths + (1)
+	shake=10
 	destroy_object(obj)
 	restart_room()
 end
@@ -721,6 +868,16 @@ function restart_room()
 end
 
 function next_room()
+ if room.x==2 and room.y==1 then
+  music(30,500,7)
+ elseif room.x==3 and room.y==1 then
+  music(20,500,7)
+ elseif room.x==4 and room.y==2 then
+  music(30,500,7)
+ elseif room.x==5 and room.y==3 then
+  music(30,500,7)
+ end
+
 	if room.x==7 then
 		load_room(0,room.y+1)
 	else
@@ -771,8 +928,28 @@ function _update()
 		end
 	end
 
+	if music_timer>0 then
+	 music_timer = music_timer - (1)
+	 if music_timer<=0 then
+	  music(10,0,7)
+	 end
+	end
+
+	if sfx_timer>0 then
+	 sfx_timer = sfx_timer - (1)
+	end
+
 	-- cancel if freeze
 	if freeze>0 then freeze = freeze - 1 return end
+
+	-- screenshake
+	if shake>0 then
+		shake = shake - (1)
+		camera()
+		if shake>0 then
+			camera(-2+rnd(5),-2+rnd(5))
+		end
+	end
 
 	-- restart (soon)
 	if will_restart and delay_restart>0 then
@@ -785,24 +962,21 @@ function _update()
 
 	-- update each object
 	foreach(objects,function(obj)
-		if obj.spd.x ~= 0 or obj.spd.y ~= 0 then
+		if obj.type == player or obj.spd.x ~= 0 or obj.spd.y ~= 0 then
 			obj.move(obj.spd.x,obj.spd.y)
 		end
 		if obj.type.update~=nil then
-			_hint_normalize()
 			obj.type.update(obj)
 		end
 	end)
 
-	if true then
-    	_hint_normalize()
-    end
-
 	-- start game
 	if is_title() then
 		if not start_game and (btn(k_jump) or btn(k_dash)) then
+			music(-1)
 			start_game_flash=50
 			start_game=true
+			sfx(38)
 		end
 		if start_game then
 			start_game_flash = start_game_flash - (1)
@@ -818,6 +992,45 @@ end
 function _draw()
 	if freeze>0 then return end
 
+	-- reset all palette values
+	pal()
+
+	-- start game flash
+	if start_game then
+		local c=10
+		if start_game_flash>10 then
+			if frames%10<5 then
+				c=7
+			end
+		elseif start_game_flash>5 then
+			c=2
+		elseif start_game_flash>0 then
+			c=1
+		else
+			c=0
+		end
+		if c<10 then
+			pal(6,c)
+			pal(12,c)
+			pal(13,c)
+			pal(5,c)
+			pal(1,c)
+			pal(7,c)
+		end
+	end
+
+	-- clear screen
+	local bg_col = 0
+	if flash_bg then
+		bg_col = frames/5
+	elseif new_bg~=nil then
+		bg_col=2
+	end
+	rectfill(0,0,128,128,bg_col)
+
+	-- draw bg terrain
+	map(room.x * 16,room.y * 16,0,0,16,16,4)
+
 	-- platforms/big chest
 	foreach(objects, function(o)
 		if o.type==platform or o.type==big_chest then
@@ -825,17 +1038,54 @@ function _draw()
 		end
 	end)
 
+	-- draw terrain
+	local off=is_title() and -4 or 0
+	map(room.x*16,room.y * 16,off,0,16,16,2)
+
 	-- draw objects
 	foreach(objects, function(o)
 		if o.type~=platform and o.type~=big_chest then
 			draw_object(o)
 		end
 	end)
+
+	-- draw fg terrain
+	map(room.x * 16,room.y * 16,0,0,16,16,8)
+
+	-- draw outside of the screen for screenshake
+	rectfill(-5,-5,-1,133,0)
+	rectfill(-5,-5,133,-1,0)
+	rectfill(-5,128,133,133,0)
+	rectfill(128,-5,133,133,0)
+
+	-- credits
+	if is_title() then
+		print("x+c",58,80,5)
+		print("matt thorson",42,96,5)
+		print("noel berry",46,102,5)
+	end
+
+	if level_index()==30 then
+		local p
+		for i=1,count(objects) do
+			if objects[i].type==player then
+				p = objects[i]
+				break
+			end
+		end
+		if p~=nil then
+			local diff=min(24,40-abs(p.x+4-64))
+			rectfill(0,0,diff,128,0)
+			rectfill(128-diff,0,128,128,0)
+		end
+	end
 end
 
 function draw_object(obj)
 	if obj.type.draw ~=nil then
 		obj.type.draw(obj)
+	elseif obj.spr > 0 then
+		spr(obj.spr,obj.x,obj.y,1,1,obj.flip.x,obj.flip.y)
 	end
 end
 

@@ -18,7 +18,7 @@ steps (`rewrite search`; plans/architecture.md "The search"):
    every input, every `rnd` leaf), pruned only by those sets. Its first win
    is the optimum and the witness.
 
-Where a level's bound is loose, `--level r0sxhn,r0sxh` runs the OBJECTS
+Where a level's bound is loose, `--level r0sxn,r0sx` runs the OBJECTS
 LADDER: the finer level's forward filtered by the coarser one's reached
 nodes. The arithmetic is a setting: PICO-8's 16.16 (`--arith fixed`, the
 real game) or the TAS tools' doubles (`--arith float`; `rewrite dual` for
@@ -37,8 +37,9 @@ left open is in plans/architecture.md "Open issues".
 - `plans/architecture.md` - the system as it is: interfaces, the tracer and
   kernel model, keys, the hull forward and its storage, the recorded edges,
   the search, the checks, open issues.
-- `plans/abstractions.md` - every level flag (`h f n`; the remainder; moving
-  platforms are always exact): what it widens, why it is sound, what refutes
+- `plans/abstractions.md` - every level flag (`f n`; the remainder and the
+  buttons' memory - held buttons, the jump buffer - are widened at every
+  level; moving platforms are always exact): what it widens, why it is sound, what refutes
   it (the widening table).
 - `plans/float.md` - the float arithmetic and the dual search.
 - `plans/level-minus-one.md` - the cost-to-go filter.
@@ -253,13 +254,13 @@ frame under `--split-frame`: `settings::Clock`). The most common:
 # outcome: DIR/result.json.
 ./safe-run.sh -- ./target/release/rewrite search --room 1,0 --frames 99 --ceiling --search-dir DIR
 # An object room with the objects ladder, level -1 and the known route checked.
-./safe-run.sh -- ./target/release/rewrite search --room 7,0 --level r0sxhn,r0sxh \
+./safe-run.sh -- ./target/release/rewrite search --room 7,0 --level r0sxn,r0sx \
     --level-minus-one 84,5 --frames 84 --ceiling --search-dir DIR --prefer tas/FILE.txt
 # In the float tools' doubles (Celia's start and seeds by default).
 ./safe-run.sh -- ./target/release/rewrite search --arith float --room 7,0 ...
 # THE DUAL SEARCH: the shortest file valid in both arithmetics (plans/float.md).
 ./safe-run.sh --memory 40G -- ./target/release/rewrite dual --room 0,3 --category gemskip100 \
-    --loading-jank 1 --level r0sxhn,r0sxh --level-minus-one 150,5 --frames 150 --search-dir DIR
+    --loading-jank 1 --level r0sxn,r0sx --level-minus-one 150,5 --frames 150 --search-dir DIR
 # A known solution against every pruning step of a finished search (its
 # settings, levels and horizon from its records).
 ./safe-run.sh -- ./target/quick/rewrite check known --search-dir DIR --inputs tas/FILE.txt

@@ -216,7 +216,7 @@ mod tests {
     /// toolchain.
     #[test]
     fn a_kernel_cache_key_moves_with_every_input() {
-        let level = Level::parse("r0sxh").expect("level");
+        let level = Level::parse("r0sx").expect("level");
         let base = Settings::default();
         let k = |s: &Settings, l: Level| super::key::<Pico8Num>(l, s).expect("key").name;
         let at = k(&base, level);
@@ -234,7 +234,7 @@ mod tests {
         for (what, s) in &changed {
             assert_ne!(at, k(s, level), "{what}: the key did not move");
         }
-        assert_ne!(at, k(&base, Level::parse("r0sxhn").expect("level")), "the level");
+        assert_ne!(at, k(&base, Level::parse("r0sxn").expect("level")), "the level");
         assert_ne!(at, super::key::<LuaF64>(level, &base).expect("key").name, "the arithmetic");
         let text = super::key::<Pico8Num>(level, &base).expect("key").text;
         assert!(text.contains(super::SOURCES) && text.contains("gcc ") && text.contains("glibc "), "{text}");
@@ -242,8 +242,8 @@ mod tests {
 
     /// CACHED = FRESH: per case, two fresh builds store the same entry
     /// (recipes and code, byte for byte) and a third build loads it: the
-    /// same kernel text and the same KEY LAYOUTS. Room (1,0) r0sxh, and room
-    /// (6,0) r0sxhf split, whose ten exact platforms are keyed by
+    /// same kernel text and the same KEY LAYOUTS. Room (1,0) r0sx, and room
+    /// (6,0) r0sxf split, whose ten exact platforms are keyed by
     /// dependencies (`exact::Deps`; the followers' templates are no
     /// recipe's: `AsmKernel::of` makes them from the level, alike for both).
     /// A damaged entry is a miss, rebuilt.
@@ -251,7 +251,7 @@ mod tests {
     #[ignore = "slow, ./check.sh t2 runs it: three builds each of room (1,0)'s and room (6,0)'s kernels, ~60 s"]
     fn a_cached_kernel_set_is_the_fresh_one() {
         use super::super::asm_kernel::Registry;
-        let cases = [("r0sxh", Settings::default()), ("r0sxhf", Settings { room: (6, 0), split_frame: true, ..Settings::default() })];
+        let cases = [("r0sx", Settings::default()), ("r0sxf", Settings { room: (6, 0), split_frame: true, ..Settings::default() })];
         for (case, (level, s)) in cases.iter().enumerate() {
             let level = Level::parse(level).expect("level");
             let roots: Vec<std::path::PathBuf> = (0..2).map(|i| std::env::temp_dir().join(format!("celeste-kernel-cache-{}-{case}-{i}", std::process::id()))).collect();

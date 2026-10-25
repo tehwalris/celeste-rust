@@ -50,7 +50,7 @@ pub struct LevelResult {
 pub struct SearchResult {
     pub(crate) format: u32,
     pub(crate) room: (i16, i16),
-    /// `--level`, as given (`r0sxhn,r0sxh`).
+    /// `--level`, as given (`r0sxn,r0sx`).
     pub(crate) level: String,
     /// The horizon in frames, and whether it was a `--ceiling`.
     pub horizon: u32,
@@ -117,11 +117,11 @@ mod tests {
         let r = SearchResult {
             format: FORMAT,
             room: (4, 2),
-            level: "r0sxhn,r0sxh".into(),
+            level: "r0sxn,r0sx".into(),
             horizon: 50,
             ceiling: false,
             steps_per_frame: 1,
-            levels: vec![LevelResult { spec: "r0sxhn".into(), dir: "level00".into(), forward_s: 1.5, first_win: Some(47), arc_bound: Some(47) }],
+            levels: vec![LevelResult { spec: "r0sxn".into(), dir: "level00".into(), forward_s: 1.5, first_win: Some(47), arc_bound: Some(47) }],
             verdict: Verdict::LevelMinusOneRefused,
             optimal: None,
             witness: None,

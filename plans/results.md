@@ -99,6 +99,43 @@ every witness is the stored route.
 | (1,2) | any% | `r0sxhn` | 99 | DFS at 99: none (exhaustive, 22k steps); BFS 4.62M steps | 103 | 8:22 | 6.7 GB |
 | (1,2) | nodiag | `r0sxhn,r0sxh,r0sx` (369M visited at level 0) | 109, 113, 113 | DFS at 113, 115 steps | 113 | 1:48 | 5.6 GB |
 
+### Under the real buttons (2026-10-25)
+
+The cart has the original's jump buffer since 2026-10-25 (correctness.md
+C7): every level widens the buttons' memory (the former `h`), the
+concrete search runs `p_jump`, `p_dash` and `jbuffer` exactly. The results
+C7 put at risk (a final level without `h`, or its arc bound under the
+optimum) re-proven on branch `jump-buffer` (merged with develop d63f0056,
+`8855405f`; nodiag (6,0) and (1,2) and 100% (6,1) on its merge with
+297b5391, `186c5515`: round 4 moved no pin): release, `--frames C --ceiling`, `--prefer` the stored witness, each row's
+settings (the 100% ones the runner's: IL load, `--concrete-balloon-seeds`
+the file's). NONE MOVED: every known route survives every pruning step,
+every witness is the stored one and leaves on its frame on a real PICO-8
+(the original cart; the 100% ones with the berry, the nodiag ones with no
+diagonal dash, the summit ones on the flag).
+
+| room | category | level, level -1 | arc bound | concrete search | found | wall | peak |
+|---|---|---|---|---|---|---|---|
+| (0,0) | any% | `r0sx` | 93 | DFS, 93 steps | 93 | 0:32 | 2.1 GB |
+| (1,0) | any% | `r0sx` | 99 | DFS, 99 steps | 99 | 0:20 | 1.4 GB |
+| (4,0) | any% | `r0sx` | 76 | DFS, 76 steps | 76 | 0:17 | 1.9 GB |
+| (5,3) | any% | `r0sxn`, (79,5) | 78 | DFS at 78: none (4,085 steps); BFS 105,673 steps | 79 | 2:48 | 5.4 GB |
+| (1,2) | any% | `r0sxn` | 99 | DFS at 99: none (92,315 steps); BFS 20.3M steps | 103 | 23:46 | 17.8 GB |
+| (6,3) | any% (summit) | `r0sx` | 55 | DFS, 55 steps | 55 | 0:05 | 0.9 GB |
+| (6,3) | gemskip any% | `r0sx`, `--frames 64` | 57 | DFS, 57 steps | 57 | 0:14 | 1.0 GB |
+| (6,0) | nodiag | split `r0sxf` | 73 | DFS, 73 steps | 73 | 8:37 | 12.8 GB |
+| (6,1) | nodiag | split `r0sxn`, (93,5) | 90 | DFS at 90: none (7,849 steps); BFS 1.95M steps | 92 | 6:46 | 4.3 GB |
+| (1,2) | nodiag | `r0sxn,r0sx` | 109, 113 | DFS, 115 steps | 113 | 1:28 | 5.6 GB |
+| (6,1) | 100% | split `r0sxn,r0sx`, (114,5), seeds 0,1,0 | 112, 113 | DFS at 113 out of budget; BFS 14.1M steps | 114 | 48:28 | 14.2 GB |
+| (4,3) | 100% | `r0sxn,r0sx`, (109,5), seeds 0,0,0 | 106, 107 | DFS at 107 out of budget; BFS 31.2M steps | 109 | 39:53 | 25.9 GB |
+
+Where the bound is under the optimum the breadth-first search carries the
+proof, and it grows with the buffer, the real game's own state: (4,3) 100%
+31.2M steps and 26 GB against 8.1M and 4 GB without the buffer, (1,2) any%
+20.3M and 18 GB against 4.62M and 6.7 GB. The concrete identity modulo the
+table's EXACT entries (the dead timers) saves 0.9% (room (6,1) nodiag): it
+is not the dead fields.
+
 ## No Diagonal Dashes (2026-10-04 .. 10-08; every improvement submitted)
 
 `--category nodiag`: the cart's diagonal dash arm raises, so a diagonal
@@ -286,5 +323,7 @@ room alone and misses it; Celia models it.
   `spurious`, `check ref --row`, `check known`): that chain found the floor-collision
   join bug and room (1,3)'s keying bug.
 - Finding the reference: scan prologue offsets (23-37), replay in the
-  original cart (`rewrite pico8 replay --original`), then `rewrite trajectory` (the minimal cart
-  has no jump buffer, so raw inputs often do not transfer).
+  original cart (`rewrite pico8 replay --original`); the file plays on the
+  minimal cart as it is (the jump buffer is the original's since
+  2026-10-25; before, raw inputs often did not transfer and `rewrite
+  trajectory` found inputs that follow the file's positions).

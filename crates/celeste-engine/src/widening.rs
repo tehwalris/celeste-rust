@@ -22,14 +22,12 @@ use celeste_core::arith::Arithmetic;
 
 use crate::runtime2::{collapse_uniform, names, Cell2, Col, Rt2, AV, NONE};
 
-/// A LEVEL: which objects the forward widens (plans/abstractions.md). Each
-/// widening over-approximates; the concrete search refutes it.
-/// `Default` is `Level::EXACT`.
+/// A LEVEL: which objects the forward widens (plans/abstractions.md), on
+/// top of what every level widens (`Flag::Always`: the remainder, and the
+/// buttons' memory). Each widening over-approximates; the concrete search
+/// refutes it. `Default` is `Level::EXACT`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
 pub struct Level {
-    /// `h`: `p_jump` / `p_dash` unknown at the boundary, forked both ways in
-    /// the frame (a held button may then re-trigger a press).
-    pub held: bool,
     /// `f`: the fly fruit's `step` and `y` unknown numbers, `spd.y` / `rem.y`
     /// their whole ranges, `fly` unknown.
     pub fruit: bool,
@@ -41,15 +39,18 @@ pub struct Level {
 
 impl Level {
     /// Every object exact (`r0sx`).
-    pub const EXACT: Level = Level { held: false, fruit: false, floors_near: false };
+    pub const EXACT: Level = Level { fruit: false, floors_near: false };
 
-    /// A level from `r0sx[h][f][n]`: the fixed prefix, then the flags in
+    /// A level from `r0sx[f][n]`: the fixed prefix, then the flags in
     /// that order (each absent = exact).
     pub fn parse(spec: &str) -> Result<Level, String> {
         let s = spec.trim();
         let mut rest = s
             .strip_prefix("r0sx")
-            .ok_or_else(|| format!("level {spec:?}: expected r0sx[h][f][n] (the remainder is the arcs', the speed exact)"))?;
+            .ok_or_else(|| format!("level {spec:?}: expected r0sx[f][n] (the remainder is the arcs', the speed exact)"))?;
+        if rest.contains('h') {
+            return Err(format!("level {spec:?}: `h` was removed: held buttons are widened at every level (plans/correctness.md C7)"));
+        }
         let mut flag = |c: char| -> bool {
             match rest.strip_prefix(c) {
                 Some(t) => {
@@ -59,12 +60,12 @@ impl Level {
                 None => false,
             }
         };
-        let level = Level { held: flag('h'), fruit: flag('f'), floors_near: flag('n') };
+        let level = Level { fruit: flag('f'), floors_near: flag('n') };
         if rest.contains('p') {
             return Err(format!("level {spec:?}: `p` (widened platforms) was removed: platforms are exact (plans/correctness.md C13)"));
         }
         if !rest.is_empty() {
-            return Err(format!("level {spec:?}: unexpected {rest:?} (flags are h, f, n in that order)"));
+            return Err(format!("level {spec:?}: unexpected {rest:?} (flags are f, n in that order)"));
         }
         Ok(level)
     }
@@ -72,7 +73,6 @@ impl Level {
     pub fn has(&self, flag: Flag) -> bool {
         match flag {
             Flag::Always => true,
-            Flag::Held => self.held,
             Flag::Fruit => self.fruit,
             Flag::Near => self.floors_near,
         }
@@ -88,7 +88,7 @@ impl std::fmt::Display for Level {
     /// The spec `parse` reads.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "r0sx")?;
-        for (on, c) in [(self.held, 'h'), (self.fruit, 'f'), (self.floors_near, 'n')] {
+        for (on, c) in [(self.fruit, 'f'), (self.floors_near, 'n')] {
             if on {
                 write!(f, "{c}")?;
             }
@@ -102,8 +102,6 @@ impl std::fmt::Display for Level {
 pub enum Flag {
     /// Every level, `r0sx` included.
     Always,
-    /// `h`.
-    Held,
     /// `f`.
     Fruit,
     /// `n`.
@@ -136,8 +134,10 @@ pub enum Stored {
     Phase { lo: i32, hi: i32 },
     /// `max(v, lo)`: every value at most `lo` reads alike.
     AtLeast(i32),
-    /// The unknown number (`AV::UNum`), which contains every value.
-    UnknownNum,
+    /// The unknown number (`AV::UNum`), which contains every value; a
+    /// `countdown`'s (a number the cart only counts down and compares with
+    /// 0) reads its comparisons as countdown atoms (`Op::UnknownNum`).
+    UnknownNum { countdown: bool },
     /// The unknown boolean (`AV::UBool`).
     UnknownBool,
     /// A constant: the slot is DEAD (nothing observed reads it).
@@ -284,14 +284,21 @@ pub const FLY_FRUIT_SPD_Y: (i32, i32) = (-0x3_8000, 0x8000);
 pub static TABLE: &[Entry] = &[
     Entry {
         name: "held buttons",
-        flag: Flag::Held,
+        flag: Flag::Always,
         target: Target::Objects("player"),
-        slots: &[slot(&["p_jump"], Stored::UnknownBool, Input::BothWays), slot(&["p_dash"], Stored::UnknownBool, Input::BothWays)],
+        slots: &[
+            slot(&["p_jump"], Stored::UnknownBool, Input::BothWays),
+            slot(&["p_dash"], Stored::UnknownBool, Input::BothWays),
+            slot(&["jbuffer"], Stored::UnknownNum { countdown: true }, Input::Unknown),
+        ],
         kind: Kind::Over,
         hook: None,
-        why: "The previous frame's buttons (read only to detect a press) unknown, each read both ways: \
-              a held button may re-trigger (a ground jump then a wall jump on consecutive frames). \
-              Refuted by the CONCRETE SEARCH.",
+        why: "THE BUTTONS' MEMORY, at every level (plans/correctness.md C7): the previous frame's \
+              buttons (read only to detect a press) unknown, each read both ways, and the jump \
+              buffer (`jbuffer`, a press kept for 4 updates) the unknown countdown: a jump may fire \
+              on any update its grace or a wall allows, which covers every buffered and \
+              re-triggered jump (a ground jump then a wall jump on consecutive updates). Refuted by \
+              the CONCRETE SEARCH, which runs the cart's buttons exactly.",
     },
     Entry {
         name: "player remainder",
@@ -351,8 +358,8 @@ pub static TABLE: &[Entry] = &[
         why: "DEAD fields: the cart reads `frames`, `seconds`, `minutes` and `deaths` only to update \
               each other and the key's sprite (below), never in anything a state's successors or the \
               search's tests depend on, so every value of them behaves alike. Checked: traced as free \
-              input cells along room (4,0)'s 100% route, no other stored field, guard, error or raise \
-              reads them, but for an error's overflow check of their own arithmetic (`minutes + 1`), \
+              input cells along room (4,0)'s and (6,2)'s 100% routes and room (5,2)'s (the orb), no \
+              other stored field, guard, error or raise reads them, but for an error's overflow check of their own arithmetic (`minutes + 1`), \
               which holds at the stored 0 (`trace::widen::tests::dead_fields_are_unread`).",
     },
     Entry {
@@ -366,12 +373,42 @@ pub static TABLE: &[Entry] = &[
               each other and the draw, so every value behaves alike. Checked with the timers.",
     },
     Entry {
+        name: "sound timers",
+        flag: Flag::Always,
+        target: Target::Globals,
+        slots: &[slot(&["sfx_timer"], Stored::Num(0), Input::Stored), slot(&["music_timer"], Stored::Num(0), Input::Stored)],
+        kind: Kind::Exact,
+        hook: None,
+        why: "DEAD fields: each read only to count itself down and to decide a call of the no-op \
+              `sfx`/`music`, so every value behaves alike. Checked with the timers.",
+    },
+    Entry {
+        name: "fly fruit sound delay",
+        flag: Flag::Always,
+        target: Target::Objects("fly_fruit"),
+        slots: &[slot(&["sfx_delay"], Stored::Num(0), Input::Stored)],
+        kind: Kind::Exact,
+        hook: None,
+        why: "DEAD field: read only to count itself down, then to call the no-op `sfx` and set the \
+              dead `sfx_timer`, so every value behaves alike. Checked with the timers.",
+    },
+    Entry {
+        name: "screen shake",
+        flag: Flag::Always,
+        target: Target::Globals,
+        slots: &[slot(&["shake"], Stored::Num(0), Input::Stored)],
+        kind: Kind::Exact,
+        hook: None,
+        why: "DEAD field: read only to count itself down and to call the no-op `camera` (with `rnd` \
+              offsets, unread), so every value behaves alike. Checked with the timers.",
+    },
+    Entry {
         name: "fly fruit",
         flag: Flag::Fruit,
         target: Target::Objects("fly_fruit"),
         slots: &[
-            slot(&["step"], Stored::UnknownNum, Input::Unknown),
-            slot(&["y"], Stored::UnknownNum, Input::Unknown),
+            slot(&["step"], Stored::UnknownNum { countdown: false }, Input::Unknown),
+            slot(&["y"], Stored::UnknownNum { countdown: false }, Input::Unknown),
             slot(&["spd", "y"], Stored::Range { lo: FLY_FRUIT_SPD_Y.0, hi: FLY_FRUIT_SPD_Y.1 }, Input::Literal),
             slot(&["rem", "y"], Stored::Range { lo: REM.0, hi: REM.1 }, Input::Literal),
             slot(&["fly"], Stored::UnknownBool, Input::Atom),
@@ -387,7 +424,7 @@ pub static TABLE: &[Entry] = &[
         name: "fall floor countdown",
         flag: Flag::Near,
         target: Target::Objects("fall_floor"),
-        slots: &[Slot { field: &["delay"], stored: Stored::UnknownNum, input: Input::Unknown, optional: true }],
+        slots: &[Slot { field: &["delay"], stored: Stored::UnknownNum { countdown: true }, input: Input::Unknown, optional: true }],
         kind: Kind::Over,
         hook: None,
         why: "The countdown, the unknown number (never the interval [MIN, MAX]: `delay - 1` of it \
@@ -398,7 +435,7 @@ pub static TABLE: &[Entry] = &[
         name: "balloon countdown",
         flag: Flag::Near,
         target: Target::Objects("balloon"),
-        slots: &[slot(&["timer"], Stored::UnknownNum, Input::Unknown)],
+        slots: &[slot(&["timer"], Stored::UnknownNum { countdown: true }, Input::Unknown)],
         kind: Kind::Over,
         hook: None,
         why: "As the fall floor's countdown.",
@@ -409,9 +446,9 @@ pub static TABLE: &[Entry] = &[
         target: Target::Objects("spring"),
         slots: &[
             slot(&["spr"], Stored::Range { lo: SPRING_SPR_RANGE.0, hi: SPRING_SPR_RANGE.1 }, Input::Stored),
-            Slot { field: &["delay"], stored: Stored::UnknownNum, input: Input::Unknown, optional: true },
-            slot(&["hide_in"], Stored::UnknownNum, Input::Unknown),
-            slot(&["hide_for"], Stored::UnknownNum, Input::Unknown),
+            Slot { field: &["delay"], stored: Stored::UnknownNum { countdown: true }, input: Input::Unknown, optional: true },
+            slot(&["hide_in"], Stored::UnknownNum { countdown: true }, Input::Unknown),
+            slot(&["hide_for"], Stored::UnknownNum { countdown: true }, Input::Unknown),
         ],
         kind: Kind::Over,
         hook: None,
@@ -452,7 +489,7 @@ pub static TABLE: &[Entry] = &[
               certainly overlaps the floor at the frame's end (there the cart's invariant, hidden, \
               owed). The input derives `collideable` as `state ~= 2` \
               (the cart keeps them in step). Refuted by the CONCRETE SEARCH or the ladder \
-              `r0sxhn,r0sxh`.",
+              `r0sxn,r0sx`.",
     },
     Entry {
         name: "balloon offset",
@@ -608,7 +645,8 @@ impl std::fmt::Display for Stored {
             Stored::Band { around, radius } => write!(f, "`{around}` +- {}; owed: inside", show_raw(*radius)),
             Stored::Phase { lo, hi } => write!(f, "one period [{}, {}]", show_raw(*lo), show_raw(*hi)),
             Stored::AtLeast(k) => write!(f, "max(v, {})", show_raw(*k)),
-            Stored::UnknownNum => write!(f, "the unknown number"),
+            Stored::UnknownNum { countdown: false } => write!(f, "the unknown number"),
+            Stored::UnknownNum { countdown: true } => write!(f, "the unknown number, a countdown"),
             Stored::UnknownBool => write!(f, "the unknown boolean"),
             Stored::Num(k) => write!(f, "{} (dead)", show_raw(*k)),
             Stored::Bool(b) => write!(f, "{b} (dead)"),
@@ -638,7 +676,6 @@ pub fn render_markdown() -> String {
     for e in TABLE {
         let flag = match e.flag {
             Flag::Always => "every",
-            Flag::Held => "`h`",
             Flag::Fruit => "`f`",
             Flag::Near => "`n`",
         };
@@ -835,7 +872,7 @@ pub fn widen_level<W: Widener>(w: &mut W, level: Level) -> anyhow::Result<()> {
                     }
                     Stored::AbsentAsZero => None,
                     Stored::Phase { lo, hi } => checked(w, ei, p, Holds::Number, Lit::Ival(constant(lo), constant(hi)))?,
-                    Stored::UnknownNum => checked(w, ei, p, Holds::NumberOrUnknown, Lit::UnknownNum { countdown: e.flag == Flag::Near })?,
+                    Stored::UnknownNum { countdown } => checked(w, ei, p, Holds::NumberOrUnknown, Lit::UnknownNum { countdown })?,
                     Stored::UnknownBool => checked(w, ei, p, Holds::Boolean, Lit::UnknownBool)?,
                     Stored::Num(n) => checked(w, ei, p, Holds::Number, Lit::Num(constant(n)))?,
                     Stored::Bool(b) => checked(w, ei, p, Holds::Boolean, Lit::Bool(b))?,
@@ -1046,19 +1083,24 @@ mod tests {
     #[test]
     fn levels_parse_and_print() {
         assert_eq!(Level::parse("r0sx").unwrap(), Level::EXACT);
-        for spec in ["r0sx", "r0sxh", "r0sxhf", "r0sxhn", "r0sxhfn", "r0sxn", "r0sxf"] {
+        for spec in ["r0sx", "r0sxf", "r0sxn", "r0sxfn"] {
             assert_eq!(Level::parse(spec).unwrap().to_string(), spec);
         }
-        let hn = Level::parse("r0sxhn").unwrap();
-        assert!(hn.held && hn.floors_near && !hn.fruit);
+        let n = Level::parse("r0sxn").unwrap();
+        assert!(n.floors_near && !n.fruit);
+        // `h` is gone: the buttons are widened at every level.
+        for spec in ["r0sxh", "r0sxhn", "r0sxnh", "r0sxfhn"] {
+            let e = Level::parse(spec).expect_err("`h`");
+            assert!(e.contains("`h` was removed: held buttons are widened at every level (plans/correctness.md C7)"), "{e}");
+        }
         // Only the `r0sx` prefix parses.
         assert!(Level::parse("r1sx").is_err());
         assert!(Level::parse("rxsx").is_err());
         assert!(Level::parse("r0s16").is_err());
         assert!(Level::parse("y2r0sx").is_err());
-        assert!(Level::parse("r0sxhb").is_err(), "floors unknown `b` is gone");
-        assert!(Level::parse("r0sxnh").is_err(), "flags in order");
-        for spec in ["r0sxhnp", "r0sxhfp", "r0sxp"] {
+        assert!(Level::parse("r0sxb").is_err(), "floors unknown `b` is gone");
+        assert!(Level::parse("r0sxnf").is_err(), "flags in order");
+        for spec in ["r0sxnp", "r0sxfp", "r0sxp"] {
             let e = Level::parse(spec).expect_err("`p` is gone");
             assert!(e.contains("`p` (widened platforms) was removed: platforms are exact"), "{spec}: {e}");
         }

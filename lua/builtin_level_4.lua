@@ -22,9 +22,9 @@ function __reset_button_states()
 end
 
 function btn(i)
-  -- TODO What happens if this is called during _draw? Are the values guaranteed
-  -- to be consistent with _update?
-
+  -- The buttons are reset once a step, before `_update`, and fixed at
+  -- their first read: `_draw` reads what `_update` read (the cart's draws
+  -- read none).
   __assert(i >= 0)
   __assert(i <= 5)
   i = i + 1
@@ -40,7 +40,8 @@ function btn(i)
 end
 
 function count(v)
-  -- TODO crash when a second argument is called
+  -- PICO-8's second argument (count one value) is not modelled: the cart
+  -- never passes it.
   return #v
 end
 
@@ -83,4 +84,5 @@ function pal() end
 function rectfill() end
 function map() end
 function spr() end
+function camera() end
 function circfill() end

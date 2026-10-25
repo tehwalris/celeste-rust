@@ -83,8 +83,7 @@ pub fn parse_trace(text: &str) -> Result<Vec<Update>> {
                 let input: i32 = input.parse().with_context(at)?;
                 out.push(Update { input: (input >= 0).then(|| input as u8), ..Default::default() });
             }
-            // A sound (`tools::golden::canonical_jumps` reads the jumps'; the
-            // state is what is compared).
+            // A sound: the state is what is compared.
             Some("s") => {}
             Some("g") => {
                 let (Some(name), Some(v)) = (w.next(), w.next()) else { bail!("{}", at()) };
@@ -236,9 +235,10 @@ mod tests {
     use crate::settings::FloatTool;
 
     /// THE FLOAT ORACLE IS UNIVERSALCLASSICTAS, BIT FOR BIT: every golden of
-    /// gates/uct/manifest.txt (the tasdatabase's files as UCT plays them, their
-    /// buffered jumps re-timed) replayed from the IL load under the file's
-    /// seeds, every number and boolean equal after every update.
+    /// gates/uct/manifest.txt (the tasdatabase's files as UCT plays them, as
+    /// they are: the cart buffers a jump as the original does) replayed from
+    /// the IL load under the file's seeds, every number and boolean equal
+    /// after every update (`jbuffer` and `p_jump` among them).
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: every UCT golden, ~30 CPU-s"]
     fn the_float_engine_plays_every_golden_as_uct_does() {

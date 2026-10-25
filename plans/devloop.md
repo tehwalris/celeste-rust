@@ -21,7 +21,7 @@ byte-identical, or re-pins them on evidence.
   hulls), and the arc gate. The arc gate pins the marks, W at every frame
   f0-f35, the optimum, the concrete witness and the known route
   (`--prefer`, `search::known`).
-- **The objects-ladder search** (t2): room (4,2) `r0sxhn,r0sxh`, every
+- **The objects-ladder search** (t2): room (4,2) `r0sxn,r0sx`, every
   `[gate]` line, and its UI export.
 - **The float and dual gates** (t2), and the float twins' frames (t1).
 - **The differential checks against the reference engine**:
@@ -86,7 +86,7 @@ ones moved out. Every `#[ignore]` reason starts with the tier that runs it
 
 - `slow, `: t2 runs it (nextest `--run-ignored only`, 8 at a time);
 - `pre-merge, `: `all` runs it, one at a time (a level -1 table build,
-  ~250 CPU-s; the floors' pin, 16 GB);
+  ~250 CPU-s);
 - `local, `: `./check.sh local` runs it.
 
 So t0's "N skipped" is these, not a pass.
@@ -122,7 +122,7 @@ The steps run in four lanes:
   f0-f27), and
   `hull10[f]` (`check replay` over the kernels' tree to f36: its recorded
   edges reproduce its states at every frame);
-- **platforms**: `forward60-platforms` (room (6,0) `r0sxhf` split frame to
+- **platforms**: `forward60-platforms` (room (6,0) `r0sxf` split frame to
   step 71, its ten platforms exact and keyed by the first one's; its
   `ckhash --edges --hulls` the r60s pin) and `widen-r60s`;
 - **slow**: the `slow, ` tests. These are the hull forward between the exact
@@ -255,12 +255,12 @@ never committed.
 
 | fixture | what | build |
 |---|---|---|
-| r10, f10 | room (1,0) 200m `r0sxh` to f56, 16.16 and float; frame 55 -> 56 | 4 s each |
-| r62h | room (6,2) 100% `r0sxhf`, level -1 (94,5), to f51; frame 50 -> 51 | 50-110 s (the table) |
-| r42n, f42n | room (4,2) 2100m `r0sxhn`, level -1 (71,5), to f61; frame 60 -> 61 | 15-25 s |
-| r42x, f42x | room (4,2) `r0sxh` (objects exact) to f56: the reference checks' object room | 14-18 s |
-| r10arc, f10arc | `search --level r0sxh --frames 56 --win-at 40,64`: the backward's tree | 4-5 s |
-| r60s | room (6,0) 700m `r0sxhf` (ten exact platforms keyed by the first), split frame, to step 71 | 18-40 s |
+| r10, f10 | room (1,0) 200m `r0sx` to f56, 16.16 and float; frame 55 -> 56 | 4 s each |
+| r62h | room (6,2) 100% `r0sxf`, level -1 (94,5), to f51; frame 50 -> 51 | 50-110 s (the table) |
+| r42n, f42n | room (4,2) 2100m `r0sxn`, level -1 (71,5), to f61; frame 60 -> 61 | 15-25 s |
+| r42x, f42x | room (4,2) `r0sx` (objects exact) to f56: the reference checks' object room | 14-18 s |
+| r10arc, f10arc | `search --level r0sx --frames 56 --win-at 40,64`: the backward's tree | 4-5 s |
+| r60s | room (6,0) 700m `r0sxf` (ten exact platforms keyed by the first), split frame, to step 71 | 18-40 s |
 | r62h57 (big) | room (6,2) 100% to f57, the reference frame | 57 s |
 
 ## Re-pinning
@@ -285,8 +285,8 @@ then the tiers' `--pin`.
 ## Gaps
 
 - **The n level against the reference.** `check ref` and `check arcs` at
-  `r0sxhn` fork the widened objects into thousands of paths a row. t1
-  checks the object room at `r0sxh`, and the n kernels end to end
+  `r0sxn` fork the widened objects into thousands of paths a row. t1
+  checks the object room at `r0sx`, and the n kernels end to end
   (search42) and by key-check.
 - **Every build of the sources builds its kernels once** (the kernel
   cache, `compiled::cache`: a set is keyed on the sources, so a commit's

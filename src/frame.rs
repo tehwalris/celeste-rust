@@ -129,7 +129,7 @@ pub fn wins_of<N: Arithmetic>(rt2: &Rt2<N>, s: &crate::settings::Settings) -> Re
 /// reports one), and the per-room optima must chain in real play
 /// (plans/correctness.md C8). An unknown counts as alive (an abstract win
 /// over-approximates; the concrete search runs it exact).
-fn died<N: Arithmetic>(rt2: &Rt2<N>) -> Result<Vec<bool>> {
+pub(crate) fn died<N: Arithmetic>(rt2: &Rt2<N>) -> Result<Vec<bool>> {
     use celeste_engine::runtime2::{NONE, AV};
     let c = rt2.globals[celeste_names::global("will_restart") as usize];
     anyhow::ensure!(c != NONE, "wins: no `will_restart` global");
@@ -1179,12 +1179,12 @@ mod tests {
 
     /// Does `registry` run `r`'s one lane (else its kernel declines), keyed
     /// against `visited`'s key space?
-    fn kernel_runs(registry: &Registry<P8>, r: &Rt2, level: Level, s: &Settings, visited: &crate::storage::visited::VisitedSet<P8>) -> bool {
+    fn kernel_runs(registry: &Registry<P8>, r: &Rt2, s: &Settings, visited: &crate::storage::visited::VisitedSet<P8>) -> bool {
         let cells = crate::storage::cells::block_cells(r).expect("cells");
         let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
         let prov = celeste_engine::exact::Provisional::default();
         let (base, xtab) = (crate::storage::edges::XferTable::default(), Default::default());
-        let mut sink = crate::storage::unit::UnitSink::new(visited, &routes, &skeletons, &prov, Filters::default(), 1, level, 0, &base, &xtab, s);
+        let mut sink = crate::storage::unit::UnitSink::new(visited, &routes, &skeletons, &prov, Filters::default(), 1, 0, &base, &xtab, s);
         sink.begin(0);
         let si = sink.push_source(0, (0, 0));
         sink.push_lane(si, cells[0], Hull::full());
@@ -1197,7 +1197,7 @@ mod tests {
     fn the_mark_filter_admits_up_to_the_deadline() {
         let s = Settings::default();
         let block = start_blocks(&s).pop().expect("a block");
-        let coarse = Level::parse("r0sxh").expect("level");
+        let coarse = Level::parse("r0sx").expect("level");
         // The coarse key space holds the projection's codes.
         let mut w = block.clone_block();
         w.widen_to(coarse);
@@ -1238,7 +1238,7 @@ mod tests {
     /// THE HULL FORWARD LIES BETWEEN THE EXACT REACH AND THE WIDENED FORWARD,
     /// room (1,0) to f34: with every hull widened to the whole circle
     /// (`hull::WIDEN`) the frames are the pinned widened ones
-    /// (gates/ckhash_room10_f000-044_widened.txt); the hull forward keeps a
+    /// (gates/ckhash_room10_f000-034_widened.txt); the hull forward keeps a
     /// SUBSET of those states, each in a layer no earlier than the widened
     /// one's; and it holds every state the exact-remainder reach
     /// (`search::reach`) reaches, in a layer no later than the frame it is
@@ -1267,7 +1267,11 @@ mod tests {
         ForwardState::start(init(), &hull, to, None, level, &s).expect("start").extend(&e, &hull, to, None).expect("hull");
         let t = crate::storage::layer::Tree::<P8>::open(&wide, to).expect("tree");
         let lines: Vec<String> = (0..=to).map(|f| { let (n, acc) = t.layer(f, None, 4).expect("layer").0.content_fingerprint(&t.space, &t.shapes).expect("fp"); format!("f{f:03} {n} {acc:016x}") }).collect();
-        let pinned = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/gates/ckhash_room10_f000-044_widened.txt")).expect("the gate");
+        let pin = concat!(env!("CARGO_MANIFEST_DIR"), "/gates/ckhash_room10_f000-034_widened.txt");
+        if std::env::var_os("CELESTE_REGENERATE").is_some() {
+            std::fs::write(pin, lines.join("\n") + "\n").expect("write the pin");
+        }
+        let pinned = std::fs::read_to_string(pin).expect("the gate (CELESTE_REGENERATE=1 writes it)");
         assert_eq!(lines, pinned.lines().take(to as usize + 1).collect::<Vec<_>>(), "the widened forward is not the gate's");
         let (ws, hs) = (states(&wide), states(&hull));
         let first_in = |sets: &[rustc_hash::FxHashSet<u64>], h: u64| sets.iter().position(|x| x.contains(&h));
@@ -1391,7 +1395,7 @@ mod tests {
         let base = crate::testutil::TestDir::new("done-marker");
         let (a, b) = (base.join("uninterrupted"), base.join("killed"));
         // The kernels (they record transfers), past the spawn.
-        let level = Level::parse("r0sxh").expect("level");
+        let level = Level::parse("r0sx").expect("level");
         let e = crate::compiled::FrameEngine::new(&s, level).expect("kernels");
         let start = RefEngine::new(&s).expect("engine").initial().expect("init");
         let init = || vec![start.clone_block().canonicalized()];
@@ -1481,7 +1485,7 @@ mod tests {
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels, ~20 CPU-s"]
     fn a_lane_outside_its_kernels_bounds_declines() {
         let s = Settings::default();
-        let level = Level::parse("r0sxh").expect("level");
+        let level = Level::parse("r0sx").expect("level");
         let grid = s.region_grid().expect("the default region grid");
         let registry = crate::compiled::asm_kernel::registry(level, &s);
         let row = standing_row(&s, level);
@@ -1505,7 +1509,7 @@ mod tests {
         let runs = |r: &Rt2| -> bool {
             let cells = crate::storage::cells::block_cells(r).expect("cells");
             assert!(grid.of_cell(cells[0]).is_some(), "the lane has a region");
-            kernel_runs(&registry, r, level, &s, &crate::storage::visited::VisitedSet::new())
+            kernel_runs(&registry, r, &s, &crate::storage::visited::VisitedSet::new())
         };
         let px = |n: i16| P8::from_i16(n);
         let half = P8::from_parts(0, 0x8000);
@@ -1528,7 +1532,7 @@ mod tests {
     #[ignore = "slow, ./check.sh t2 runs it: room (6,0)'s split kernels, ~40 CPU-s"]
     fn the_kernels_emission_checks_the_followers() {
         let s = Settings { room: (6, 0), split_frame: true, ..Default::default() };
-        let level = Level::parse("r0sxhf").expect("level");
+        let level = Level::parse("r0sxf").expect("level");
         let registry = crate::compiled::asm_kernel::registry(level, &s);
         let mut reference = RefEngine::new(&s).expect("ref engine");
         let start = reference.initial().expect("start");
@@ -1543,7 +1547,7 @@ mod tests {
             .collect();
         let mut visited = crate::storage::visited::VisitedSet::new();
         crate::storage::wave::seed(&mut visited, &rows, Hull::full(), &s).expect("the steps keyed");
-        assert!(kernel_runs(&registry, &rows[1], level, &s, &visited), "the second step runs against its own record");
+        assert!(kernel_runs(&registry, &rows[1], &s, &visited), "the second step runs against its own record");
         let ty = celeste_names::global("platform");
         let mut adds = visited.keys.to_additions();
         let mut corrupted = 0;
@@ -1559,17 +1563,18 @@ mod tests {
         }
         assert!(corrupted > 0, "the follower's records");
         visited.keys = celeste_engine::exact::KeySpace::from_additions(adds).expect("the records replay");
-        let fatal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| kernel_runs(&registry, &rows[1], level, &s, &visited))).expect_err("a follower other than its record is FATAL");
+        let fatal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| kernel_runs(&registry, &rows[1], &s, &visited))).expect_err("a follower other than its record is FATAL");
         let msg = fatal.downcast_ref::<String>().cloned().unwrap_or_default();
         assert!(msg.contains("declared key dependency is VIOLATED") && msg.contains("the kernels' emission"), "{msg}");
     }
 
-    /// A DYING EXIT IS NO WIN (plans/correctness.md C8). Room (2,2)'s top
-    /// row holds a right-facing spike (tile 59) at tile 8, beside the exit. A
-    /// player at x 64 rising from y -3 at 2 px a frame is in its kill zone
-    /// after its move (not moving left) and above y -4: the one update kills
-    /// it and, on its table, loads room (3,2) with the restart pending. The
-    /// same rise at x 40, clear of the spike, is the room's clean exit.
+    /// A DYING EXIT IS NO WIN (plans/correctness.md C8), nor a witness's
+    /// exit (`concrete::leaving`). Room (2,2)'s top row holds a right-facing
+    /// spike (tile 59) at tile 8, beside the exit. A player at x 64 rising
+    /// from y -3 at 2 px a frame is in its kill zone after its move (not
+    /// moving left) and above y -4: the one update kills it and, on its
+    /// table, loads room (3,2) with the restart pending. The same rise at x
+    /// 40, clear of the spike, is the room's clean exit.
     #[test]
     fn a_dying_exit_is_no_win() {
         let s = Settings { room: (2, 2), ..Default::default() };
@@ -1598,9 +1603,12 @@ mod tests {
         assert_eq!(died(&dying).expect("died"), [true], "it died in that update");
         assert_eq!(wins_of(&dying, &s).expect("wins"), [false], "a dying exit is no win");
         assert_eq!(not_expanded(&dying, 1, None, &s).expect("not expanded"), [true], "nor is it expanded");
+        assert_eq!(crate::concrete::leaving(&dying, &s).expect("leaving"), Some(false), "nor is it a witness's exit");
         let clean = rise(40);
         assert_eq!(died(&clean).expect("died"), [false]);
         assert_eq!(wins_of(&clean, &s).expect("wins"), [true], "the clean exit wins");
+        assert_eq!(crate::concrete::leaving(&clean, &s).expect("leaving"), Some(true), "and is a witness's exit");
+        assert_eq!(crate::concrete::leaving(&st, &s).expect("leaving"), None, "the player in the room has not left it");
     }
 
     /// THE ORB DEADLINE AGAINST THE CART (plans/correctness.md C2), in
@@ -1715,7 +1723,7 @@ mod tests {
     }
 
     /// THE SPLIT FRAME at a near level reaches the unsplit (pinned) state
-    /// counts at every boundary, room (2,1) `r0sxhn`. Guards nil-global
+    /// counts at every boundary, room (2,1) `r0sxn`. Guards nil-global
     /// removal and the mid-frame cut not widening floors the player reads.
     /// (A mid-frame state's hull merges its sources' and part b moves no
     /// remainder, so the boundaries' hulls are the unsplit frame's.)
@@ -1723,7 +1731,7 @@ mod tests {
     #[ignore = "slow, ./check.sh t2 runs it: room (2,1)'s split kernels and a forward, ~55 CPU-s"]
     fn split_frame_reaches_the_unsplit_frontier_at_a_near_level() {
         let s = Settings { room: (2, 1), split_frame: true, ..Default::default() };
-        let level = Level::parse("r0sxhn").expect("level");
+        let level = Level::parse("r0sxn").expect("level");
         let dir = &std::path::PathBuf::from(format!("/var/tmp/celeste-frame-split-near-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("checkpoint dir");

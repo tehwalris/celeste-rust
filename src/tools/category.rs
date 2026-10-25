@@ -3,7 +3,7 @@
 //! result verified end to end.
 //!
 //! JOBS is a JSON list of `{"cat": "nodiag", "room": "0,0", "name": "100m",
-//! "offset": 27, "levels": "r0sxhn,r0sxh", "l1": true, "mem": "60G"}`;
+//! "offset": 27, "levels": "r0sxn,r0sx", "l1": true, "mem": "60G"}`;
 //! optional: `flags` (more flags for the search, e.g. `["--split-frame"]`),
 //! `tag`, `timeout` (s), `reuse` (a level-0 tree directory, moved in when it
 //! exists and moved back there when the job ends: jobs can count horizons
@@ -332,7 +332,7 @@ pub fn run(job: &Job, cx: &Ctx) -> Result<Row> {
         let rec = std::fs::read_to_string(tree.join("result.json")).ok().map(|t| serde_json::from_str::<Value>(&t)).transpose()?;
         Ok(Some((status.code().unwrap_or(-1), rec, t.elapsed().as_secs_f64())))
     };
-    let (opt, mut ours): (u32, Vec<u8>) = match job.opt_str("witness").filter(|w| !w.is_empty()) {
+    let (opt, ours): (u32, Vec<u8>) = match job.opt_str("witness").filter(|w| !w.is_empty()) {
         Some(w) => {
             let ours = crate::concrete::read_inputs(w)?;
             res.set("witness_from", w);
@@ -390,25 +390,12 @@ pub fn run(job: &Job, cx: &Ctx) -> Result<Row> {
     // witness`'s, in a 100% category), and the upload carries the one that
     // works.
     let hundred = cat.hundred();
-    let witness = |sd: &[String]| crate::concrete::witness(&ours, &settings(room, cat, jank, sd)?);
     let mut candidates = vec![seeds.clone()];
-    candidates.extend(witness(&seeds)?.chest_seed_variants);
-    let (mut mine, mut e, mut fs, mut berry, mut sd) = (ours.clone(), None, Vec::new(), false, seeds.clone());
+    candidates.extend(crate::concrete::witness(&ours, &settings(room, cat, jank, &seeds)?)?.chest_seed_variants);
+    let (mut e, mut fs, mut berry, mut sd) = (None, Vec::new(), false, seeds.clone());
     for cand in candidates {
         sd = cand;
-        mine = ours.clone();
         (e, fs) = replay_exit(r, room, &ours, &sd, cat, jank)?;
-        if e != Some(opt) {
-            // A jump press that does nothing in the minimal cart can fire
-            // later in the original (its jump buffer, C7): keep only the
-            // presses that fire.
-            let canon = witness(&sd)?.canonical;
-            let (e2, fs2) = replay_exit(r, room, &canon, &sd, cat, jank)?;
-            res.set("jump_canonicalized", format!("original cart exit {} -> {}", py_opt(e), py_opt(e2)));
-            if e2 == Some(opt) {
-                (mine, e, fs) = (canon, e2, fs2);
-            }
-        }
         // The berry taken before the exit: a `lifeup` appears where it was.
         berry = e.is_some_and(|e| e != 0 && fs.iter().any(|fr| fr.lifeup && fr.f < e));
         if e == Some(opt) && (berry || !hundred) {
@@ -418,10 +405,6 @@ pub fn run(job: &Job, cx: &Ctx) -> Result<Row> {
     if e == Some(opt) && sd != seeds {
         res.set("chest_seeds", format!("[{}] -> [{}]", seeds.join(","), sd.join(",")));
         seeds = sd;
-    }
-    if e == Some(opt) {
-        ours = mine;
-        std::fs::write(jd.join("witness.txt"), join(&ours))?;
     }
     res.set("ours_original_cart_exit", e);
     if hundred {
@@ -543,10 +526,6 @@ fn py_tail(xs: &[u8], c: i64) -> &[u8] {
 
 fn join(xs: &[u8]) -> String {
     xs.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(",")
-}
-
-fn py_opt(x: Option<u32>) -> String {
-    x.map_or("None".into(), |v| v.to_string())
 }
 
 /// Step 5: the improvement's web UI run (`export-ui` with both runs'
@@ -767,7 +746,7 @@ mod tests {
     /// A job with a key the runner does not know is refused.
     #[test]
     fn an_unknown_job_key_is_refused() {
-        let job: serde_json::Map<String, Value> = serde_json::from_str(r#"{"cat": "100", "room": "4,0", "name": "500m", "offset": 25, "levels": "r0sxh", "flgs": []}"#).expect("json");
+        let job: serde_json::Map<String, Value> = serde_json::from_str(r#"{"cat": "100", "room": "4,0", "name": "500m", "offset": 25, "levels": "r0sx", "flgs": []}"#).expect("json");
         let e = check_job(Job(job)).expect_err("a typo").to_string();
         assert_eq!(e, "job 100/500m: unknown keys ['flgs'] (the module's doc lists them)");
     }

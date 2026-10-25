@@ -137,8 +137,18 @@ sounds like one of these. The full write-ups are in git history.
 - **`p_jump`/`p_dash` widened with nothing exact behind it** (2026-08-06,
   08-16): a held trail admits a ground jump then a wall jump; the ladder
   could report a spurious optimum. The rule "never widen without something
-  exact that refutes it" came from it. `h` is refuted by the concrete
-  search.
+  exact that refutes it" came from it. The buttons' widening (`h`, every
+  level's since 2026-10-25) is refuted by the concrete search.
+- **The cart without the jump buffer** (2022 - 2026-10-25, C7): "a
+  buffered jump executes identically to an exactly-timed press" missed a
+  buffered jump then a fresh one on consecutive updates (PICO-8, room
+  (1,0) f42): every optimum held for a game a little smaller than the real
+  one. A cart difference is a difference of the GAME unless proven
+  otherwise. Its first cost fix, reading jump as released at the abstract
+  levels, lost real states ((1,0) f24 24 -> 12: on the player's creation
+  frame the buffer is concretely 0); the kept fix proves the duplicates
+  identical when the kernel is built. A variant that compared slots per
+  lane emitted no less and cost +15% instructions.
 - **The count-up's memo keyed on the level's row key** (fixed `522de36`):
   two concrete states shared an entry, so "no concrete win within f" was no
   proof. A cache in front of an exact check must be keyed exactly.

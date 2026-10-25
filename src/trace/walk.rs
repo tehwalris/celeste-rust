@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn the_no_player_chain_refuses_loudly_but_for_an_rnd_draw() {
         use crate::settings::Settings;
-        let level = crate::abstraction::Level::parse("r0sxh").expect("level");
+        let level = crate::abstraction::Level::parse("r0sx").expect("level");
         let chain = |s: Settings, max_nodes: Option<usize>| {
             let (mut tr, start) = super::boot::<celeste_core::arith::Fixed>(&s, level).expect("boot");
             tr.it.max_nodes = max_nodes.unwrap_or(tr.it.max_nodes);
@@ -459,17 +459,23 @@ mod tests {
         assert!(e.contains("no-player chain, frame 0") && e.contains("the trace grew the graph"), "{e}");
     }
 
+    /// NEAR FLOORS SIDE BY SIDE SPLIT ONLY WHAT COLLISIONS READ: each fall
+    /// floor a region's player reaches makes two rows (solid, hidden), not
+    /// three (`verify::absorbed`; room (6,1) region (4,6) made 2 x 3^4 = 162
+    /// outcomes before it). The jump buffer's countdown (a buffered jump fires
+    /// or not) at most doubles a frame's outcomes: at most 144, twice the
+    /// buffer-less bound (measured 48 and 80; 32 and 48 without the buffer).
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (6,1)'s lattice walk, ~15 s"]
     fn near_floors_side_by_side_split_only_what_collisions_read() {
         let s = crate::settings::Settings { room: (6, 1), ..Default::default() };
-        let opts = crate::abstraction::Level { held: true, floors_near: true, ..crate::abstraction::Level::EXACT };
+        let opts = crate::abstraction::Level { floors_near: true, ..crate::abstraction::Level::EXACT };
         let only = [super::Region { ix: 3, iy: 6 }, super::Region { ix: 4, iy: 6 }];
         let lw: super::LatticeWalk = super::room_constant_lattice(opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
         let mut traced = 0;
         for ((shape, region), f) in &lw.frames {
             let Some(r) = region else { continue };
-            assert!(f.frame.outs.len() <= 72, "shape {shape} region ({},{}): {} outcomes", r.ix, r.iy, f.frame.outs.len());
+            assert!(f.frame.outs.len() <= 144, "shape {shape} region ({},{}): {} outcomes", r.ix, r.iy, f.frame.outs.len());
             traced += 1;
         }
         assert!(traced >= 2, "{traced} (shape, region) nodes traced");
@@ -486,7 +492,7 @@ mod tests {
     fn a_respawn_after_the_loading_jank_is_inside_its_shapes_bounds() {
         use super::super::{iface, shapes, widen};
         let s = crate::settings::Settings { room: (0, 3), category: crate::settings::Category::Gemskip100, loading_jank: Some(1), ..Default::default() };
-        let opts = crate::abstraction::Level::parse("r0sxh").expect("level");
+        let opts = crate::abstraction::Level::parse("r0sx").expect("level");
         let only: Vec<super::Region> = (0..8).flat_map(|ix| (5..8).map(move |iy| super::Region { ix, iy })).collect();
         let lw: super::LatticeWalk = super::room_constant_lattice(opts, &super::Walk { settings: &s, only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
         let mut bounded = 0;

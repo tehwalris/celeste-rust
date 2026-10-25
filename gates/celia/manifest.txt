@@ -1,168 +1,168 @@
-100 1 room=0,0 seeds=- gemskip=0 jank=- updates=115 celia=finished retimed=0
-100 3 room=2,0 seeds=- gemskip=0 jank=1 updates=128 celia=finished retimed=0
-100 4 room=3,0 seeds=- gemskip=0 jank=4 updates=89 celia=finished retimed=4
-100 5 room=4,0 seeds=-1 gemskip=0 jank=14 updates=153 celia=finished retimed=5
-100 7 room=6,0 seeds=- gemskip=0 jank=2 updates=128 celia=DID_NOT_FINISH_(DIED_at_frame_112) retimed=0
-100 9 room=0,1 seeds=0.7728,0.8905 gemskip=0 jank=9 updates=122 celia=finished retimed=2
-100 12 room=3,1 seeds=0,0 gemskip=0 jank=7 updates=78 celia=finished retimed=2
-100 13 room=4,1 seeds=0,0.71825,0,1 gemskip=0 jank=3 updates=153 celia=finished retimed=1
-100 14 room=5,1 seeds=0.2608,0.0865,0.4823 gemskip=0 jank=6 updates=129 celia=finished retimed=0
-100 15 room=6,1 seeds=0,1,0 gemskip=0 jank=5 updates=114 celia=finished retimed=0
-100 17 room=0,2 seeds=- gemskip=0 jank=8 updates=90 celia=finished retimed=0
-100 19 room=2,2 seeds=- gemskip=0 jank=7 updates=131 celia=finished retimed=2
-100 23 room=6,2 seeds=- gemskip=0 jank=2 updates=94 celia=finished retimed=0
-100 25 room=0,3 seeds=1 gemskip=0 jank=1 updates=133 celia=finished retimed=2
-100 26 room=1,3 seeds=0 gemskip=0 jank=8 updates=163 celia=finished retimed=2
-100 28 room=3,3 seeds=- gemskip=0 jank=3 updates=187 celia=finished retimed=6
-100 29 room=4,3 seeds=0,0,0 gemskip=0 jank=7 updates=109 celia=finished retimed=0
-100 30 room=5,3 seeds=0,-1,0.71825,0 gemskip=0 jank=6 updates=114 celia=finished retimed=0
-any 1 room=0,0 seeds=- gemskip=0 jank=- updates=93 celia=finished retimed=2
-any 2 room=1,0 seeds=- gemskip=0 jank=2 updates=99 celia=finished retimed=8
-any 3 room=2,0 seeds=- gemskip=0 jank=1 updates=94 celia=finished retimed=4
-any 4 room=3,0 seeds=- gemskip=0 jank=4 updates=89 celia=finished retimed=4
-any 5 room=4,0 seeds=0 gemskip=0 jank=14 updates=76 celia=finished retimed=0
-any 6 room=5,0 seeds=0.636 gemskip=0 jank=3 updates=77 celia=finished retimed=6
-any 7 room=6,0 seeds=0.71395 gemskip=0 jank=2 updates=69 celia=finished retimed=2
-any 8 room=7,0 seeds=0 gemskip=0 jank=12 updates=84 celia=finished retimed=0
-any 9 room=0,1 seeds=0,0.8905 gemskip=0 jank=9 updates=100 celia=finished retimed=2
-any 10 room=1,1 seeds=0,0.8905 gemskip=0 jank=6 updates=94 celia=finished retimed=4
-any 11 room=2,1 seeds=0,0.8905 gemskip=0 jank=5 updates=81 celia=finished retimed=6
-any 12 room=3,1 seeds=0,0 gemskip=0 jank=7 updates=71 celia=finished retimed=0
-any 13 room=4,1 seeds=0.32205,0.20335,0.3813,0 gemskip=0 jank=3 updates=95 celia=finished retimed=0
-any 14 room=5,1 seeds=0.2608,0.0865,0.4823 gemskip=0 jank=6 updates=104 celia=finished retimed=2
-any 15 room=6,1 seeds=0,0,0 gemskip=0 jank=5 updates=89 celia=finished retimed=0
-any 16 room=7,1 seeds=0 gemskip=0 jank=11 updates=86 celia=finished retimed=3
-any 17 room=0,2 seeds=- gemskip=0 jank=8 updates=81 celia=finished retimed=0
-any 18 room=1,2 seeds=0.93967494187012,0,0,0,0 gemskip=0 jank=4 updates=103 celia=finished retimed=0
-any 19 room=2,2 seeds=0 gemskip=0 jank=7 updates=74 celia=finished retimed=0
-any 20 room=3,2 seeds=0,0,0,0.37515 gemskip=0 jank=3 updates=128 celia=finished retimed=0
-any 21 room=4,2 seeds=0,0,0,0,0,0 gemskip=0 jank=6 updates=71 celia=finished retimed=3
-any 22 room=5,2 seeds=- gemskip=0 jank=8 updates=150 celia=finished retimed=6
-any 23 room=6,2 seeds=0,0,0,0,0,0 gemskip=0 jank=2 updates=75 celia=finished retimed=1
-any 24 room=7,2 seeds=- gemskip=0 jank=2 updates=94 celia=finished retimed=0
-any 25 room=0,3 seeds=0 gemskip=0 jank=1 updates=97 celia=finished retimed=0
-any 26 room=1,3 seeds=0 gemskip=0 jank=8 updates=127 celia=finished retimed=0
-any 27 room=2,3 seeds=0,0.02485 gemskip=0 jank=3 updates=106 celia=finished retimed=0
-any 28 room=3,3 seeds=0,0.15341642642793 gemskip=0 jank=3 updates=172 celia=finished retimed=1
-any 29 room=4,3 seeds=0,0,0 gemskip=0 jank=7 updates=85 celia=finished retimed=6
-any 30 room=5,3 seeds=0,0,0.1855,0 gemskip=0 jank=6 updates=79 celia=finished retimed=0
-any 31 room=6,3 seeds=- gemskip=0 jank=7 updates=87 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_95_player_65_48) retimed=2
-gemskip100 23 room=6,2 seeds=- gemskip=1 jank=2 updates=165 celia=finished retimed=0
-gemskip100 25 room=0,3 seeds=0 gemskip=1 jank=1 updates=141 celia=DID_NOT_FINISH_(DIED_at_frame_117) retimed=2
-gemskip100 26 room=1,3 seeds=- gemskip=1 jank=8 updates=213 celia=finished retimed=0
-gemskip100 28 room=3,3 seeds=1,0.02 gemskip=1 jank=3 updates=214 celia=finished retimed=2
-gemskip100 29 room=4,3 seeds=0,0,0 gemskip=1 jank=7 updates=116 celia=finished retimed=6
-gemskip100 30 room=5,3 seeds=0,0,0,0 gemskip=1 jank=6 updates=132 celia=finished retimed=2
-gemskipany 22 room=5,2 seeds=- gemskip=1 jank=8 updates=111 celia=finished retimed=4
-gemskipany 23 room=6,2 seeds=- gemskip=1 jank=2 updates=120 celia=finished retimed=0
-gemskipany 24 room=7,2 seeds=- gemskip=1 jank=2 updates=99 celia=finished retimed=2
-gemskipany 25 room=0,3 seeds=0 gemskip=1 jank=1 updates=104 celia=finished retimed=0
-gemskipany 26 room=1,3 seeds=- gemskip=1 jank=8 updates=149 celia=finished retimed=2
-gemskipany 27 room=2,3 seeds=0.23765,0 gemskip=1 jank=3 updates=137 celia=finished retimed=0
-gemskipany 28 room=3,3 seeds=0,0 gemskip=1 jank=3 updates=182 celia=finished retimed=2
-gemskipany 29 room=4,3 seeds=0,0,0 gemskip=1 jank=7 updates=90 celia=finished retimed=3
-gemskipany 30 room=5,3 seeds=0,0,0,0 gemskip=1 jank=6 updates=89 celia=finished retimed=4
-gemskipany 31 room=6,3 seeds=- gemskip=1 jank=7 updates=103 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_111_player_58_48) retimed=4
-gemskipnodiag 22 room=5,2 seeds=- gemskip=1 jank=8 updates=132 celia=finished retimed=8
-gemskipnodiag 23 room=6,2 seeds=- gemskip=1 jank=2 updates=153 celia=finished retimed=4
-gemskipnodiag 24 room=7,2 seeds=- gemskip=1 jank=2 updates=114 celia=finished retimed=0
-gemskipnodiag 25 room=0,3 seeds=0 gemskip=1 jank=1 updates=120 celia=finished retimed=0
-gemskipnodiag 26 room=1,3 seeds=0 gemskip=1 jank=8 updates=180 celia=finished retimed=6
-gemskipnodiag 27 room=2,3 seeds=0,0.10775 gemskip=1 jank=3 updates=175 celia=finished retimed=5
-gemskipnodiag 28 room=3,3 seeds=0,0 gemskip=1 jank=3 updates=231 celia=finished retimed=5
-gemskipnodiag 29 room=4,3 seeds=0,0,0.83175 gemskip=1 jank=7 updates=123 celia=finished retimed=9
-gemskipnodiag 30 room=5,3 seeds=0,0,0,0 gemskip=1 jank=6 updates=120 celia=finished retimed=0
-nodiag 1 room=0,0 seeds=- gemskip=0 jank=- updates=93 celia=finished retimed=0
-nodiag 2 room=1,0 seeds=- gemskip=0 jank=2 updates=102 celia=finished retimed=0
-nodiag 3 room=2,0 seeds=- gemskip=0 jank=1 updates=107 celia=finished retimed=0
-nodiag 4 room=3,0 seeds=- gemskip=0 jank=4 updates=93 celia=finished retimed=0
-nodiag 5 room=4,0 seeds=0 gemskip=0 jank=14 updates=81 celia=finished retimed=0
-nodiag 6 room=5,0 seeds=0 gemskip=0 jank=3 updates=93 celia=finished retimed=0
-nodiag 7 room=6,0 seeds=- gemskip=0 jank=2 updates=73 celia=finished retimed=4
-nodiag 8 room=7,0 seeds=0 gemskip=0 jank=12 updates=99 celia=finished retimed=1
-nodiag 9 room=0,1 seeds=0,0.04 gemskip=0 jank=9 updates=108 celia=finished retimed=2
-nodiag 10 room=1,1 seeds=0,0.8905 gemskip=0 jank=6 updates=94 celia=finished retimed=4
-nodiag 11 room=2,1 seeds=0 gemskip=0 jank=5 updates=86 celia=finished retimed=2
-nodiag 12 room=3,1 seeds=0,0,0,0,0,0 gemskip=0 jank=7 updates=71 celia=finished retimed=0
-nodiag 13 room=4,1 seeds=0.4,0,0,0 gemskip=0 jank=3 updates=99 celia=finished retimed=2
-nodiag 14 room=5,1 seeds=- gemskip=0 jank=6 updates=119 celia=finished retimed=0
-nodiag 15 room=6,1 seeds=0,0 gemskip=0 jank=5 updates=93 celia=finished retimed=0
-nodiag 16 room=7,1 seeds=0 gemskip=0 jank=11 updates=89 celia=finished retimed=0
-nodiag 17 room=0,2 seeds=- gemskip=0 jank=8 updates=87 celia=finished retimed=0
-nodiag 18 room=1,2 seeds=- gemskip=0 jank=4 updates=118 celia=finished retimed=2
-nodiag 19 room=2,2 seeds=0,0,0,0,0,0 gemskip=0 jank=7 updates=76 celia=finished retimed=0
-nodiag 20 room=3,2 seeds=0,0,0,0 gemskip=0 jank=3 updates=152 celia=finished retimed=4
-nodiag 21 room=4,2 seeds=0,0,0,0,0,0 gemskip=0 jank=6 updates=71 celia=finished retimed=3
-nodiag 22 room=5,2 seeds=- gemskip=0 jank=8 updates=157 celia=finished retimed=0
-nodiag 23 room=6,2 seeds=- gemskip=0 jank=2 updates=80 celia=finished retimed=2
-nodiag 24 room=7,2 seeds=- gemskip=0 jank=2 updates=97 celia=finished retimed=0
-nodiag 25 room=0,3 seeds=0,0,0,0,0,0 gemskip=0 jank=1 updates=99 celia=finished retimed=0
-nodiag 26 room=1,3 seeds=0 gemskip=0 jank=8 updates=133 celia=finished retimed=0
-nodiag 27 room=2,3 seeds=0,0,0,0,0,0 gemskip=0 jank=3 updates=107 celia=finished retimed=0
-nodiag 28 room=3,3 seeds=0,0 gemskip=0 jank=3 updates=179 celia=finished retimed=0
-nodiag 29 room=4,3 seeds=0,0,0 gemskip=0 jank=7 updates=106 celia=finished retimed=0
-nodiag 30 room=5,3 seeds=0,0,0,0,0,0 gemskip=0 jank=6 updates=96 celia=finished retimed=0
-random0 1 room=0,0 seeds=- gemskip=0 jank=- updates=147 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_17_96) retimed=2
-random0 2 room=1,0 seeds=- gemskip=0 jank=2 updates=143 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_9_112) retimed=6
-random0 3 room=2,0 seeds=- gemskip=0 jank=1 updates=116 celia=DID_NOT_FINISH_(DIED_at_frame_92) retimed=4
-random0 4 room=3,0 seeds=- gemskip=0 jank=4 updates=147 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_-1_96) retimed=2
-random0 5 room=4,0 seeds=- gemskip=0 jank=14 updates=114 celia=DID_NOT_FINISH_(DIED_at_frame_85) retimed=0
-random0 6 room=5,0 seeds=- gemskip=0 jank=3 updates=149 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_91_104) retimed=2
-random0 7 room=6,0 seeds=- gemskip=0 jank=2 updates=40 celia=DID_NOT_FINISH_(DIED_at_frame_18) retimed=0
-random0 8 room=7,0 seeds=- gemskip=0 jank=12 updates=62 celia=DID_NOT_FINISH_(DIED_at_frame_39) retimed=0
-random0 9 room=0,1 seeds=- gemskip=0 jank=9 updates=72 celia=DID_NOT_FINISH_(DIED_at_frame_45) retimed=0
-random0 10 room=1,1 seeds=- gemskip=0 jank=6 updates=92 celia=DID_NOT_FINISH_(DIED_at_frame_67) retimed=0
-random0 11 room=2,1 seeds=- gemskip=0 jank=5 updates=137 celia=DID_NOT_FINISH_(DIED_at_frame_114) retimed=2
-random0 12 room=3,1 seeds=- gemskip=0 jank=7 updates=145 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_35_64) retimed=2
-random0 13 room=4,1 seeds=- gemskip=0 jank=3 updates=47 celia=DID_NOT_FINISH_(DIED_at_frame_22) retimed=0
-random0 14 room=5,1 seeds=- gemskip=0 jank=6 updates=33 celia=DID_NOT_FINISH_(DIED_at_frame_8) retimed=0
-random0 15 room=6,1 seeds=- gemskip=0 jank=5 updates=38 celia=DID_NOT_FINISH_(DIED_at_frame_13) retimed=0
-random0 16 room=7,1 seeds=- gemskip=0 jank=11 updates=67 celia=DID_NOT_FINISH_(DIED_at_frame_40) retimed=2
-random0 17 room=0,2 seeds=- gemskip=0 jank=8 updates=124 celia=DID_NOT_FINISH_(DIED_at_frame_99) retimed=1
-random0 18 room=1,2 seeds=- gemskip=0 jank=4 updates=74 celia=DID_NOT_FINISH_(DIED_at_frame_47) retimed=0
-random0 19 room=2,2 seeds=- gemskip=0 jank=7 updates=36 celia=DID_NOT_FINISH_(DIED_at_frame_13) retimed=0
-random0 20 room=3,2 seeds=- gemskip=0 jank=3 updates=92 celia=DID_NOT_FINISH_(DIED_at_frame_61) retimed=0
-random0 21 room=4,2 seeds=- gemskip=0 jank=6 updates=53 celia=DID_NOT_FINISH_(DIED_at_frame_16) retimed=0
-random0 22 room=5,2 seeds=- gemskip=0 jank=8 updates=145 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_59_80) retimed=2
-random0 23 room=6,2 seeds=- gemskip=0 jank=2 updates=85 celia=DID_NOT_FINISH_(DIED_at_frame_60) retimed=2
-random0 24 room=7,2 seeds=- gemskip=0 jank=2 updates=51 celia=DID_NOT_FINISH_(DIED_at_frame_28) retimed=0
-random0 25 room=0,3 seeds=- gemskip=0 jank=1 updates=30 celia=DID_NOT_FINISH_(DIED_at_frame_6) retimed=0
-random0 26 room=1,3 seeds=- gemskip=0 jank=8 updates=122 celia=DID_NOT_FINISH_(DIED_at_frame_97) retimed=4
-random0 27 room=2,3 seeds=- gemskip=0 jank=3 updates=45 celia=DID_NOT_FINISH_(DIED_at_frame_22) retimed=0
-random0 28 room=3,3 seeds=- gemskip=0 jank=3 updates=169 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_9_8) retimed=4
-random0 29 room=4,3 seeds=- gemskip=0 jank=7 updates=37 celia=DID_NOT_FINISH_(DIED_at_frame_8) retimed=0
-random0 30 room=5,3 seeds=- gemskip=0 jank=6 updates=36 celia=DID_NOT_FINISH_(DIED_at_frame_5) retimed=0
-random0 31 room=6,3 seeds=- gemskip=0 jank=7 updates=143 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_9_112) retimed=0
-random1 1 room=0,0 seeds=- gemskip=0 jank=- updates=126 celia=DID_NOT_FINISH_(DIED_at_frame_99) retimed=2
-random1 2 room=1,0 seeds=- gemskip=0 jank=2 updates=143 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_25_48) retimed=2
-random1 3 room=2,0 seeds=- gemskip=0 jank=1 updates=144 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_42_81) retimed=4
-random1 4 room=3,0 seeds=- gemskip=0 jank=4 updates=149 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_153_player_15_96) retimed=6
-random1 5 room=4,0 seeds=- gemskip=0 jank=14 updates=149 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_27_88) retimed=0
-random1 6 room=5,0 seeds=- gemskip=0 jank=3 updates=142 celia=DID_NOT_FINISH_(DIED_at_frame_113) retimed=2
-random1 7 room=6,0 seeds=- gemskip=0 jank=2 updates=61 celia=DID_NOT_FINISH_(DIED_at_frame_39) retimed=0
-random1 8 room=7,0 seeds=- gemskip=0 jank=12 updates=49 celia=DID_NOT_FINISH_(DIED_at_frame_26) retimed=0
-random1 9 room=0,1 seeds=- gemskip=0 jank=9 updates=61 celia=DID_NOT_FINISH_(DIED_at_frame_34) retimed=0
-random1 10 room=1,1 seeds=- gemskip=0 jank=6 updates=95 celia=DID_NOT_FINISH_(DIED_at_frame_70) retimed=0
-random1 11 room=2,1 seeds=- gemskip=0 jank=5 updates=36 celia=DID_NOT_FINISH_(DIED_at_frame_13) retimed=0
-random1 12 room=3,1 seeds=- gemskip=0 jank=7 updates=145 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_7_104) retimed=2
-random1 13 room=4,1 seeds=- gemskip=0 jank=3 updates=83 celia=DID_NOT_FINISH_(DIED_at_frame_58) retimed=2
-random1 14 room=5,1 seeds=- gemskip=0 jank=6 updates=53 celia=DID_NOT_FINISH_(DIED_at_frame_28) retimed=2
-random1 15 room=6,1 seeds=- gemskip=0 jank=5 updates=34 celia=DID_NOT_FINISH_(DIED_at_frame_9) retimed=0
-random1 16 room=7,1 seeds=- gemskip=0 jank=11 updates=98 celia=DID_NOT_FINISH_(DIED_at_frame_71) retimed=4
-random1 17 room=0,2 seeds=- gemskip=0 jank=8 updates=110 celia=DID_NOT_FINISH_(DIED_at_frame_85) retimed=4
-random1 18 room=1,2 seeds=- gemskip=0 jank=4 updates=77 celia=DID_NOT_FINISH_(DIED_at_frame_50) retimed=0
-random1 19 room=2,2 seeds=- gemskip=0 jank=7 updates=54 celia=DID_NOT_FINISH_(DIED_at_frame_31) retimed=0
-random1 20 room=3,2 seeds=- gemskip=0 jank=3 updates=111 celia=DID_NOT_FINISH_(DIED_at_frame_80) retimed=0
-random1 21 room=4,2 seeds=- gemskip=0 jank=6 updates=49 celia=DID_NOT_FINISH_(DIED_at_frame_12) retimed=0
-random1 22 room=5,2 seeds=- gemskip=0 jank=8 updates=145 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_18_104) retimed=0
-random1 23 room=6,2 seeds=- gemskip=0 jank=2 updates=59 celia=DID_NOT_FINISH_(DIED_at_frame_34) retimed=2
-random1 24 room=7,2 seeds=- gemskip=0 jank=2 updates=116 celia=DID_NOT_FINISH_(DIED_at_frame_93) retimed=2
-random1 25 room=0,3 seeds=- gemskip=0 jank=1 updates=34 celia=DID_NOT_FINISH_(DIED_at_frame_10) retimed=0
-random1 26 room=1,3 seeds=- gemskip=0 jank=8 updates=92 celia=DID_NOT_FINISH_(DIED_at_frame_67) retimed=0
-random1 27 room=2,3 seeds=- gemskip=0 jank=3 updates=46 celia=DID_NOT_FINISH_(DIED_at_frame_23) retimed=0
-random1 28 room=3,3 seeds=- gemskip=0 jank=3 updates=169 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_1_8) retimed=2
-random1 29 room=4,3 seeds=- gemskip=0 jank=7 updates=43 celia=DID_NOT_FINISH_(DIED_at_frame_14) retimed=1
-random1 30 room=5,3 seeds=- gemskip=0 jank=6 updates=38 celia=DID_NOT_FINISH_(DIED_at_frame_7) retimed=0
-random1 31 room=6,3 seeds=- gemskip=0 jank=7 updates=143 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_22_96) retimed=2
-witness-gemskip100 25 room=0,3 seeds=0 gemskip=1 jank=1 updates=104 celia=DID_NOT_FINISH_(DIED_at_frame_80) retimed=0
-witness-room10gate 2 room=1,0 seeds=- gemskip=0 jank=2 updates=63 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_71_player_17_112) retimed=0
+100 1 room=0,0 seeds=- gemskip=0 jank=- updates=115 celia=finished
+100 3 room=2,0 seeds=- gemskip=0 jank=1 updates=128 celia=finished
+100 4 room=3,0 seeds=- gemskip=0 jank=4 updates=89 celia=finished
+100 5 room=4,0 seeds=-1 gemskip=0 jank=14 updates=153 celia=finished
+100 7 room=6,0 seeds=- gemskip=0 jank=2 updates=128 celia=DID_NOT_FINISH_(DIED_at_frame_112)
+100 9 room=0,1 seeds=0.7728,0.8905 gemskip=0 jank=9 updates=122 celia=finished
+100 12 room=3,1 seeds=0,0 gemskip=0 jank=7 updates=78 celia=finished
+100 13 room=4,1 seeds=0,0.71825,0,1 gemskip=0 jank=3 updates=153 celia=finished
+100 14 room=5,1 seeds=0.2608,0.0865,0.4823 gemskip=0 jank=6 updates=129 celia=finished
+100 15 room=6,1 seeds=0,1,0 gemskip=0 jank=5 updates=114 celia=finished
+100 17 room=0,2 seeds=- gemskip=0 jank=8 updates=90 celia=finished
+100 19 room=2,2 seeds=- gemskip=0 jank=7 updates=131 celia=finished
+100 23 room=6,2 seeds=- gemskip=0 jank=2 updates=94 celia=finished
+100 25 room=0,3 seeds=1 gemskip=0 jank=1 updates=133 celia=finished
+100 26 room=1,3 seeds=0 gemskip=0 jank=8 updates=163 celia=finished
+100 28 room=3,3 seeds=- gemskip=0 jank=3 updates=187 celia=finished
+100 29 room=4,3 seeds=0,0,0 gemskip=0 jank=7 updates=109 celia=finished
+100 30 room=5,3 seeds=0,-1,0.71825,0 gemskip=0 jank=6 updates=114 celia=finished
+any 1 room=0,0 seeds=- gemskip=0 jank=- updates=93 celia=finished
+any 2 room=1,0 seeds=- gemskip=0 jank=2 updates=99 celia=finished
+any 3 room=2,0 seeds=- gemskip=0 jank=1 updates=94 celia=finished
+any 4 room=3,0 seeds=- gemskip=0 jank=4 updates=89 celia=finished
+any 5 room=4,0 seeds=0 gemskip=0 jank=14 updates=76 celia=finished
+any 6 room=5,0 seeds=0.636 gemskip=0 jank=3 updates=77 celia=finished
+any 7 room=6,0 seeds=0.71395 gemskip=0 jank=2 updates=69 celia=finished
+any 8 room=7,0 seeds=0 gemskip=0 jank=12 updates=84 celia=finished
+any 9 room=0,1 seeds=0,0.8905 gemskip=0 jank=9 updates=100 celia=finished
+any 10 room=1,1 seeds=0,0.8905 gemskip=0 jank=6 updates=94 celia=finished
+any 11 room=2,1 seeds=0,0.8905 gemskip=0 jank=5 updates=81 celia=finished
+any 12 room=3,1 seeds=0,0 gemskip=0 jank=7 updates=71 celia=finished
+any 13 room=4,1 seeds=0.32205,0.20335,0.3813,0 gemskip=0 jank=3 updates=95 celia=finished
+any 14 room=5,1 seeds=0.2608,0.0865,0.4823 gemskip=0 jank=6 updates=104 celia=finished
+any 15 room=6,1 seeds=0,0,0 gemskip=0 jank=5 updates=89 celia=finished
+any 16 room=7,1 seeds=0 gemskip=0 jank=11 updates=86 celia=finished
+any 17 room=0,2 seeds=- gemskip=0 jank=8 updates=81 celia=finished
+any 18 room=1,2 seeds=0.93967494187012,0,0,0,0 gemskip=0 jank=4 updates=103 celia=finished
+any 19 room=2,2 seeds=0 gemskip=0 jank=7 updates=74 celia=finished
+any 20 room=3,2 seeds=0,0,0,0.37515 gemskip=0 jank=3 updates=128 celia=finished
+any 21 room=4,2 seeds=0,0,0,0,0,0 gemskip=0 jank=6 updates=71 celia=finished
+any 22 room=5,2 seeds=- gemskip=0 jank=8 updates=150 celia=finished
+any 23 room=6,2 seeds=0,0,0,0,0,0 gemskip=0 jank=2 updates=75 celia=finished
+any 24 room=7,2 seeds=- gemskip=0 jank=2 updates=94 celia=finished
+any 25 room=0,3 seeds=0 gemskip=0 jank=1 updates=97 celia=finished
+any 26 room=1,3 seeds=0 gemskip=0 jank=8 updates=127 celia=finished
+any 27 room=2,3 seeds=0,0.02485 gemskip=0 jank=3 updates=106 celia=finished
+any 28 room=3,3 seeds=0,0.15341642642793 gemskip=0 jank=3 updates=172 celia=finished
+any 29 room=4,3 seeds=0,0,0 gemskip=0 jank=7 updates=85 celia=finished
+any 30 room=5,3 seeds=0,0,0.1855,0 gemskip=0 jank=6 updates=79 celia=finished
+any 31 room=6,3 seeds=- gemskip=0 jank=7 updates=87 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_95_player_65_48)
+gemskip100 23 room=6,2 seeds=- gemskip=1 jank=2 updates=165 celia=finished
+gemskip100 25 room=0,3 seeds=0 gemskip=1 jank=1 updates=141 celia=DID_NOT_FINISH_(DIED_at_frame_117)
+gemskip100 26 room=1,3 seeds=- gemskip=1 jank=8 updates=213 celia=finished
+gemskip100 28 room=3,3 seeds=1,0.02 gemskip=1 jank=3 updates=214 celia=finished
+gemskip100 29 room=4,3 seeds=0,0,0 gemskip=1 jank=7 updates=116 celia=finished
+gemskip100 30 room=5,3 seeds=0,0,0,0 gemskip=1 jank=6 updates=132 celia=finished
+gemskipany 22 room=5,2 seeds=- gemskip=1 jank=8 updates=111 celia=finished
+gemskipany 23 room=6,2 seeds=- gemskip=1 jank=2 updates=120 celia=finished
+gemskipany 24 room=7,2 seeds=- gemskip=1 jank=2 updates=99 celia=finished
+gemskipany 25 room=0,3 seeds=0 gemskip=1 jank=1 updates=104 celia=finished
+gemskipany 26 room=1,3 seeds=- gemskip=1 jank=8 updates=149 celia=finished
+gemskipany 27 room=2,3 seeds=0.23765,0 gemskip=1 jank=3 updates=137 celia=finished
+gemskipany 28 room=3,3 seeds=0,0 gemskip=1 jank=3 updates=182 celia=finished
+gemskipany 29 room=4,3 seeds=0,0,0 gemskip=1 jank=7 updates=90 celia=finished
+gemskipany 30 room=5,3 seeds=0,0,0,0 gemskip=1 jank=6 updates=89 celia=finished
+gemskipany 31 room=6,3 seeds=- gemskip=1 jank=7 updates=103 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_111_player_58_48)
+gemskipnodiag 22 room=5,2 seeds=- gemskip=1 jank=8 updates=132 celia=finished
+gemskipnodiag 23 room=6,2 seeds=- gemskip=1 jank=2 updates=153 celia=finished
+gemskipnodiag 24 room=7,2 seeds=- gemskip=1 jank=2 updates=114 celia=finished
+gemskipnodiag 25 room=0,3 seeds=0 gemskip=1 jank=1 updates=120 celia=finished
+gemskipnodiag 26 room=1,3 seeds=0 gemskip=1 jank=8 updates=180 celia=finished
+gemskipnodiag 27 room=2,3 seeds=0,0.10775 gemskip=1 jank=3 updates=175 celia=finished
+gemskipnodiag 28 room=3,3 seeds=0,0 gemskip=1 jank=3 updates=231 celia=finished
+gemskipnodiag 29 room=4,3 seeds=0,0,0.83175 gemskip=1 jank=7 updates=123 celia=finished
+gemskipnodiag 30 room=5,3 seeds=0,0,0,0 gemskip=1 jank=6 updates=120 celia=finished
+nodiag 1 room=0,0 seeds=- gemskip=0 jank=- updates=93 celia=finished
+nodiag 2 room=1,0 seeds=- gemskip=0 jank=2 updates=102 celia=finished
+nodiag 3 room=2,0 seeds=- gemskip=0 jank=1 updates=107 celia=finished
+nodiag 4 room=3,0 seeds=- gemskip=0 jank=4 updates=93 celia=finished
+nodiag 5 room=4,0 seeds=0 gemskip=0 jank=14 updates=81 celia=finished
+nodiag 6 room=5,0 seeds=0 gemskip=0 jank=3 updates=93 celia=finished
+nodiag 7 room=6,0 seeds=- gemskip=0 jank=2 updates=73 celia=finished
+nodiag 8 room=7,0 seeds=0 gemskip=0 jank=12 updates=99 celia=finished
+nodiag 9 room=0,1 seeds=0,0.04 gemskip=0 jank=9 updates=108 celia=finished
+nodiag 10 room=1,1 seeds=0,0.8905 gemskip=0 jank=6 updates=94 celia=finished
+nodiag 11 room=2,1 seeds=0 gemskip=0 jank=5 updates=86 celia=finished
+nodiag 12 room=3,1 seeds=0,0,0,0,0,0 gemskip=0 jank=7 updates=71 celia=finished
+nodiag 13 room=4,1 seeds=0.4,0,0,0 gemskip=0 jank=3 updates=99 celia=finished
+nodiag 14 room=5,1 seeds=- gemskip=0 jank=6 updates=119 celia=finished
+nodiag 15 room=6,1 seeds=0,0 gemskip=0 jank=5 updates=93 celia=finished
+nodiag 16 room=7,1 seeds=0 gemskip=0 jank=11 updates=89 celia=finished
+nodiag 17 room=0,2 seeds=- gemskip=0 jank=8 updates=87 celia=finished
+nodiag 18 room=1,2 seeds=- gemskip=0 jank=4 updates=118 celia=finished
+nodiag 19 room=2,2 seeds=0,0,0,0,0,0 gemskip=0 jank=7 updates=76 celia=finished
+nodiag 20 room=3,2 seeds=0,0,0,0 gemskip=0 jank=3 updates=152 celia=finished
+nodiag 21 room=4,2 seeds=0,0,0,0,0,0 gemskip=0 jank=6 updates=71 celia=finished
+nodiag 22 room=5,2 seeds=- gemskip=0 jank=8 updates=157 celia=finished
+nodiag 23 room=6,2 seeds=- gemskip=0 jank=2 updates=80 celia=finished
+nodiag 24 room=7,2 seeds=- gemskip=0 jank=2 updates=97 celia=finished
+nodiag 25 room=0,3 seeds=0,0,0,0,0,0 gemskip=0 jank=1 updates=99 celia=finished
+nodiag 26 room=1,3 seeds=0 gemskip=0 jank=8 updates=133 celia=finished
+nodiag 27 room=2,3 seeds=0,0,0,0,0,0 gemskip=0 jank=3 updates=107 celia=finished
+nodiag 28 room=3,3 seeds=0,0 gemskip=0 jank=3 updates=179 celia=finished
+nodiag 29 room=4,3 seeds=0,0,0 gemskip=0 jank=7 updates=106 celia=finished
+nodiag 30 room=5,3 seeds=0,0,0,0,0,0 gemskip=0 jank=6 updates=96 celia=finished
+random0 1 room=0,0 seeds=- gemskip=0 jank=- updates=147 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_17_96)
+random0 2 room=1,0 seeds=- gemskip=0 jank=2 updates=143 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_9_112)
+random0 3 room=2,0 seeds=- gemskip=0 jank=1 updates=116 celia=DID_NOT_FINISH_(DIED_at_frame_92)
+random0 4 room=3,0 seeds=- gemskip=0 jank=4 updates=147 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_-1_96)
+random0 5 room=4,0 seeds=- gemskip=0 jank=14 updates=114 celia=DID_NOT_FINISH_(DIED_at_frame_85)
+random0 6 room=5,0 seeds=- gemskip=0 jank=3 updates=149 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_91_104)
+random0 7 room=6,0 seeds=- gemskip=0 jank=2 updates=40 celia=DID_NOT_FINISH_(DIED_at_frame_18)
+random0 8 room=7,0 seeds=- gemskip=0 jank=12 updates=62 celia=DID_NOT_FINISH_(DIED_at_frame_39)
+random0 9 room=0,1 seeds=- gemskip=0 jank=9 updates=72 celia=DID_NOT_FINISH_(DIED_at_frame_45)
+random0 10 room=1,1 seeds=- gemskip=0 jank=6 updates=92 celia=DID_NOT_FINISH_(DIED_at_frame_67)
+random0 11 room=2,1 seeds=- gemskip=0 jank=5 updates=137 celia=DID_NOT_FINISH_(DIED_at_frame_114)
+random0 12 room=3,1 seeds=- gemskip=0 jank=7 updates=145 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_35_64)
+random0 13 room=4,1 seeds=- gemskip=0 jank=3 updates=47 celia=DID_NOT_FINISH_(DIED_at_frame_22)
+random0 14 room=5,1 seeds=- gemskip=0 jank=6 updates=33 celia=DID_NOT_FINISH_(DIED_at_frame_8)
+random0 15 room=6,1 seeds=- gemskip=0 jank=5 updates=38 celia=DID_NOT_FINISH_(DIED_at_frame_13)
+random0 16 room=7,1 seeds=- gemskip=0 jank=11 updates=67 celia=DID_NOT_FINISH_(DIED_at_frame_40)
+random0 17 room=0,2 seeds=- gemskip=0 jank=8 updates=124 celia=DID_NOT_FINISH_(DIED_at_frame_99)
+random0 18 room=1,2 seeds=- gemskip=0 jank=4 updates=74 celia=DID_NOT_FINISH_(DIED_at_frame_47)
+random0 19 room=2,2 seeds=- gemskip=0 jank=7 updates=36 celia=DID_NOT_FINISH_(DIED_at_frame_13)
+random0 20 room=3,2 seeds=- gemskip=0 jank=3 updates=92 celia=DID_NOT_FINISH_(DIED_at_frame_61)
+random0 21 room=4,2 seeds=- gemskip=0 jank=6 updates=53 celia=DID_NOT_FINISH_(DIED_at_frame_16)
+random0 22 room=5,2 seeds=- gemskip=0 jank=8 updates=145 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_59_80)
+random0 23 room=6,2 seeds=- gemskip=0 jank=2 updates=85 celia=DID_NOT_FINISH_(DIED_at_frame_60)
+random0 24 room=7,2 seeds=- gemskip=0 jank=2 updates=51 celia=DID_NOT_FINISH_(DIED_at_frame_28)
+random0 25 room=0,3 seeds=- gemskip=0 jank=1 updates=30 celia=DID_NOT_FINISH_(DIED_at_frame_6)
+random0 26 room=1,3 seeds=- gemskip=0 jank=8 updates=122 celia=DID_NOT_FINISH_(DIED_at_frame_97)
+random0 27 room=2,3 seeds=- gemskip=0 jank=3 updates=45 celia=DID_NOT_FINISH_(DIED_at_frame_22)
+random0 28 room=3,3 seeds=- gemskip=0 jank=3 updates=169 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_9_8)
+random0 29 room=4,3 seeds=- gemskip=0 jank=7 updates=37 celia=DID_NOT_FINISH_(DIED_at_frame_8)
+random0 30 room=5,3 seeds=- gemskip=0 jank=6 updates=36 celia=DID_NOT_FINISH_(DIED_at_frame_5)
+random0 31 room=6,3 seeds=- gemskip=0 jank=7 updates=143 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_9_112)
+random1 1 room=0,0 seeds=- gemskip=0 jank=- updates=126 celia=DID_NOT_FINISH_(DIED_at_frame_99)
+random1 2 room=1,0 seeds=- gemskip=0 jank=2 updates=143 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_25_48)
+random1 3 room=2,0 seeds=- gemskip=0 jank=1 updates=144 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_42_81)
+random1 4 room=3,0 seeds=- gemskip=0 jank=4 updates=147 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_15_96)
+random1 5 room=4,0 seeds=- gemskip=0 jank=14 updates=149 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_27_88)
+random1 6 room=5,0 seeds=- gemskip=0 jank=3 updates=142 celia=DID_NOT_FINISH_(DIED_at_frame_113)
+random1 7 room=6,0 seeds=- gemskip=0 jank=2 updates=61 celia=DID_NOT_FINISH_(DIED_at_frame_39)
+random1 8 room=7,0 seeds=- gemskip=0 jank=12 updates=49 celia=DID_NOT_FINISH_(DIED_at_frame_26)
+random1 9 room=0,1 seeds=- gemskip=0 jank=9 updates=61 celia=DID_NOT_FINISH_(DIED_at_frame_34)
+random1 10 room=1,1 seeds=- gemskip=0 jank=6 updates=95 celia=DID_NOT_FINISH_(DIED_at_frame_70)
+random1 11 room=2,1 seeds=- gemskip=0 jank=5 updates=36 celia=DID_NOT_FINISH_(DIED_at_frame_13)
+random1 12 room=3,1 seeds=- gemskip=0 jank=7 updates=145 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_7_104)
+random1 13 room=4,1 seeds=- gemskip=0 jank=3 updates=83 celia=DID_NOT_FINISH_(DIED_at_frame_58)
+random1 14 room=5,1 seeds=- gemskip=0 jank=6 updates=53 celia=DID_NOT_FINISH_(DIED_at_frame_28)
+random1 15 room=6,1 seeds=- gemskip=0 jank=5 updates=34 celia=DID_NOT_FINISH_(DIED_at_frame_9)
+random1 16 room=7,1 seeds=- gemskip=0 jank=11 updates=98 celia=DID_NOT_FINISH_(DIED_at_frame_71)
+random1 17 room=0,2 seeds=- gemskip=0 jank=8 updates=110 celia=DID_NOT_FINISH_(DIED_at_frame_85)
+random1 18 room=1,2 seeds=- gemskip=0 jank=4 updates=77 celia=DID_NOT_FINISH_(DIED_at_frame_50)
+random1 19 room=2,2 seeds=- gemskip=0 jank=7 updates=54 celia=DID_NOT_FINISH_(DIED_at_frame_31)
+random1 20 room=3,2 seeds=- gemskip=0 jank=3 updates=111 celia=DID_NOT_FINISH_(DIED_at_frame_80)
+random1 21 room=4,2 seeds=- gemskip=0 jank=6 updates=49 celia=DID_NOT_FINISH_(DIED_at_frame_12)
+random1 22 room=5,2 seeds=- gemskip=0 jank=8 updates=145 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_18_104)
+random1 23 room=6,2 seeds=- gemskip=0 jank=2 updates=59 celia=DID_NOT_FINISH_(DIED_at_frame_34)
+random1 24 room=7,2 seeds=- gemskip=0 jank=2 updates=116 celia=DID_NOT_FINISH_(DIED_at_frame_93)
+random1 25 room=0,3 seeds=- gemskip=0 jank=1 updates=34 celia=DID_NOT_FINISH_(DIED_at_frame_10)
+random1 26 room=1,3 seeds=- gemskip=0 jank=8 updates=92 celia=DID_NOT_FINISH_(DIED_at_frame_67)
+random1 27 room=2,3 seeds=- gemskip=0 jank=3 updates=46 celia=DID_NOT_FINISH_(DIED_at_frame_23)
+random1 28 room=3,3 seeds=- gemskip=0 jank=3 updates=169 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_1_8)
+random1 29 room=4,3 seeds=- gemskip=0 jank=7 updates=43 celia=DID_NOT_FINISH_(DIED_at_frame_14)
+random1 30 room=5,3 seeds=- gemskip=0 jank=6 updates=38 celia=DID_NOT_FINISH_(DIED_at_frame_7)
+random1 31 room=6,3 seeds=- gemskip=0 jank=7 updates=143 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_151_player_22_96)
+witness-gemskip100 25 room=0,3 seeds=0 gemskip=1 jank=1 updates=104 celia=DID_NOT_FINISH_(DIED_at_frame_80)
+witness-room10gate 2 room=1,0 seeds=- gemskip=0 jank=2 updates=63 celia=DID_NOT_FINISH_(TIMEOUT:_no_exit_by_frame_71_player_17_112)

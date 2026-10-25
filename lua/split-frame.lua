@@ -1,6 +1,6 @@
 function _update()
-	-- SPLIT FRAME (prototype, plans/room60-overnight-2026-09-28.md): one
-	-- frame is two steps. Part a (`__phase` nil): the timers, freeze,
+	-- SPLIT FRAME (plans/architecture.md "The split frame"): one frame is
+	-- two steps. Part a (`__phase` nil): the timers, freeze,
 	-- restart, and every object up to and including the PLAYER'S MOVE;
 	-- part b: the player's update (the buttons), the objects after it, the
 	-- tail, and `_draw`. `__phase` marks a state between the parts, `__frozen`
@@ -16,8 +16,28 @@ function _update()
 			end
 		end
 
+		if music_timer>0 then
+		 music_timer = music_timer - (1)
+		 if music_timer<=0 then
+		  music(10,0,7)
+		 end
+		end
+
+		if sfx_timer>0 then
+		 sfx_timer = sfx_timer - (1)
+		end
+
 		-- cancel if freeze
 		if freeze>0 then freeze = freeze - 1 __phase = {} __frozen = {} return end
+
+		-- screenshake
+		if shake>0 then
+			shake = shake - (1)
+			camera()
+			if shake>0 then
+				camera(-2+rnd(5),-2+rnd(5))
+			end
+		end
 
 		-- restart (soon)
 		if will_restart and delay_restart>0 then
@@ -31,12 +51,11 @@ function _update()
 		-- update each object, up to the player's move
 		foreach(objects,function(obj)
 			if __phase ~= nil then return end
-			if obj.spd.x ~= 0 or obj.spd.y ~= 0 then
+			if obj.type == player or obj.spd.x ~= 0 or obj.spd.y ~= 0 then
 				obj.move(obj.spd.x,obj.spd.y)
 			end
 			if obj.type == player then __phase = {} return end
 			if obj.type.update~=nil then
-				_hint_normalize()
 				obj.type.update(obj)
 			end
 		end)
@@ -53,24 +72,18 @@ function _update()
 			if obj.type == player then
 				past = true
 				if obj.type.update~=nil then
-					_hint_normalize()
 					obj.type.update(obj)
 				end
 			end
 			return
 		end
-		if obj.spd.x ~= 0 or obj.spd.y ~= 0 then
+		if obj.type == player or obj.spd.x ~= 0 or obj.spd.y ~= 0 then
 			obj.move(obj.spd.x,obj.spd.y)
 		end
 		if obj.type.update~=nil then
-			_hint_normalize()
 			obj.type.update(obj)
 		end
 	end)
-
-	if true then
-    	_hint_normalize()
-    end
 
 	-- start game
 	if is_title() then

@@ -1577,8 +1577,6 @@ impl<'a, D: Domain> Interp<'a, D> {
                 self.prints.push(D::A::hex(v));
                 (st, Value::Nil)
             }
-            // A merge hint: the tracer merges at every join anyway.
-            "_hint_normalize" => (st, Value::Nil),
             // A SHAPE change.
             "__array_table_drop_last" => {
                 let Value::Table(t) = &args[0] else {

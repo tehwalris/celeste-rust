@@ -53,9 +53,10 @@ RB=$T/release/rewrite
 G=gates/fixtures
 C=${CHECK_DIR:-/var/tmp/celeste-check-${PWD##*/}-$(printf %s "$PWD" | sha1sum | cut -c1-8)}
 TH=${THREADS:-16}
-# Every step's memory cap (safe-run.sh): the steps peak under 6 GB, and a
-# step that outgrows its cap fails instead of taking the machine's memory.
-# A lane runs one step at a time: 10G a lane; the test runs get 20G.
+# Every step's memory cap (safe-run.sh): the steps peak under 6 GB (but
+# `refcheck`, which has its own), and a step that outgrows its cap fails
+# instead of taking the machine's memory. A lane runs one step at a time:
+# 10G a lane; the test runs get 20G.
 MEM=10G
 mkdir -p "$C"
 # The failed and skipped steps, by name (lanes are subshells: a file).
@@ -158,13 +159,16 @@ widencheck() {
 }
 
 # refcheck NAME FRAME: the kernels against the reference engine, 32
-# sampled rows of a fixture's frame (an r0sxh fixture's).
+# sampled rows of a fixture's frame (an r0sx fixture's). A worker holds
+# every fork path of its row, and the reference forks each row's buttons,
+# held buttons and jump buffer: room (4,2)'s rows peak at 8.5 GB (16.16)
+# and 12 GB (doubles) on 8 workers, 15 and 21 GB on 16.
 refcheck() {
-    ./safe-run.sh --memory "$MEM" -- "$B" check ref --tree "$F/$1" --step "$2" --samples 32 --threads "$TH"
+    ./safe-run.sh --memory 16G -- "$B" check ref --tree "$F/$1" --step "$2" --samples 32 --threads 8
 }
 
 # arccheck NAME FLAGS...: the recorded transfers of a fixture's f56
-# against the reference engine, 32 sampled records (an r0sxh fixture's).
+# against the reference engine, 32 sampled records (an r0sx fixture's).
 arccheck() {
     local name=$1; shift
     ./safe-run.sh --memory "$MEM" -- "$B" check arcs --tree "$F/$name" --from-step 56 --to-step 56 --samples 32 --threads "$TH" --path-cap 4096 "$@"
@@ -313,10 +317,10 @@ gate10d_dual() {
     grep -E '^DUAL BOUND|^\[gate\] h35 dual' "$C/t2/dual10.out" > "$C/t2/dual10.gate"
     same "$C/t2/dual10.gate" gates/dual_room10_win9-101_h35.txt
 }
-# The objects ladder (r0sxhn filtering r0sxh) at a synthetic win, its
+# The objects ladder (r0sxn filtering r0sx) at a synthetic win, its
 # witness as the known route: every level's [gate] lines pinned.
 search42() {
-    ./safe-run.sh --memory "$MEM" -- "$B" search --room 4,2 --level r0sxhn,r0sxh --frames 50 --win-at 32,56 --search-dir "$C/t2/s42" --prefer "$G/known_room42_win32-56.txt" --save-marks "$C/t2/s42-marks" > "$C/t2/s42.out" || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" search --room 4,2 --level r0sxn,r0sx --frames 50 --win-at 32,56 --search-dir "$C/t2/s42" --prefer "$G/known_room42_win32-56.txt" --save-marks "$C/t2/s42-marks" > "$C/t2/s42.out" || return 1
     grep '^\[gate\]' "$C/t2/s42.out" > "$C/t2/s42.gate"
     same "$C/t2/s42.gate" "$G/search42.gate"
 }
@@ -354,7 +358,7 @@ hull10() {
 # only `tools/fixtures.sh pin r60s` writes (so not `same`: t2 --pin leaves
 # it).
 forward60() {
-    ./safe-run.sh --memory "$MEM" -- "$B" forward --room 6,0 --level r0sxhf --steps 71 --split-frame --tree "$C/t2/p60" > /dev/null || return 1
+    ./safe-run.sh --memory "$MEM" -- "$B" forward --room 6,0 --level r0sxf --steps 71 --split-frame --tree "$C/t2/p60" > /dev/null || return 1
     ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/p60" --steps 71 --edges --hulls 2> /dev/null | diff "$G/r60s.ckhash" - >&2
 }
 
@@ -451,7 +455,7 @@ fixtures() {
 }
 
 # The pre-merge tests (#[ignore = "pre-merge, ..."]), one at a time (the
-# floors' pin peaks at 16 GB).
+# level -1 table builds).
 premerge() {
     step premerge-tests ignoredtests pre-merge --test-threads 1
     grep -E 'Summary' "$C/premerge-tests.err" | tail -1

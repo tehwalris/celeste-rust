@@ -83,7 +83,7 @@ pub(crate) struct FwdTimes {
 #[derive(Serialize, Clone, Debug)]
 pub(crate) struct LevelRun {
     pub(crate) level: usize,
-    /// The level's spec (`r0sxhn`), or the arc pass's name.
+    /// The level's spec (`r0sxn`), or the arc pass's name.
     pub(crate) precision: String,
     pub(crate) fwd: Vec<FwdLine>,
     pub(crate) bwd: [u32; 0],

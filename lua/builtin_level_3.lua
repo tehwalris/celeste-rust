@@ -23,12 +23,8 @@ function foreach(tbl, func)
   -- The evidence that THIS version is right is that community TAS: under
   -- the old index walk it never left the room, and under this one it exits
   -- at frame 95, exactly as recorded. Rooms (0, 0) and (1, 0) still exit at
-  -- 94 and 100. A TAS that runs on real PICO-8 is the closest thing to a
-  -- differential test against PICO-8 that we have.
-  --
-  -- TODO still test the rest of the builtins, and the numerics, against a
-  -- real PICO-8 rather than against lore - which is what produced the
-  -- snapshot version.
+  -- 94 and 100. The builtins and the numerics are checked against a real
+  -- PICO-8 by the probe goldens (`trace::probe`, lua/probe/).
   local i = 1
   local prev = nil
   for step=1,32767 do
@@ -43,7 +39,7 @@ function foreach(tbl, func)
   end
 end
 
--- HACK This is not a pico8 function, but it's convenient to put it here
+-- Not a PICO-8 function: the builtins' own assertion (`btn`'s range).
 function __assert(cond, msg)
   if not cond then
     __print("Assertion failed")

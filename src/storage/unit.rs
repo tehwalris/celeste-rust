@@ -571,8 +571,6 @@ pub struct UnitSink<'a, N: Rem = P8> {
     /// The wave's provisional keys (a code the key space lacks: a new state).
     prov: &'a Provisional<N>,
     frame: u32,
-    /// The level the wave runs at (a reference row's key view).
-    level: crate::abstraction::Level,
     pub(crate) worker: u32,
     pub(crate) unit: u32,
     src: Sources<N>,
@@ -601,7 +599,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         prov: &'a Provisional<N>,
         filters: Filters<'a, N>,
         frame: u32,
-        level: crate::abstraction::Level,
         worker: u32,
         base: &'a super::edges::XferTable<N>,
         xfer_tab: &'a std::sync::RwLock<Vec<Pair<N>>>,
@@ -612,7 +609,6 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             skeletons,
             prov,
             frame,
-            level,
             worker,
             unit: 0,
             src: Sources::default(),
@@ -857,13 +853,13 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     }
 
     /// A reference row (CANONICAL) as the tree holds it, and its key
-    /// (provisional where a code is new): widened as its kernels key it (held
-    /// buttons, every level's widenings: `Rt2::widen_to`). The WIDENED row: a
+    /// (provisional where a code is new): widened as its kernels key it
+    /// (every level's widenings, the buttons' memory among them:
+    /// `Rt2::widen_to`). The WIDENED row: a
     /// stored row is what its key decodes to (plans/architecture.md "Keys").
     pub(crate) fn row_key(&mut self, row: &Rt2<N>) -> (Rt2<N>, Key) {
-        let level = crate::abstraction::Level { held: self.level.held, ..crate::abstraction::Level::EXACT };
         let mut w = row.clone_block();
-        w.widen_to(level);
+        w.widen_to(crate::abstraction::Level::EXACT);
         w.canonical();
         if self.keys.shape(w.shape_hash).is_none() {
             self.note_shape(&celeste_engine::exact::ShapeRecord::of(&w));

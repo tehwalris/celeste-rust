@@ -62,10 +62,10 @@ const EXAMPLES: &str = "Examples:
   ./safe-run.sh -- target/release/rewrite search --room 1,0 --frames 99 --ceiling --search-dir DIR
   # A room with objects, level -1 filtered at the horizon, a category, the real-play entry
   # (plans/results.md \"How to run a room\"); --prefer FILE checks a known route too:
-  ./safe-run.sh -- target/release/rewrite search --room X,Y --level r0sxhn --frames C --ceiling \\
+  ./safe-run.sh -- target/release/rewrite search --room X,Y --level r0sxn --frames C --ceiling \\
       --level-minus-one C,5 [--category CAT] [--loading-jank J] --search-dir DIR
-  # The objects ladder where r0sxhn's bound is loose (room (7,0): 80 against 84):
-  ./safe-run.sh -- target/release/rewrite search --room 7,0 --level r0sxhn,r0sxh \\
+  # The objects ladder where r0sxn's bound is loose (room (7,0): 80 against 84):
+  ./safe-run.sh -- target/release/rewrite search --room 7,0 --level r0sxn,r0sx \\
       --level-minus-one 84,5 --frames 84 --ceiling --search-dir DIR
   # One forward and its fingerprint (the room (1,0) gate):
   ./safe-run.sh -- target/quick/rewrite forward --room 1,0 --steps 44 --tree D
@@ -187,9 +187,8 @@ enum Command {
     /// stdout: `--inputs` replayed on the reference engine (the minimal
     /// cart) from the room's start, its balloons and chests seeded by
     /// `--balloon-seeds` as the TAS tools seed them: the frame it leaves
-    /// the room (`exit`), the inputs with the jump bit kept only where a
-    /// jump fires (`canonical`), and in a 100% category the chest seed
-    /// lists to try (`chest_seed_variants`).
+    /// the room (`exit`), and in a 100% category the chest seed lists to
+    /// try (`chest_seed_variants`).
     Witness(run::WitnessArgs),
     /// A REAL PICO-8, headless: one room replayed, a room in real play
     /// through the chain of rooms before it, the start real play enters a
@@ -234,8 +233,8 @@ pub struct SearchArgs {
     #[arg(long)]
     ceiling: bool,
     /// The levels (`Level::parse`), comma-separated, coarsest first:
-    /// `r0sx` for a room without objects, `r0sxhn` with objects,
-    /// `r0sxhn,r0sxh` for an exact-objects level filtered by the abstract one.
+    /// `r0sx` for a room without objects, `r0sxn` with objects,
+    /// `r0sxn,r0sx` for an exact-objects level filtered by the abstract one.
     #[arg(long, default_value = "r0sx")]
     level: String,
     /// The search's directory: level i's tree goes to `level{i:02}/` under it.
@@ -280,7 +279,7 @@ pub struct ForwardArgs {
     /// --split-frame; `settings::Clock`).
     #[arg(long)]
     steps: u32,
-    /// The level (`Level::parse`, e.g. `r0sxhn`).
+    /// The level (`Level::parse`, e.g. `r0sxn`).
     #[arg(long, value_parser = Level::parse, default_value = "r0sx")]
     level: Level,
     /// The tree (its files land under it).
