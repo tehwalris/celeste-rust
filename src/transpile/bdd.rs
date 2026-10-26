@@ -548,11 +548,12 @@ pub fn simplify_local<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], cap: usize,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeste_core::arith::Fixed;
     use celeste_core::pico8_num::{Pico8Num, Pico8NumInterval};
     use std::collections::HashMap as Map;
 
     /// The local pass at the settings the lowering uses.
-    fn local(g: &Graph, roots: &[NodeId]) -> (Graph, Vec<NodeId>, Stats) {
+    fn local(g: &Graph<Fixed>, roots: &[NodeId]) -> (Graph<Fixed>, Vec<NodeId>, Stats) {
         simplify_local(g, roots, LOCAL_CAP, LOCAL_EXPAND)
     }
 
@@ -567,7 +568,7 @@ mod tests {
         // The property the rewrite's safety rests on: for the remerge shape,
         // at EVERY tri-state assignment, wherever `(A & p) | (A & not p)` is
         // decided, `A` is decided and agrees. Ancestors include compounds.
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let cells: Vec<NodeId> = (0..3).map(|i| g.leaf(Op::Cell(i))).collect();
         let ancestors = vec![
             cells[0],
@@ -619,7 +620,7 @@ mod tests {
     fn complementary_comparisons_are_one_variable_and_its_negation() {
         // `fold` rewrites `Not(Lt(x,y))` to `Ge(x,y)`; if every comparison were
         // its own variable that would hide the complementarity.
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let (x, y) = (g.leaf(Op::Cell(1)), g.leaf(Op::Cell(2)));
         let lt = g.fold(Op::Lt, vec![x, y]);
         let ge = g.fold(Op::Ge, vec![x, y]);
@@ -630,7 +631,7 @@ mod tests {
         assert_eq!(out.get(map[either as usize]).op, Op::ConstBool(true));
         assert_eq!(out.get(map[both as usize]).op, Op::ConstBool(false));
         // The same for the other pair, spelled the other way round.
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let (x, y) = (g.leaf(Op::Cell(1)), g.leaf(Op::Cell(2)));
         let gt = g.fold(Op::Gt, vec![x, y]);
         let le = g.fold(Op::Le, vec![x, y]);
@@ -649,7 +650,7 @@ mod tests {
     /// through a SWAPPED comparison (`Gt(y, x)` is `Lt(x, y)`).
     #[test]
     fn local_decides_tautologies_remerges_and_swapped_comparisons() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let a = g.leaf(Op::Cell(1));
         let x = g.leaf(Op::Cell(2));
         let na = g.fold(Op::Not, vec![a]);
@@ -679,7 +680,7 @@ mod tests {
     /// merge per level, in ONE pass.
     #[test]
     fn local_collapses_a_three_level_remerge_in_one_pass() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let a0 = g.leaf(Op::Cell(1));
         let a1 = g.leaf(Op::Cell(4));
         let a = g.fold(Op::And, vec![a0, a1]);
@@ -720,7 +721,7 @@ mod tests {
     /// them is then a tautology.
     #[test]
     fn local_sees_a_collapse_it_created_in_the_same_pass() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let (x, y, z) = (g.leaf(Op::Cell(1)), g.leaf(Op::Cell(2)), g.leaf(Op::Cell(3)));
         let b = g.leaf(Op::Cell(4));
         let nb = g.fold(Op::Not, vec![b]);
@@ -738,7 +739,7 @@ mod tests {
     /// tree is rebuilt over its distinct leaves.
     #[test]
     fn local_drops_duplicate_leaves() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let (a, b, c) = (g.leaf(Op::Cell(1)), g.leaf(Op::Cell(2)), g.leaf(Op::Cell(3)));
         let ba = g.fold(Op::And, vec![b, a]);
         let cba = g.fold(Op::And, vec![c, ba]);
@@ -755,7 +756,7 @@ mod tests {
     /// incompleteness that makes the conclusions hold.
     #[test]
     fn local_treats_different_comparisons_as_independent() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let x = g.leaf(Op::Cell(1));
         let three = g.leaf(Op::Const(n(3).as_raw_u32() as i32, n(3).as_raw_u32() as i32));
         let five = g.leaf(Op::Const(n(5).as_raw_u32() as i32, n(5).as_raw_u32() as i32));
@@ -770,8 +771,8 @@ mod tests {
     /// graphs agree at every tri-state assignment (stronger than the concrete
     /// demand; catches a mis-ordered `ite`). The one legitimate difference is
     /// a node DECIDED where the original was unknown.
-    fn check_preserves(simplifier: impl Fn(&Graph, &[NodeId]) -> (Graph, Vec<NodeId>, Stats)) {
-        let mut g = Graph::new();
+    fn check_preserves(simplifier: impl Fn(&Graph<Fixed>, &[NodeId]) -> (Graph<Fixed>, Vec<NodeId>, Stats)) {
+        let mut g = Graph::<Fixed>::default();
         let cells: Vec<NodeId> = (0..4).map(|i| g.leaf(Op::Cell(i))).collect();
         let nums: Vec<NodeId> = (10..12).map(|i| g.leaf(Op::Cell(i))).collect();
         let mut pool = cells.clone();
@@ -865,7 +866,7 @@ mod tests {
     fn the_cap_is_reported_rather_than_silent() {
         // A truncated analysis that finds nothing reads like a complete one
         // that finds nothing, so the count is the safety property here.
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let cells: Vec<NodeId> = (0..40).map(|i| g.leaf(Op::Cell(i))).collect();
         // Parity over 40 independent atoms - the textbook BDD blow-up
         // under a bad variable order, and a good way to hit a small cap.

@@ -9,12 +9,9 @@ use std::sync::Arc;
 
 use celeste_core::arith::Arithmetic;
 use celeste_core::room::Room;
-use celeste_core::pico8_num::Pico8Num;
 use serde::{Deserialize, Serialize};
 
 use crate::shape::{Cell, Shape};
-
-pub type P8 = Pico8Num;
 
 /// The hash mixer: slot functions and fingerprints only (a state's
 /// identity is its exact key, `exact`).

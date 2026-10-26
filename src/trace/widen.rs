@@ -474,7 +474,7 @@ mod tests {
     use crate::transpile::graph::{Eval, Val};
     use std::collections::HashMap;
 
-    fn canonical(st: &State<Symbolic>, p: &Path) -> Option<Val> {
+    fn canonical(st: &State<Symbolic<P8>>, p: &Path) -> Option<Val<P8>> {
         for e in Level::EXACT.entries() {
             for paths in entry_paths(st, e) {
                 for (s, q) in e.slots.iter().zip(paths) {
@@ -507,7 +507,7 @@ mod tests {
         // Per dead slot (its entry and field), the frames traced with it.
         let mut seen: std::collections::BTreeMap<String, usize> = Default::default();
         let mut overflow_checks = 0;
-        let routes: [((i16, i16), &str, &dyn Fn(&State<Symbolic>, &Symbolic) -> bool); 3] = [
+        let routes: [((i16, i16), &str, &dyn Fn(&State<Symbolic<P8>>, &Symbolic<P8>) -> bool); 3] = [
             ((4, 0), "tas/room_4_0_hundred_frame_152.txt", &|st, d| matches!(iface::get(st, &[iface::key("has_key")]), Some(Value::Bool(b)) if d.decide(&b) == Some(true))),
             ((6, 2), "tas/room_6_2_hundred_frame_93.txt", &|st, d| objects_of_type(st, "fly_fruit").iter().any(|f| matches!(iface::get(st, &field(f, &["fly"])), Some(Value::Bool(b)) if d.decide(&b) == Some(true)))),
             ((5, 2), "tas/room_5_2_exit_frame_150.txt", &|st, d| matches!(iface::get(st, &[iface::key("music_timer")]), Some(Value::Num(n)) if d.as_const(&n).is_some_and(|v| v > P8::from_i16(0)))),
@@ -516,7 +516,7 @@ mod tests {
             let s = crate::settings::Settings { room, ..Default::default() };
             let chunks = cart::Chunks::parse(&s).expect("chunks");
             let frame = &chunks.frame;
-            let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+            let mut it: Interp<Symbolic<P8>> = Interp::new(Symbolic::default());
             let mut st = cart::boot(&mut it, &chunks, s.room).expect("boot");
             let route = crate::concrete::read_inputs(file).expect("the route");
             let mut event = false;
@@ -552,7 +552,7 @@ mod tests {
                 }
                 let (g, map, _) = crate::transpile::bdd::simplify_local(&it.d.graph, &roots_in, crate::transpile::bdd::LOCAL_CAP, crate::transpile::bdd::LOCAL_EXPAND);
                 // Every input cell is a dead slot's; at its stored constant.
-                let stored: HashMap<u32, Val> = f
+                let stored: HashMap<u32, Val<P8>> = f
                     .iface
                     .slots
                     .iter()

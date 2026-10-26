@@ -22,12 +22,11 @@ use super::Sk;
 use super::stats::{Lap, Stats, S};
 use crate::frame::{Filters, FrameStep};
 use crate::search::rem::{Pair, Rem};
-use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::exact::{KeyAdditions, MissKey, Provisional};
 
 /// An OLD frontier state: its hull grown since its last push (`was`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Old<N: Rem = P8> {
+pub(crate) struct Old<N: Rem> {
     pub(crate) sk: Sk,
     pub(crate) layer: u16,
     pub(crate) hull: HullOf<N>,
@@ -41,12 +40,12 @@ impl<N: Rem> From<Old<N>> for Grown<N> {
 }
 
 /// OLD states by layer (ascending; no empty layer), each layer's sorted.
-pub(crate) type ByLayer<N = P8> = Vec<OldLayer<N>>;
+pub(crate) type ByLayer<N> = Vec<OldLayer<N>>;
 
 /// The OLD states of one LAYER, sorted: per ENTRY (region, key) its cells
 /// and first state, per state its hull and `was` (32 B an entry, 16 a state).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OldLayer<N: Rem = P8> {
+pub struct OldLayer<N: Rem> {
     pub(crate) layer: u16,
     entries: Vec<OldEntry>,
     hulls: Vec<[HullOf<N>; 2]>,
@@ -114,7 +113,7 @@ impl<N: Rem> OldLayer<N> {
 /// A FRONTIER: the states whose hull grew at a frame - the NEW ones (a
 /// layer, their hulls in its state order) and the OLD ones (expanded before).
 #[derive(Clone)]
-pub struct Frontier<N: Rem = P8> {
+pub struct Frontier<N: Rem> {
     pub new: Layer<N>,
     pub hulls: Vec<HullOf<N>>,
     pub old: ByLayer<N>,
@@ -143,7 +142,7 @@ impl<N: Rem> Frontier<N> {
 
 /// A WAVE's outcome: the next frontier (its new states with their
 /// skeletons), the new states' wins, the frame's stats.
-pub struct Wave<N: Rem = P8> {
+pub struct Wave<N: Rem> {
     pub frontier: Frontier<N>,
     /// The new states' wins: per entry of `frontier.new` (ascending) its win
     /// cells.
@@ -289,7 +288,7 @@ const WORKER_STACK: usize = 512 << 20;
 
 /// What a wave reads and grows besides its frontier (the forward's; the
 /// pipeline's workers read it all).
-pub(crate) struct WaveCtx<'a, N: Rem = P8> {
+pub(crate) struct WaveCtx<'a, N: Rem> {
     pub(crate) visited: &'a mut VisitedSet<N>,
     pub(crate) xfers: &'a mut XferTable<N>,
     pub(crate) filters: Filters<'a, N>,
@@ -1389,6 +1388,7 @@ pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Rt2<N>>, frame: u3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeste_core::arith::Fixed;
     use crate::search::hull::Hull;
     use crate::settings::Settings;
 
@@ -1403,7 +1403,7 @@ mod tests {
             Settings { room: (7, 0), loading_jank: Some(1), ..Default::default() },
         ];
         for s in cases {
-            let start = crate::engines::reference::RefEngine::new(&s).expect("engine").initial().expect("start").canonicalized();
+            let start = crate::engines::reference::ReferenceEngine::<Fixed>::new(&s).expect("engine").initial().expect("start").canonicalized();
             let mut view = start.clone_block();
             view.widen_to(crate::abstraction::Level::EXACT);
             view.canonical();
@@ -1428,7 +1428,7 @@ mod tests {
         let mut v = 7u64;
         let mut next = move || crate::testutil::lcg(&mut v) >> 11;
         let hull = |x: u64| Hull::from_bytes(&(x & 0x7fff_7fff_7fff_7fff).to_le_bytes());
-        let mut olds: Vec<Old> = (0..60_000)
+        let mut olds: Vec<Old<Fixed>> = (0..60_000)
             .map(|_| {
                 let (r, k, c) = (next() % 5, next() % 9000, next() % 64);
                 Old { sk: Sk { region: r as u32, key: (0, k), local: c as u8 }, layer: 9, hull: hull(next()), was: hull(next()) }
@@ -1456,7 +1456,7 @@ mod tests {
     #[test]
     fn exact_platforms_are_keyed_by_the_first() {
         use celeste_engine::widening::key_deps;
-        let start_of = |s: &Settings| crate::engines::reference::RefEngine::new(s).expect("engine").initial().expect("start").canonicalized();
+        let start_of = |s: &Settings| crate::engines::reference::ReferenceEngine::<Fixed>::new(s).expect("engine").initial().expect("start").canonicalized();
         let s = Settings { room: (6, 0), split_frame: true, ..Default::default() };
         let start = start_of(&s);
         let platforms = start.objects_of_type(celeste_names::global("platform"));

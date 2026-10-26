@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 
-use celeste_core::arith::{Arithmetic, Fixed};
+use celeste_core::arith::Arithmetic;
 
 use super::lower::Bound;
 use crate::transpile::garith::GraphArith;
@@ -60,7 +60,7 @@ impl RegionGrid {
     }
 }
 
-pub type InputRanges<A = Fixed> = Vec<(super::iface::Path, (<A as Arithmetic>::Lit, <A as Arithmetic>::Lit))>;
+pub type InputRanges<A> = Vec<(super::iface::Path, (<A as Arithmetic>::Lit, <A as Arithmetic>::Lit))>;
 
 /// A walk SHAPE: its block's shape hash (`Rt2::shape_hash`), what the
 /// kernels are keyed by.
@@ -331,7 +331,7 @@ type Hull<A> = std::collections::BTreeMap<super::iface::Path, (A, A)>;
 /// field bounds its shape where its hull is not one value and every
 /// explored state of the shape holds it a constant.
 #[derive(Default)]
-struct NoPlayer<A: GraphArith = Fixed> {
+struct NoPlayer<A: GraphArith> {
     /// The start's chain reached the player: the hulls bound.
     on: bool,
     /// Per shape: each numeric field's hull over the states where it was a
@@ -418,6 +418,7 @@ impl<A: GraphArith> NoPlayer<A> {
 
 #[cfg(test)]
 mod tests {
+    use celeste_core::arith::Fixed;
     /// A NO-PLAYER STATE IS ITS SHAPE AND ITS CONSTANTS' BITS: a double's -0
     /// and 0 (equal to the cart's `==`) are two states, and equal bits one.
     #[test]
@@ -463,7 +464,7 @@ mod tests {
         let s = crate::settings::Settings { room: (6, 1), ..Default::default() };
         let opts = crate::abstraction::Level { floors_near: true, ..crate::abstraction::Level::EXACT };
         let only = [super::Region { ix: 3, iy: 6 }, super::Region { ix: 4, iy: 6 }];
-        let lw: super::LatticeWalk = super::room_constant_lattice(&super::Walk { run: &crate::settings::Run::new(&s, opts), only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
+        let lw: super::LatticeWalk<Fixed> = super::room_constant_lattice(&super::Walk { run: &crate::settings::Run::new(&s, opts), only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
         let mut traced = 0;
         for ((shape, region), f) in &lw.frames {
             let Some(r) = region else { continue };
@@ -486,7 +487,7 @@ mod tests {
         let s = crate::settings::Settings { room: (0, 3), category: crate::settings::Category::Gemskip100, loading_jank: Some(1), ..Default::default() };
         let opts = crate::abstraction::Level::parse("r0sx").expect("level");
         let only: Vec<super::Region> = (0..8).flat_map(|ix| (5..8).map(move |iy| super::Region { ix, iy })).collect();
-        let lw: super::LatticeWalk = super::room_constant_lattice(&super::Walk { run: &crate::settings::Run::new(&s, opts), only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
+        let lw: super::LatticeWalk<Fixed> = super::room_constant_lattice(&super::Walk { run: &crate::settings::Run::new(&s, opts), only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
         let mut bounded = 0;
         for ((shape, region), f) in &lw.frames {
             let rep = &lw.reps[shape];
@@ -864,7 +865,7 @@ fn with_extra(mut ival: Vec<super::iface::Path>, extra: Option<&std::collections
     ival
 }
 
-struct WalkJob<A: GraphArith = Fixed> {
+struct WalkJob<A: GraphArith> {
     node: WalkNode,
     roots: Vec<super::iface::Path>,
     pin: Vec<(super::iface::Path, super::iface::Conc<A>)>,
@@ -875,7 +876,7 @@ struct WalkJob<A: GraphArith = Fixed> {
 }
 
 /// A live outcome of a traced walk node, as the walk reads it.
-struct WalkOutcome<A: GraphArith = Fixed> {
+struct WalkOutcome<A: GraphArith> {
     key: ShapeKey,
     constants: std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>,
     ival: Vec<super::iface::Path>,
@@ -888,7 +889,7 @@ struct WalkOutcome<A: GraphArith = Fixed> {
     respawn: Option<std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>>,
 }
 
-enum WalkTraced<A: GraphArith = Fixed> {
+enum WalkTraced<A: GraphArith> {
     /// The refusal, and what the trace poisoned before it.
     Refused(String, std::collections::BTreeMap<String, usize>),
     Traced {
@@ -903,7 +904,7 @@ enum WalkTraced<A: GraphArith = Fixed> {
 }
 
 /// A walk node's converged frame, its bounds, and its binding.
-pub struct WalkFrame<A: GraphArith = Fixed> {
+pub struct WalkFrame<A: GraphArith> {
     pub frame: super::frame::Frame<A>,
     pub bounds: InputRanges<A>,
     pub bound: std::result::Result<Bound<A>, String>,
@@ -972,7 +973,7 @@ fn walk_trace<A: GraphArith>(
 
 /// The tracer a walk ran in, kept to re-trace a shape in the same arena.
 #[derive(Clone)]
-pub struct Tracer<A: GraphArith = Fixed> {
+pub struct Tracer<A: GraphArith> {
     pub it: super::interp::Interp<'static, super::domain::Symbolic<A>>,
     pub chunks: &'static super::cart::Chunks,
 }
@@ -985,7 +986,7 @@ pub struct Walk<'a> {
     pub only: Option<&'a [Region]>,
 }
 
-pub struct LatticeWalk<A: GraphArith = Fixed> {
+pub struct LatticeWalk<A: GraphArith> {
     pub tracer: Tracer<A>,
     pub start_key: ShapeKey,
     pub lattice: std::collections::BTreeMap<ShapeKey, std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>>,

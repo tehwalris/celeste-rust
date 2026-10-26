@@ -3,11 +3,11 @@
 //! start state dumped as a real PICO-8's (`rewrite pico8 replay --dump`).
 
 use anyhow::Result;
-use celeste_core::arith::Arithmetic;
-use celeste_engine::runtime2::{Rt2, AV, NONE, P8};
+use celeste_core::arith::{Arithmetic, Fixed};
+use celeste_engine::runtime2::{Rt2, AV, NONE};
 use celeste_rust::concrete::{format_input, num_at, objects_of_type};
 use celeste_rust::settings::Settings;
-use celeste_rust::engines::reference::RefEngine;
+use celeste_rust::engines::reference::ReferenceEngine;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -34,7 +34,7 @@ pub struct Args {
 /// frame.
 pub fn run(cfg: &Settings, a: Args) -> Result<()> {
     let Args { inputs, frames, object, dump_start } = a;
-    let mut eng = RefEngine::new(cfg)?;
+    let mut eng = ReferenceEngine::<Fixed>::new(cfg)?;
     let mut state = eng.initial()?;
     if dump_start {
         dump_start_state(&state);
@@ -79,7 +79,7 @@ pub fn witness(cfg: &Settings, a: WitnessArgs) -> Result<()> {
 
 /// One value as the PICO-8 replay's dump prints it (`tools::pico8`); a
 /// table of numbers inline.
-fn dump_value(st: &Rt2<P8>, c: u32) -> Option<String> {
+fn dump_value(st: &Rt2<Fixed>, c: u32) -> Option<String> {
     use celeste_engine::shape::Cell;
     Some(match st.cols[c as usize].at(0) {
         AV::Num(n) => Arithmetic::hex(n),
@@ -103,7 +103,7 @@ fn dump_value(st: &Rt2<P8>, c: u32) -> Option<String> {
 }
 
 /// `obj I TYPE k=v ...` per object in `objects` order, keys sorted.
-fn dump_start_state(st: &Rt2<P8>) {
+fn dump_start_state(st: &Rt2<Fixed>) {
     use celeste_engine::shape::Cell;
     let mut names = std::collections::HashMap::new();
     for t in celeste_rust::tools::pico8::TYPES {
@@ -131,7 +131,7 @@ fn dump_start_state(st: &Rt2<P8>) {
 
 /// Formats as floor.frac_hex, NOT sign-magnitude: `-4.76ec` is
 /// (-4 << 16) | 0x76ec = -3.5355, not -(4 + 0x76ec/65536).
-fn format_num(n: P8) -> String {
+fn format_num(n: Fixed) -> String {
     let whole = n.whole_part_as_i16();
     let frac = n.fraction_part_as_u16();
     if frac == 0 {
@@ -141,20 +141,20 @@ fn format_num(n: P8) -> String {
     }
 }
 
-fn first_object(st: &Rt2<P8>, type_name: &str) -> Option<u32> {
+fn first_object(st: &Rt2<Fixed>, type_name: &str) -> Option<u32> {
     objects_of_type(st, type_name).first().copied()
 }
 
-fn xy(st: &Rt2<P8>, obj: u32, field: &str) -> Option<(P8, P8)> {
+fn xy(st: &Rt2<Fixed>, obj: u32, field: &str) -> Option<(Fixed, Fixed)> {
     Some((num_at(st, obj, &[field, "x"])?, num_at(st, obj, &[field, "y"])?))
 }
 
-fn position(st: &Rt2<P8>, obj: u32) -> Option<(P8, P8)> {
+fn position(st: &Rt2<Fixed>, obj: u32) -> Option<(Fixed, Fixed)> {
     Some((num_at(st, obj, &["x"])?, num_at(st, obj, &["y"])?))
 }
 
 /// One object's number fields for `--object`.
-fn print_object(st: &Rt2<P8>, type_name: &str) {
+fn print_object(st: &Rt2<Fixed>, type_name: &str) {
     let Some(id) = first_object(st, type_name) else {
         return println!("  {type_name}: none");
     };
@@ -172,7 +172,7 @@ fn print_object(st: &Rt2<P8>, type_name: &str) {
     println!("  {type_name}: {}", parts.join(" "));
 }
 
-fn freeze(st: &Rt2<P8>) -> Option<P8> {
+fn freeze(st: &Rt2<Fixed>) -> Option<Fixed> {
     let cell = st.shape.globals()[celeste_names::global_id("freeze")? as usize];
     match (cell != NONE).then(|| st.cols[cell as usize].at(0))? {
         AV::Num(n) => Some(n),
@@ -180,11 +180,11 @@ fn freeze(st: &Rt2<P8>) -> Option<P8> {
     }
 }
 
-fn print_frame(st: &Rt2<P8>, frame_num: u32, input_byte: u8) {
+fn print_frame(st: &Rt2<Fixed>, frame_num: u32, input_byte: u8) {
     let freeze = freeze(st).map(format_num).unwrap_or("?".to_string());
     let input = format_input(input_byte);
     if let Some((player, (x, y))) = first_object(st, "player").and_then(|p| Some((p, position(st, p)?))) {
-        let (spd_x, spd_y) = xy(st, player, "spd").unwrap_or((P8::from_i16(0), P8::from_i16(0)));
+        let (spd_x, spd_y) = xy(st, player, "spd").unwrap_or((Fixed::from_i16(0), Fixed::from_i16(0)));
         let rem = match xy(st, player, "rem") {
             Some((rx, ry)) => format!(" rem=({}, {})", format_num(rx), format_num(ry)),
             None => String::new(),

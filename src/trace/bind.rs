@@ -198,7 +198,7 @@ mod tests {
         use crate::trace::{cart, domain::Symbolic, interp::Interp};
         let s = crate::settings::Settings::default();
         let chunks = cart::Chunks::parse(&s).expect("chunks");
-        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let mut it: Interp<Symbolic<Fixed>> = Interp::new(Symbolic::default());
         let mut st = cart::boot(&mut it, &chunks, s.room).expect("boot");
         for _ in 0..12 {
             st = cart::run_one(&mut it, &chunks.frame, st).expect("warm-up");

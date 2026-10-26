@@ -10,10 +10,11 @@
 //! over-approximation of all of them.
 
 use anyhow::{Context, Result};
+use celeste_core::arith::Fixed;
 
 use crate::game_runner::previous_room;
 use crate::trace::cart::{room_objects, RoomObject};
-use crate::engines::reference::RefEngine;
+use crate::engines::reference::ReferenceEngine;
 
 /// Object tiles whose object a play can destroy before the exit: a berry
 /// taken (26), a fly fruit taken or flown off (28), a key taken (8), a chest
@@ -88,7 +89,7 @@ pub fn starts(s: &crate::settings::Settings) -> Result<Starts> {
     let mut classes: Vec<(celeste_engine::exact::ExactRow, u32, Vec<usize>)> = Vec::new();
     for &j in &feasible {
         let sj = crate::settings::Settings { loading_jank: Some(j), ..s.clone() };
-        let b = RefEngine::new(&sj)?.initial()?.canonicalized();
+        let b = ReferenceEngine::<Fixed>::new(&sj)?.initial()?.canonicalized();
         let row = celeste_engine::exact::exact_rows(&b).swap_remove(0);
         let cell = crate::storage::cells::block_cells(&b)?[0];
         match classes.iter_mut().find(|(r, c, _)| *r == row && *c == cell) {
@@ -112,7 +113,7 @@ pub fn starts(s: &crate::settings::Settings) -> Result<Starts> {
 /// input (frame f: the f-th `_update(); _draw()` after `_init()`).
 fn spawn_frame(s: &crate::settings::Settings, room: (i16, i16)) -> Result<u32> {
     let sp = crate::settings::Settings { room, loading_jank: None, ..s.clone() };
-    let mut eng = RefEngine::new(&sp)?;
+    let mut eng = ReferenceEngine::<Fixed>::new(&sp)?;
     let mut state = eng.initial()?;
     for f in 1..=120 {
         let mut next = eng.frame(&state, 0)?;

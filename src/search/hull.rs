@@ -14,11 +14,10 @@
 //! holding the union when the union fits in half the circle (its largest
 //! gap, longer than half, holds a cut), and a superset otherwise.
 
-use super::arcs::{clip, Circle, Fixed16, Seg, Transfer};
+use super::arcs::{clip, Circle, Seg, Transfer};
 #[cfg(test)]
 use super::arcs::{Piece, Region};
 use super::rem::{Rem, Word};
-use celeste_core::pico8_num::Pico8Num as P8;
 
 /// The points of `C`: `0..size`.
 #[inline]
@@ -41,7 +40,7 @@ fn num<C: Circle>(w: C::W) -> u64 {
 /// end (the whole circle starts at the first point).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 #[repr(C)]
-pub(crate) struct Arc<C: Circle = Fixed16> {
+pub(crate) struct Arc<C: Circle> {
     pub(crate) start: C::W,
     pub(crate) last: C::W,
 }
@@ -98,7 +97,7 @@ impl<C: Circle> Arc<C> {
 /// A state's HULL: one arc per axis, the box of its remainders. Never empty.
 #[derive(Clone, Copy, Debug, Hash, PartialOrd, Ord, Default)]
 #[repr(C)]
-pub struct Hull<C: Circle = Fixed16> {
+pub struct Hull<C: Circle> {
     pub(crate) x: Arc<C>,
     pub(crate) y: Arc<C>,
 }
@@ -245,7 +244,7 @@ fn image<C: Circle>(a: Arc<C>, t: &Transfer<C>, out: &mut [Seg<C::P>; 4]) -> usi
 /// A direct-mapped cache `(hull, the hull it last pushed, transfer id) ->
 /// the push` (`None`: nothing): sources share hulls and transfers, and a
 /// push depends on nothing else.
-pub(crate) struct PushCache<N: Rem = P8> {
+pub(crate) struct PushCache<N: Rem> {
     slots: Vec<Slot<N::C>>,
 }
 
@@ -294,7 +293,7 @@ fn cut<C: Circle>(c: usize) -> u64 {
 /// A HULL BEING ACCUMULATED: per axis and chart (`axis * 2 + chart`) the
 /// interval `[lo, hi]` of every point added (`lo > hi`: none).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct HullAcc<C: Circle = Fixed16> {
+pub(crate) struct HullAcc<C: Circle> {
     lo: [C::W; 4],
     hi: [C::W; 4],
 }
@@ -373,6 +372,7 @@ impl<C: Circle> HullAcc<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::arcs::Fixed16;
     use crate::search::arcs::{Act, Doubles, Transfer, CIRCLE};
     use crate::search::rem::tests::{lcg, pieces};
 

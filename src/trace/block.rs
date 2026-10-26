@@ -433,6 +433,7 @@ impl<N: Arithmetic, D: Domain<A = N>> FromBlock<'_, N, D> {
 
 #[cfg(test)]
 mod tests {
+    use celeste_core::arith::Fixed;
     /// THE SIGNATURE READS BACK ITS BLOCK: on the start blocks of rooms of
     /// every kind of object (the platforms', a 100% room's), `sig::kinds`
     /// of what `sig::write` writes is the block's cells' kinds, and every
@@ -448,7 +449,7 @@ mod tests {
             Settings { room: (4, 2), ..Default::default() },
             Settings { room: (6, 2), category: Category::Hundred, loading_jank: Some(2), ..Default::default() },
         ] {
-            let eng = crate::engines::reference::RefEngine::new(&s).expect("ref engine");
+            let eng = crate::engines::reference::ReferenceEngine::<Fixed>::new(&s).expect("ref engine");
             let b = eng.initial().expect("the start converts");
             let want: Vec<Kind> = b.cells().iter().map(|c| c.kind()).collect();
             assert_eq!(sig::kinds(b.shape.sig()).as_deref(), Ok(&want[..]), "room {:?}", s.room);
@@ -464,7 +465,7 @@ mod tests {
     #[test]
     fn a_block_whose_pointers_differ_under_its_shape_hash_is_fatal() {
         use crate::trace::heap::Value;
-        let eng = crate::engines::reference::RefEngine::new(&Default::default()).expect("ref engine");
+        let eng = crate::engines::reference::ReferenceEngine::<Fixed>::new(&Default::default()).expect("ref engine");
         let start = eng.start_state();
         let b = crate::engines::reference::to_block(start, eng.room()).expect("the start converts");
         let mut st = start.clone();
@@ -489,7 +490,7 @@ mod tests {
     fn a_closure_capturing_another_table_than_its_owner_is_refused() {
         use crate::trace::heap::Value;
         let s = crate::settings::Settings::default();
-        let eng = crate::engines::reference::RefEngine::new(&s).expect("ref engine");
+        let eng = crate::engines::reference::ReferenceEngine::<Fixed>::new(&s).expect("ref engine");
         let start = eng.start_state();
         crate::engines::reference::to_block(start, eng.room()).expect("the start converts");
         let mut st = start.clone();

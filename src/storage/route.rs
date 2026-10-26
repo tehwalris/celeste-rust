@@ -17,7 +17,6 @@ use super::set::{PackedTable, PlainTable};
 use super::visited::{Key, StateInfo, VisitedSet};
 use super::Sk;
 use crate::search::rem::Rem;
-use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::exact::is_provisional;
 
 /// `JobScratch::e_of`'s mark of a provisional target.
@@ -27,7 +26,7 @@ const PROV: u32 = u32::MAX;
 /// `index`, at most 3/4 full) its cells and the RUN of their hulls in
 /// `slots`, by cell (moved to the end when the key gains a cell; compacted
 /// once the dead pass half the live; arrays grow by an eighth): ~30 B a state.
-pub(crate) struct Touched<N: Rem = P8> {
+pub(crate) struct Touched<N: Rem> {
     index: Vec<u32>,
     keys: Vec<TouchedKey>,
     slots: Vec<AccOf<N>>,
@@ -194,7 +193,7 @@ impl Routes {
 /// A unit's bundles of one route: its TARGETS (key, cells), PUSHES (target,
 /// cell, hull), the unit's sources (shared), the bundles naming both by
 /// index, the source regions their edges leave.
-pub(crate) struct Chunk<N: Rem = P8> {
+pub(crate) struct Chunk<N: Rem> {
     pub(crate) route: u32,
     pub(crate) unit: u32,
     pub(crate) worker: u32,
@@ -216,7 +215,7 @@ pub(crate) struct Ub {
     pub(crate) mask: u64,
 }
 
-pub(crate) struct RouteState<N: Rem = P8> {
+pub(crate) struct RouteState<N: Rem> {
     pub(crate) shape: u64,
     pub(crate) slot: u32,
     /// The visited set's region, once the shape is numbered.
@@ -575,7 +574,7 @@ pub(crate) fn run_route<N: Rem>(st: &mut RouteState<N>, slice: u32, chunks: &[&C
 
 /// A route's frame end: its NEW states (by key) with their hulls in the
 /// table's order, and the states whose hull GREW.
-pub(crate) struct Sealed<N: Rem = P8> {
+pub(crate) struct Sealed<N: Rem> {
     pub(crate) region: u32,
     pub(crate) table: PlainTable,
     pub(crate) hulls: Vec<HullOf<N>>,
@@ -600,7 +599,7 @@ pub(crate) fn seal_sort<N: Rem>(st: &mut RouteState<N>, region: u32, finals: &Fx
     Ok(Touch { region, touched, accs, waited, t_sort: t.elapsed() })
 }
 
-pub(crate) struct Touch<N: Rem = P8> {
+pub(crate) struct Touch<N: Rem> {
     pub(crate) region: u32,
     pub(crate) touched: Vec<TouchedKey>,
     pub(crate) accs: Vec<AccOf<N>>,
@@ -612,7 +611,7 @@ pub(crate) struct Touch<N: Rem = P8> {
 pub(crate) const SEAL_PART: usize = 1 << 15;
 
 /// A `seal_part`: its new states (keys, cells, hulls), grown.
-pub(crate) struct SealPart<N: Rem = P8> {
+pub(crate) struct SealPart<N: Rem> {
     keys: Vec<Key>,
     masks: Vec<u64>,
     hulls: Vec<HullOf<N>>,

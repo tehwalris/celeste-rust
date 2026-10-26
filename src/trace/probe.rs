@@ -24,6 +24,7 @@
 //! values pin `Pico8Num`'s explicit `wrapping_*` / `saturating_*`.
 
 use anyhow::{bail, Result};
+use celeste_core::arith::Fixed;
 
 use super::cart::{fresh_state, run_one};
 use super::domain::Symbolic;
@@ -44,8 +45,8 @@ fn read(p: &str) -> Result<String> {
 fn run_corpus_source(corpus: &str) -> Result<Vec<String>> {
     let src = format!("{}\n{}\n{corpus}", super::cart::BUILTIN_LEVEL_3, super::cart::BUILTIN_LEVEL_4);
     let ast = full_moon::parse(&src).map_err(|e| anyhow::anyhow!("parse: {}", e))?;
-    let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-    let mut st = fresh_state::<Symbolic>(&mut it.d);
+    let mut it: Interp<Symbolic<Fixed>> = Interp::new(Symbolic::default());
+    let mut st = fresh_state::<Symbolic<Fixed>>(&mut it.d);
     st.heap.tables.get_mut(&st.globals).expect("the globals table").hash.insert("__hex".to_string(), Value::Builtin("__hex"));
     run_one(&mut it, &ast, st)?;
     Ok(std::mem::take(&mut it.prints))

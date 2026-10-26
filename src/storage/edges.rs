@@ -16,6 +16,7 @@ use super::bundle::{self, Bundle};
 use super::file::{self, At, Mapped};
 use super::Sk;
 use crate::search::rem::{Pair, Rem};
+#[cfg(test)]
 use celeste_core::pico8_num::Pico8Num as P8;
 
 /// The global transfer table: every distinct pair the tree's edges carry,
@@ -23,7 +24,7 @@ use celeste_core::pico8_num::Pico8Num as P8;
 /// trusted length the tree record's trust marker's (`record::done`: pairs
 /// past it are a killed wave's).
 #[derive(Clone)]
-pub struct XferTable<N: Rem = P8> {
+pub struct XferTable<N: Rem> {
     pub(crate) pairs: Vec<Pair<N>>,
     index: PairIndex,
     /// Pairs written to `xfer.bin`.
@@ -400,7 +401,7 @@ impl EdgeFiles {
 
 /// A level's recorded graph up to a horizon, mapped: its edge files and the
 /// global transfer table.
-pub struct EdgeStore<N: Rem = P8> {
+pub struct EdgeStore<N: Rem> {
     files: EdgeFiles,
     xfers: Vec<Pair<N>>,
     pub edges: u64,

@@ -1079,7 +1079,7 @@ impl<N: Arithmetic> Rt2<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime2::P8;
+    use celeste_core::pico8_num::Pico8Num as P8;
 
     #[test]
     fn levels_parse_and_print() {

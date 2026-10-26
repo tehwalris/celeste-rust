@@ -904,10 +904,10 @@ both!(input_representations, input_representations_fixed, input_representations_
 /// arithmetic, one step either side of every bound.
 #[test]
 fn scalar_overflow_is_at_most_two_compares() {
-    let mut g = Graph::new();
+    let mut g = Graph::<Fixed>::default();
     let (x, y) = (g.leaf(Op::Cell(0)), g.leaf(Op::Cell(1)));
     // (op, the literal: None for two cells / unary, the literal first)
-    let mut forms: Vec<(Op, Option<i32>, bool)> = vec![(Op::Add, None, false), (Op::Sub, None, false), (Op::Neg, None, false), (Op::Abs, None, false)];
+    let mut forms: Vec<(Op<Fixed>, Option<i32>, bool)> = vec![(Op::Add, None, false), (Op::Sub, None, false), (Op::Neg, None, false), (Op::Abs, None, false)];
     for k in [0, 1, -1, 0x1_0000, -0x1_0000, 0x7fff_0000, i32::MAX, i32::MIN] {
         forms.extend([(Op::Add, Some(k), false), (Op::Sub, Some(k), false), (Op::Sub, Some(k), true)]);
     }
@@ -970,7 +970,7 @@ fn scalar_overflow_is_at_most_two_compares() {
 /// operation fails, and every other lane is the exact result.
 #[test]
 fn interval_overflow_declines() {
-    let mut g = Graph::new();
+    let mut g = Graph::<Fixed>::default();
     let (civ, cnum) = (cells(&mut g, &[Ty::Ival, Ty::Num])[0], g.leaf(Op::Cell(1)));
     let add = g.add(Op::Add, vec![civ, cnum]);
     let sub = g.add(Op::Sub, vec![civ, cnum]);
@@ -1016,11 +1016,11 @@ fn interval_overflow_declines() {
 /// `NoWrap`: no compare.
 #[test]
 fn interval_scale_and_divide_overflow_is_one_compare_a_bound() {
-    let fits = |g: &Graph, x: NodeId| one_operand(g, x).expect("one operand").fits.expect("fits somewhere");
-    let mut g = Graph::new();
+    let fits = |g: &Graph<Fixed>, x: NodeId| one_operand(g, x).expect("one operand").fits.expect("fits somewhere");
+    let mut g = Graph::<Fixed>::default();
     let civ = cells(&mut g, &[Ty::Ival])[0];
     // (op, raw literal, the literal first, can wrap)
-    let forms: [(Op, i32, bool, bool); 10] = [
+    let forms: [(Op<Fixed>, i32, bool, bool); 10] = [
         (Op::Mul, 0x2_0000, false, true),
         (Op::Mul, 0x3_0000, true, true),
         (Op::Mul, 0x1_8000, false, true),
@@ -1078,7 +1078,7 @@ fn interval_scale_and_divide_overflow_is_one_compare_a_bound() {
 /// `/`, both endpoints.
 #[test]
 fn inline_div_rem_by_a_power_of_two_is_pico8s() {
-    let mut g = Graph::new();
+    let mut g = Graph::<Fixed>::default();
     let (x, y) = (g.leaf(Op::Cell(0)), g.leaf(Op::Cell(1)));
     let iv = g.add(Op::Span, vec![x, y]);
     let mut roots = Vec::new();
@@ -1118,7 +1118,7 @@ fn inline_div_rem_by_a_power_of_two_is_pico8s() {
 /// feeding arithmetic.
 #[test]
 fn call_outs_are_the_arithmetics() {
-    let mut g = Graph::new();
+    let mut g = Graph::<Fixed>::default();
     let (x, y) = (g.leaf(Op::Cell(0)), g.leaf(Op::Cell(1)));
     let three = g.leaf(Op::Const(3 << 16, 3 << 16));
     let mut roots = Vec::new();
@@ -1138,7 +1138,7 @@ fn call_outs_are_the_arithmetics() {
 /// are saved, and `ZERO` is zero again after the call.
 #[test]
 fn a_call_out_preserves_what_is_live_across_it() {
-    let mut g = Graph::new();
+    let mut g = Graph::<Fixed>::default();
     let (x, y) = (g.leaf(Op::Cell(0)), g.leaf(Op::Cell(1)));
     let three = g.leaf(Op::Const(3 << 16, 3 << 16));
     let before = g.add(Op::Add, vec![x, y]); // live across the call
@@ -1158,7 +1158,7 @@ fn a_call_out_preserves_what_is_live_across_it() {
 /// save area between the calls (eight call-outs, four values held across).
 #[test]
 fn values_held_across_a_run_of_calls_survive_it() {
-    let mut g = Graph::new();
+    let mut g = Graph::<Fixed>::default();
     let cs: Vec<NodeId> = (0..8u32).map(|c| g.leaf(Op::Cell(c))).collect();
     let three = g.leaf(Op::Const(3 << 16, 3 << 16));
     let held: Vec<NodeId> = (0..4).map(|i| g.add(Op::Add, vec![cs[i], cs[i + 4]])).collect();
@@ -1182,7 +1182,7 @@ fn values_held_across_a_run_of_calls_survive_it() {
 /// uses, exact.
 #[test]
 fn rematerialized_constants_under_pressure_are_exact() {
-    let mut g = Graph::new();
+    let mut g = Graph::<Fixed>::default();
     let cs: Vec<NodeId> = (0..48u32).map(|c| g.leaf(Op::Cell(c))).collect();
     let ks: Vec<NodeId> = [-1i32, 0, 1, 0x10000, -0x8000, 7, 0x7fff_ffff, i32::MIN].iter().map(|&k| g.leaf(Op::Const(k, k))).collect();
     let firsts: Vec<NodeId> = (0..cs.len())

@@ -287,7 +287,7 @@ fn run_levels<N: KernelLanes>(
 }
 
 /// A search's last level, its horizon not refuted.
-pub(crate) struct Solved<N: Rem = P8> {
+pub(crate) struct Solved<N: Rem> {
     /// The rotation graph's optimum, a lower bound on the game's, in FRAMES.
     pub(crate) arc: u32,
     /// The concrete optimum and its witness, when asked for and found.
@@ -299,7 +299,7 @@ pub(crate) struct Solved<N: Rem = P8> {
 /// A level's arc phase as the concrete searches read it: W, the tree's
 /// shapes (W's nodes' regions) and its key space, the start's node and the
 /// optimum.
-pub(crate) struct Arcs<N: Rem = P8> {
+pub(crate) struct Arcs<N: Rem> {
     pub(crate) w: Winning<N::C>,
     pub(crate) shapes: Vec<u64>,
     pub(crate) space: celeste_engine::exact::KeySpace<N>,

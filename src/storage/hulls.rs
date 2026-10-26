@@ -20,7 +20,6 @@ use super::file::{self, At, Mapped};
 use super::wave::Frontier;
 use super::Sk;
 use crate::search::rem::Rem;
-use celeste_core::pico8_num::Pico8Num as P8;
 
 /// New states' hulls a block.
 pub(crate) const NEW_BLOCK: usize = 1 << 18;
@@ -30,7 +29,7 @@ pub(crate) const GROWN_BLOCK: usize = 1 << 16;
 
 /// A frontier state: the state, its layer, its hull.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Grown<N: Rem = P8> {
+pub struct Grown<N: Rem> {
     pub(crate) sk: Sk,
     pub(crate) layer: u16,
     pub(crate) hull: HullOf<N>,

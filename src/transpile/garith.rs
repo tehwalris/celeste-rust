@@ -163,7 +163,7 @@ mod value_box_tests {
 }
 
 /// A static range as sorted, disjoint pieces (inclusive ends).
-pub type Pieces<A = Fixed> = Vec<(<A as GraphArith>::End, <A as GraphArith>::End)>;
+pub type Pieces<A> = Vec<(<A as GraphArith>::End, <A as GraphArith>::End)>;
 
 /// The most pieces a range keeps; past that it is one hull.
 pub const MAX_PIECES: usize = 64;
@@ -547,7 +547,7 @@ impl GraphArith for Fixed {
 
     /// The floors: `raw >> 16`; the values of `flr(x + 1/2)`: `(raw + 1/2)
     /// >> 16`, exactly.
-    fn spanned(grid: Cut, ps: &Pieces, uncapped: bool) -> i64 {
+    fn spanned(grid: Cut, ps: &Pieces<Fixed>, uncapped: bool) -> i64 {
         let half = if grid == Cut::Rounds { 0x8000 } else { 0 };
         let r = |v: i64| (v + half) >> 16;
         let w = if uncapped {

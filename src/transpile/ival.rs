@@ -91,6 +91,7 @@ pub fn fold_into<A: GraphArith>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeste_core::arith::Fixed;
     use crate::transpile::graph::Cut;
     use crate::pico8_num::Pico8Num;
 
@@ -119,7 +120,7 @@ mod tests {
     /// variable however opaque its operand is.
     #[test]
     fn a_comparison_of_abs_against_zero_is_not_a_free_variable() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let x = g.leaf(Op::Cell(0));
         let y = g.leaf(Op::Cell(1));
         let sum = g.fold(Op::Add, vec![x, y]);
@@ -141,8 +142,8 @@ mod tests {
         let room = Room::of((rx, ry));
 
         let at = |x: i16, y: i16| -> Option<bool> {
-            let mut g = Graph::new();
-            let n = |g: &mut Graph, v: i16| {
+            let mut g = Graph::<Fixed>::default();
+            let n = |g: &mut Graph<Fixed>, v: i16| {
                 let r = Pico8Num::from_i16(v).as_raw_u32() as i32;
                 g.leaf(Op::Const(r, r))
             };
@@ -171,9 +172,9 @@ mod tests {
         assert!(solid_seen && open_seen, "the room has both walls and space");
 
         // An UNKNOWN position is not decidable.
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let cell = g.leaf(Op::Cell(0));
-        let n = |g: &mut Graph, v: i16| {
+        let n = |g: &mut Graph<Fixed>, v: i16| {
             let r = Pico8Num::from_i16(v).as_raw_u32() as i32;
             g.leaf(Op::Const(r, r))
         };
@@ -200,7 +201,7 @@ mod tests {
                 for (w, h) in [(6i16, 5i16), (8, 8)] {
                     for at in -8..136i16 {
                         for top_is_y in [true, false] {
-                            let mut g = Graph::new();
+                            let mut g = Graph::<Fixed>::default();
                             let exact = g.leaf(Op::Const(raw(at), raw(at)));
                             let top = g.leaf(Op::Cell(0));
                             let (px, py) = if top_is_y { (exact, top) } else { (top, exact) };
@@ -250,7 +251,7 @@ mod tests {
                 let tile = |i: i16, j: i16| cart.mget_whole(rx * 16 + i, ry * 16 + j) as i16;
                 for (i0, j0) in [(0i16, 0i16), (3, 1), (7, 12), (13, 13), (-1, 14), (14, -1)] {
                     for (w, h) in [(1i16, 1i16), (2, 2), (3, 2), (3, 3)] {
-                        let mut g = Graph::new();
+                        let mut g = Graph::<Fixed>::default();
                         let (ci, cj) = (g.leaf(Op::Cell(0)), g.leaf(Op::Cell(1)));
                         let ri = g.fold(Op::Restrict(raw(i0), raw(i0 + w - 1)), vec![ci]);
                         let rj = g.fold(Op::Restrict(raw(j0), raw(j0 + h - 1)), vec![cj]);
@@ -299,7 +300,7 @@ mod tests {
     /// nodes that do not depend on it.
     #[test]
     fn an_unmodelled_op_becomes_top_rather_than_an_error() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let x = g.leaf(Op::Cell(0));
         let w = g.leaf(Op::Const(65536, 65536));
         let tile = g.fold(Op::TileFlagAt, vec![x, x, w, w, w]);
@@ -319,7 +320,7 @@ mod tests {
     /// decides it.
     #[test]
     fn fragment_validity_is_not_decided_from_a_wide_hull() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let x = g.leaf(Op::Cell(0));
         let ok1 = g.fold(Op::FragOk(Cut::Floors, 1), vec![x]);
         let frag1 = g.fold(Op::Frag(Cut::Floors, 1), vec![x]);
@@ -328,7 +329,7 @@ mod tests {
         assert_eq!(out.get(map[frag1 as usize]).op, Op::Frag(Cut::Floors, 1), "the fragment stays a fragment");
 
         // Inside one floor nothing straddles, so fragment 1 is never valid.
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let lo = g.leaf(Op::Const(65536 * 3 + 1000, 65536 * 3 + 1000));
         let hi = g.leaf(Op::Const(65536 * 3 + 50000, 65536 * 3 + 50000));
         let x = g.fold(Op::Span, vec![lo, hi]);
@@ -342,7 +343,7 @@ mod tests {
     /// not fold to false (which refuses every lane).
     #[test]
     fn known_of_a_wide_hull_is_undecided() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let x = g.leaf(Op::Cell(0));
         let fl = g.fold(Op::Flr, vec![x]);
         let known = g.fold(Op::Known, vec![fl]);
@@ -350,7 +351,7 @@ mod tests {
         assert_eq!(out.get(map[known as usize]).op, Op::Known, "wide hull: undecided");
 
         // A point hull is decided everywhere.
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let p = g.leaf(Op::Const(65536 * 3 + 1000, 65536 * 3 + 1000));
         let fl = g.fold(Op::Flr, vec![p]);
         let known = g.fold(Op::Known, vec![fl]);
@@ -361,7 +362,7 @@ mod tests {
     /// Folding must not change what the graph computes (sampled).
     #[test]
     fn folding_does_not_change_what_the_graph_computes() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let x = g.leaf(Op::Cell(0));
         let y = g.leaf(Op::Cell(1));
         let b = g.leaf(Op::Cell(2));
@@ -380,7 +381,7 @@ mod tests {
         for i in -3i16..4 {
             for j in -3i16..4 {
                 for bv in [false, true] {
-                    let mut cells: HashMap<u32, Val> = HashMap::new();
+                    let mut cells: HashMap<u32, Val<Fixed>> = HashMap::new();
                     cells.insert(0, Val::exact_num(Pico8Num::from_i16(i)));
                     cells.insert(1, Val::exact_num(Pico8Num::from_i16(j)));
                     cells.insert(2, Val::Bool(Some(bv)));

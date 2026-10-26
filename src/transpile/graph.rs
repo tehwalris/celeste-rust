@@ -20,7 +20,7 @@ pub use super::garith::GraphArith;
 /// An abstract value for ONE lane: an exact number is a singleton interval,
 /// a known boolean is `Some`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Val<A: Arithmetic = Fixed> {
+pub enum Val<A: Arithmetic> {
     Num(A::Ival),
     /// `None` = unknown, the abstract interpreter's third boolean.
     Bool(Option<bool>),
@@ -87,14 +87,14 @@ pub const ANY_VALID: u8 = 0x80;
 /// What a `Pin` reads its input as: a number (a point, or a literal
 /// interval `[lo, hi]`, as literals: `Arithmetic::Lit`) or a boolean.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Pinned<A: Arithmetic = Fixed> {
+pub enum Pinned<A: Arithmetic> {
     Num(A::Lit, A::Lit),
     Bool(bool),
 }
 
 /// The op vocabulary: one variant per MEANING, not per emitted form.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum Op<A: Arithmetic = Fixed> {
+pub enum Op<A: Arithmetic> {
     // Leaves.
     /// A literal: low and high bounds as `A::Lit` (raw 16.16, a double's
     /// bits: raw so `Op` is `Hash`); an exact literal is `Const(x, x)`.
@@ -259,7 +259,7 @@ impl Ty {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct Node<A: Arithmetic = Fixed> {
+pub struct Node<A: Arithmetic> {
     pub op: Op<A>,
     pub args: Vec<NodeId>,
 }
@@ -268,7 +268,7 @@ pub struct Node<A: Arithmetic = Fixed> {
 /// TYPED one: each node's lane type (`Ty`), from its op's signature
 /// (`Graph::type_of`) and, for a cell, the cell's recorded kind.
 #[derive(Default, Clone)]
-pub struct Graph<A: GraphArith = Fixed> {
+pub struct Graph<A: GraphArith> {
     nodes: Vec<Node<A>>,
     /// Parallel to `nodes`: each node's lane type.
     tys: Vec<Ty>,
@@ -285,13 +285,6 @@ pub struct Graph<A: GraphArith = Fixed> {
 
 /// The most fragments one fork can have (a byte names a fragment).
 pub const MAX_WAYS: usize = 255;
-
-impl Graph<Fixed> {
-    /// An empty 16.16 graph (`Graph::<A>::default()` in another arithmetic).
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
 
 impl<A: GraphArith> Graph<A> {
     /// An empty graph on the same fork grid and cell kinds.
@@ -1213,7 +1206,7 @@ mod tests {
     use super::*;
     use celeste_core::pico8_num::Pico8NumInterval;
 
-    fn pieces_of(g: &Graph, memo: &mut HashMap<NodeId, Option<crate::transpile::garith::Pieces>>, n: NodeId) -> Option<crate::transpile::garith::Pieces> {
+    fn pieces_of(g: &Graph<Fixed>, memo: &mut HashMap<NodeId, Option<crate::transpile::garith::Pieces<Fixed>>>, n: NodeId) -> Option<crate::transpile::garith::Pieces<Fixed>> {
         <Fixed as GraphArith>::pieces_of(g, memo, n)
     }
 
@@ -1223,7 +1216,7 @@ mod tests {
 
     #[test]
     fn interning_shares_identical_nodes() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let a = g.leaf(Op::Cell(1));
         let b = g.leaf(Op::Cell(2));
         let s1 = g.add(Op::Add, vec![a, b]);
@@ -1237,7 +1230,7 @@ mod tests {
 
     #[test]
     fn evaluates_exact_arithmetic() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let a = g.leaf(Op::Cell(1));
         let k = g.leaf(Op::Const(n(3).as_raw_u32() as i32, n(3).as_raw_u32() as i32));
         let sum = g.add(Op::Add, vec![a, k]);
@@ -1248,7 +1241,7 @@ mod tests {
 
     #[test]
     fn comparison_of_overlapping_intervals_is_unknown() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let a = g.leaf(Op::Cell(1));
         let b = g.leaf(Op::Cell(2));
         let lt = g.add(Op::Lt, vec![a, b]);
@@ -1269,7 +1262,7 @@ mod tests {
     #[test]
     fn validity_is_an_ordinary_node() {
         // Validity is an ordinary node: a select is valid only where `known(c)`.
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let c = g.leaf(Op::Cell(1));
         let t = g.leaf(Op::Const(n(1).as_raw_u32() as i32, n(1).as_raw_u32() as i32));
         let f = g.leaf(Op::Const(n(2).as_raw_u32() as i32, n(2).as_raw_u32() as i32));
@@ -1296,7 +1289,7 @@ mod tests {
 
     #[test]
     fn and_short_circuits_through_unknown() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let a = g.leaf(Op::Cell(1));
         let b = g.leaf(Op::Cell(2));
         let and = g.add(Op::And, vec![a, b]);
@@ -1309,7 +1302,7 @@ mod tests {
     fn folding_is_exact_not_merely_sound() {
         // Every `fold` rule must be EXACT: `fold` and `add` evaluate alike at
         // every leaf assignment (hence no `x and not x -> false`).
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let b: Vec<NodeId> = (0..3).map(|i| g.leaf(Op::Cell(i))).collect();
         let nums: Vec<NodeId> = (10..12).map(|i| g.leaf(Op::Cell(i))).collect();
         let tt = g.leaf(Op::ConstBool(true));
@@ -1333,7 +1326,7 @@ mod tests {
 
         // (folded, unfolded) pairs to compare.
         let mut pairs: Vec<(NodeId, NodeId)> = Vec::new();
-        let both = |g: &mut Graph, op: Op, args: Vec<NodeId>| {
+        let both = |g: &mut Graph<Fixed>, op: Op<Fixed>, args: Vec<NodeId>| {
             let f = g.fold(op.clone(), args.clone());
             let p = g.add(op, args);
             (f, p)
@@ -1411,7 +1404,7 @@ mod tests {
     #[test]
     fn commutative_operands_are_put_in_a_canonical_order() {
         // `add` stays the raw constructor (the control above).
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let a = g.leaf(Op::Cell(1));
         let b = g.leaf(Op::Cell(2));
         for op in [Op::Add, Op::Min, Op::Max, Op::Eq, Op::And, Op::Or] {
@@ -1434,7 +1427,7 @@ mod tests {
     #[test]
     fn a_select_between_boolean_constants_is_boolean_algebra() {
         // `if c then true else x` is `c or x`.
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let c = g.leaf(Op::Cell(1));
         let x = g.leaf(Op::Cell(2));
         let tt = g.leaf(Op::ConstBool(true));
@@ -1455,7 +1448,7 @@ mod tests {
     #[test]
     fn a_split_guard_merged_back_is_the_guard() {
         // `(g and c) or (g and not c)` is `g` and must not read `c`.
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let guard = g.leaf(Op::Cell(1));
         let c = g.leaf(Op::Cell(2));
         let nc = g.fold(Op::Not, vec![c]);
@@ -1478,7 +1471,7 @@ mod tests {
     #[test]
     fn a_negated_comparison_is_the_opposite_comparison() {
         // Makes `x < y` and `not (x >= y)` the SAME node.
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let (x, y) = (g.leaf(Op::Cell(1)), g.leaf(Op::Cell(2)));
         for (op, opp) in [
             (Op::Lt, Op::Ge),
@@ -1500,7 +1493,7 @@ mod tests {
     #[test]
     fn a_select_between_equal_arms_is_not_a_select() {
         // A join proposes a select per cell, almost all untouched: free.
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let c = g.leaf(Op::Cell(1));
         let x = g.leaf(Op::Cell(2));
         assert_eq!(g.fold(Op::Sel, vec![c, x, x]), x);
@@ -1534,8 +1527,8 @@ mod tests {
         let inner = g.add(Op::Sel, vec![left, neg, zero]);
         let input = g.add(Op::Sel, vec![right, one, inner]);
 
-        let mut shared = Graph::new();
-        let sig = |l: u8, r: u8, shared: &mut Graph| {
+        let mut shared = Graph::<Fixed>::default();
+        let sig = |l: u8, r: u8, shared: &mut Graph<Fixed>| {
             let map = d.graph.specialize_subset_into(&[l, r], None, shared);
             (map[input as usize], map[left as usize], map[right as usize])
         };
@@ -1556,7 +1549,7 @@ mod tests {
     #[test]
     fn unmodelled_operations_are_loud() {
         // An op we cannot evaluate EXACTLY must error, never approximate.
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let a = g.leaf(Op::Cell(1));
         let b = g.leaf(Op::Cell(2));
         let m = g.add(Op::Mul, vec![a, b]);
@@ -1583,7 +1576,7 @@ mod tests {
         let mut checked_forms = 0;
         for (op, first) in forms {
             for k in ks {
-                let mut g = Graph::new();
+                let mut g = Graph::<Fixed>::default();
                 let x = g.leaf(Op::Cell(0));
                 let c = g.leaf(Op::Const(k, k));
                 let m = g.add(op.clone(), if first { vec![c, x] } else { vec![x, c] });
@@ -1631,13 +1624,13 @@ mod tests {
         assert!(checked_forms > 40, "{checked_forms} forms that can overflow");
         // Negation and `abs`: everything but MIN.
         for op in [Op::Neg, Op::Abs] {
-            let mut g = Graph::new();
+            let mut g = Graph::<Fixed>::default();
             let x = g.leaf(Op::Cell(0));
             let m = g.add(op.clone(), vec![x]);
             assert_eq!(one_operand(&g, m), Some(OneOperand { operand: 0, fits: Some((i32::MIN + 1, i32::MAX)) }));
         }
         // `k / x` is no `OneOperand`, nor is an operation of two cells.
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let (x, y, c) = (g.leaf(Op::Cell(0)), g.leaf(Op::Cell(1)), g.leaf(Op::Const(0x1_0000, 0x1_0000)));
         for (op, args) in [(Op::Div, vec![c, x]), (Op::Add, vec![x, y]), (Op::Mul, vec![x, y])] {
             let m = g.add(op, args);
@@ -1652,8 +1645,8 @@ mod tests {
     /// constant: `fold` panics with the operation and its operands.
     #[test]
     fn a_literal_fold_folds_exactly() {
-        let mut g = Graph::new();
-        let k = |g: &mut Graph, v: i32| g.leaf(Op::Const(v, v));
+        let mut g = Graph::<Fixed>::default();
+        let k = |g: &mut Graph<Fixed>, v: i32| g.leaf(Op::Const(v, v));
         let (a, b) = (k(&mut g, 3 << 16), k(&mut g, -(5 << 16)));
         for (op, want) in [(Op::Add, -2 << 16), (Op::Sub, 8 << 16), (Op::Mul, -15 << 16), (Op::Div, -0x9999)] {
             let r = g.fold(op.clone(), vec![a, b]);
@@ -1671,7 +1664,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "constant fold overflow: + of the literals 32767.99998")]
     fn a_literal_fold_that_overflows_is_an_error() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let (max, eps) = (g.leaf(Op::Const(i32::MAX, i32::MAX)), g.leaf(Op::Const(1, 1)));
         g.fold(Op::Add, vec![max, eps]);
     }
@@ -1679,7 +1672,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "constant fold overflow: / of the literals 1 and 0 leaves the 16.16 range")]
     fn a_literal_division_by_zero_is_an_error() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let (one, zero) = (g.leaf(Op::Const(1 << 16, 1 << 16)), g.leaf(Op::Const(0, 0)));
         g.fold(Op::Div, vec![one, zero]);
     }
@@ -1687,7 +1680,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "constant fold overflow: abs of the literals -32768 and -32768")]
     fn a_literal_abs_of_min_is_an_error() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let min = g.leaf(Op::Const(i32::MIN, i32::MIN));
         g.fold(Op::Abs, vec![min]);
     }
@@ -1696,7 +1689,7 @@ mod tests {
     /// unknown, not PICO-8's wrapped endpoints (which bound nothing).
     #[test]
     fn a_product_range_that_overflows_is_unknown() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let raw = g.leaf(Op::Cell(0));
         let s = g.add(Op::Restrict(0, i32::MAX), vec![raw]);
         let two = g.leaf(Op::Const(0x2_0000, 0x2_0000));
@@ -1710,7 +1703,7 @@ mod tests {
     /// A select on a non-constant condition is the UNION of its arms.
     #[test]
     fn pieces_keep_a_select_as_a_union() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let raw = g.leaf(Op::Cell(0));
         let s = g.add(Op::Restrict(-(1 << 16), 1 << 16), vec![raw]);
         let five = g.leaf(Op::Const(5 << 16, 5 << 16));
@@ -1731,7 +1724,7 @@ mod tests {
     /// one lane could fail.
     #[test]
     fn the_ends_of_a_hull_are_not_points() {
-        let mut g = Graph::new();
+        let mut g = Graph::<Fixed>::default();
         let v = g.leaf(Op::Cell(0));
         let hi = g.add(Op::Hi, vec![v]);
         let one = g.leaf(Op::Const(1 << 16, 1 << 16));

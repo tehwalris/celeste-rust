@@ -8,7 +8,6 @@
 
 use anyhow::Result;
 
-use celeste_core::arith::Fixed;
 
 use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{Graph, NodeId};
@@ -19,7 +18,7 @@ use super::walk::{room_constant_lattice, Region, Walk};
 
 /// THE specialization of a bound frame (`lower::specialize_frame`): the
 /// fused graph and its bodies, computed once.
-pub struct Lowered<A: GraphArith = Fixed> {
+pub struct Lowered<A: GraphArith> {
     pub(crate) fused: Graph<A>,
     pub(crate) bodies: Vec<Body>,
 }
@@ -27,13 +26,13 @@ pub struct Lowered<A: GraphArith = Fixed> {
 /// One output shape of a traced frame: its stored fields, and what it
 /// computes (`roots`, over the engine's cells; `roots.fields` parallel to
 /// `fields`).
-pub struct FrameOutcome<A: GraphArith = Fixed> {
+pub struct FrameOutcome<A: GraphArith> {
     pub fields: Vec<OutField<A>>,
     pub roots: Roots,
 }
 
 /// A traced frame in the ENGINE's numbering: everything `lower_frame` needs.
-pub struct Bound<A: GraphArith = Fixed> {
+pub struct Bound<A: GraphArith> {
     /// The frame's graph over the engine's cells, each cell typed
     /// (`Graph::cell_kind`: its input layout).
     pub graph: Graph<A>,
@@ -114,7 +113,7 @@ pub fn lower_frame<A: GraphArith>(bound: &mut Bound<A>, room: Option<&celeste_co
 }
 
 /// One traced frame, bound and lowered: what the kernel registry assembles.
-pub struct LoweredFrame<A: GraphArith = Fixed> {
+pub struct LoweredFrame<A: GraphArith> {
     pub frame: Frame<A>,
     pub bound: Bound<A>,
     pub lowered: Lowered<A>,

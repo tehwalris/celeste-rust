@@ -1010,7 +1010,7 @@ mod tests {
         let dir = crate::testutil::TestDir::new("ui-marks");
         std::fs::create_dir_all(&dir).unwrap();
         let save = |name: &str, rows: &[((u64, u64), u32, u64, u16)]| {
-            let mut v = crate::frame::Visited::<celeste_engine::runtime2::P8>::new(Default::default());
+            let mut v = crate::frame::Visited::<celeste_core::arith::Fixed>::new(Default::default());
             for &(key, cell, shape, deadline) in rows {
                 v.insert_until(shape, key, cell, deadline);
             }
@@ -1068,7 +1068,7 @@ mod tests {
         // Out of order: refused.
         let bad = dir.join("bad.bin");
         let rows: Vec<crate::frame::MarkRow> = vec![(7, 3, 5, 6, 0), (7, 3, 1, 2, 0)];
-        crate::storage::file::save_value::<celeste_engine::runtime2::P8, _>(&bad, &(rows, 9u32, celeste_engine::exact::KeySpace::<celeste_engine::runtime2::P8>::default().to_additions())).unwrap();
+        crate::storage::file::save_value::<celeste_core::arith::Fixed, _>(&bad, &(rows, 9u32, celeste_engine::exact::KeySpace::<celeste_core::arith::Fixed>::default().to_additions())).unwrap();
         assert!(scan_marks(MarksMap::open(&bad, crate::settings::Arith::Fixed).unwrap(), &bad, 2).is_err());
     }
 

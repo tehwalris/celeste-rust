@@ -64,7 +64,8 @@ the circle its points are `search::arcs::Circle` (`Fixed16`, `Doubles`:
 the hulls, the arcs' sets). A frame's captures become a transfer by ONE
 decoder for both (`rem::decode`: the arithmetic's own operations, every
 comparison by value, `-0` is `0`; 16.16's floor split shifted back by
-1/2 first). Fixed is every default type parameter.
+1/2 first). No type parameter defaults to an arithmetic: code that holds
+numbers names `Fixed` or `Float` (`conventions`: a default is refused).
 
 ## The remainder model and the round fork
 

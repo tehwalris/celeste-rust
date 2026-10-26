@@ -559,7 +559,8 @@ mod tests {
     use super::sig::{self, kinds};
     use super::{Cell, KeyRole, Kind, Layout, Shape};
     use crate::exact::{Deps, ShapeRecord};
-    use crate::runtime2::{AV, NONE, P8};
+    use crate::runtime2::{AV, NONE};
+    use celeste_core::pico8_num::Pico8Num as P8;
 
     /// Every kind, as `sig::write` writes it, reads back as its cell's; a
     /// shape's signature and hash are its cells' and globals'.

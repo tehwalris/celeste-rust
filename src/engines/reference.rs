@@ -7,8 +7,7 @@
 //! state, and a leaf a block, through the one converter (`trace::block`).
 
 use anyhow::{bail, ensure, Result};
-use celeste_core::arith::{Arithmetic, Fixed, Float};
-use celeste_core::pico8_num::Pico8Num;
+use celeste_core::arith::Arithmetic;
 use celeste_engine::runtime2::{Rt2, AV};
 use full_moon::ast;
 
@@ -23,9 +22,10 @@ use crate::trace::refdomain::{Cursor, RefDomain};
 use crate::trace::state::{ArcAxis, State};
 use crate::trace::widen::{field, objects_of_type};
 
-/// The reference engine of arithmetic `A`: `RefEngine` is the real game's
-/// (16.16), the oracle of the kernels; `FloatRefEngine` the float tools'
-/// (UniversalClassicTas, Celia), the float oracle (plans/float.md).
+/// The reference engine of arithmetic `A`: `ReferenceEngine<Fixed>` is the
+/// real game's (16.16), the oracle of the kernels; `ReferenceEngine<Float>`
+/// the float tools' (UniversalClassicTas, Celia), the float oracle
+/// (plans/float.md).
 pub struct ReferenceEngine<A: Arithmetic> {
     it: Interp<'static, RefDomain<A>>,
     /// `__reset_button_states();_update();_draw()`: the buttons are forks.
@@ -41,11 +41,6 @@ pub struct ReferenceEngine<A: Arithmetic> {
     level: Level,
     settings: std::sync::Arc<crate::settings::Settings>,
 }
-
-/// The real game's reference engine (16.16).
-pub type RefEngine = ReferenceEngine<Fixed>;
-/// The float tools' reference engine (Lua doubles).
-pub type FloatRefEngine = ReferenceEngine<Float>;
 
 impl<A: Arithmetic> ReferenceEngine<A> {
     /// Parse the cart, run its toplevel and `_init` for the start room of
@@ -442,7 +437,7 @@ where
 /// THE REFERENCE ENGINE AS THE FORWARD'S `FrameStep` (`rewrite forward
 /// --reference`): one engine a worker, every fork leaf one row with its
 /// source lane's cell and its transfer - so its tree is the kernels'.
-pub struct RefFrameStep<N: Rem = Pico8Num> {
+pub struct RefFrameStep<N: Rem> {
     engines: Vec<std::sync::Mutex<ReferenceEngine<N>>>,
     run: crate::settings::Run,
 }
@@ -682,6 +677,7 @@ fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A>, fn_inf
 
 #[cfg(test)]
 mod tests {
+    use celeste_core::arith::Fixed;
     /// The pins' distance tests are EXACT in doubles, where `a - b` rounds:
     /// TwoSum's error decides a rounded difference equal to the bound.
     #[test]
@@ -713,7 +709,7 @@ mod tests {
     fn a_builtin_in_several_slots_converts_alike_on_both_sides() {
         use celeste_engine::runtime2::{Col, AV};
         use celeste_engine::shape::Cell;
-        let eng = RefEngine::new(&Default::default()).expect("ref engine");
+        let eng = ReferenceEngine::<Fixed>::new(&Default::default()).expect("ref engine");
         let mut st = eng.base.clone();
         let g = st.globals;
         // `abs` also in the global `flr` and in `room.x`.
@@ -737,7 +733,7 @@ mod tests {
     #[test]
     fn inputs_agreeing_on_the_buttons_read_make_the_same_successors() {
         let inputs = crate::concrete::read_inputs("tas/room_1_0_exit_frame_99.txt").expect("the exit's inputs");
-        let mut eng = RefEngine::new(&Default::default()).expect("ref engine");
+        let mut eng = ReferenceEngine::<Fixed>::new(&Default::default()).expect("ref engine");
         let exact = |bs: Vec<Rt2<Fixed>>| -> Vec<(celeste_engine::exact::ExactRow, u32)> { bs.iter().map(|b| (celeste_engine::exact::exact_rows(b).swap_remove(0), crate::storage::cells::block_cells(&b).expect("cells")[0])).collect() };
         let mut row = eng.initial().expect("initial state");
         let (mut runs, mut checked) = (0, 0);
@@ -772,7 +768,7 @@ mod tests {
     fn pins_keep_the_projected_successors(settings: crate::settings::Settings, route: &str, stride: usize, all_inputs: bool, level: &str, what: &str) -> (usize, usize, usize) {
         let level = Level::parse(level).expect("level");
         let inputs = crate::concrete::read_inputs(route).expect("the route's inputs");
-        let mut eng = RefEngine::new(&settings).expect("ref engine");
+        let mut eng = ReferenceEngine::<Fixed>::new(&settings).expect("ref engine");
         // The projections compared EXACTLY (their canonical bytes).
         let projected = |bs: &[Rt2<Fixed>]| -> std::collections::BTreeSet<(celeste_engine::exact::ExactRow, u32)> {
             bs.iter()
@@ -813,7 +809,7 @@ mod tests {
         let (leaves_pinned, leaves_full) = crate::par::Pool::new(16)
             .map_with(
                 sampled.len(),
-                || RefEngine::new(&settings),
+                || ReferenceEngine::<Fixed>::new(&settings),
                 |eng, k| {
                     let (f, abs) = &sampled[k];
                     let (mut pinned_n, mut full_n) = (0, 0);
