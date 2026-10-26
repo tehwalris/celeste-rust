@@ -569,13 +569,11 @@ observer (`frame::RowCheck`, `check keys`).
 - **Absent-as-zero** fields (a fall floor's or spring's missing `delay`):
   exact modulo raises, guarded syntactically (`cart::check_absent_fields`);
   the clean form, a nil-or-number column, would re-pin everything.
-- **`check reference` at `f`** disagrees with the kernels from the first
-  step in room (6,0) (`r0sxf`: the kernels 2 states a step through the
-  spawn, the reference 1; develop c67dbae6 alike): the reference engine
-  stores a row widened by every level's entries only (`UnitSink::row_key`,
-  `Level::EXACT`: the held buttons among them), the kernels the fly fruit
-  too. `r0sx` agrees. Its scope
-  should be stated, or the reference row widened as the kernels' is.
+- **`check reference` at `n` under the split frame** is refused: the
+  block side's near floors are not the kernels' mid-frame ones
+  (`Hook::NearFloor`). At `f` it agrees since C5 (the reference reads and
+  stores its rows widened at the level), but costly past room (6,0)'s
+  spawn (20 GB by step 50).
 - **`check arcs` at object levels** forks every straddling comparison on a
   widened phase (balloons, springs): room (7,0) `r0sxn` exceeds its path
   cap. A different probe (concrete members of the row) is needed.

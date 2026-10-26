@@ -31,7 +31,8 @@ byte-identical, or re-pins them on evidence.
     keys have FOLLOWERS (room (6,0)'s ten platforms, `exact::Deps`), every
     row's key recomputed at the boundary with its followers checked;
   - t2: `reference10[f]`, the reference engine's forward tree equal to the
-    kernels', f0-f27 with edges and hulls, fixed and float;
+    kernels', f0-f27 with edges and hulls, fixed and float; `reference60f`,
+    the same at the fruit level (the r60s fixture to step 48);
   - t2: `hull10[f]`, the hull replay over the recorded edges.
 - **A platform room** (t2): its forward to step 71. Big has its frame.
 - **The instruction budget** (perf).
@@ -125,12 +126,15 @@ The steps run in four lanes:
   edges reproduce its states at every frame);
 - **platforms**: `forward60-platforms` (room (6,0) `r0sxf` split frame to
   step 71, its ten platforms exact and keyed by the first one's; its
-  `ckhash --edges --hulls` the r60s pin) and `widen-r60s`;
+  `ckhash --edges --hulls` the r60s pin), `widen-r60s`, and `reference60f`
+  (`check reference` of the r60s fixture to step 48: the fruit level);
 - **slow**: the `slow, ` tests. These are the hull forward between the exact
   reach and the widened forward (f34), the bounds the region and platform
   kernels check, the split frame at a near level, a run killed before its
   done marker, the respawn and near-floor walks, the float goldens (UCT,
-  Celia), the fly fruit's pin, the exact reach of the known route, the
+  Celia), the fly fruit's pin, the reference at the fruit level and a
+  fault it catches, the exact reach of the known route, a wrong cut
+  `check known` names, the
   maps' tile scans, and the concrete and dual searches' breadth-first
   layers (room (1,0)'s arc gate with the depth-first try skipped: the
   witnesses pinned, the same at 3 and 32 threads).

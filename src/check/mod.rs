@@ -10,4 +10,5 @@ pub mod differential;
 pub mod explain;
 pub mod gate;
 pub mod keys;
+pub mod reference;
 pub mod replay;

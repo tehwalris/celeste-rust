@@ -163,10 +163,26 @@ settled here. Evidence is file:line at develop 19869c5d.
 
 ## C5. Verification gaps at the object levels
 - (`p` is gone, C13: platforms are exact and the reference runs them.)
-- `check reference` cannot compare at `f`: in room (6,0) at `r0sxhf` the
-  kernels make 2 states a step, the reference 1 (the reference widens only
-  the held buttons, the kernels the fruit too; plans/architecture.md "Open
-  issues"). The fruit level is checked only by pins and the concrete search.
+- (a) FIXED (branch correctness-2): `check reference` at `f`. Was: in room
+  (6,0) at `r0sxf` the kernels made 2 states a step, the reference 1. TWO
+  causes: the reference STORED its rows widened at `Level::EXACT`
+  (`UnitSink::row_key`), not at the level; and it READ the start as stored
+  (unwidened: the tree holds the start as the engine made it), where the
+  kernels read the fly fruit's `fly` as an atom and its `step`, `y` as
+  unknowns whatever the row holds - their extra state at step 1 is the
+  branch where the unknown `y` passes -16 and the fruit is destroyed. Now
+  `RefFrameStep` reads and stores at the run's level through the widening
+  table's block side (`Rt2::widen_to` on the input block; `emit_row`'s
+  level), and refuses a near level under the split frame (the block side's
+  near floors are not the kernels' mid-frame ones). Evidence: `check
+  reference --tree r60s --steps 48` 0 of 146 lines differ (70 s, 1.5 GB;
+  to step 50, 0 of 152, but 161 s and 23 GB), a new t2 step
+  `reference60f`; t2's `reference10[f]` (r0sx) unchanged. LIVE: the slow
+  test `check::reference::tests::the_reference_widens_as_the_kernels_do_at_the_fruit_level`
+  runs room (6,0) `r0sxf` to step 6, kernels against the reference (0 of
+  20 lines differ), then the reference widened at the exact level (a
+  test-only fault, `RefFrameStep::widened_at`): all 18 lines of steps 1-6
+  differ. `check reference` moved into `src/check/reference.rs`.
 - At `n`, `check ref` and `check arcs` skip most rows over the reference's
   path cap; room (7,0) `check arcs` is an open issue.
 - Proposals: a reachable-sample soundness check at every level (audit

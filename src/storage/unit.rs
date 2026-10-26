@@ -853,13 +853,14 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     }
 
     /// A reference row (CANONICAL) as the tree holds it, and its key
-    /// (provisional where a code is new): widened as its kernels key it
-    /// (every level's widenings, the buttons' memory among them:
-    /// `Rt2::widen_to`). The WIDENED row: a
-    /// stored row is what its key decodes to (plans/architecture.md "Keys").
-    pub(crate) fn row_key(&mut self, row: &Rt2<N>) -> (Rt2<N>, Key) {
+    /// (provisional where a code is new): widened as `level`'s kernels
+    /// store it (the widening table's block side, `Rt2::widen_to`: every
+    /// level's entries, the buttons' memory among them, and the level's
+    /// own, the fruit's at `f`). The WIDENED row: a stored row is what its
+    /// key decodes to (plans/architecture.md "Keys").
+    fn row_key(&mut self, row: &Rt2<N>, level: crate::abstraction::Level) -> (Rt2<N>, Key) {
         let mut w = row.clone_block();
-        w.widen_to(crate::abstraction::Level::EXACT);
+        w.widen_to(level);
         w.canonical();
         if self.keys.shape(w.shape_hash()).is_none() {
             self.note_shape(&std::sync::Arc::new(celeste_engine::shape::Layout::of(&w)));
@@ -872,15 +873,15 @@ impl<'a, N: Rem> UnitSink<'a, N> {
     }
 
     /// The reference engine's emission: one row from unit lane `lane`
-    /// (stored widened: `row_key`) by transfer `pair`.
+    /// (stored widened at `level`: `row_key`) by transfer `pair`.
     /// Its skeleton is `decode::reference_skeleton`: a reference row's
     /// columns follow its values, not a kernel's template.
-    pub(crate) fn emit_row(&mut self, row: &Rt2<N>, lane: usize, cell: u32, pair: Pair<N>) -> Result<()> {
+    pub(crate) fn emit_row(&mut self, row: &Rt2<N>, level: crate::abstraction::Level, lane: usize, cell: u32, pair: Pair<N>) -> Result<()> {
         debug_assert_eq!(row.width, 1);
         if self.minus_one_drop(row.shape_hash(), cell) {
             return Ok(());
         }
-        let (w, key) = self.row_key(row);
+        let (w, key) = self.row_key(row, level);
         anyhow::ensure!(w.shape_hash() == row.shape_hash(), "a reference row's widening changed its shape ({:016x} -> {:016x})", row.shape_hash(), w.shape_hash());
         if !self.guards.registered.contains(&w.shape_hash()) {
             self.skeletons.register(&super::decode::reference_skeleton(&w))?;
