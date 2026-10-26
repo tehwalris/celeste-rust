@@ -566,14 +566,15 @@ impl<N: Arithmetic> Prune<N> for MarkFilter<'_, N> {
 mod tests {
     use super::*;
     use crate::abstraction::Level;
-    use crate::engines::reference::RefEngine;
-    use celeste_engine::runtime2::{P8, AV};
+    use crate::engines::reference::ReferenceEngine;
+    use celeste_core::pico8_num::Pico8Num as P8;
+    use celeste_engine::runtime2::AV;
 
     /// The mark filter admits a marked node's rows up to its deadline only.
     #[test]
     fn the_mark_filter_admits_up_to_the_deadline() {
         let s = Settings::default();
-        let block = RefEngine::new(&s).expect("ref engine").initial().expect("initial state").canonicalized();
+        let block = ReferenceEngine::<P8>::new(&s).expect("ref engine").initial().expect("initial state").canonicalized();
         let coarse = Level::parse("r0sx").expect("level");
         // The coarse key space holds the projection's codes.
         let mut w = block.clone_block();
@@ -646,8 +647,8 @@ mod tests {
         let mut bounds = Vec::new();
         for split_frame in [false, true] {
             let s = Settings { room: (5, 2), split_frame, ..Default::default() };
-            let mut eng = RefEngine::new(&s).expect("ref engine");
-            let frame = |eng: &mut RefEngine, b: &Rt2<P8>, input: u8| {
+            let mut eng = ReferenceEngine::<P8>::new(&s).expect("ref engine");
+            let frame = |eng: &mut ReferenceEngine<P8>, b: &Rt2<P8>, input: u8| {
                 let mut leaves = eng.frame(b, input).expect("a frame");
                 assert_eq!(leaves.len(), 1, "one leaf");
                 leaves.remove(0)
@@ -700,7 +701,7 @@ mod tests {
     /// mid-frame step 59 inside f30 (still opening in f30), not step 60.
     #[test]
     fn the_orb_cut_counts_frames_under_the_split_frame() {
-        let closed = RefEngine::new(&Settings { room: (5, 2), ..Default::default() }).expect("ref engine").initial().expect("the start");
+        let closed = ReferenceEngine::<P8>::new(&Settings { room: (5, 2), ..Default::default() }).expect("ref engine").initial().expect("the start");
         let skip = |step: u32, h: u32, per_frame: u32| orb_deadline_skip(&closed, step, h, crate::settings::Clock { per_frame })[0];
         assert!(!skip(29, 100, 1) && skip(30, 100, 1));
         assert!(!skip(58, 200, 2) && !skip(59, 200, 2) && skip(60, 200, 2));
@@ -722,7 +723,7 @@ mod tests {
         let rect = Settings { room: (5, 2), win_at: Some((9, 9, 101, 101)), ..Default::default() };
         let cuts = Prunes::<P8>::of(&rect, orb, None);
         assert_eq!(names(&cuts), [("the exit cut", Kind::Cut), ("the out-of-room cut", Kind::Cut), ("the orb cut", Kind::Cut)]);
-        let start = RefEngine::new(&rect).expect("ref engine").initial().expect("the start");
+        let start = ReferenceEngine::<P8>::new(&rect).expect("ref engine").initial().expect("the start");
         let by = |p: &Prunes<P8>, s: &Settings, step: u32| p.each().into_iter().map(|q| verdict(q, &start, step, s).expect("verdict").is_some()).collect::<Vec<_>>();
         assert_eq!(by(&cuts, &rect, 30), [false, false, true]);
         assert_eq!((cuts.not_expanded(&start, 30).expect("cuts"), cuts.not_expanded(&start, 29).expect("cuts")), (vec![true], vec![false]));

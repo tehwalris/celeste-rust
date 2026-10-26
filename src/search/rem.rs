@@ -449,7 +449,7 @@ impl Rem for P8 {
     /// is one floor's: its image never wraps - checked, FATAL otherwise), or
     /// the constant point.
     #[inline]
-    fn transfer(a: &AxisXfer) -> Transfer {
+    fn transfer(a: &AxisXfer) -> Transfer<Fixed16> {
         let guard = Seg { lo: a.lo, hi: a.hi };
         let act = match a.tag {
             0 => {

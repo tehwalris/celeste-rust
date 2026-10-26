@@ -17,7 +17,6 @@
 
 use anyhow::{anyhow, ensure, Context, Result};
 use celeste_core::arith::Arithmetic;
-use celeste_core::pico8_num::Pico8Num as P8;
 
 use celeste_engine::exact::{Code, FieldDict, Key, KeySpace};
 use celeste_engine::runtime2::{Col, ColRepr, Rt2, Template, AV};
@@ -228,7 +227,7 @@ impl<N: Arithmetic> Builder<N> {
 /// template, `asm_kernel::unify`, or a `reference_skeleton`), as its
 /// `layer::SkelRecord` and that record's template. Another record under one
 /// shape (it would decode otherwise) is FATAL.
-pub(crate) struct Skeletons<N: Arithmetic = P8>(std::sync::RwLock<rustc_hash::FxHashMap<u64, (super::layer::SkelRecord<N>, std::sync::Arc<Template<N>>)>>);
+pub(crate) struct Skeletons<N: Arithmetic>(std::sync::RwLock<rustc_hash::FxHashMap<u64, (super::layer::SkelRecord<N>, std::sync::Arc<Template<N>>)>>);
 
 impl<N: Arithmetic> Default for Skeletons<N> {
     fn default() -> Self {

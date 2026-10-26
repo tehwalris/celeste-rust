@@ -7,7 +7,7 @@ use std::fmt::Debug;
 
 use anyhow::{bail, Result};
 
-use celeste_core::arith::{Arithmetic, Fixed};
+use celeste_core::arith::Arithmetic;
 use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{Cut, Eval, Graph, NodeId, Op, Ty, Unknown};
 
@@ -324,7 +324,7 @@ fn fold_compare<A: Arithmetic>(op: Cmp, a: A, b: A) -> bool {
 
 /// The tracing domain. Owns the graph it is building.
 #[derive(Default, Clone)]
-pub struct Symbolic<A: GraphArith = Fixed> {
+pub struct Symbolic<A: GraphArith> {
     pub graph: Graph<A>,
     /// `split_ways` takes a static range's full width (level -1, whose speed
     /// is a range at every node).
@@ -352,7 +352,7 @@ pub struct Symbolic<A: GraphArith = Fixed> {
 /// What ONE trace accumulates. `frame::trace` replaces it wholesale at its
 /// start, so a trace that failed part-way leaves nothing behind.
 #[derive(Default, Clone)]
-pub struct FrameScratch<A: GraphArith = Fixed> {
+pub struct FrameScratch<A: GraphArith> {
     /// FORK choices handed out this frame (the fork ids), buttons included.
     pub forks: u8,
     /// What each `both_values` fork was made for (the buttons':
@@ -1380,7 +1380,7 @@ mod tests {
         let (rem, spd) = (d.graph.leaf(Op::Cell(0)), d.graph.leaf(Op::Cell(1)));
         let (rem, spd) = (d.restrict(rem, -0x8000, 0x7fff), d.restrict(spd, -5 << 16, 5 << 16));
         let zero = d.graph.leaf(Op::Const(0, 0));
-        let k = |d: &mut Symbolic, v: i32| d.graph.leaf(Op::Const(v, v));
+        let k = |d: &mut Symbolic<P8>, v: i32| d.graph.leaf(Op::Const(v, v));
         let (neg, pos, half) = (k(&mut d, -0x18000), k(&mut d, 0x18000), k(&mut d, 0x8000));
         let gt = d.graph.fold(Op::Gt, vec![spd, zero]);
         let lt = d.graph.fold(Op::Lt, vec![spd, zero]);

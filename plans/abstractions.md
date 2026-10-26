@@ -196,7 +196,7 @@ input, never a stored value); the concrete search's seeded-balloon view
   ends unless an operand reads an unknown. Refuted by the ladder
   (`r0sxfn,r0sxn,r0sx`) and the concrete search.
 - **`check arcs` at `f`** steps the reference at the level with the
-  kernels' forks (`RefEngine::step_at`), under two exact pins, each checked
+  kernels' forks (`ReferenceEngine::step_at`), under two exact pins, each checked
   against the unpinned reference: the fly fruit's `spd.y`/`rem.y` pinned
   to 0, and at `n` a floor isolated from the player (20 px, no spring near)
   pinned to state 0.

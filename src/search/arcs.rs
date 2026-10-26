@@ -78,7 +78,7 @@ pub enum Act<C: Circle> {
 /// GUARD: one piece of the circle, never wrapping) and what it does to
 /// them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Transfer<C: Circle = Fixed16> {
+pub struct Transfer<C: Circle> {
     pub(crate) guard: Seg<C::P>,
     pub(crate) act: Act<C>,
 }
@@ -320,7 +320,7 @@ struct Slab<W> {
 /// a non-empty x set, touching slabs never with the same one, so equal sets
 /// are equal values; at most `Circle::MAX_SEGS` segments.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub(crate) struct Region<C: Circle = Fixed16> {
+pub(crate) struct Region<C: Circle> {
     slabs: Vec<Slab<C::W>>,
     xs: Vec<Stored<C::W>>,
 }
@@ -404,7 +404,7 @@ impl<C: Circle> Region<C> {
 
 /// A set of the torus, borrowed: a `Region`'s or a `RegionArena`'s.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct RegionRef<'a, C: Circle = Fixed16> {
+pub struct RegionRef<'a, C: Circle> {
     slabs: &'a [Slab<C::W>],
     xs: &'a [Stored<C::W>],
 }
@@ -527,7 +527,7 @@ const CHUNK_WORDS: usize = 1 << 25;
 /// place (8 B). A full chunk is SEALED: kept, or (`spill_to`) mapped from a
 /// scratch file (`storage::scratch`). Records never move, so it grows
 /// without copying itself (a doubling list peaks at 90 GB for 50 GB of sets).
-pub(crate) struct RegionArena<C: Circle = Fixed16> {
+pub(crate) struct RegionArena<C: Circle> {
     /// Set `i`'s record: its chunk (high 32 bits; `sealed.len()` is the open
     /// one) and its first word there.
     at: Vec<u64>,
@@ -545,7 +545,7 @@ pub(crate) struct RegionArena<C: Circle = Fixed16> {
 /// one held is found; a new one is pushed (a hash collision with a
 /// different set: pushed apart, the index keeps the first).
 #[derive(Default)]
-pub(crate) struct Interner<C: Circle = Fixed16> {
+pub(crate) struct Interner<C: Circle> {
     arena: RegionArena<C>,
     index: rustc_hash::FxHashMap<u64, u32>,
 }
@@ -778,7 +778,7 @@ mod tests {
             r.as_ref().pull(tx, ty, &mut out);
             let pr = Region::<Fixed16>::from_pieces(&mut out, &mut Vec::new());
             let mut pp: Vec<u32> = probes.iter().flat_map(|&v| {
-                let back = |t: Transfer| match t.act {
+                let back = |t: Transfer<Fixed16>| match t.act {
                     Act::Mono(d) => (v as i64 - d as i64).clamp(0, CIRCLE as i64 - 1) as u32,
                     Act::Const(_) => v,
                 };

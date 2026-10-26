@@ -24,9 +24,8 @@
 //! depend on it either; `finish` numbers the sets by use, ties by arena
 //! code. Only `A::Rounds`, `A::MaxRound` and the walls do (unpinned).
 
-use super::arcs::{region_hash, Circle, Fixed16, Interner, Region, RegionArena, RegionRef};
+use super::arcs::{region_hash, Circle, Interner, Region, RegionArena, RegionRef};
 use super::rem::{Rem, Xfer};
-use celeste_core::pico8_num::Pico8Num as P8;
 use crate::storage::codec::{get_sk, get_varint, put_sk, put_varint};
 use crate::storage::edges::EdgeStore;
 use crate::storage::scratch::Words;
@@ -74,7 +73,7 @@ pub(crate) const BLOCK: usize = 16;
 /// as `t` falls: a few SPANS, as varints - per node its state (`put_sk`),
 /// layer and span count, per span its length and set (numbered by use); per
 /// `BLOCK` nodes the first state and byte offset.
-pub(crate) struct Winning<C: Circle = Fixed16> {
+pub(crate) struct Winning<C: Circle> {
     n: usize,
     blocks: Vec<(Sk, u64)>,
     data: Words<u8>,
@@ -142,7 +141,7 @@ impl<C: Circle> Sets<C> {
     }
 }
 
-pub(crate) struct Node<'a, C: Circle = Fixed16> {
+pub(crate) struct Node<'a, C: Circle> {
     pub(crate) id: Sk,
     pub(crate) layer: u32,
     count: u32,
@@ -191,7 +190,7 @@ impl<'a, C: Circle> Node<'a, C> {
     }
 }
 
-pub(crate) struct Nodes<'a, C: Circle = Fixed16> {
+pub(crate) struct Nodes<'a, C: Circle> {
     w: &'a Winning<C>,
     k: usize,
     end: usize,
@@ -412,7 +411,7 @@ pub(crate) fn backward<N: Rem>(store: &EdgeStore<N>, pairs: &[Xfer<N>], wins: &[
 }
 
 /// The backward between frames: `W_{t+1}`, its changed sets, closed spans.
-pub struct Backward<'a, N: Rem = P8> {
+pub struct Backward<'a, N: Rem> {
     store: &'a EdgeStore<N>,
     /// Per target region the first frame with edges into it.
     first: FxHashMap<u32, u32>,
@@ -824,8 +823,7 @@ impl<'a, N: Rem> Backward<'a, N> {
         st.set(A::Nodes, self.cur.len() as u64);
         // The step's workers are gone: return their freed pages now
         // (mimalloc reclaims them lazily: ~3 GB held on a big room).
-        // SAFETY: mimalloc's documented API, callable from any thread.
-        unsafe { libmimalloc_sys::mi_collect(true) };
+        crate::par::collect_freed();
         st.lap(A::Merge, &mut lap);
         self.stats.merge(&st);
         eprintln!(
@@ -979,7 +977,7 @@ pub(crate) fn optimum<C: Circle>(w: &Winning<C>, start: Option<u32>, point: (C::
 /// What the backward starts from, the tree in `dir` up to `horizon`: the
 /// start, the win states with their layers, the edge store (every frame
 /// that kept rows has edges; one that kept none, under level -1, may not).
-pub struct Seeds<N: Rem = P8> {
+pub struct Seeds<N: Rem> {
     pub(crate) start: Sk,
     pub wins: Vec<(Sk, u32)>,
     pub store: EdgeStore<N>,
@@ -1028,6 +1026,8 @@ impl<N: Rem> Seeds<N> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::search::arcs::Fixed16;
+    use celeste_core::arith::Fixed;
     use crate::search::rem::{AxisXfer, Pair};
     use crate::search::arcs::{point, Act, Seg, Transfer, CIRCLE};
 
@@ -1056,7 +1056,7 @@ pub(crate) mod tests {
     }
 
     /// A transfer's image of a point of its guard.
-    pub(crate) fn apply(t: Transfer, p: u32) -> u32 {
+    pub(crate) fn apply(t: Transfer<Fixed16>, p: u32) -> u32 {
         match t.act {
             Act::Mono(d) => (p as i64 + d as i64) as u32,
             Act::Const(c) => c,
@@ -1070,7 +1070,7 @@ pub(crate) mod tests {
 
     /// A transfer as the tree's table stores it (a translation as the
     /// rotation it is mod 1).
-    pub(crate) fn axis(t: Transfer) -> AxisXfer {
+    pub(crate) fn axis(t: Transfer<Fixed16>) -> AxisXfer {
         match t.act {
             Act::Mono(d) => AxisXfer { lo: t.guard.lo, hi: t.guard.hi, tag: 0, val: d.rem_euclid(CIRCLE as i32) },
             Act::Const(c) => AxisXfer { lo: t.guard.lo, hi: t.guard.hi, tag: 1, val: c as i32 },
@@ -1088,7 +1088,7 @@ pub(crate) mod tests {
     }
 
     impl TestTree {
-        pub(crate) fn new(name: &str, layers: Vec<u32>, edges: &[(u32, u32, Transfer, Transfer)], wins: Vec<u32>) -> Self {
+        pub(crate) fn new(name: &str, layers: Vec<u32>, edges: &[(u32, u32, Transfer<Fixed16>, Transfer<Fixed16>)], wins: Vec<u32>) -> Self {
             use std::sync::atomic::{AtomicU32, Ordering};
             static SEQ: AtomicU32 = AtomicU32::new(0);
             let dir = crate::testutil::TestDir::new(&format!("arcdp-{name}-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
@@ -1110,7 +1110,7 @@ pub(crate) mod tests {
         }
 
         /// The store up to `horizon`, its transfers, and its win seeds.
-        pub(crate) fn open(&self, horizon: u32) -> (EdgeStore, Vec<(Transfer, Transfer)>, Vec<(Sk, u32)>) {
+        pub(crate) fn open(&self, horizon: u32) -> (EdgeStore<Fixed>, Vec<(Transfer<Fixed16>, Transfer<Fixed16>)>, Vec<(Sk, u32)>) {
             let store = EdgeStore::<celeste_core::pico8_num::Pico8Num>::open(&self.dir, horizon).expect("open");
             let pairs = store.pairs().iter().map(<celeste_core::pico8_num::Pico8Num as Rem>::xfer).collect();
             let wins = self.wins.iter().map(|&k| (sid(k), self.layers[k as usize])).collect();
@@ -1125,7 +1125,7 @@ pub(crate) mod tests {
     }
 
     /// A random transfer on one axis.
-    pub(crate) fn random_transfer(r: &mut dyn FnMut(u32) -> u32) -> Transfer {
+    pub(crate) fn random_transfer(r: &mut dyn FnMut(u32) -> u32) -> Transfer<Fixed16> {
         let cut = 1 + r(CIRCLE - 1);
         let guard = match r(3) {
             0 => Seg { lo: 0, hi: CIRCLE },
@@ -1140,7 +1140,7 @@ pub(crate) mod tests {
     /// A random graph from node 0: `n` nodes, `3n` edges, layers the BFS
     /// distances (unreachable nodes' edges dropped), wins a third of the
     /// others reached. `y_too`: random y transfers (else the identity).
-    pub(crate) fn random_graph(r: &mut dyn FnMut(u32) -> u32, n: u32, y_too: bool) -> (Vec<u32>, Vec<(u32, u32, Transfer, Transfer)>, Vec<u32>) {
+    pub(crate) fn random_graph(r: &mut dyn FnMut(u32) -> u32, n: u32, y_too: bool) -> (Vec<u32>, Vec<(u32, u32, Transfer<Fixed16>, Transfer<Fixed16>)>, Vec<u32>) {
         let still = Transfer { guard: Seg { lo: 0, hi: CIRCLE }, act: Act::Mono(0) };
         let mut edges = Vec::new();
         for _ in 0..n * 3 {
@@ -1166,9 +1166,9 @@ pub(crate) mod tests {
     /// `W` by its definition, every node at every frame: a win's the torus
     /// from its layer on, any other's the union of its out-edges' pulls of
     /// the next frame's (from its layer on), by node and frame.
-    pub(crate) fn definition(layers: &[u32], edges: &[(u32, u32, Transfer, Transfer)], wins: &[u32], horizon: u32) -> Vec<Vec<Option<Region>>> {
+    pub(crate) fn definition(layers: &[u32], edges: &[(u32, u32, Transfer<Fixed16>, Transfer<Fixed16>)], wins: &[u32], horizon: u32) -> Vec<Vec<Option<Region<Fixed16>>>> {
         let n = layers.len();
-        let mut want: Vec<Vec<Option<Region>>> = vec![vec![None; n]; horizon as usize + 1];
+        let mut want: Vec<Vec<Option<Region<Fixed16>>>> = vec![vec![None; n]; horizon as usize + 1];
         for t in (0..=horizon).rev() {
             for i in 0..n as u32 {
                 if layers[i as usize] == u32::MAX || layers[i as usize] > t {
@@ -1268,7 +1268,7 @@ pub(crate) mod tests {
             }
             let horizon = 8;
             let tree = TestTree::new("opt", layers, &edges, wins);
-            let ws: Vec<Winning> = (0..=horizon)
+            let ws: Vec<Winning<Fixed16>> = (0..=horizon)
                 .map(|h| {
                     let (store, pairs, seeds) = tree.open(h);
                     backward(&store, &pairs, &seeds, h, 2, None).expect("backward")

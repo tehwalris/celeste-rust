@@ -90,7 +90,7 @@ fn census_in(run: &Run, store: &crate::compiled::cache::Store) -> Result<Vec<Ker
 /// same slots and symbols), its text with provenance, censused.
 fn rebuild(run: &Run) -> Result<Vec<KernelCensus>> {
     let refs = crate::trace::lower::lattice_kernel_refs::<Fixed>(run).context("retracing the start room for the census")?;
-    crate::par::Pool::per_core().stack(128 << 20).map(refs.len(), |si| {
+    crate::par::Pool::new(run.settings.threads()).stack(128 << 20).map(refs.len(), |si| {
         let (region, r) = &refs[si];
         let shape = r.frame.in_rt2.shape_hash();
         let (fused, bodies) = (&r.lowered.fused, &r.lowered.bodies);

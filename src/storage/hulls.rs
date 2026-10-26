@@ -20,7 +20,6 @@ use super::file::{self, At, Mapped};
 use super::wave::Frontier;
 use super::Sk;
 use crate::search::rem::Rem;
-use celeste_core::pico8_num::Pico8Num as P8;
 
 /// New states' hulls a block.
 pub(crate) const NEW_BLOCK: usize = 1 << 18;
@@ -30,7 +29,7 @@ pub(crate) const GROWN_BLOCK: usize = 1 << 16;
 
 /// A frontier state: the state, its layer, its hull.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Grown<N: Rem = P8> {
+pub struct Grown<N: Rem> {
     pub(crate) sk: Sk,
     pub(crate) layer: u16,
     pub(crate) hull: HullOf<N>,
@@ -181,7 +180,7 @@ fn decode<N: Rem>(file: &Mapped, x: &Block) -> Result<(Vec<HullOf<N>>, Vec<Grown
 /// states (sorted: checked).
 pub(crate) fn read<N: Rem>(file: &Mapped, blocks: &[Block], threads: usize) -> Result<(Vec<HullOf<N>>, Vec<Grown<N>>)> {
     ensure!(blocks.windows(2).all(|w| w[0].grown <= w[1].grown), "{}: a new states' block after a grown one", file.path().display());
-    let parts = super::wave::par_map(blocks, threads, |x| decode::<N>(file, x));
+    let parts = crate::par::map(blocks, threads, |x| decode::<N>(file, x));
     let (mut hulls, mut grown) = (Vec::new(), Vec::new());
     for p in parts {
         let (h, g) = p?;
@@ -215,7 +214,7 @@ pub(crate) fn check<N: Rem>(file: &Mapped, blocks: &[Block], front: &Frontier<N>
     let path = file.path();
     let cuts = cuts(front);
     ensure!(blocks.len() == cuts.len(), "{}: STORED HULLS DIFFER from the forward's ({} blocks read back, {} written)", path.display(), blocks.len(), cuts.len());
-    let same = super::wave::par_map(&blocks.iter().zip(&cuts).collect::<Vec<_>>(), threads, |(x, (g, i, r))| -> Result<bool> {
+    let same = crate::par::map(&blocks.iter().zip(&cuts).collect::<Vec<_>>(), threads, |(x, (g, i, r))| -> Result<bool> {
         let (h, gr) = decode::<N>(file, x)?;
         Ok(x.grown == *g && if *g { gr == grown_of(front, *i, r.clone()) } else { h == front.hulls[r.clone()] })
     });

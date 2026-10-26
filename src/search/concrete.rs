@@ -424,7 +424,7 @@ pub(super) fn concrete_search<N: Rem>(side: &Side<'_, N>, horizon: u32, bound: u
 
 /// W's nodes by `(shape, key, cell)`: a node IS its state (`Sk`), so only
 /// the tree's shapes are listed.
-pub(crate) struct NodeKeys<'w, C: Circle = super::arcs::Fixed16> {
+pub(crate) struct NodeKeys<'w, C: Circle> {
     w: &'w Winning<C>,
     /// Shape hash -> shape index, sorted.
     shapes: Vec<(u64, u32)>,
@@ -534,9 +534,9 @@ pub(super) fn dfs_budget() -> u64 {
 }
 
 /// The inputs a state was stepped under, with the buttons each frame read
-/// (`RefEngine::frame_reads`). An input agreeing with one on every button
-/// that one read runs the same frame (the output writes no button), so
-/// skipping it changes only the step count: its successors are repeats.
+/// (`ReferenceEngine::frame_reads`). An input agreeing with one on every
+/// button that one read runs the same frame (the output writes no button),
+/// so skipping it changes only the step count: its successors are repeats.
 #[derive(Default)]
 pub(super) struct Covered(Vec<(u8, u8)>);
 

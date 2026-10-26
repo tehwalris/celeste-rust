@@ -77,7 +77,7 @@ pub struct Interp<'a, D: Domain> {
     pub arc_capture: bool,
     /// The site of the split call being made.
     split_site: Option<SplitSite>,
-    /// THE BUTTON READS (`RefEngine::frame_reads`): the button table and a
+    /// THE BUTTON READS (`ReferenceEngine::frame_reads`): the button table and a
     /// mask of the buttons the frame read from it (bit `i - 1` for
     /// `[i]`; any other read of the table sets every bit).
     pub button_reads: Option<(TableId, u8)>,

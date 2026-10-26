@@ -446,7 +446,8 @@ pub fn boot<'a, D: Domain>(it: &mut Interp<'a, D>, chunks: &'a Chunks, room: (i1
 
 #[cfg(test)]
 mod tests {
-    use crate::engines::reference::RefEngine;
+    use celeste_core::arith::Fixed;
+    use crate::engines::reference::ReferenceEngine;
 
     /// The dash starts each category allows, through the reference engine
     /// (the kernels trace the same patched source): room (1,0), the player
@@ -460,7 +461,7 @@ mod tests {
         let starts = [DASH | RIGHT | UP, DASH | RIGHT, DASH | UP, DASH];
         // The cart is read when an engine is built, under its settings.
         let successors = |s: crate::settings::Settings| -> Vec<usize> {
-            let mut eng = RefEngine::new(&s).expect("engine");
+            let mut eng = ReferenceEngine::<Fixed>::new(&s).expect("engine");
             let mut row = eng.initial().expect("initial");
             for _ in 0..40 {
                 row = eng.step_one(&row, 0).expect("idle frame");

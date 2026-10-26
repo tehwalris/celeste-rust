@@ -32,7 +32,7 @@ use celeste_core::arith::Arithmetic;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::runtime2::{mix64, Rt2, AV, P8};
+use crate::runtime2::{mix64, Rt2, AV};
 use crate::shape::{Anchors, Cell, KeyRole, Layout};
 
 /// A packed key: (bits 64..127, bits 0..63). Bit 127 tags a PROVISIONAL key.
@@ -66,7 +66,7 @@ fn of_key(k: Key) -> u128 {
 /// raws are the arithmetic's (`Arithmetic::Raw`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct Code<N: Arithmetic = P8> {
+pub struct Code<N: Arithmetic> {
     pub kind: u8,
     pub a: N::Raw,
     pub b: N::Raw,
@@ -185,7 +185,7 @@ fn bits_for(n: usize) -> u32 {
 
 /// One field's dictionary and its bits in the shape's key.
 #[derive(Clone, Debug)]
-pub struct FieldDict<N: Arithmetic = P8> {
+pub struct FieldDict<N: Arithmetic> {
     codes: Vec<Code<N>>,
     /// Numbers: an open-addressing table, each slot holding its index's
     /// PLACED bits (`place`, kept current as runs are added).
@@ -444,7 +444,7 @@ pub struct ShapeRecord {
 /// index of the leader's dictionary (as long as the leader's dictionary,
 /// always).
 #[derive(Clone, Debug)]
-pub struct Follow<N: Arithmetic = P8> {
+pub struct Follow<N: Arithmetic> {
     leader: u32,
     cells: Vec<u32>,
     cols: Vec<Vec<Code<N>>>,
@@ -519,7 +519,7 @@ fn check_pointer<N: Arithmetic>(shape: u64, cell: u32, first: Option<Code<N>>, c
 /// One shape's dictionaries (by cell; `None` for a cell that is not keyed,
 /// its `KeyRole`'s: a structure cell, or a follower: `Follow`).
 #[derive(Clone, Debug)]
-pub struct ShapeKeys<N: Arithmetic = P8> {
+pub struct ShapeKeys<N: Arithmetic> {
     layout: std::sync::Arc<Layout>,
     fields: Vec<Option<FieldDict<N>>>,
     next_bit: u32,
@@ -668,7 +668,7 @@ impl ContentHash {
 /// A row's key against a key space: packed, or (a code is missing) its
 /// exact content.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub enum RowKey<N: Arithmetic = P8> {
+pub enum RowKey<N: Arithmetic> {
     Hit(Key),
     Miss(MissKey<N>),
 }
@@ -677,7 +677,7 @@ pub enum RowKey<N: Arithmetic = P8> {
 /// fields that hit and the (cell, code) of those that missed, by cell.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct MissKey<N: Arithmetic = P8> {
+pub struct MissKey<N: Arithmetic> {
     pub shape: u64,
     pub partial: Key,
     pub missing: Vec<(u32, Code<N>)>,
@@ -687,7 +687,7 @@ pub struct MissKey<N: Arithmetic = P8> {
 /// (with their places). Recorded per frame; a replay is order-free.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct KeyAdditions<N: Arithmetic = P8> {
+pub struct KeyAdditions<N: Arithmetic> {
     pub shapes: Vec<ShapeRecord>,
     /// `(shape, cell, index, code)`; a follower's index is its leader's.
     pub codes: Vec<(u64, u32, u32, Code<N>)>,
@@ -717,7 +717,7 @@ impl<N: Arithmetic> KeyAdditions<N> {
 static GEN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug)]
-pub struct KeySpace<N: Arithmetic = P8> {
+pub struct KeySpace<N: Arithmetic> {
     shapes: FxHashMap<u64, ShapeKeys<N>>,
     run_counts: FxHashMap<(u64, u32), u32>,
     gen: u64,
@@ -1143,7 +1143,7 @@ const PROV_SHARDS: usize = 256;
 /// A wave's PROVISIONAL keys: each distinct miss content interned to
 /// `PROVISIONAL | shard << 32` (high word), local number (low word). Ids
 /// depend on scheduling; the translation turns them into final keys.
-pub struct Provisional<N: Arithmetic = P8> {
+pub struct Provisional<N: Arithmetic> {
     shards: Vec<Mutex<(FxHashMap<MissKey<N>, u32>, Vec<MissKey<N>>)>>,
     shapes: Mutex<FxHashMap<u64, std::sync::Arc<Layout>>>,
 }
@@ -1239,6 +1239,7 @@ pub fn exact_rows<N: Arithmetic>(rt2: &Rt2<N>) -> Vec<ExactRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeste_core::pico8_num::Pico8Num as P8;
 
     /// A record's layout (the key space takes layouts).
     fn lay(r: &ShapeRecord) -> std::sync::Arc<Layout> {
@@ -1265,7 +1266,7 @@ mod tests {
         assert!(words.len() < celeste_names::GLOBAL_NAMES.len(), "the signature lists the globals present, not every slot");
     }
 
-    fn n(x: i32) -> Code {
+    fn n(x: i32) -> Code<P8> {
         Code::num(x as u32, x as u32)
     }
 
@@ -1281,7 +1282,7 @@ mod tests {
         ks.add_codes(7, 1, &[Code::boolean(Some(false)), Code::boolean(Some(true))], &mut adds);
         ks.add_codes(7, 3, &[n(1), n(2), n(3)], &mut adds);
         let s = ks.shape(7).unwrap();
-        let key = |a: Code, b: Code, c: Code| s.key_of_codes(&[(0, a), (1, b), (3, c)]).unwrap();
+        let key = |a: Code<P8>, b: Code<P8>, c: Code<P8>| s.key_of_codes(&[(0, a), (1, b), (3, c)]).unwrap();
         let k1 = key(n(5), Code::boolean(Some(true)), n(3));
         let first = adds.clone();
         // Growth: a constant field becomes two codes, another past 4 codes.
@@ -1362,7 +1363,7 @@ mod tests {
     }
 
     /// A three-value-cell shape (cells 0, 1, 2): cell 0 the leader of 1 and 2.
-    fn dep_space() -> (KeySpace, KeyAdditions) {
+    fn dep_space() -> (KeySpace<P8>, KeyAdditions<P8>) {
         let rec = ShapeRecord { hash: 5, sig: vec![1, 1, 1, u32::MAX], pos: None, deps: vec![Deps { leader: 0, followers: vec![1, 2] }] };
         let mut ks = KeySpace::new();
         let mut adds = KeyAdditions::default();
@@ -1371,7 +1372,7 @@ mod tests {
     }
 
     /// A miss of the dependent shape: the leader's code and its followers'.
-    fn dep_miss(l: i32, a: i32, b: i32) -> MissKey {
+    fn dep_miss(l: i32, a: i32, b: i32) -> MissKey<P8> {
         MissKey { shape: 5, partial: (0, 0), missing: vec![(0, n(l)), (1, n(a)), (2, n(b))] }
     }
 
@@ -1438,7 +1439,7 @@ mod tests {
         ks.row_keys(&b);
     }
 
-    fn ptr(t: u32) -> Code {
+    fn ptr(t: u32) -> Code<P8> {
         Code::of(AV::Ptr(t))
     }
 
@@ -1493,7 +1494,7 @@ mod tests {
         let mut ks = KeySpace::new();
         let mut adds = KeyAdditions::default();
         ks.add_shape(&lay(&ShapeRecord { hash: 1, sig, pos: None, deps: Vec::new() }), &mut adds);
-        let codes: Vec<Code> = (0..1 << 15).map(n).collect();
+        let codes: Vec<Code<P8>> = (0..1 << 15).map(n).collect();
         for c in 0..9 {
             ks.add_codes(1, c, &codes, &mut adds);
         }

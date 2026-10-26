@@ -30,10 +30,9 @@ use crate::compiled::KernelLanes;
 use crate::frame::Visited;
 use crate::prune::{Kind, MarkFilter, Prunes, Recorded};
 use crate::storage::Sk;
-use celeste_core::pico8_num::Pico8Num as P8;
 
 /// A known solution to check, and the filter the level's forward ran under.
-pub(crate) struct Route<'a, N: Rem = P8> {
+pub(crate) struct Route<'a, N: Rem> {
     pub(crate) inputs: &'a [u8],
     pub(crate) filter: Option<&'a MarkFilter<'a, N>>,
     /// Also the hull forward's claim (`Hulls`): `rewrite check known`.
@@ -41,7 +40,7 @@ pub(crate) struct Route<'a, N: Rem = P8> {
 }
 
 /// What the hull forward's claim is checked against: tree, hulls, edges.
-pub(crate) struct Hulls<N: Rem = P8> {
+pub(crate) struct Hulls<N: Rem> {
     tree: crate::storage::layer::Tree<N>,
     visited: crate::storage::visited::VisitedSet<N>,
     edges: crate::storage::edges::EdgeStore<N>,
@@ -62,7 +61,7 @@ impl<N: Rem> Hulls<N> {
 }
 
 /// What the arc phase holds for the check (`check_level`).
-struct Pruning<'a, N: Rem = P8> {
+struct Pruning<'a, N: Rem> {
     /// The level's W as the concrete search admits states.
     pub(crate) side: &'a Side<'a, N>,
     /// In search steps.

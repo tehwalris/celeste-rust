@@ -1,7 +1,8 @@
 //! The repository's own conventions, checked: check.sh finds its tiers'
 //! ignored tests (every `#[ignore]` names its tier), every function is
-//! called, and the core names no tool. (That every run is under a memory
-//! cap is checked at run time: `settings::refuse_uncapped`, one-cargo.sh.)
+//! called, the core names no tool, and no type parameter defaults to an
+//! arithmetic. (That every run is under a memory cap is checked at run
+//! time: `settings::refuse_uncapped`, one-cargo.sh.)
 
 /// The `.rs` files under `dir` (`target/` aside).
 fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -213,4 +214,90 @@ fn the_core_names_no_tool() {
     }
     assert!(users > 0, "the scan found the tools' users");
     assert!(bad.is_empty(), "the core names a tool (the tools use the core, never the reverse):\n{}", bad.join("\n"));
+}
+
+/// The arithmetics' number types and remainder circles, by every name the
+/// code gives them: 16.16's and the doubles'.
+const ARITHMETICS: &[&str] = &["P8", "Pico8Num", "Fixed", "Fixed16", "Float", "LuaF64", "Doubles"];
+
+/// `code` with its string literals' contents blanked.
+fn blank_strings(code: &str) -> String {
+    let (mut in_str, mut escaped) = (false, false);
+    code.chars()
+        .map(|c| {
+            let inside = in_str && !(c == '"' && !escaped);
+            match c {
+                _ if escaped => escaped = false,
+                '\\' if in_str => escaped = true,
+                '"' => in_str = !in_str,
+                _ => {}
+            }
+            if inside { ' ' } else { c }
+        })
+        .collect()
+}
+
+/// The arithmetics a code line's type parameters default to (`<N: Rem =
+/// P8>`, `<A = Fixed>`, `= super::arcs::Fixed16,`): every `=` that is no
+/// comparison, match arm or compound assignment, followed by a path whose
+/// last segment is one of `ARITHMETICS` and then `,`, `>` or the line's
+/// end. String literals do not count.
+fn arithmetic_defaults(code: &str) -> Vec<&'static str> {
+    let code = blank_strings(code);
+    let b = code.as_bytes();
+    let mut out = Vec::new();
+    for i in 0..b.len() {
+        let (prev, next) = (if i > 0 { b[i - 1] } else { b' ' }, b.get(i + 1).copied().unwrap_or(b' '));
+        if b[i] != b'=' || b"=!<>+-*/%&|^".contains(&prev) || next == b'=' || next == b'>' {
+            continue;
+        }
+        let rest = code[i + 1..].trim_start();
+        let (path, after) = rest.split_at(rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':')).unwrap_or(rest.len()));
+        let after = after.trim_start();
+        if let Some(a) = ARITHMETICS.iter().find(|a| path.rsplit("::").next() == Some(**a)) {
+            if after.is_empty() || after.starts_with([',', '>']) {
+                out.push(*a);
+            }
+        }
+    }
+    out
+}
+
+/// NO TYPE PARAMETER DEFAULTS TO AN ARITHMETIC (plans/float.md, "The
+/// parameter"): code that holds numbers or remainders names its arithmetic
+/// (`Tree<Fixed>`, `ReferenceEngine<Float>`). A default (`<N: Rem = P8>`)
+/// let 16.16-only code run on a float tree by omission (plans/correctness.md
+/// (f)). Refused: a default to either arithmetic's number type or circle,
+/// under any of its names (`ARITHMETICS`).
+#[test]
+fn no_type_parameter_defaults_to_an_arithmetic() {
+    // The scan sees a default however it is written, and nothing else.
+    for (line, default) in [
+        ("pub struct Tree<N: Arithmetic = P8> {", true),
+        ("pub(crate) struct NodeKeys<'w, C: Circle = super::arcs::Fixed16> {", true),
+        ("pub type InputRanges<A = Fixed> = Vec<A>;", true),
+        ("    N: Rem = celeste_core::pico8_num::Pico8Num,", true),
+        ("struct Twin<A = LuaF64, C = Doubles>(A, C);", true),
+        ("    type C = Fixed16;", false),
+        ("let x = Fixed::from_i16(1);", false),
+        ("ensure!(s.arith == Arith::Fixed, \"not = P8> \\\" = Fixed>\");", false),
+        ("Arith::Float => P8,", false),
+        ("pub(crate) struct RegionSet<T: Table = PlainTable> {", false),
+    ] {
+        assert_eq!(!arithmetic_defaults(line).is_empty(), default, "{line}");
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    sources(&root.join("src"), &mut files);
+    sources(&root.join("crates"), &mut files);
+    assert!(files.len() > 100, "the scan found the sources ({})", files.len());
+    let mut bad = Vec::new();
+    for p in &files {
+        for (n, line) in std::fs::read_to_string(p).expect("read").lines().enumerate() {
+            if code_of(line).is_some_and(|code| !arithmetic_defaults(code).is_empty()) {
+                bad.push(format!("{}:{}: {}", p.strip_prefix(root).unwrap_or(p).display(), n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "a type parameter defaults to an arithmetic (name it at the instantiation: `Tree<Fixed>`):\n{}", bad.join("\n"));
 }

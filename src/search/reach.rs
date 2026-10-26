@@ -16,7 +16,6 @@ use super::backward::Winning;
 use super::rem::{Point, Rem, Xfer};
 use crate::storage::edges::EdgeStore;
 use crate::storage::Sk;
-use celeste_core::pico8_num::Pico8Num as P8;
 
 /// A FORWARD DATAFLOW over recorded edges (`forward`): nodes (a state, or
 /// W's node), each with its out-edges `(target, transfer)` read once; a
@@ -111,7 +110,7 @@ pub(crate) fn forward<F: Flow>(flow: &mut F, start: Vec<(F::Node, F::Set)>, hori
 /// The out-edges `inside_w` follows (from a non-win source to a node with a
 /// set at or past the edge's frame; the others carry nothing), loaded at the
 /// source's first reach: 8 B an edge, not the graph between W's nodes.
-pub(crate) struct ReachEdges<'a, N: Rem = P8> {
+pub(crate) struct ReachEdges<'a, N: Rem> {
     store: &'a EdgeStore<N>,
     w: &'a Winning<N::C>,
     /// The win states, sorted: never expanded, so never left.
@@ -272,6 +271,7 @@ pub(crate) fn inside_w<N: Rem>(w: &Winning<N::C>, g: &mut ReachEdges<N>, pairs: 
 /// FAILS (the oracle never coarsens).
 #[cfg(test)]
 pub(crate) mod exact {
+    use crate::search::arcs::Fixed16;
     use anyhow::Result;
     use rustc_hash::FxHashMap;
 
@@ -290,8 +290,8 @@ pub(crate) mod exact {
     /// layer + 1 (the tree's), a win's none.
     struct Exact {
         seeds: super::super::backward::Seeds<P8>,
-        tree: crate::storage::layer::Tree,
-        layers: Vec<crate::storage::layer::Layer>,
+        tree: crate::storage::layer::Tree<P8>,
+        layers: Vec<crate::storage::layer::Layer<P8>>,
         wins: Vec<Sk>,
         out: FxHashMap<Sk, Box<[(Sk, u32)]>>,
         threads: usize,
@@ -299,7 +299,7 @@ pub(crate) mod exact {
 
     impl Flow for Exact {
         type Node = Sk;
-        type Set = Region;
+        type Set = Region<Fixed16>;
         type Part = Piece;
         type Scratch = Vec<Seg>;
 
@@ -339,20 +339,20 @@ pub(crate) mod exact {
             self.out.get(&s).map_or(&[], |l| l)
         }
 
-        fn push(&self, _t: u32, _s: Sk, set: &Region, _m: Sk, x: u32, out: &mut Vec<Piece>) {
-            let (tx, ty): (Transfer, Transfer) = self.seeds.pairs[x as usize];
+        fn push(&self, _t: u32, _s: Sk, set: &Region<Fixed16>, _m: Sk, x: u32, out: &mut Vec<Piece>) {
+            let (tx, ty): (Transfer<Fixed16>, Transfer<Fixed16>) = self.seeds.pairs[x as usize];
             set.as_ref().push(tx, ty, out);
         }
 
         /// United (which must fit `MAX_SEGS` segments).
-        fn close(&self, _t: u32, _m: Sk, parts: &[(Sk, Piece)], scratch: &mut Vec<Seg>) -> Result<Option<Region>> {
+        fn close(&self, _t: u32, _m: Sk, parts: &[(Sk, Piece)], scratch: &mut Vec<Seg>) -> Result<Option<Region<Fixed16>>> {
             let mut v: Vec<Piece> = parts.iter().map(|p| p.1).collect();
             let u = Region::try_from_pieces(&mut v, scratch, MAX_SEGS).ok_or_else(|| anyhow::anyhow!("an exactly reached set past {MAX_SEGS} segments"))?;
             Ok((!u.is_empty()).then_some(u))
         }
     }
 
-    pub(crate) fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: usize, mut visit: impl FnMut(u32, &[(Sk, Region)]) -> Result<()>) -> Result<FxHashMap<Sk, u32>> {
+    pub(crate) fn reach(dir: &std::path::Path, horizon: u32, point: (u32, u32), threads: usize, mut visit: impl FnMut(u32, &[(Sk, Region<Fixed16>)]) -> Result<()>) -> Result<FxHashMap<Sk, u32>> {
         let seeds = super::super::backward::Seeds::<P8>::load(dir, horizon)?;
         let tree = crate::storage::layer::Tree::open(dir, horizon)?;
         let wins = seeds.win_ids();
@@ -372,6 +372,8 @@ pub(crate) mod exact {
 
 #[cfg(test)]
 mod tests {
+    use crate::search::arcs::Fixed16;
+    use celeste_core::arith::Fixed;
     use super::super::backward::backward;
     use super::ReachEdges;
     use super::super::backward::tests::{apply, random_graph, rng, sid, TestTree};
@@ -384,15 +386,15 @@ mod tests {
     #[test]
     #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s kernels and a forward, ~25 CPU-s"]
     fn the_exact_reach_holds_the_known_route_inside_the_tree() {
-        use crate::engines::reference::RefEngine;
+        use crate::engines::reference::ReferenceEngine;
         let s = crate::settings::Settings { win_at: Some((9, 9, 101, 101)), threads: Some(4), ..Default::default() };
         let dir = crate::testutil::TestDir::new("reach");
         let run = crate::settings::Run::new(&s, crate::abstraction::Level::parse("r0sx").expect("level"));
-        crate::frame::grow_tree(&dir, 35, None, None, &run, || Ok(Box::new(crate::compiled::FrameEngine::new(&run)?)), || Ok(vec![RefEngine::new(&s)?.initial()?.canonicalized()])).expect("forward");
+        crate::frame::grow_tree(&dir, 35, None, None, &run, || Ok(Box::new(crate::compiled::FrameEngine::new(&run)?)), || Ok(vec![ReferenceEngine::<Fixed>::new(&s)?.initial()?.canonicalized()])).expect("forward");
         let p0 = (super::super::arcs::point(0), super::super::arcs::point(0));
         let tree = crate::storage::layer::Tree::open(&dir, 35).expect("tree");
         let mut per_frame: Vec<Vec<crate::storage::Sk>> = Vec::new();
-        let mut sets: Vec<Vec<(crate::storage::Sk, super::Region)>> = Vec::new();
+        let mut sets: Vec<Vec<(crate::storage::Sk, super::Region<Fixed16>)>> = Vec::new();
         let last = super::exact::reach(&dir, 35, p0, 4, |_, cur| {
             per_frame.push(cur.iter().map(|c| c.0).collect());
             sets.push(cur.to_vec());
@@ -409,7 +411,7 @@ mod tests {
         // The known route (gates/known_room10_win9-101.txt, 33 frames): its
         // state at every frame is reached exactly.
         let known = crate::concrete::read_inputs(concat!(env!("CARGO_MANIFEST_DIR"), "/gates/known_room10_win9-101.txt")).expect("known route");
-        let mut eng = RefEngine::new(&s).expect("engine");
+        let mut eng = ReferenceEngine::<Fixed>::new(&s).expect("engine");
         let mut row = eng.initial().expect("initial").canonicalized();
         for (i, &b) in known.iter().enumerate().take(33) {
             row = eng.step_one(&row, b).expect("one successor");

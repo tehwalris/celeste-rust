@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 
-use celeste_core::arith::{Arithmetic, Fixed};
+use celeste_core::arith::Arithmetic;
 
 use super::lower::Bound;
 use crate::transpile::garith::GraphArith;
@@ -60,7 +60,7 @@ impl RegionGrid {
     }
 }
 
-pub type InputRanges<A = Fixed> = Vec<(super::iface::Path, (<A as Arithmetic>::Lit, <A as Arithmetic>::Lit))>;
+pub type InputRanges<A> = Vec<(super::iface::Path, (<A as Arithmetic>::Lit, <A as Arithmetic>::Lit))>;
 
 /// A walk SHAPE: its block's shape hash (`Rt2::shape_hash`), what the
 /// kernels are keyed by.
@@ -331,7 +331,7 @@ type Hull<A> = std::collections::BTreeMap<super::iface::Path, (A, A)>;
 /// field bounds its shape where its hull is not one value and every
 /// explored state of the shape holds it a constant.
 #[derive(Default)]
-struct NoPlayer<A: GraphArith = Fixed> {
+struct NoPlayer<A: GraphArith> {
     /// The start's chain reached the player: the hulls bound.
     on: bool,
     /// Per shape: each numeric field's hull over the states where it was a
@@ -418,6 +418,7 @@ impl<A: GraphArith> NoPlayer<A> {
 
 #[cfg(test)]
 mod tests {
+    use celeste_core::arith::Fixed;
     /// A NO-PLAYER STATE IS ITS SHAPE AND ITS CONSTANTS' BITS: a double's -0
     /// and 0 (equal to the cart's `==`) are two states, and equal bits one.
     #[test]
@@ -463,7 +464,7 @@ mod tests {
         let s = crate::settings::Settings { room: (6, 1), ..Default::default() };
         let opts = crate::abstraction::Level { floors_near: true, ..crate::abstraction::Level::EXACT };
         let only = [super::Region { ix: 3, iy: 6 }, super::Region { ix: 4, iy: 6 }];
-        let lw: super::LatticeWalk = super::room_constant_lattice(&super::Walk { run: &crate::settings::Run::new(&s, opts), only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
+        let lw: super::LatticeWalk<Fixed> = super::room_constant_lattice(&super::Walk { run: &crate::settings::Run::new(&s, opts), only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
         let mut traced = 0;
         for ((shape, region), f) in &lw.frames {
             let Some(r) = region else { continue };
@@ -486,7 +487,7 @@ mod tests {
         let s = crate::settings::Settings { room: (0, 3), category: crate::settings::Category::Gemskip100, loading_jank: Some(1), ..Default::default() };
         let opts = crate::abstraction::Level::parse("r0sx").expect("level");
         let only: Vec<super::Region> = (0..8).flat_map(|ix| (5..8).map(move |iy| super::Region { ix, iy })).collect();
-        let lw: super::LatticeWalk = super::room_constant_lattice(&super::Walk { run: &crate::settings::Run::new(&s, opts), only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
+        let lw: super::LatticeWalk<Fixed> = super::room_constant_lattice(&super::Walk { run: &crate::settings::Run::new(&s, opts), only: Some(&only) }).unwrap_or_else(|e| panic!("{e:#}"));
         let mut bounded = 0;
         for ((shape, region), f) in &lw.frames {
             let rep = &lw.reps[shape];
@@ -503,6 +504,40 @@ mod tests {
             }
         }
         assert!(bounded >= 2, "{bounded} no-player shapes bound the spawn's y (the chain's and a respawn's)");
+    }
+
+    /// THE WALK IS THE SAME ON ANY NUMBER OF WORKERS (`--threads`): room
+    /// (1,0)'s walk on 1 worker and on 8 reaches the same lattice, the same
+    /// representatives (each shape's constants; per node its input shape,
+    /// slots, cells and bounds) and the same start, and its kernel set -
+    /// built without the cache, which would skip the walk - the same text
+    /// and key layouts. What the walk's rounds and the build's pools hand
+    /// out is merged by index (`par::Pool`), and each job traces in a fresh
+    /// arena.
+    #[test]
+    #[ignore = "slow, ./check.sh t2 runs it: room (1,0)'s walk and kernel build at 1 and 8 workers, ~40 s"]
+    fn the_walk_and_its_kernels_are_the_same_on_one_worker_and_eight() {
+        let at = |threads: usize| {
+            let s = crate::settings::Settings { threads: Some(threads), ..Default::default() };
+            let run = crate::settings::Run::new(&s, crate::abstraction::Level::parse("r0sx").expect("level"));
+            let lw = super::room_constant_lattice::<Fixed>(&super::Walk { run: &run, only: None }).unwrap_or_else(|e| panic!("{e:#}"));
+            let reps: std::collections::BTreeMap<_, _> = lw.reps.iter().map(|(k, st)| (*k, super::super::shapes::field_constants(st, &lw.tracer.it.d, &run.level).expect("constants"))).collect();
+            let nodes: Vec<_> = lw
+                .frames
+                .iter()
+                .map(|(node, f)| (*node, f.frame.in_rt2.shape_hash(), f.frame.iface.slots.clone(), f.frame.in_cells.clone(), f.bounds.clone(), f.frame.outs.len(), f.frame.fork_ways.clone()))
+                .collect();
+            let kernels = crate::compiled::asm_kernel::Registry::<Fixed>::build_with(&run, None, false).unwrap_or_else(|e| panic!("{e:#}"));
+            ((lw.lattice, reps, nodes, lw.start_key, lw.start_ivals, lw.ival_extra), (kernels.len(), kernels.text_digest(), kernels.key_layouts()))
+        };
+        let (one, eight) = (at(1), at(8));
+        assert!(one.0 .2.len() > 100, "the walk reached {} (shape, region) nodes", one.0 .2.len());
+        assert!(one.0 .0 == eight.0 .0, "the lattice differs at 1 and 8 workers");
+        assert!(one.0 .1 == eight.0 .1, "the representatives' constants differ");
+        assert!(one.0 .2 == eight.0 .2, "a node's input shape, slots, cells, bounds or outcomes differ");
+        assert!(one.0 .3 == eight.0 .3 && one.0 .4 == eight.0 .4 && one.0 .5 == eight.0 .5, "the start differs");
+        assert_eq!((one.1 .0, one.1 .1), (eight.1 .0, eight.1 .1), "the kernel sets' sizes and texts");
+        assert!(one.1 .2 == eight.1 .2, "the kernels' key layouts differ");
     }
 }
 
@@ -526,8 +561,11 @@ pub fn room_constant_lattice<A: GraphArith>(walk: &Walk) -> Result<LatticeWalk<A
     let (mut w, mut frontier) = WalkState::start(&mut it, chunks, &start, walk)?;
     // THE ROUNDS: each traces its frontier in parallel against a lattice
     // snapshot; results apply in node order between rounds. Each frame is
-    // bound in the worker arena it was traced in.
-    let n_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    // bound in the worker arena it was traced in. The run's `--threads`
+    // workers, each holding its own copy of the tracer (a `Tracer` is
+    // `Send`, not `Sync`).
+    let n_workers = walk.run.settings.threads();
+    let pool = crate::par::Pool::new(n_workers).stack(128 << 20);
     let mut tracers: Vec<Tracer<A>> = (0..n_workers).map(|_| Tracer { it: it.clone(), chunks }).collect();
     let (mut traces, mut round) = (0usize, 0usize);
     let t_walk = std::time::Instant::now();
@@ -536,15 +574,9 @@ pub fn room_constant_lattice<A: GraphArith>(walk: &Walk) -> Result<LatticeWalk<A
         traces += frontier.len();
         anyhow::ensure!(traces <= 20000, "constant-lattice fixpoint did not converge");
         let jobs = w.jobs(&frontier)?;
-        // Each worker clones its own copy (a `Tracer` is `Send`, not `Sync`), and
-        // per job a FRESH arena from it, so a graph depends on the job, not on
-        // scheduling.
-        let free = std::sync::Mutex::new(tracers.iter_mut().collect::<Vec<_>>());
-        let traced: Vec<WalkTraced<A>> = crate::par::Pool::new(n_workers).stack(128 << 20).map_with(
-            jobs.len(),
-            || free.lock().expect("the walk's tracers").pop().ok_or_else(|| anyhow::anyhow!("a tracer per walk worker")),
-            |tr, i| walk_trace(&mut tr.clone(), &w.reps, &jobs[i], opts, w.grid, walk.only, w.room0),
-        )?;
+        // Per job a FRESH arena from its worker's copy, so a graph depends
+        // on the job, not on the scheduling.
+        let traced: Vec<WalkTraced<A>> = pool.map_on(&mut tracers, jobs.len(), |tr, i| walk_trace(&mut tr.clone(), &w.reps, &jobs[i], opts, w.grid, walk.only, w.room0))?;
         let (mut next, respawned) = w.apply(&mut it, chunks, &jobs, traced)?;
         if respawned {
             w.respawned()?;
@@ -864,7 +896,7 @@ fn with_extra(mut ival: Vec<super::iface::Path>, extra: Option<&std::collections
     ival
 }
 
-struct WalkJob<A: GraphArith = Fixed> {
+struct WalkJob<A: GraphArith> {
     node: WalkNode,
     roots: Vec<super::iface::Path>,
     pin: Vec<(super::iface::Path, super::iface::Conc<A>)>,
@@ -875,7 +907,7 @@ struct WalkJob<A: GraphArith = Fixed> {
 }
 
 /// A live outcome of a traced walk node, as the walk reads it.
-struct WalkOutcome<A: GraphArith = Fixed> {
+struct WalkOutcome<A: GraphArith> {
     key: ShapeKey,
     constants: std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>,
     ival: Vec<super::iface::Path>,
@@ -888,7 +920,7 @@ struct WalkOutcome<A: GraphArith = Fixed> {
     respawn: Option<std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>>,
 }
 
-enum WalkTraced<A: GraphArith = Fixed> {
+enum WalkTraced<A: GraphArith> {
     /// The refusal, and what the trace poisoned before it.
     Refused(String, std::collections::BTreeMap<String, usize>),
     Traced {
@@ -903,7 +935,7 @@ enum WalkTraced<A: GraphArith = Fixed> {
 }
 
 /// A walk node's converged frame, its bounds, and its binding.
-pub struct WalkFrame<A: GraphArith = Fixed> {
+pub struct WalkFrame<A: GraphArith> {
     pub frame: super::frame::Frame<A>,
     pub bounds: InputRanges<A>,
     pub bound: std::result::Result<Bound<A>, String>,
@@ -972,7 +1004,7 @@ fn walk_trace<A: GraphArith>(
 
 /// The tracer a walk ran in, kept to re-trace a shape in the same arena.
 #[derive(Clone)]
-pub struct Tracer<A: GraphArith = Fixed> {
+pub struct Tracer<A: GraphArith> {
     pub it: super::interp::Interp<'static, super::domain::Symbolic<A>>,
     pub chunks: &'static super::cart::Chunks,
 }
@@ -985,7 +1017,7 @@ pub struct Walk<'a> {
     pub only: Option<&'a [Region]>,
 }
 
-pub struct LatticeWalk<A: GraphArith = Fixed> {
+pub struct LatticeWalk<A: GraphArith> {
     pub tracer: Tracer<A>,
     pub start_key: ShapeKey,
     pub lattice: std::collections::BTreeMap<ShapeKey, std::collections::BTreeMap<super::iface::Path, super::iface::Conc<A>>>,
