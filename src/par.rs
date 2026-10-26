@@ -21,11 +21,6 @@ impl Pool {
         Pool { threads: threads.max(1), stack: None }
     }
 
-    /// One worker per available core.
-    pub(crate) fn per_core() -> Self {
-        Self::new(std::thread::available_parallelism().map_or(8, |p| p.get()))
-    }
-
     /// Workers with a `bytes` stack (the tracer recurses deeply).
     pub(crate) fn stack(mut self, bytes: usize) -> Self {
         self.stack = Some(bytes);

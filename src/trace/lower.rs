@@ -132,10 +132,11 @@ pub(crate) fn lattice_kernel_refs<A: GraphArith>(run: &crate::settings::Run) -> 
             Ok((region, wf.frame, bound))
         })
         .collect::<Result<Vec<_>>>()?;
-    // Lower (the expensive half of a build), in parallel. Each frame is
-    // taken by exactly one worker (a `Frame` is not cloned).
+    // Lower (the expensive half of a build), on the run's `--threads`
+    // workers. Each frame is taken by exactly one worker (a `Frame` is not
+    // cloned).
     let slots: Vec<std::sync::Mutex<Option<(Option<Region>, super::frame::Frame<A>, Bound<A>)>>> = frames.into_iter().map(|x| std::sync::Mutex::new(Some(x))).collect();
-    let refs = crate::par::Pool::per_core().stack(128 << 20).map(slots.len(), |i| {
+    let refs = crate::par::Pool::new(run.settings.threads()).stack(128 << 20).map(slots.len(), |i| {
         let (key, f, mut bound) = slots[i].lock().expect("a frame's slot").take().expect("each frame is lowered once");
         let lowered = super::lower::lower_frame(&mut bound, Some(room));
         Ok((key, LoweredFrame { frame: f, bound, lowered }))

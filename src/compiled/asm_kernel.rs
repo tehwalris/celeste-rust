@@ -811,8 +811,9 @@ impl<N: KernelLanes> Registry<N> {
             .context("retracing the start room for ASM kernels")?;
         let trace_s = t0.elapsed().as_secs_f64();
         let t_asm = std::time::Instant::now();
-        // The shapes in parallel; a shape's build recurses deeply.
-        let pool = crate::par::Pool::per_core().stack(128 * 1024 * 1024);
+        // The shapes in parallel on the run's `--threads` workers; a shape's
+        // build recurses deeply.
+        let pool = crate::par::Pool::new(run.settings.threads()).stack(128 * 1024 * 1024);
         let n_workers = pool.workers(refs.len());
         let built = pool.map(refs.len(), |si| {
             let (region, r) = &refs[si];
