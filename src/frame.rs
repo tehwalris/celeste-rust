@@ -1394,31 +1394,60 @@ mod tests {
         }
     }
 
-    /// THE SPLIT FRAME at a near level reaches the unsplit (pinned) state
-    /// counts at every boundary, room (2,1) `r0sxn`. Guards nil-global
+    /// THE SPLIT FRAME at a near level, room (2,1) `r0sxn`, against the
+    /// unsplit frame to f30 (plans/correctness.md C3): their EXACT REACHES
+    /// (`reach::exact`, exact in the remainder over each tree's recorded
+    /// graph) are the same at every boundary, states and remainder sets
+    /// alike; their HULL trees the same states through f29, and at f30 the
+    /// split one 26 fewer, a subset - the unsplit hulls' over-approximation
+    /// (one arc per axis holds no union, and the mid-frame merges choose
+    /// other arcs), no state either reaches exactly. Guards nil-global
     /// removal and the mid-frame cut not widening floors the player reads.
-    /// (A mid-frame state's hull merges its sources' and part b moves no
-    /// remainder, so the boundaries' hulls are the unsplit frame's.)
     #[test]
-    #[ignore = "slow, ./check.sh t2 runs it: room (2,1)'s split kernels and a forward, ~55 CPU-s"]
+    #[ignore = "slow, ./check.sh t2 runs it: room (2,1)'s kernels split and not, two forwards and their exact reaches, ~90 CPU-s"]
     fn split_frame_reaches_the_unsplit_frontier_at_a_near_level() {
-        let s = Settings { room: (2, 1), split_frame: true, ..Default::default() };
         let level = Level::parse("r0sxn").expect("level");
-        let run = Run::new(&s, level);
-        let dir = &std::path::PathBuf::from(format!("/var/tmp/celeste-frame-split-near-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(dir);
-        std::fs::create_dir_all(dir).expect("checkpoint dir");
-        let engine = crate::compiled::FrameEngine::new(&run).expect("engine");
-        let init = start_blocks(&s);
-        // Unsplit, frame by frame: 1 state a frame through the spawn, then these.
-        let unsplit: Vec<(u32, usize)> = (0..24).map(|f| (f, 1)).chain([(24, 27), (25, 191), (26, 676), (27, 1883), (28, 4514)]).collect();
-        let last = unsplit.last().unwrap().0;
-        forward_run(&engine, init, dir, 2 * last).expect("split forward");
-        let tree = crate::storage::layer::Tree::<P8>::open(dir, 2 * last).expect("the tree");
-        for (f, want) in unsplit {
-            let got = tree.states(2 * f) as usize;
-            assert_eq!(got, want, "frame {f} (step {}): the split frame reached {got} states, the unsplit {want}", 2 * f);
+        let base = crate::testutil::TestDir::new("split-near");
+        let last = 30u32;
+        // Per boundary: each state's content id and its exact reach's set.
+        type ByFrame = Vec<rustc_hash::FxHashMap<u64, crate::search::arcs::Region<crate::search::arcs::Fixed16>>>;
+        let grow = |split_frame: bool| -> (Vec<rustc_hash::FxHashSet<u64>>, ByFrame) {
+            let s = Settings { room: (2, 1), split_frame, ..Default::default() };
+            let run = Run::new(&s, level);
+            let dir = base.join(if split_frame { "split" } else { "unsplit" });
+            let per = s.clock().per_frame;
+            let engine = crate::compiled::FrameEngine::new(&run).expect("engine");
+            forward_run(&engine, start_blocks(&s), &dir, per * last).expect("forward");
+            let tree = crate::storage::layer::Tree::<P8>::open(&dir, per * last).expect("the tree");
+            let h = tree.space.content_hash();
+            let id = |sk| {
+                let (shape, key, cell) = tree.state(sk).expect("state");
+                h.state(shape, key, cell)
+            };
+            let states = (0..=last).map(|f| tree.layer(per * f, None, 4).expect("layer").0.states_iter().map(id).collect()).collect();
+            let mut exact: ByFrame = vec![Default::default(); last as usize + 1];
+            crate::search::reach::exact::reach(&dir, per * last, crate::search::rem::start_point::<P8>(), 4, |t, cur| {
+                if t % per == 0 {
+                    exact[(t / per) as usize].extend(cur.iter().map(|(sk, r)| (id(*sk), r.clone())));
+                }
+                Ok(())
+            })
+            .expect("exact reach");
+            (states, exact)
+        };
+        let (us, ue) = grow(false);
+        let (ss, se) = grow(true);
+        for f in 0..last as usize {
+            assert_eq!(ss[f], us[f], "frame {f}: the split frame's states are not the unsplit's");
         }
-        let _ = std::fs::remove_dir_all(dir);
+        let l = last as usize;
+        assert!(ss[l].is_subset(&us[l]), "frame {last}: a split state the unsplit frame never reaches");
+        assert_eq!((us[l].len(), ss[l].len()), (17648, 17622), "frame {last}: the states, unsplit and split");
+        for f in 0..=l {
+            assert!(ue[f] == se[f], "frame {f}: the exact reaches differ ({} states unsplit, {} split)", ue[f].len(), se[f].len());
+        }
+        assert_eq!(ue[l].len(), 17433, "frame {last}: the states the exact reach holds");
+        let missing: Vec<&u64> = us[l].difference(&ss[l]).collect();
+        assert!(missing.iter().all(|m| ue.iter().all(|x| !x.contains_key(m))), "a state the split frame misses is exactly reached");
     }
 }

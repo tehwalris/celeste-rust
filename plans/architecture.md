@@ -513,8 +513,9 @@ gemskipnodiag and onlydiag make the forbidden dash arm raise, so it is no
 move, exactly.
 
 **The split frame** (`--split-frame`, rooms (6,0), (6,1)): `_update` as two
-steps around the player's move; kernels shrink ~10-20x with identical
-states at frame boundaries. UNITS (`settings::Clock`, where every
+steps around the player's move; kernels shrink ~10-20x with the same
+EXACT reach at frame boundaries (the hull trees can differ: the mid-frame
+merges choose other arcs, plans/correctness.md C3). UNITS (`settings::Clock`, where every
 conversion is): STEPS are the internal unit, since a mid-frame state is a
 node of its own (the backward pulls W through it). The tree and its
 files, the edges, W, the marks, level -1's recorded H (`2C` for a horizon

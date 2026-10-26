@@ -90,11 +90,43 @@ settled here. Evidence is file:line at develop 19869c5d.
   tas/room_5_2_exit_frame_150.txt`: arc bound 150, concrete optimum 150,
   the known route survives every pruning step (5.6 min, peak 7 GB).
 
-## C3. Room (2,1): the split frame reaches FEWER states than unsplit at `p`
-- Noted in architecture.md ("unexplained"). Fewer states is the direction a
-  soundness bug shows. Find a state reached unsplit but not split and explain
-  it (a legitimate projection difference, or a bug). Blocks any further split-
-  frame refactor (audit M6).
+## C3. Room (2,1): the split frame reaches FEWER states than unsplit (EXPLAINED: the hulls' precision, no bug; branch correctness-2)
+- Was: at `p` the split frame reached fewer states, "unexplained"; fewer
+  is the direction a soundness bug shows.
+- Re-checked with `p` gone, at `r0sxn` (2026-10-26, develop 959d669b + C1,
+  release): `forward --room 2,1 --level r0sxn --steps 60` (43 s, 4.5 GB)
+  against `--split-frame --steps 120` (25 s, 4.1 GB). Every boundary the
+  same states (count and content) through f29; from f30 the split frame
+  FEWER, cumulatively -26 at f30, -207 f35, -715 f41, -38,957 f57,
+  -29,131 f60 (87,212,592 against 87,241,723, -0.03%). At f30 the split
+  states a strict subset (26 missing, none extra); 223 missing by f33.
+- THE EXACT REACH (`reach::exact`: exact in the remainder over each tree's
+  recorded graph) is IDENTICAL in the two trees at every boundary f0-f33,
+  states and remainder sets (17,433 states at f30, 75,514 at f33), every
+  split one inside its hull; NONE of the missing states is exactly reached
+  in the unsplit graph (past f33 the oracle passes its 1024-segment cap).
+- So they are the unsplit hulls' over-approximation, not states of the
+  game: a hull is one arc per axis, which holds no union, and its arc
+  depends on what was merged (the split frame merges at the mid-frame
+  node). One of them: f30, `player.x = -2, y = 112`, a right dash just
+  begun (`move_x`'s loop from 0 takes 2 px at rem.x -0.5; the dash's
+  freeze skips the draw's clamp), from x = 0, y = 112, spd.x -0.2, grace 3
+  at f29, whose unsplit hull's x arc is [45876, 19661] across the end
+  (index 0..19661 in it) and split one [19661, 65535]: the edge's guard x
+  [0, 13108) meets only the unsplit arc. Both hulls hold the state's exact
+  set; neither holds the other.
+- A LEGITIMATE PRECISION DIFFERENCE (the hull representation), not a
+  soundness bug: the split frame is not a superset in hull trees, and the
+  same in the exact reach. The slow test
+  `frame::tests::split_frame_reaches_the_unsplit_frontier_at_a_near_level`
+  now states it to f30 (both forwards; the exact reaches equal at every
+  boundary, the hull trees through f29, at f30 the split one a subset by
+  26, no missing state exactly reached). Its doc's old claim that the
+  boundaries' hulls are the unsplit frame's was wrong. As far as this item
+  goes, a further split-frame refactor (audit M6) is unblocked.
+- Not shown past f33 (the exact oracle's cap); the probe was a throwaway
+  test (/var/tmp/correctness-2-scripts/frame-with-c3-probe.rs, not
+  committed).
 
 ## C4. The minimal cart's move guard: UNREACHABLE (proven); the player unguarded (DECIDED, branch jump-buffer)
 - Original: `obj.move(obj.spd.x,obj.spd.y)` unconditionally (celeste.lua:1195);
