@@ -1188,13 +1188,13 @@ mod tests {
     use celeste_engine::runtime2::{Col, AV};
 
     /// The start room's initial block.
-    fn start_blocks(s: &Settings) -> Vec<Rt2> {
+    fn start_blocks(s: &Settings) -> Vec<Rt2<P8>> {
         vec![RefEngine::new(s).expect("ref engine").initial().expect("initial state").canonicalized()]
     }
 
     /// The start's row a few frames after the player appears (standing, at
     /// rest), widened to `run`'s level.
-    fn standing_row(run: &crate::settings::Run) -> Rt2 {
+    fn standing_row(run: &crate::settings::Run) -> Rt2<P8> {
         let mut reference = RefEngine::new(&run.settings).expect("ref engine");
         let mut row = reference.initial().expect("initial state");
         let mut after = 0;
@@ -1210,7 +1210,7 @@ mod tests {
 
     /// Does `registry` run `r`'s one lane (else its kernel declines), keyed
     /// against `visited`'s key space?
-    fn kernel_runs(registry: &Registry<P8>, r: &Rt2, s: &Settings, visited: &crate::storage::visited::VisitedSet<P8>) -> bool {
+    fn kernel_runs(registry: &Registry<P8>, r: &Rt2<P8>, s: &Settings, visited: &crate::storage::visited::VisitedSet<P8>) -> bool {
         let cells = crate::storage::cells::block_cells(r).expect("cells");
         let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
         let prov = celeste_engine::exact::Provisional::default();
@@ -1552,7 +1552,7 @@ mod tests {
         let row = standing_row(&run);
         let ids = crate::compiled::ids();
         let with = |f: u32, axis: u32, v: P8| with_player_field(&row, f, axis, v);
-        let runs = |r: &Rt2| -> bool {
+        let runs = |r: &Rt2<P8>| -> bool {
             let cells = crate::storage::cells::block_cells(r).expect("cells");
             assert!(grid.of_cell(cells[0]).is_some(), "the lane has a region");
             kernel_runs(&registry, r, &s, &crate::storage::visited::VisitedSet::new())
@@ -1570,7 +1570,7 @@ mod tests {
 
     /// `row` with its player's table field `f`'s `axis` set to `v`; a number
     /// column or an interval one, as it was.
-    fn with_player_field(row: &Rt2, f: u32, axis: u32, v: P8) -> Rt2 {
+    fn with_player_field(row: &Rt2<P8>, f: u32, axis: u32, v: P8) -> Rt2<P8> {
         let mut r = row.clone_block();
         let pc = r.obj_field_cell(r.player_objects()[0], f).expect("the player's table field");
         let Col::U(AV::Ptr(t)) = r.cols[pc as usize] else { panic!("the player's field is not a table") };
@@ -1620,7 +1620,7 @@ mod tests {
         let start = reference.initial().expect("start");
         let one = reference.step_one(&start, 0).expect("step 1");
         let two = reference.step_one(&one, 0).expect("step 2");
-        let rows: Vec<Rt2> = [start, one, two]
+        let rows: Vec<Rt2<P8>> = [start, one, two]
             .into_iter()
             .map(|mut r| {
                 r.widen_to(level);
@@ -1706,13 +1706,13 @@ mod tests {
     #[test]
     fn the_orb_deadline_is_below_the_carts_chest_to_orb_time() {
         let ids = crate::compiled::ids();
-        let num = |b: &Rt2, c: u32| match b.cols[c as usize].at(0) {
+        let num = |b: &Rt2<P8>, c: u32| match b.cols[c as usize].at(0) {
             AV::Num(n) => n,
             other => panic!("not a number: {other:?}"),
         };
-        let global = |b: &Rt2, name: &str| num(b, b.shape.globals()[celeste_names::global(name) as usize]);
-        let chest_state = |b: &Rt2| b.objects_of_type(ids.g_big_chest).first().map(|&o| num(b, b.obj_field_cell(o, ids.f_state).expect("a state")));
-        let orb_still = |b: &Rt2| {
+        let global = |b: &Rt2<P8>, name: &str| num(b, b.shape.globals()[celeste_names::global(name) as usize]);
+        let chest_state = |b: &Rt2<P8>| b.objects_of_type(ids.g_big_chest).first().map(|&o| num(b, b.obj_field_cell(o, ids.f_state).expect("a state")));
+        let orb_still = |b: &Rt2<P8>| {
             b.objects_of_type(celeste_names::global("orb")).iter().any(|&o| {
                 let AV::Ptr(spd) = b.cols[b.obj_field_cell(o, ids.f_spd).expect("spd") as usize].at(0) else { panic!("the orb's spd is no table") };
                 num(b, b.obj_field_cell(spd, ids.f_y).expect("spd.y")) == P8::from_i16(0)
@@ -1723,7 +1723,7 @@ mod tests {
         for split_frame in [false, true] {
             let s = Settings { room: (5, 2), split_frame, ..Default::default() };
             let mut eng = RefEngine::new(&s).expect("ref engine");
-            let frame = |eng: &mut RefEngine, b: &Rt2, input: u8| {
+            let frame = |eng: &mut RefEngine, b: &Rt2<P8>, input: u8| {
                 let mut leaves = eng.frame(b, input).expect("a frame");
                 assert_eq!(leaves.len(), 1, "one leaf");
                 leaves.remove(0)

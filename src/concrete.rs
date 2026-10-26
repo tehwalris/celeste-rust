@@ -137,6 +137,7 @@ pub(crate) fn leaving<N: Arithmetic>(state: &Rt2<N>, s: &crate::settings::Settin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeste_core::arith::Fixed;
     use crate::engines::reference::RefEngine;
 
     /// The split frame (`--split-frame`) must run exactly the original
@@ -147,7 +148,7 @@ mod tests {
     fn split_frame_lands_on_the_unsplit_states_through_a_dash_freeze() {
         let bytes = read_inputs("tas/room_1_0_exit_frame_99.txt").expect("tas");
         assert_eq!(bytes.len(), 99);
-        let fingerprint = |r: &Rt2| {
+        let fingerprint = |r: &Rt2<Fixed>| {
             let mut c = r.clone_block();
             c.canonical();
             (r.shape_hash(), celeste_engine::exact::exact_rows(&c), crate::storage::cells::block_cells(r).expect("cells"))

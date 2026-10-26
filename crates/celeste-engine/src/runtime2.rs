@@ -36,7 +36,7 @@ pub const POS_WHOLE: u32 = 0xffff_0000;
 /// One lane's abstract value, its numbers of type `N` (the arithmetic's).
 /// `Copy`, 12 bytes + tag in 16.16.
 #[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
-pub enum AV<N = P8> {
+pub enum AV<N> {
     Num(N),
     Ival(N, N),
     Bool(bool),
@@ -51,7 +51,7 @@ pub enum AV<N = P8> {
 /// A column: one value per lane, or one value for every lane (`U`, which
 /// costs nothing per lane).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum Col<N = P8> {
+pub enum Col<N> {
     U(AV<N>),
     V(Vec<AV<N>>),
     /// An all-Num column stored raw: 4 B/lane, branchless op loops.
@@ -82,7 +82,7 @@ impl<N: Copy + PartialEq> Col<N> {
 /// `Template`): one value in every row, or per row a number, an interval,
 /// a boolean (known or not), any value.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub enum ColRepr<N = P8> {
+pub enum ColRepr<N> {
     Uniform(AV<N>),
     Num,
     Ival,
@@ -165,7 +165,7 @@ impl<N: Arithmetic> ColRepr<N> {
 /// cell how its rows hold their values (`ColRepr`; a non-value cell's
 /// uniform). A kernel outcome's rows, a reference row's, a stored shape's.
 #[derive(Clone)]
-pub struct Template<N = P8> {
+pub struct Template<N> {
     pub shape: Arc<Shape>,
     pub strings: Arc<[String]>,
     pub room: &'static Room,
@@ -218,7 +218,7 @@ pub fn names() -> &'static Names {
     })
 }
 
-pub struct Rt2<N = P8> {
+pub struct Rt2<N> {
     pub width: usize,
     /// The structure every lane shares (its hash the block's shape key).
     pub shape: Arc<Shape>,

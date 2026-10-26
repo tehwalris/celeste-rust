@@ -2217,7 +2217,7 @@ mod tests {
             let run = crate::settings::Run::new(&s, crate::abstraction::Level::EXACT);
             let lw = crate::trace::walk::room_constant_lattice::<celeste_core::arith::Fixed>(&crate::trace::walk::Walk { run: &run, only: None }).expect("the walk");
             for st in lw.reps.values() {
-                let b: celeste_engine::Rt2 = crate::trace::block::skeleton(st, lw.room).expect("a block");
+                let b: celeste_engine::Rt2<P8> = crate::trace::block::skeleton(st, lw.room).expect("a block");
                 let located = located_object(st).map(|p| celeste_engine::slots::deref(&b, crate::trace::bind::resolve(&b, &p).expect("the path resolves")).expect("an object"));
                 let anchors = Anchors::of(&b);
                 assert_eq!(located, anchors.position.map(|p| p.obj), "room {:?}: level -1 locates another object than the anchors' position", s.room);

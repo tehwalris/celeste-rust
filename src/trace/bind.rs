@@ -90,13 +90,14 @@ pub fn resolve_all<N: Arithmetic>(rt2: &Rt2<N>, paths: &[Path]) -> Result<Vec<u3
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeste_core::arith::Fixed;
     use celeste_engine::runtime2::{Col, AV, NONE};
     use celeste_names::gen;
     use crate::trace::iface::key;
 
     /// Rebuild a shape witness (a real boundary shape with its canonical cell
     /// ids) as a block, structure only.
-    fn block_from_witness(path: &str) -> Rt2 {
+    fn block_from_witness(path: &str) -> Rt2<Fixed> {
         let text = std::fs::read_to_string(path).expect("witness");
         let w: serde_json::Value = serde_json::from_str(&text).expect("json");
         let cells = w["cells"].as_array().expect("cells");
@@ -202,7 +203,7 @@ mod tests {
         for _ in 0..12 {
             st = cart::run_one(&mut it, &chunks.frame, st).expect("warm-up");
         }
-        let rt2: Rt2 = crate::trace::block::skeleton(&st, it.room.expect("the room")).expect("structure");
+        let rt2: Rt2<Fixed> = crate::trace::block::skeleton(&st, it.room.expect("the room")).expect("structure");
         let mut seen: std::collections::HashMap<u32, Path> = Default::default();
         let (mut ok, mut unnameable) = (0usize, 0usize);
         for p in crate::trace::iface::scalars(&st, &[]).expect("scalars") {

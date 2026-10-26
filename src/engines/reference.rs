@@ -724,7 +724,7 @@ mod tests {
         let row = to_block(&st, eng.room()).expect("block");
         let abs = crate::builtins::BUILTIN_NAMES.iter().position(|n| *n == "abs").expect("abs") as u32;
         assert_eq!(row.cells().iter().filter(|c| **c == Cell::Bi(abs)).count(), 3, "a Bi cell at each of the three slots");
-        let points_at_builtin = |c: &Col| matches!(c, Col::U(AV::Ptr(p)) if matches!(row.cells()[*p as usize], Cell::Bi(_)));
+        let points_at_builtin = |c: &Col<Fixed>| matches!(c, Col::U(AV::Ptr(p)) if matches!(row.cells()[*p as usize], Cell::Bi(_)));
         assert!(!row.cols.iter().any(points_at_builtin), "no slot points at a builtin's cell");
         eng.check_agreement(&row).expect("both sides convert it alike");
     }
@@ -738,7 +738,7 @@ mod tests {
     fn inputs_agreeing_on_the_buttons_read_make_the_same_successors() {
         let inputs = crate::concrete::read_inputs("tas/room_1_0_exit_frame_99.txt").expect("the exit's inputs");
         let mut eng = RefEngine::new(&Default::default()).expect("ref engine");
-        let exact = |bs: Vec<Rt2>| -> Vec<(celeste_engine::exact::ExactRow, u32)> { bs.iter().map(|b| (celeste_engine::exact::exact_rows(b).swap_remove(0), crate::storage::cells::block_cells(&b).expect("cells")[0])).collect() };
+        let exact = |bs: Vec<Rt2<Fixed>>| -> Vec<(celeste_engine::exact::ExactRow, u32)> { bs.iter().map(|b| (celeste_engine::exact::exact_rows(b).swap_remove(0), crate::storage::cells::block_cells(&b).expect("cells")[0])).collect() };
         let mut row = eng.initial().expect("initial state");
         let (mut runs, mut checked) = (0, 0);
         for (f, &byte) in inputs.iter().enumerate() {
@@ -774,7 +774,7 @@ mod tests {
         let inputs = crate::concrete::read_inputs(route).expect("the route's inputs");
         let mut eng = RefEngine::new(&settings).expect("ref engine");
         // The projections compared EXACTLY (their canonical bytes).
-        let projected = |bs: &[Rt2]| -> std::collections::BTreeSet<(celeste_engine::exact::ExactRow, u32)> {
+        let projected = |bs: &[Rt2<Fixed>]| -> std::collections::BTreeSet<(celeste_engine::exact::ExactRow, u32)> {
             bs.iter()
                 .map(|b| {
                     let mut w = b.clone_block();
@@ -788,7 +788,7 @@ mod tests {
         // checked on its own engine (the unpinned steps are the cost).
         let mut row = eng.initial().expect("initial state");
         let mut with = 0;
-        let mut sampled: Vec<(usize, Rt2)> = Vec::new();
+        let mut sampled: Vec<(usize, Rt2<Fixed>)> = Vec::new();
         for (f, &byte) in inputs.iter().enumerate() {
             if f % stride == 0 {
                 let mut abs = row.clone_block();
