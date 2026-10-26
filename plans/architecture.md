@@ -41,7 +41,11 @@ crates/celeste-names    FROZEN name tables (GLOBAL_NAMES order = canonical      
 crates/celeste-engine   Rt2 blocks, exact keys, the widening table          deps: core, names
 celeste-rust (src/)
   frame.rs              the forward (ForwardState: start, resume, extend),
-                        trees (grow_tree, TreeL1), wins, MarkFilter
+                        trees (grow_tree), wins
+  prune.rs              the forward's pruning, one interface (`Prune`):
+                        the filters (level -1's TreeL1, the ladder's
+                        MarkFilter), the cuts (exit, out of the room, a
+                        lost berry, the orb's deadline), `Prunes`
   storage/              the player-position cells (cells), the visited set,
                         the wave, the region phase, the frame/hull/edge
                         files (one container: file; their varints and
@@ -344,9 +348,11 @@ wave.
 **The wave** (`storage::wave::run_wave`), one pipeline a frame:
 - the frontier is cut into UNITS of whole entries of one shape (~1/256 of
   the frame) and SLICES (256k lanes). A unit is DECODED right before the
-  kernels (`decode::decode_rows`); `frame::not_expanded` (exits, a lost
-  berry, the orb's deadline) is decided there;
-- per emission the unit's sink drops level -1's rows, keys the row and ORs
+  kernels (`decode::decode_rows`); the CUTS (`Prunes::not_expanded`: an
+  exit, a row out of the room under a win rectangle, a lost berry, the
+  orb's deadline) are decided there;
+- per emission the unit's sink drops level -1's rows (and the ladder's,
+  per batch), keys the row and ORs
   it into a BUNDLE (source key, transfer, offset, target key -> target
   cells) keyed by the target's ROUTE (shape, region slot);
 - a unit ends as per-route CHUNKS with their pushes. Re-push units make
@@ -369,6 +375,19 @@ shapes' skeletons), the edge file, and last the record's trust marker
 file is read back and compared with the forward's state (fatal on a
 difference). The DECODE GUARD checks a shape's first emitted row per
 worker and wave against its decode.
+
+**The pruning** (`prune`): every row the forward drops or leaves
+unexpanded is one PRUNE's, each with its projection (what of the level's
+row it decides by), its record line and its horizon. FILTERS drop a row
+where it is made, at every step but the start: level -1 (at emission and
+re-push), the objects ladder (at emission and the frame's end). CUTS keep
+a row and never expand it. `Prunes` holds a forward's, the wave reading
+each in its concrete form (level -1 per lane, the ladder per batch, the
+cuts once a unit); the known-route check iterates `Prunes::each`, the list
+the cuts are applied from, so it sees every prune the forward applies and
+names the one that drops a route. Prunes are the forward's alone: the
+backward, the reach and the concrete search are exact or exhaustive
+inside W.
 
 **Resume** rebuilds the visited set from the frame files, replays their
 frontiers, and takes the last one as the frontier. A search resumes by
@@ -441,7 +460,7 @@ act" distributes over unions, so the union over all paths is exact.
    it reaches H). Won rows are stored and not expanded.
    - **Level -1** (`--level-minus-one H,S`, plans/level-minus-one.md): a
      push into a cell that cannot exit by H is dropped.
-   - **A finer level is filtered** (`frame::MarkFilter`): a state at frame
+   - **A finer level is filtered** (`prune::MarkFilter`): a state at frame
      t is kept only if its projection onto the previous level is REACHED
      there with a deadline >= t. REACHED (`reach::inside_w`): the start's
      remainder pushed forward inside W, `R_{t+1}(m) = U push_e(R_t(p)) ∩
@@ -529,10 +548,11 @@ observer (`frame::RowCheck`, `check keys`).
   over the finished search), their float twins and the dual gate.
 - **The known-route check** (`search::known`): `search --prefer FILE` and
   `rewrite check known` step a known solution through the reference engine
-  and FAIL at the first pruning step that drops it: level -1, the ladder's
-  filter, the node's W at the exact remainder, the reach marks. Pruning
-  errors produce a wrong optimum or a false tie, never a fake improvement,
-  so nothing else notices them.
+  and FAIL at the first pruning step that drops it, naming it: every prune
+  of the forward (`Prunes::each`: level -1, the ladder's filter, the cuts),
+  the hull forward's claim (`check known`), the node's W at the exact
+  remainder, the reach marks. Pruning errors produce a wrong optimum or a
+  false tie, never a fake improvement, so nothing else notices them.
 - **Kernels against the reference**: `check ref` (row by row),
   `check keys` (keys against the boundary), `check widen` (the widening
   table's two sides agree), `check arcs` (every edge has a transfer;

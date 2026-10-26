@@ -4,23 +4,62 @@ Open soundness and verification questions. Philippe wants to handle these
 hands-on: refactors must NOT change the code paths below until each item is
 settled here. Evidence is file:line at develop 19869c5d.
 
-## C1. Pruning is not first-class; the known-route check misses cuts
-- `search::known` (known.rs:320-392) lists the pruning steps by hand:
-  level -1 `too_late`, the ladder's `allowed`, the hull claim, W's support,
-  W at the exact remainder, the reach marks.
-- `frame::not_expanded` (frame.rs:327-347, applied at wave.rs:333) also cuts:
-  exits, `berry_lost`, `orb_deadline_skip`, out-of-room under `--win-at`. None
-  is a named step: a route a wrong cut drops shows only as "NOT IN THE TREE"
-  (known.rs:366-374), unattributed.
-- Proposal (audit architecture.md M1): one `Prune` interface (filters and
-  cuts, each with its projection, its tree-record line and its horizon);
-  `check known` iterates it, so it is complete by construction.
-
+## C1. Pruning is not first-class; the known-route check misses cuts (FIXED, branch correctness-2)
+- Was: `search::known` listed the pruning steps by hand (level -1
+  `too_late`, the ladder's `allowed`, the hull claim, W's support, W at the
+  exact remainder, the reach marks); `frame::not_expanded`'s cuts (exits,
+  `berry_lost`, `orb_deadline_skip`, out-of-room under `--win-at`) were no
+  named step: a route a wrong cut drops showed only as "NOT IN THE TREE",
+  unattributed, a step later.
+- FIXED: ONE interface, `prune::Prune` (`About`: name, kind - FILTER, dropped
+  where made, or CUT, kept unexpanded - and projection; its tree-record
+  line; its horizon; per lane `prunes`, and `why`). `prune::Prunes` holds a
+  forward's: the tree's (`Recorded`: `TreeL1`, `OrbCut`), the ladder's
+  `MarkFilter`, the cuts its settings imply (`Exit`, `OutOfRoom`,
+  `BerryLost`). It replaces `Filters` and the `orb` parameter in `WaveCtx`.
+  The hot forms are concrete: level -1 per lane (`TreeL1::drops`) and the
+  ladder per batch (`MarkFilter::allowed`) as fields of the sink, the cuts
+  once a unit through `Prunes::not_expanded`, which applies exactly the cuts
+  `Prunes::each` lists (one `dyn` call per cut per unit, none per lane).
+  `each` destructures every field. Prunes reach neither the backward, the
+  reach nor the concrete search.
+- `check known` / `search --prefer` iterate `Prunes::each` on the level's row
+  (`lookup_view` widened as the tree holds it): every filter at every step
+  past the start AND on the winning leaf (new: an exit row a filter drops
+  was blamed on W), every cut at every step before the exit (a cut's
+  report beats "not in W's support", which it causes). A failure names the
+  prune, its projection, its record line and the step (the error message
+  too). Two guards: each prune's record line is the tree's (the ladder's
+  marks recomputed by the check must be the ones the tree was filtered
+  for, but for a lower `--frames`, a stricter filter, noted), and no
+  prune's horizon is below the check's. `check known` also reads a tree
+  that ENDED on an empty frontier (`frame::tree_ends_by`: a cut that takes
+  every row), which it refused before.
+- Proof (2026-10-26): every pin of `./check.sh t0 t1 t2 big` identical; the
+  31 `[asm build]` kernel-text digests of those runs identical to the base
+  959d669b's; `--prefer` passes on the t2 gates (arc10, arc10f, dual10) and
+  search42 (its ladder level: "the ladder's filter (`filtered_for steps 50
+  level-1 off marks 241 2f8fd886e0cf30be`)", the tree's record line).
+  `check known` on finished searches with each kind of cut: arc10 (exit,
+  out-of-room), s42 (the ladder), room (5,2) any% `r0sx`, (150,5), h150
+  (level -1, exit, the orb cut `orb_cut h 150`: optimum 150, the stored
+  witness, 66.6 s, 7.1 GB), room (0,0) 100% `r0sx`, (115,5), h115 (level -1,
+  exit, the lost-berry cut: optimum 115, the stored witness, 50.3 s, 9.2
+  GB). NEW TEST `known::tests::check_known_names_a_wrong_cut_and_its_step`
+  (t2): a test-only fault on the exit cut (`prune::FAULT`) at the known
+  route's cell at step 30 drops it, and `check known` fails "PRUNED ... by
+  step 30: the exit cut does NOT EXPAND it at step 30"; at step 20 the
+  fault ends the tree and the check names it alike. The record guard,
+  shown by hand: a copy of s42 with its `filtered_for` fingerprint changed
+  is refused. Perf (instructions a rep, release, base -> C1): r62h
+  16.815G -> 16.812G (-0.02%), r62h57 43.919G -> 43.931G (+0.03%), f42n
+  5.0123G -> 5.0125G (+0.00%).
 - Unblocks native level -1 (assessment, 2026-10-20): feasible but a design
   decision: per-shape inductive ranges carried by the kernels, a loud
   widen-and-retrace path for declined lanes, and a position-only level whose
   backward computes distances; about -1,000 lines net; every level -1 result
-  re-verified. The known-route check must cover it first (this item).
+  re-verified. The known-route check covers it now: it would be one more
+  `Prune` (set aside by Philippe).
 
 ## C2. The orb deadline: a hand-derived bound nothing checks (FIXED, branch correctness-batch)
 - CHECKED: `ORB_MIN_FRAMES_AFTER_CHEST = 70` against the cart

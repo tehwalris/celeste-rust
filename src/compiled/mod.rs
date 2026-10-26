@@ -43,7 +43,7 @@ pub struct BoundaryIds {
     pub f_x: u32,
     pub f_y: u32,
     pub f_dash_effect_time: u32,
-    /// The berry's sources (`frame::berry_lost`): the strawberry, the fly
+    /// The berry's sources (`prune::berry_lost`): the strawberry, the fly
     /// fruit, the key, the chest the key opens (its `state`), and the fake
     /// wall that drops one when broken.
     pub g_fruit: u32,
@@ -52,7 +52,7 @@ pub struct BoundaryIds {
     pub g_chest: u32,
     pub g_fake_wall: u32,
     pub f_state: u32,
-    /// The orb room's big chest (`frame::orb_deadline_skip`).
+    /// The orb room's big chest (`prune::orb_deadline_skip`).
     pub g_big_chest: u32,
     /// The balloon's phase and bob (`concrete::lookup_view`, a seeded state).
     pub g_balloon: u32,

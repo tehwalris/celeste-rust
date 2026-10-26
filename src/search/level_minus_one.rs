@@ -961,7 +961,7 @@ fn sound_d(g: &Graph1, rev: &[Vec<u32>], chain_frames: u32, end_node: u32) -> Ve
     }
 }
 
-/// THE LEVEL -1 FILTER's table (`frame::MinusOne`): per (block shape hash,
+/// THE LEVEL -1 FILTER's table (`prune::MinusOne`): per (block shape hash,
 /// player cell), a lower bound on the frames to an exit (`sound_d`).
 pub struct CostToGo {
     /// Fx, not SipHash: probed per emitted row (`UnitSink::minus_one_drop`).

@@ -8,6 +8,7 @@ pub mod concrete;
 pub mod engines;
 pub mod metrics;
 pub mod par;
+pub mod prune;
 pub mod search;
 pub mod settings;
 pub mod starts;

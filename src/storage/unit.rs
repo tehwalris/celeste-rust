@@ -13,7 +13,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::decode::Skeletons;
 use super::route::{Chunk, Routes, UnitBundles};
 use super::visited::{Key, VisitedSet};
-use crate::frame::Filters;
+use crate::prune::Prunes;
 use crate::search::rem::{Pair, Rem};
 use celeste_engine::exact::{is_provisional, KeySpace, Provisional, RowKey};
 
@@ -398,10 +398,10 @@ impl<'a> RouteIds<'a> {
     }
 }
 
-/// The objects ladder's VERDICTS at emission (`MarkFilter`): per target,
+/// The objects ladder's VERDICTS at emission (`prune::MarkFilter`): per target,
 /// once a unit, decided in batches (a projection per block, not per row).
 struct Verdicts<'a, N: Rem> {
-    marks: Option<&'a crate::frame::MarkFilter<'a, N>>,
+    marks: Option<&'a crate::prune::MarkFilter<'a, N>>,
     of: rustc_hash2::FxHashMap<Target, u8>,
     /// The rows awaiting a verdict, per shape, and their targets.
     bufs: Vec<RowBuf<N>>,
@@ -450,10 +450,10 @@ struct Guards<'a, N: Rem> {
     last_shape: u64,
 }
 
-/// LEVEL -1 at emission: the tree's filter, and the last (shape, cell)
-/// asked.
+/// LEVEL -1 at emission (`Prunes::minus_one`'s hot form): the tree's
+/// filter, and the last (shape, cell) asked.
 struct Drops {
-    l1: Option<crate::frame::TreeL1>,
+    l1: Option<crate::prune::TreeL1>,
     last: Option<((u64, u32), bool)>,
 }
 
@@ -589,7 +589,7 @@ impl<'a, N: Rem> UnitSink<'a, N> {
         routes: &'a Routes,
         skeletons: &'a Skeletons<N>,
         prov: &'a Provisional<N>,
-        filters: Filters<'a, N>,
+        prunes: &Prunes<'a, N>,
         frame: u32,
         worker: u32,
         base: &'a super::edges::XferTable<N>,
@@ -607,8 +607,8 @@ impl<'a, N: Rem> UnitSink<'a, N> {
             xfers: Xfers::new(base, xfer_tab),
             routes: RouteIds::new(routes),
             pusher: Pusher::default(),
-            drops: Drops { l1: filters.l1, last: None },
-            verdicts: Verdicts { marks: filters.marks, of: Default::default(), bufs: Vec::new(), at: Vec::new(), disallowed: false },
+            drops: Drops { l1: prunes.minus_one, last: None },
+            verdicts: Verdicts { marks: prunes.ladder, of: Default::default(), bufs: Vec::new(), at: Vec::new(), disallowed: false },
             guards: Guards { observer: None, observed: Vec::new(), noted: Default::default(), registered: Default::default(), guarded: Default::default(), reference: false, last_shape: 0 },
             bundles: UnitBundles::default(),
             src_regions: Vec::new(),
