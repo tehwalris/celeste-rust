@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use celeste_core::arith::Arithmetic;
 use celeste_engine::exact::{Key, KeyAdditions, KeySpace};
-use celeste_engine::runtime2::{mix64, Col, ColRepr, Rt2, Template, AV, P8};
+use celeste_engine::runtime2::{mix64, Col, ColRepr, Rt2, Template, AV};
 use celeste_engine::shape::{Cell, Shape};
 
 use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128, wide};
@@ -24,7 +24,7 @@ use super::set::{PlainTable, RegionSet};
 use super::Sk;
 
 #[derive(Clone)]
-pub struct Layer<N: Arithmetic = P8> {
+pub struct Layer<N: Arithmetic> {
     pub(crate) set: RegionSet,
     /// Per shape (hash) its skeleton, a template (`SkelRecord::template`).
     pub(crate) skeletons: FxHashMap<u64, Arc<Template<N>>>,
@@ -111,7 +111,7 @@ pub(crate) fn bits(mut m: u64) -> impl Iterator<Item = u32> {
 /// cell how its column holds numbers (`ColRepr::decoded`: the code merges
 /// `Num(n)` and `Ival(n, n)`). Equal records decode every key alike.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub(crate) struct SkelRecord<N = P8> {
+pub(crate) struct SkelRecord<N> {
     pub(crate) shape_hash: u64,
     pub(crate) structure: Vec<DiskCell<N>>,
     pub(crate) globals: Vec<u32>,
@@ -127,7 +127,7 @@ pub(crate) struct SkelRecord<N = P8> {
 /// cell it was before `shape::Cell` (a closure's captures as uniform
 /// pointer columns), so the files' bytes are the same.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub(crate) enum DiskCell<N = P8> {
+pub(crate) enum DiskCell<N> {
     Val,
     Obj(Vec<(u32, u32)>),
     Arr(Vec<u32>),
@@ -238,7 +238,7 @@ pub(crate) struct RegionIndex {
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(bound = "")]
-pub(crate) struct FrameHeader<N: Arithmetic = P8> {
+pub(crate) struct FrameHeader<N: Arithmetic> {
     pub(crate) frame: u32,
     /// `(index, hash)` of the shapes numbered here.
     pub(crate) shapes: Vec<(u32, u64)>,
@@ -266,7 +266,7 @@ impl<N: Arithmetic> FrameHeader<N> {
 }
 
 /// What a frame file holds besides its states.
-pub(crate) struct FrameMeta<'a, N: Arithmetic = P8> {
+pub(crate) struct FrameMeta<'a, N: Arithmetic> {
     pub(crate) frame: u32,
     pub(crate) shapes: &'a [(u32, u64)],
     pub(crate) keys: &'a KeyAdditions<N>,
@@ -393,7 +393,7 @@ pub(crate) fn write_frame<N: crate::search::rem::Rem>(path: &Path, meta: &FrameM
     })
 }
 
-pub(crate) struct FrameFile<N: Arithmetic = P8> {
+pub(crate) struct FrameFile<N: Arithmetic> {
     file: Mapped,
     pub(crate) header: FrameHeader<N>,
 }
@@ -429,7 +429,7 @@ impl<N: Arithmetic> FrameFile<N> {
     /// from `room` (`None`: none - a reader of keys and cells only).
     pub(crate) fn layer(&self, room: Option<(i16, i16)>, threads: usize) -> Result<(Layer<N>, Vec<(u32, u64)>)> {
         let n = self.header.regions.len();
-        let parts: Vec<Result<RegionEntries>> = super::wave::par_map(&(0..n).collect::<Vec<_>>(), threads, |&i| self.region(i));
+        let parts: Vec<Result<RegionEntries>> = crate::par::map(&(0..n).collect::<Vec<_>>(), threads, |&i| self.region(i));
         let mut layer = Layer::<N>::default();
         let mut wins = Vec::new();
         for (i, p) in parts.into_iter().enumerate() {
@@ -491,7 +491,7 @@ pub(crate) fn check_frame_file<N: crate::search::rem::Rem>(path: &Path, front: &
     let starts = layer.set.entry_starts();
     let differ = |what: String| anyhow!("{}: STORED STATES DIFFER from the forward's ({what})", path.display());
     ensure!(f.header.regions.len() == tables.len(), differ(format!("{} regions in memory, {} read back", tables.len(), f.header.regions.len())));
-    let parts: Vec<Result<()>> = super::wave::par_map(&(0..tables.len()).collect::<Vec<_>>(), threads, |&i| {
+    let parts: Vec<Result<()>> = crate::par::map(&(0..tables.len()).collect::<Vec<_>>(), threads, |&i| {
         let (region, t) = &tables[i];
         ensure!(f.header.regions[i].region == *region, differ(format!("region {} read back as {}", region, f.header.regions[i].region)));
         let e = f.region(i)?;
@@ -511,7 +511,7 @@ pub(crate) fn check_frame_file<N: crate::search::rem::Rem>(path: &Path, front: &
 /// A TREE's frame files through a frame: its codebooks (the shapes by
 /// index, the key space: every file's additions, any order) and each
 /// frame's file (none past a dead frontier: those frames are empty).
-pub struct Tree<N: Arithmetic = P8> {
+pub struct Tree<N: Arithmetic> {
     pub(crate) dir: PathBuf,
     pub(crate) last: u32,
     pub(crate) frames: Vec<Option<FrameFile<N>>>,
@@ -663,8 +663,10 @@ pub(crate) fn decode_states<N: Arithmetic>(layer: &Layer<N>, space: &KeySpace<N>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeste_core::pico8_num::Pico8Num as P8;
+    use crate::search::arcs::Fixed16;
 
-    fn layer_of(entries: &[(u32, Key, u64)]) -> Layer {
+    fn layer_of(entries: &[(u32, Key, u64)]) -> Layer<P8> {
         let mut l = Layer::default();
         let mut i = 0;
         while i < entries.len() {
@@ -695,11 +697,11 @@ mod tests {
         let p = frame_path(&dir, 7);
         let st = |region: u32, key: (u64, u64), local: u8| Sk { region, key, local };
         let h = |a: u16, b: u16| Hull { x: HArc { start: a, last: b }, y: HArc { start: b, last: a } };
-        let hulls: Vec<Hull> = (0..a.states() as u32).map(|i| h(i as u16, (i * 7) as u16)).collect();
-        let g = |sk: Sk, layer: u16, hull: Hull| Grown { sk, layer, hull };
+        let hulls: Vec<Hull<Fixed16>> = (0..a.states() as u32).map(|i| h(i as u16, (i * 7) as u16)).collect();
+        let g = |sk: Sk, layer: u16, hull: Hull<Fixed16>| Grown { sk, layer, hull };
         let mut grown = vec![g(st(3, (0, 5), 0), 0, h(1, 2)), g(st(3, (0, 5), 9), 0, h(65535, 0)), g(st(3, (1 << 40, 1), 1), 0, h(3, 65535)), g(st(70, (0, 0), 63), 2, h(0, 0)), g(st(4096, (u64::MAX, u64::MAX), 5), 2, h(9, 9)), g(st(5, (0, 1), 5), 6, h(9, 9))];
         let mut v = 1u64;
-        let mut big: Vec<Grown> = (0..GROWN_BLOCK as u64 * 2 + 77)
+        let mut big: Vec<Grown<P8>> = (0..GROWN_BLOCK as u64 * 2 + 77)
             .map(|i| {
                 crate::testutil::lcg(&mut v);
                 g(st((v >> 50) as u32, (v >> 7, v), (v % 64) as u8), (i / 5000) as u16 + 7, h(v as u16, (v >> 16) as u16))
@@ -709,8 +711,8 @@ mod tests {
         big.dedup_by_key(|g| (g.layer, g.sk));
         grown.extend(big);
         // The grown states as a frontier's old layers (their `was` unwritten).
-        let by_layer = |gs: &[Grown]| -> Vec<OldLayer> {
-            let mut by: Vec<OldLayer> = Vec::new();
+        let by_layer = |gs: &[Grown<P8>]| -> Vec<OldLayer<P8>> {
+            let mut by: Vec<OldLayer<P8>> = Vec::new();
             for x in gs {
                 if by.last().is_none_or(|l| l.layer != x.layer) {
                     by.push(OldLayer::new(x.layer, 0));
@@ -736,7 +738,7 @@ mod tests {
         assert!(write_frame(&p, &meta, &Frontier { old: swapped, ..front.clone() }, &wins, 2).is_err(), "layers unsorted");
         // The new states' hulls past a block.
         let many = layer_of(&(0..(NEW_BLOCK as u64 + 5) / 64 + 1).map(|k| (9, (0, k), u64::MAX)).collect::<Vec<_>>());
-        let mh: Vec<Hull> = (0..many.states() as u32).map(|i| h(i as u16, 3)).collect();
+        let mh: Vec<Hull<Fixed16>> = (0..many.states() as u32).map(|i| h(i as u16, 3)).collect();
         let front = Frontier { new: many, hulls: mh.clone(), old: Vec::new() };
         write_frame(&p, &meta, &front, &[], 2).unwrap();
         check_frame_file(&p, &front, &[], 2).unwrap();

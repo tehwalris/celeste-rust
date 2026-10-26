@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn where_a_path_ended_merges_per_case() {
         let mut d = Symbolic::default();
-        let mut t: State<Symbolic> = State::new(&mut d);
+        let mut t: State<Symbolic<P8>> = State::new(&mut d);
         let mut f = t.clone();
         let sym = d.graph.leaf(Op::Cell(1));
         let zero = d.num(P8::from_i16(0));
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn merging_costs_a_select_only_where_the_arms_disagree() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State::new(&mut d);
+        let mut s: State<Symbolic<P8>> = State::new(&mut d);
         let player = s.heap.new_table();
         s.heap.tables.get_mut(&s.globals).unwrap().hash.insert("p".into(), Value::Table(player));
 
@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn a_merge_selects_on_the_separating_decision_not_the_guard() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State::new(&mut d);
+        let mut s: State<Symbolic<P8>> = State::new(&mut d);
         let a = d.num(P8::from_i16(1));
         let b = d.num(P8::from_i16(2));
         s.heap.tables.get_mut(&s.globals).unwrap().hash.insert("x".into(), Value::Num(a));
@@ -570,7 +570,7 @@ mod tests {
         assert_eq!(m.state.path, vec![(g, true)], "the merged path is the common prefix");
 
         // Paths not diverging at one shared decision fall back to the guard.
-        let mut p: State<Symbolic> = State::new(&mut d);
+        let mut p: State<Symbolic<P8>> = State::new(&mut d);
         (p.guard, p.path) = (g, vec![(g, true)]);
         let mut q = p.clone();
         q.guard = c;
@@ -583,7 +583,7 @@ mod tests {
     #[test]
     fn differing_shapes_do_not_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State::new(&mut d);
+        let mut s: State<Symbolic<P8>> = State::new(&mut d);
         let obj = s.heap.new_table();
         s.heap.tables.get_mut(&s.globals).unwrap().arr.push(Value::Table(obj));
 
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn garbage_does_not_prevent_a_merge() {
         let mut d = Symbolic::default();
-        let mut s: State<Symbolic> = State::new(&mut d);
+        let mut s: State<Symbolic<P8>> = State::new(&mut d);
         let mut f = s.clone();
         // One arm allocated a temporary nothing points at.
         let _garbage = f.heap.new_table();

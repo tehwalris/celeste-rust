@@ -8,7 +8,6 @@ use std::collections::BTreeSet;
 
 use anyhow::{anyhow, bail, Result};
 
-use celeste_core::arith::Fixed;
 
 use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{Op, Ty};
@@ -48,7 +47,7 @@ pub fn key(k: &str) -> Step {
 
 /// A scalar outside any domain: what a slot concretely holds.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Conc<A: GraphArith = Fixed> {
+pub enum Conc<A: GraphArith> {
     Num(A),
     Bool(bool),
 }
@@ -140,7 +139,7 @@ fn collect<D: Domain>(
 /// held `init[i]` before it was replaced by a graph leaf. `pins`: `(cell
 /// index, value)` for inputs BAKED INTO the body, read only by their `Op::Pin`
 /// check (`error::pins_hold`).
-pub struct Iface<A: GraphArith = Fixed> {
+pub struct Iface<A: GraphArith> {
     pub slots: Vec<Path>,
     pub init: Vec<Conc<A>>,
     pub pins: Vec<(usize, Conc<A>)>,

@@ -96,7 +96,7 @@ reference for semantics only.
    block in; every output row out through the storage's `UnitSink`, keyed,
    with its cell (player position), widened for the level. Two impls: the
    compiled `compiled::FrameEngine` and the reference `engines::reference`
-   (`RefEngine`: the tracer's interpreter over `RefDomain`, one lane and
+   (`ReferenceEngine`: the tracer's interpreter over `RefDomain`, one lane and
    one fork path at a time). Both convert states to blocks through one
    converter (`trace::block`), so their rows key alike.
 2. **The block** (`Rt2`): columnar; key and cell exposed, fields opaque.

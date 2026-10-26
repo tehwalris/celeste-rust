@@ -359,8 +359,10 @@ settled here. Evidence is file:line at develop 19869c5d.
   rooms; a grid the kernels cannot be built on fails at the build). It is
   no longer recorded and `--override-settings` is deleted; settings
   VERSION 4.
-- OPEN (f): the `= P8` type defaults let fixed-only code run on float trees
-  by omission (`Visited::load` exists only for 16.16); remove the defaults
-  so the arithmetic is explicit. Deferred: a wide mechanical change across
-  the engine and storage, which the `p` deletion (platforms-exact) is
-  rewriting now.
+- SETTLED (f), round 4 F3b/F3c: the `= P8` type defaults let fixed-only
+  code run on float trees by omission (`Visited::load` exists only for
+  16.16). No type parameter defaults to an arithmetic or a circle any
+  more, nor do the aliases `RefEngine`/`FloatRefEngine`, `Graph::new` or
+  `runtime2::P8` stand for one: fixed-only code says `<Fixed>`, and
+  `conventions::no_type_parameter_defaults_to_an_arithmetic` refuses a
+  default.

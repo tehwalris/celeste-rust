@@ -4,13 +4,14 @@
 //! against the host libm (`robust`).
 
 use anyhow::Result;
-use celeste_engine::runtime2::{Rt2, P8};
+use celeste_core::arith::Fixed;
+use celeste_engine::runtime2::Rt2;
 use celeste_rust::frame::wins_of;
 use celeste_rust::search::inspect::cell_names;
 use celeste_rust::settings::{Arith, Settings};
 use celeste_rust::storage::layer::Tree;
 use celeste_rust::storage::Sk;
-use celeste_rust::engines::reference::RefEngine;
+use celeste_rust::engines::reference::ReferenceEngine;
 
 use crate::{prefixes, where_, Rows};
 
@@ -89,7 +90,7 @@ pub fn census(run: &Settings, a: CensusArgs) -> Result<()> {
     anyhow::ensure!(!t.float(), "census: a 16.16 tree only so far");
     let cfg = &*t.run.settings;
     let (frame, only) = a.rows.of(&t)?;
-    let tree = Tree::<P8>::open(&t.dir, frame)?;
+    let tree = Tree::<Fixed>::open(&t.dir, frame)?;
     let ids = celeste_rust::compiled::ids();
     let keep = |s: Sk| only.is_none_or(|c| s.cell() == c);
     // Per shape: its rows, per column its distinct codes (capped), whether
@@ -97,12 +98,12 @@ pub fn census(run: &Settings, a: CensusArgs) -> Result<()> {
     // cells and the distinct (spd.x, spd.y) pairs.
     struct S {
         rows: u64,
-        cols: Vec<rustc_hash::FxHashSet<Code>>,
+        cols: Vec<rustc_hash::FxHashSet<Code<Fixed>>>,
         varying: Vec<bool>,
         ivals: Vec<u64>,
         ubools: Vec<u64>,
         names: std::collections::HashMap<usize, String>,
-        spd: rustc_hash::FxHashSet<(Code, Code)>,
+        spd: rustc_hash::FxHashSet<(Code<Fixed>, Code<Fixed>)>,
     }
     let mut by_shape: std::collections::BTreeMap<u64, S> = Default::default();
     for (_, rt2) in tree.rows(frame, cfg.room, 1 << 20, &keep, cfg.threads())? {
@@ -163,7 +164,7 @@ pub fn census(run: &Settings, a: CensusArgs) -> Result<()> {
     // by frame (pointers count as structure).
     if a.erase.is_some() || only.is_some() {
         let erase = prefixes(a.erase.as_deref().unwrap_or(""));
-        let code = |v: AV| -> Code { Code::of(if let AV::Ptr(_) = v { AV::Ptr(0) } else { v }) };
+        let code = |v: AV<Fixed>| -> Code<Fixed> { Code::of(if let AV::Ptr(_) = v { AV::Ptr(0) } else { v }) };
         let mut through: rustc_hash::FxHashSet<Box<[u8]>> = Default::default();
         println!("frame | new | distinct new | distinct through");
         for f in 0..=frame {
@@ -255,12 +256,12 @@ pub fn trajectory(cfg: &Settings, a: TrajectoryArgs) -> Result<()> {
             Ok(Some(celeste_rust::settings::pair::<i32>(l, &trajectory).map_err(anyhow::Error::msg)?))
         })
         .collect::<Result<_>>()?;
-    let mut eng = RefEngine::new(&cfg)?;
+    let mut eng = ReferenceEngine::<Fixed>::new(&cfg)?;
     // (state, the inputs that led to it)
-    let mut layer: Vec<(Rt2, Vec<u8>)> = vec![(eng.initial()?, Vec::new())];
+    let mut layer: Vec<(Rt2<Fixed>, Vec<u8>)> = vec![(eng.initial()?, Vec::new())];
     for (i, want) in traj.iter().enumerate() {
         let f = i as u32 + 1;
-        let mut next: Vec<(Rt2, Vec<u8>)> = Vec::new();
+        let mut next: Vec<(Rt2<Fixed>, Vec<u8>)> = Vec::new();
         let mut seen: rustc_hash::FxHashSet<celeste_engine::exact::ExactRow> = Default::default();
         let mut tried = 0usize;
         // Where the successors went: reported when none is at `want`.

@@ -15,7 +15,7 @@
 
 use anyhow::{bail, Result};
 
-use celeste_core::arith::{Arithmetic, Fixed};
+use celeste_core::arith::Arithmetic;
 
 use crate::trace::domain::{Arith, Cmp, Domain, Fun1, Fun2};
 use crate::transpile::graph::Cut;
@@ -81,7 +81,7 @@ impl Cursor {
 
 /// The reference domain of arithmetic `A`: the cursor is its only state.
 #[derive(Debug, Default, Clone)]
-pub struct RefDomain<A: Arithmetic = Fixed> {
+pub struct RefDomain<A: Arithmetic> {
     pub cursor: Cursor,
     arith: std::marker::PhantomData<A>,
 }
@@ -281,6 +281,7 @@ impl<A: Arithmetic> Domain for RefDomain<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeste_core::arith::Fixed;
     use crate::pico8_num::{Pico8Num as P8, Pico8NumInterval as Iv};
 
     #[test]

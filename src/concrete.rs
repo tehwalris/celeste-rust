@@ -1,8 +1,8 @@
 //! Concrete inputs and states: input bytes and reading a concrete row's
-//! fields. The concrete step itself is `RefEngine::step`.
+//! fields. The concrete step itself is `ReferenceEngine::step`.
 
 use anyhow::{anyhow, Context, Result};
-use celeste_core::arith::Arithmetic;
+use celeste_core::arith::{Arithmetic, Fixed};
 use celeste_engine::runtime2::{Rt2, AV};
 
 
@@ -108,7 +108,7 @@ pub fn witness(inputs: &[u8], s: &crate::settings::Settings) -> Result<Witness> 
     } else {
         Vec::new()
     };
-    let mut eng = crate::engines::reference::RefEngine::new(&crate::settings::Settings { seed_chests: true, ..s.clone() })?;
+    let mut eng = crate::engines::reference::ReferenceEngine::<Fixed>::new(&crate::settings::Settings { seed_chests: true, ..s.clone() })?;
     let mut state = eng.initial()?;
     let mut exit = None;
     for (i, &b) in inputs.iter().enumerate() {
@@ -137,7 +137,7 @@ pub(crate) fn leaving<N: Arithmetic>(state: &Rt2<N>, s: &crate::settings::Settin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engines::reference::RefEngine;
+    use crate::engines::reference::ReferenceEngine;
 
     /// The split frame (`--split-frame`) must run exactly the original
     /// frame, down to the SHAPE (equal states in two shapes never dedupe).
@@ -147,14 +147,14 @@ mod tests {
     fn split_frame_lands_on_the_unsplit_states_through_a_dash_freeze() {
         let bytes = read_inputs("tas/room_1_0_exit_frame_99.txt").expect("tas");
         assert_eq!(bytes.len(), 99);
-        let fingerprint = |r: &Rt2| {
+        let fingerprint = |r: &Rt2<Fixed>| {
             let mut c = r.clone_block();
             c.canonical();
             (r.shape_hash(), celeste_engine::exact::exact_rows(&c), crate::storage::cells::block_cells(r).expect("cells"))
         };
         // The cart is read when an engine is built, under its settings.
-        let mut whole = RefEngine::new(&Default::default()).expect("engine");
-        let mut split = RefEngine::new(&crate::settings::Settings { split_frame: true, ..Default::default() }).expect("split engine");
+        let mut whole = ReferenceEngine::<Fixed>::new(&Default::default()).expect("engine");
+        let mut split = ReferenceEngine::<Fixed>::new(&crate::settings::Settings { split_frame: true, ..Default::default() }).expect("split engine");
 
         let mut a = whole.initial().expect("init");
         let mut b = split.initial().expect("split init");
@@ -179,7 +179,7 @@ mod tests {
         use celeste_core::pico8_num::Pico8Num as P8;
         let runs: [(u8, usize); 8] = [(0, 23), (2, 10), (34, 1), (0, 4), (16, 1), (0, 2), (16, 1), (0, 6)];
         let inputs: Vec<u8> = runs.iter().flat_map(|&(b, n)| std::iter::repeat(b).take(n)).collect();
-        let mut eng = RefEngine::new(&Default::default()).expect("engine");
+        let mut eng = ReferenceEngine::<Fixed>::new(&Default::default()).expect("engine");
         let mut state = eng.initial().expect("start");
         for &b in &inputs[..42] {
             state = eng.frame(&state, b).expect("frame").pop().expect("one leaf");

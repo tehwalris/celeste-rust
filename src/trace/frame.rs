@@ -11,13 +11,12 @@ use crate::transpile::graph::Ty;
 
 use super::domain::{Domain, Symbolic};
 use crate::transpile::garith::GraphArith;
-use celeste_core::arith::Fixed;
 use super::heap::Value;
 use super::iface::{self, Conc, Iface, Path};
 use super::interp::{Flow, Interp};
 use super::state::State;
 
-pub struct FrameOut<A: GraphArith = Fixed> {
+pub struct FrameOut<A: GraphArith> {
     pub guard: NodeId,
     /// Where this outcome's row is undefined (`trace::error`); live lanes on
     /// which it holds decline. Derived, never carried.
@@ -72,7 +71,7 @@ impl<A: GraphArith> Clone for FrameOut<A> {
     }
 }
 
-pub struct Frame<A: GraphArith = Fixed> {
+pub struct Frame<A: GraphArith> {
     pub iface: Iface<A>,
     pub fork_origins: Vec<(u8, String)>,
     pub forks: u8,
@@ -129,7 +128,7 @@ fn out_fields<A: GraphArith>(
     Ok((out, ubool))
 }
 
-pub struct TraceSpec<'s, A: GraphArith = Fixed> {
+pub struct TraceSpec<'s, A: GraphArith> {
     /// The input slots: every scalar under them is a cell.
     pub roots: &'s [Path],
     /// Slots the body reads as a constant (`Op::Pin`).
@@ -360,11 +359,12 @@ fn finish_outcome<A: GraphArith>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeste_core::arith::Fixed;
     use crate::trace::cart;
     use crate::transpile::graph::{Eval, Graph, Val};
 
     /// Input cells `cells` (in `Iface` order) as exact values.
-    fn exact(cells: &[Conc]) -> std::collections::HashMap<u32, Val> {
+    fn exact(cells: &[Conc<Fixed>]) -> std::collections::HashMap<u32, Val<Fixed>> {
         cells.iter().enumerate().map(|(i, c)| (i as u32, match c {
             Conc::Num(n) => Val::exact_num(*n),
             Conc::Bool(b) => Val::Bool(Some(*b)),
@@ -449,7 +449,7 @@ mod tests {
         let s = crate::settings::Settings::default();
         let chunks = cart::Chunks::parse(&s).expect("chunks");
         let frame = &chunks.frame;
-        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let mut it: Interp<Symbolic<Fixed>> = Interp::new(Symbolic::default());
         let mut st = cart::boot(&mut it, &chunks, s.room).expect("boot");
         let mut player = None;
         for _ in 0..40 {
@@ -472,9 +472,9 @@ mod tests {
         // No error in whichever outcome claims this assignment.
         let (g, map) = at_buttons(&it.d.graph, &f, &[false; 6]).expect("the six buttons");
         let room = it.room.expect("the room");
-        let ok_at = |cells: &[Conc]| -> bool {
+        let ok_at = |cells: &[Conc<Fixed>]| -> bool {
             let v = g.eval(&exact(cells), Eval::Exact, Some(room)).expect("the frame at a point");
-            let live: Vec<&FrameOut> = f.outs.iter().filter(|o| v[map[o.guard as usize] as usize] == Val::Bool(Some(true))).collect();
+            let live: Vec<&FrameOut<Fixed>> = f.outs.iter().filter(|o| v[map[o.guard as usize] as usize] == Val::Bool(Some(true))).collect();
             assert!(!live.is_empty(), "an outcome claims the lane");
             let ok: Vec<bool> = live.iter().map(|o| v[map[o.error as usize] as usize] == Val::Bool(Some(false))).collect();
             assert!(ok.iter().all(|&k| k == ok[0]), "the claiming outcomes disagree on the key");
@@ -513,7 +513,7 @@ mod tests {
             .iter()
             .map(|(x, y, w, h)| full_moon::parse(&format!("ice_probe = ice_at({x},{y},{w},{h})")).expect("parse probe"))
             .collect();
-        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let mut it: Interp<Symbolic<Fixed>> = Interp::new(Symbolic::default());
         let st = cart::boot(&mut it, &chunks, s.room).expect("boot");
         let cd = &celeste_core::cart_data::CART;
         let scan = |rx: i16, ry: i16, x: i16, y: i16, w: i16, h: i16| -> bool {
@@ -607,10 +607,10 @@ end
 ",
         )
         .expect("parse probe");
-        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
+        let mut it: Interp<Symbolic<Fixed>> = Interp::new(Symbolic::default());
         it.room = Some(celeste_core::room::Room::of(s.room));
         // `cart::boot`, with the Lua `tile_flag_at` kept under another name.
-        let st = cart::fresh_state::<Symbolic>(&mut it.d);
+        let st = cart::fresh_state::<Symbolic<Fixed>>(&mut it.d);
         let st = cart::run_one(&mut it, &chunks.top, st).expect("toplevel");
         let mut st = cart::run_one(&mut it, &keep, st).expect("keep the Lua tile_flag_at");
         cart::inject_tile_flag_at(&mut st);
@@ -672,8 +672,8 @@ end
 ";
         let top = full_moon::parse(src).expect("parse");
         let call = full_moon::parse("result = f(amount)").expect("parse call");
-        let mut it: Interp<Symbolic> = Interp::new(Symbolic::default());
-        let st = cart::fresh_state::<Symbolic>(&mut it.d);
+        let mut it: Interp<Symbolic<Fixed>> = Interp::new(Symbolic::default());
+        let st = cart::fresh_state::<Symbolic<Fixed>>(&mut it.d);
         let mut st = cart::run_one(&mut it, &top, st).expect("toplevel");
         let cell = it.d.graph.leaf(crate::transpile::graph::Op::Cell(0));
         iface::set(&mut st, &[iface::key("amount")], Value::Num(cell)).expect("set amount");

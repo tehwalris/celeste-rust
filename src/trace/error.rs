@@ -224,10 +224,11 @@ fn undecided<A: GraphArith>(d: &mut Symbolic<A>, b: NodeId) -> NodeId {
 
 #[cfg(test)]
 mod tests {
+    use celeste_core::arith::Fixed;
     use super::super::domain::Domain;
     use super::*;
 
-    fn cell(d: &mut Symbolic, i: u32, interval: bool) -> NodeId {
+    fn cell(d: &mut Symbolic<Fixed>, i: u32, interval: bool) -> NodeId {
         if interval {
             d.graph.set_cell_kind(i, crate::transpile::graph::Ty::Ival);
             d.forget_intervals();
@@ -236,13 +237,13 @@ mod tests {
     }
 
     /// `not NoWrap(n)`: `n`'s own overflow error.
-    fn wraps(d: &mut Symbolic, n: NodeId) -> NodeId {
+    fn wraps(d: &mut Symbolic<Fixed>, n: NodeId) -> NodeId {
         let fits = d.graph.fold(Op::NoWrap, vec![n]);
         d.graph.fold(Op::Not, vec![fits])
     }
 
     /// `a or b`, as `for_outcomes` builds it.
-    fn or(d: &mut Symbolic, a: NodeId, b: NodeId) -> NodeId {
+    fn or(d: &mut Symbolic<Fixed>, a: NodeId, b: NodeId) -> NodeId {
         d.graph.fold(Op::Or, vec![a, b])
     }
 
@@ -398,7 +399,7 @@ mod tests {
     fn interval_scale_and_divide_own_their_no_wrap_where_the_literal_can_overflow() {
         let mut d = Symbolic::default();
         let x = cell(&mut d, 0, true);
-        let k = |d: &mut Symbolic, raw: i32| d.graph.leaf(Op::Const(raw, raw));
+        let k = |d: &mut Symbolic<Fixed>, raw: i32| d.graph.leaf(Op::Const(raw, raw));
         for (op, raw, owns) in [
             (Op::Mul, 0x2_0000, true),
             (Op::Mul, 0x1_0000, false),

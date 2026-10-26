@@ -5,7 +5,6 @@
 //! Abstract-domain limits are per-lane facts in the graph (a body's `error`
 //! mask), never Rust errors.
 
-use celeste_core::arith::Fixed;
 use celeste_engine::runtime2::AV;
 
 use super::garith::GraphArith;
@@ -13,7 +12,7 @@ use super::graph::{NodeId, Ty};
 
 /// One stored field of an outcome.
 #[derive(Clone, Debug)]
-pub struct OutField<A: GraphArith = Fixed> {
+pub struct OutField<A: GraphArith> {
     pub cell: u32,
     /// The column's type (an interval column may hold a point).
     pub ty: Ty,

@@ -10,7 +10,6 @@ use std::os::raw::c_void;
 use anyhow::{Context, Result};
 
 use celeste_core::arith::Arithmetic;
-use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::exact::Code;
 use celeste_engine::shape::{KeyRole, Layout};
 use celeste_engine::runtime2::{Col, ColRepr, Rt2, Template, AV};
@@ -142,7 +141,7 @@ impl DupRef {
 
 /// A per-outcome accumulator recipe: its rows' skeleton and the boundary's
 /// constants, so the append emits rows already at the boundary.
-struct AccTemplate<N: Arithmetic = P8> {
+struct AccTemplate<N: Arithmetic> {
     shape_hash: u64,
     /// The key's uniform fields: every KEYED value cell uniform at the
     /// boundary, at its WIDENED value, as `(cell, code)` by cell.
@@ -182,7 +181,7 @@ fn thread_stack() -> usize {
 
 /// One shape's assembled kernel and the metadata the append needs, in the
 /// lanes of `N` (`KernelLanes`).
-struct AsmKernel<N: KernelLanes = P8> {
+struct AsmKernel<N: KernelLanes> {
     loaded: Loaded,
     compiled: Compiled,
     bodies: Vec<AsmBody>,
@@ -445,7 +444,7 @@ impl<N: KernelLanes> AsmKernel<N> {
 }
 
 /// Per (thread, kernel) reusable input and output buffers.
-pub struct Scratch<N: KernelLanes = P8> {
+pub struct Scratch<N: KernelLanes> {
     kernel: usize,
     inbuf: Vec<u8>,
     outbuf: Vec<u8>,
@@ -487,7 +486,7 @@ impl<N: KernelLanes> Scratch<N> {
 }
 
 /// A body's roots by kind with their union columns, plus its uniform cells.
-struct BodyCols<N: Arithmetic = P8> {
+struct BodyCols<N: Arithmetic> {
     num: Vec<(usize, usize)>,
     ival: Vec<(usize, usize)>,
     /// A NUMBER root into a union `Ival` column, stored `[v, v]`.
@@ -594,7 +593,7 @@ impl<N: KernelLanes> BodyCols<N> {
 }
 
 /// One input column of a call, resolved to what the packer copies from.
-enum InputView<'c, N: Arithmetic = P8> {
+enum InputView<'c, N: Arithmetic> {
     Num(&'c [N]),
     NumU(N::Raw),
     Ival(&'c [(N, N)]),
@@ -658,7 +657,7 @@ fn read_zb_may<N: KernelLanes>(buf: &[u8], half: usize, off: usize) -> u16 {
 }
 
 /// The start room's assembled kernels for one level.
-pub struct Registry<N: KernelLanes = P8> {
+pub struct Registry<N: KernelLanes> {
     /// One kernel per reached (shape, region); a missing key is a coverage gap.
     kernels: HashMap<(u64, Option<Region>), AsmKernel<N>>,
     /// The region grid the set was built on.
@@ -812,8 +811,9 @@ impl<N: KernelLanes> Registry<N> {
             .context("retracing the start room for ASM kernels")?;
         let trace_s = t0.elapsed().as_secs_f64();
         let t_asm = std::time::Instant::now();
-        // The shapes in parallel; a shape's build recurses deeply.
-        let pool = crate::par::Pool::per_core().stack(128 * 1024 * 1024);
+        // The shapes in parallel on the run's `--threads` workers; a shape's
+        // build recurses deeply.
+        let pool = crate::par::Pool::new(run.settings.threads()).stack(128 * 1024 * 1024);
         let n_workers = pool.workers(refs.len());
         let built = pool.map(refs.len(), |si| {
             let (region, r) = &refs[si];
@@ -958,7 +958,7 @@ fn apply_union<N: KernelLanes>(kernel: &mut AsmKernel<N>, unions: &HashMap<u64, 
 /// rest, alike for a fresh build and a cached one (`compiled::cache`).
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
-pub(crate) struct Recipe<N: Arithmetic = P8> {
+pub(crate) struct Recipe<N: Arithmetic> {
     pub(crate) shape: u64,
     pub(crate) region: Option<Region>,
     pub(crate) compiled: Compiled,
@@ -993,7 +993,7 @@ pub(crate) struct BodySlots {
 /// cell's the traced outcome's.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
-pub(crate) struct Outcome<N: Arithmetic = P8> {
+pub(crate) struct Outcome<N: Arithmetic> {
     cells: Vec<celeste_engine::shape::Cell>,
     globals: Vec<u32>,
     cols: Vec<ColRepr<N>>,
@@ -1333,7 +1333,7 @@ impl Drop for BuildPurgeDelay {
         if b.0 == 0 {
             super::set_purge_delay(b.1);
             // Purge what the (exited) builder threads freed under the delay.
-            unsafe { libmimalloc_sys::mi_collect(true) };
+            crate::par::collect_freed();
         }
     }
 }

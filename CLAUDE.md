@@ -22,7 +22,8 @@ Where a level's bound is loose, `--level r0sxn,r0sx` runs the OBJECTS
 LADDER: the finer level's forward filtered by the coarser one's reached
 nodes. The arithmetic is a setting: PICO-8's 16.16 (`--arith fixed`, the
 real game) or the TAS tools' doubles (`--arith float`; `rewrite dual` for
-runs valid in both).
+runs valid in both). No type parameter defaults to an arithmetic: code that
+holds numbers names `Fixed` or `Float` (a conventions test).
 
 Every any% room has a confirmed optimum, and the categories nodiag, 100%
 and gemskip are mostly done (plans/results.md).
@@ -249,7 +250,9 @@ One binary documents itself: `rewrite --help` (the search, every
 diagnostic, `run`: one concrete run), `rewrite <command> --help` (`rewrite
 check --help`: the checks of a tree; `rewrite bench --help`; `rewrite l1
 --help`: the level -1 table, its probe and check). The settings flags
-(`--room`, the category, `--level-minus-one`, `--threads`, ...) are shared
+(`--room`, the category, `--level-minus-one`, `--threads` (which also sizes
+the startup walk and the kernel build; default one per physical core), ...)
+are shared
 by every command; a command that
 reads a finished tree (`--tree DIR`, or a search's `--search-dir`)
 takes them from the tree's records instead and refuses them. UNITS are in

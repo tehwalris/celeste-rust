@@ -6,7 +6,6 @@
 use crate::search::hull::{AccOf, HullOf};
 use anyhow::Result;
 use celeste_core::arith::Arithmetic;
-use celeste_core::pico8_num::Pico8Num as P8;
 use celeste_engine::runtime2::{Col, ColRepr, Rt2, Template, AV};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -19,7 +18,7 @@ use celeste_engine::exact::{is_provisional, KeySpace, Provisional, RowKey};
 
 /// A typed varying column of buffered rows: raw words, (low, high) pairs,
 /// or a byte per bool (0 false, 1 true, 2 unknown).
-pub(crate) enum TCol<N: Arithmetic = P8> {
+pub(crate) enum TCol<N: Arithmetic> {
     Num(Vec<N::Raw>),
     Ival(Vec<(N::Raw, N::Raw)>),
     Bool(Vec<u8>),
@@ -27,7 +26,7 @@ pub(crate) enum TCol<N: Arithmetic = P8> {
 
 /// Rows of one shape, columnar over its template, buffered only to be
 /// looked at: the coarser level's verdicts, the key check, the decode guard.
-pub(crate) struct RowBuf<N: Arithmetic = P8> {
+pub(crate) struct RowBuf<N: Arithmetic> {
     pub(crate) shape: u64,
     template: Template<N>,
     /// `(cell, column)` per varying cell, in the kernel's order.
@@ -557,7 +556,7 @@ impl<N: Rem> Pusher<N> {
     }
 }
 
-pub struct UnitSink<'a, N: Rem = P8> {
+pub struct UnitSink<'a, N: Rem> {
     keys: &'a KeySpace<N>,
     skeletons: &'a Skeletons<N>,
     /// The wave's provisional keys (a code the key space lacks: a new state).

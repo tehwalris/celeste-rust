@@ -8,7 +8,6 @@
 
 use anyhow::Result;
 
-use celeste_core::arith::Fixed;
 
 use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{Graph, NodeId};
@@ -19,7 +18,7 @@ use super::walk::{room_constant_lattice, Region, Walk};
 
 /// THE specialization of a bound frame (`lower::specialize_frame`): the
 /// fused graph and its bodies, computed once.
-pub struct Lowered<A: GraphArith = Fixed> {
+pub struct Lowered<A: GraphArith> {
     pub(crate) fused: Graph<A>,
     pub(crate) bodies: Vec<Body>,
 }
@@ -27,13 +26,13 @@ pub struct Lowered<A: GraphArith = Fixed> {
 /// One output shape of a traced frame: its stored fields, and what it
 /// computes (`roots`, over the engine's cells; `roots.fields` parallel to
 /// `fields`).
-pub struct FrameOutcome<A: GraphArith = Fixed> {
+pub struct FrameOutcome<A: GraphArith> {
     pub fields: Vec<OutField<A>>,
     pub roots: Roots,
 }
 
 /// A traced frame in the ENGINE's numbering: everything `lower_frame` needs.
-pub struct Bound<A: GraphArith = Fixed> {
+pub struct Bound<A: GraphArith> {
     /// The frame's graph over the engine's cells, each cell typed
     /// (`Graph::cell_kind`: its input layout).
     pub graph: Graph<A>,
@@ -114,7 +113,7 @@ pub fn lower_frame<A: GraphArith>(bound: &mut Bound<A>, room: Option<&celeste_co
 }
 
 /// One traced frame, bound and lowered: what the kernel registry assembles.
-pub struct LoweredFrame<A: GraphArith = Fixed> {
+pub struct LoweredFrame<A: GraphArith> {
     pub frame: Frame<A>,
     pub bound: Bound<A>,
     pub lowered: Lowered<A>,
@@ -133,10 +132,11 @@ pub(crate) fn lattice_kernel_refs<A: GraphArith>(run: &crate::settings::Run) -> 
             Ok((region, wf.frame, bound))
         })
         .collect::<Result<Vec<_>>>()?;
-    // Lower (the expensive half of a build), in parallel. Each frame is
-    // taken by exactly one worker (a `Frame` is not cloned).
+    // Lower (the expensive half of a build), on the run's `--threads`
+    // workers. Each frame is taken by exactly one worker (a `Frame` is not
+    // cloned).
     let slots: Vec<std::sync::Mutex<Option<(Option<Region>, super::frame::Frame<A>, Bound<A>)>>> = frames.into_iter().map(|x| std::sync::Mutex::new(Some(x))).collect();
-    let refs = crate::par::Pool::per_core().stack(128 << 20).map(slots.len(), |i| {
+    let refs = crate::par::Pool::new(run.settings.threads()).stack(128 << 20).map(slots.len(), |i| {
         let (key, f, mut bound) = slots[i].lock().expect("a frame's slot").take().expect("each frame is lowered once");
         let lowered = super::lower::lower_frame(&mut bound, Some(room));
         Ok((key, LoweredFrame { frame: f, bound, lowered }))

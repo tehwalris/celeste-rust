@@ -21,7 +21,7 @@ use anyhow::Result;
 use celeste_core::arith::Arithmetic;
 use celeste_engine::exact::{follower_violation, Code, FieldDict, Follow, MissKey, ShapeKeys};
 use celeste_engine::shape::KeyRole;
-use celeste_engine::runtime2::{Rt2, P8};
+use celeste_engine::runtime2::Rt2;
 
 use super::{AsmKernel, KernelLanes};
 use crate::transpile::graph::Ty;
@@ -237,7 +237,7 @@ impl KeyField {
 /// a fin root, `fin = Some((0, 0))` with one), and `UnitSink::xfer_id_raw`'s
 /// cache is keyed on them.
 pub(crate) const RAW_WORDS: usize = 4 * AxisRoots::N + 1;
-pub(crate) type RawWords<N = P8> = [<N as Arithmetic>::Raw; RAW_WORDS];
+pub(crate) type RawWords<N> = [<N as Arithmetic>::Raw; RAW_WORDS];
 
 /// A body's transfer roots (`kernel::ArcRoots`) as (offset, kind), in
 /// `ArcRoots::nodes`' order; `fin`: the outcome ends with a player.
@@ -371,7 +371,7 @@ pub(super) const MAX_DEPS: usize = 4;
 /// the `(cell, code)` of those that miss; which dependencies' leaders are
 /// among those (`exact::Deps`, a bit each), and per dependency the leader
 /// index its uniform followers were last checked at (`NONE`: none yet).
-pub(super) struct PartKey<N: Arithmetic = P8> {
+pub(super) struct PartKey<N: Arithmetic> {
     pub key: u128,
     pub missing: Vec<(u32, Code<N>)>,
     leader_missing: u32,
@@ -577,7 +577,7 @@ thread_local! {
 }
 
 /// What a slice's emission reads besides the kernel's outputs.
-pub(super) struct Slice<'a, N: Arithmetic = P8> {
+pub(super) struct Slice<'a, N: Arithmetic> {
     pub chunk: &'a Rt2<N>,
     pub lanes: &'a [usize],
     pub buf: &'a [u8],

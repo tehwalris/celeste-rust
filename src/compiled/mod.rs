@@ -93,7 +93,7 @@ pub fn ids() -> &'static BoundaryIds {
 
 /// The kernels of one LEVEL under the run's settings
 /// (`asm_kernel::registry`, built on first use), in the arithmetic of `N`.
-pub struct Kernels<N: KernelLanes = celeste_core::pico8_num::Pico8Num> {
+pub struct Kernels<N: KernelLanes> {
     run: crate::settings::Run,
     /// Each kernel counts the slices it runs (`counting`).
     counting: bool,
@@ -190,7 +190,7 @@ pub fn print_kernel_stats(st: &crate::storage::stats::Stats) -> Result<()> {
     Ok(())
 }
 
-/// The compiled `FrameStep` (the reference's: `RefEngine`).
+/// The compiled `FrameStep` (the reference's: `ReferenceEngine`).
 impl<N: KernelLanes> crate::frame::FrameStep<N> for Kernels<N> {
     fn step(
         &self,

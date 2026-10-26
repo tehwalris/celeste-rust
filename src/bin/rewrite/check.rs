@@ -32,7 +32,7 @@ pub enum Command {
     ///
     /// `--samples` stored rows of `--step` (`--row N`: the N-th alone),
     /// each one step through the tree level's kernels and through
-    /// `RefEngine`, both projected onto the level and compared by named
+    /// `ReferenceEngine`, both projected onto the level and compared by named
     /// fields. A reference successor the kernels miss is a SOUNDNESS gap; a
     /// kernel successor the reference never makes is a PRECISION gap. Every
     /// row, kernel successor and reference leaf must also convert alike on
@@ -45,7 +45,7 @@ pub enum Command {
     /// Every recorded edge carries a transfer; then `--samples` records per
     /// frame, the source row stepped by the REFERENCE engine at the tree's
     /// level (all 64 inputs, the row's unknowns forked as the kernels fork
-    /// them: `RefEngine::step_at`): at remainders INSIDE the guard some
+    /// them: `ReferenceEngine::step_at`): at remainders INSIDE the guard some
     /// input must reach the target with the predicted remainder and every
     /// one that reaches it must land where some record of that (pred,
     /// target) taking the point predicts, and at points no record of the

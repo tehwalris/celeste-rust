@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 
 use celeste_core::arith::Arithmetic;
-use celeste_engine::runtime2::{Rt2, P8};
+use celeste_engine::runtime2::Rt2;
 
 use crate::search::rem::Rem;
 use crate::storage::stats::{Lap, Stats, S};
@@ -400,7 +400,7 @@ pub(crate) trait RowCheck<N: Rem>: Sync {
 }
 
 /// What a forward filters by.
-pub(crate) struct Filters<'a, N: Arithmetic = P8> {
+pub(crate) struct Filters<'a, N: Arithmetic> {
     /// The coarser level's arc marks (the objects ladder).
     pub(crate) marks: Option<&'a MarkFilter<'a, N>>,
     /// The tree's level -1 filter.
@@ -429,7 +429,7 @@ impl<N: Arithmetic> Default for Filters<'_, N> {
 /// coarse node winning from t with r (coarse over-approximates, r exact).
 /// The projection is keyed in the COARSE tree's key space (the marks'): a
 /// code it lacks is a state the coarse tree never reached.
-pub struct MarkFilter<'a, N: Arithmetic = P8> {
+pub struct MarkFilter<'a, N: Arithmetic> {
     marked: &'a Visited<N>,
     coarser: crate::abstraction::Level,
     clock: crate::settings::Clock,
@@ -492,7 +492,7 @@ pub(crate) fn widened_keys<N: Arithmetic>(
 
 /// The interface between the loop and the engines (kernels or reference):
 /// lanes in, every successor row out, widened for the level and keyed.
-pub trait FrameStep<N: Rem = P8>: Sync {
+pub trait FrameStep<N: Rem>: Sync {
     /// One frame of `lanes` of `block` into `sink`; called concurrently on
     /// disjoint ranges (scratch in the sink or behind a lock).
     fn step(&self, block: &Rt2<N>, cell_in: &[u32], lanes: &[usize], sink: &mut crate::storage::unit::UnitSink<N>) -> Result<()>;
@@ -509,7 +509,7 @@ pub trait FrameStep<N: Rem = P8>: Sync {
 
 /// The forward's in-memory state, EXTENDED frame by frame (each checkpointed).
 #[derive(Clone)]
-pub struct ForwardState<N: Rem = P8> {
+pub struct ForwardState<N: Rem> {
     /// The last frame's frontier: its new states, and the old ones whose
     /// hull grew there.
     frontier: Frontier<N>,
@@ -1061,7 +1061,7 @@ pub(crate) fn load_marks<N: Arithmetic>(path: &std::path::Path) -> Result<(Vec<M
 /// An in-memory set of states `(shape, cell, key)` (a level's MARKED states
 /// or a diagnostic's), saved as a marks file; its keys are in the key space
 /// of the tree it names.
-pub(crate) struct Visited<N: Arithmetic = P8> {
+pub(crate) struct Visited<N: Arithmetic> {
     /// Sharded by (shape, cell); each key maps to its DEADLINE, the last frame
     /// from which it still wins by the horizon (`u16::MAX`: none).
     shards: rustc_hash::FxHashMap<(u64, u32), rustc_hash::FxHashMap<(u64, u64), u16>>,
@@ -1176,11 +1176,12 @@ pub(crate) fn tree_first_win_through<N: Arithmetic>(dir: &std::path::Path, horiz
 
 #[cfg(test)]
 mod tests {
+    use crate::search::arcs::Fixed16;
     use crate::settings::Run;
     use super::*;
     use crate::abstraction::Level;
     use crate::compiled::asm_kernel::Registry;
-    use crate::engines::reference::{RefEngine, RefFrameStep};
+    use crate::engines::reference::{ReferenceEngine, RefFrameStep};
     use crate::search::hull::Hull;
     use crate::settings::Settings;
     use crate::storage::layer::Layer;
@@ -1188,14 +1189,14 @@ mod tests {
     use celeste_engine::runtime2::{Col, AV};
 
     /// The start room's initial block.
-    fn start_blocks(s: &Settings) -> Vec<Rt2> {
-        vec![RefEngine::new(s).expect("ref engine").initial().expect("initial state").canonicalized()]
+    fn start_blocks(s: &Settings) -> Vec<Rt2<P8>> {
+        vec![ReferenceEngine::<P8>::new(s).expect("ref engine").initial().expect("initial state").canonicalized()]
     }
 
     /// The start's row a few frames after the player appears (standing, at
     /// rest), widened to `run`'s level.
-    fn standing_row(run: &crate::settings::Run) -> Rt2 {
-        let mut reference = RefEngine::new(&run.settings).expect("ref engine");
+    fn standing_row(run: &crate::settings::Run) -> Rt2<P8> {
+        let mut reference = ReferenceEngine::<P8>::new(&run.settings).expect("ref engine");
         let mut row = reference.initial().expect("initial state");
         let mut after = 0;
         while after < 3 {
@@ -1210,7 +1211,7 @@ mod tests {
 
     /// Does `registry` run `r`'s one lane (else its kernel declines), keyed
     /// against `visited`'s key space?
-    fn kernel_runs(registry: &Registry<P8>, r: &Rt2, s: &Settings, visited: &crate::storage::visited::VisitedSet<P8>) -> bool {
+    fn kernel_runs(registry: &Registry<P8>, r: &Rt2<P8>, s: &Settings, visited: &crate::storage::visited::VisitedSet<P8>) -> bool {
         let cells = crate::storage::cells::block_cells(r).expect("cells");
         let (routes, skeletons) = (crate::storage::route::Routes::default(), crate::storage::decode::Skeletons::default());
         let prov = celeste_engine::exact::Provisional::default();
@@ -1320,7 +1321,7 @@ mod tests {
         // The exact reach, inside the hull tree's states and hulls.
         let st = ForwardState::<P8>::at(&hull, to, &run).expect("at");
         let tree = crate::storage::layer::Tree::<P8>::open(&hull, to).expect("tree");
-        let layers: Vec<Layer> = (0..=to).map(|f| tree.layer(f, None, 4).expect("layer").0).collect();
+        let layers: Vec<Layer<P8>> = (0..=to).map(|f| tree.layer(f, None, 4).expect("layer").0).collect();
         let p0 = crate::search::rem::start_point::<P8>();
         let mut checked = 0u64;
         crate::search::reach::exact::reach(&hull, to, p0, 4, |t, cur| {
@@ -1430,7 +1431,7 @@ mod tests {
         let dir = crate::testutil::TestDir::new("resume-frontier");
         let init = start_blocks(&s);
         let e = RefFrameStep::<P8>::new(&Run::new(&s, Level::EXACT)).expect("engines");
-        let frontier = |st: &ForwardState| -> (Vec<(u32, (u64, u64), u64)>, Vec<Hull>, crate::storage::wave::ByLayer) { (st.frontier.new.iter().collect(), st.frontier.hulls.clone(), st.frontier.old.clone()) };
+        let frontier = |st: &ForwardState<P8>| -> (Vec<(u32, (u64, u64), u64)>, Vec<Hull<Fixed16>>, crate::storage::wave::ByLayer<P8>) { (st.frontier.new.iter().collect(), st.frontier.hulls.clone(), st.frontier.old.clone()) };
         let mut st = ForwardState::start(init, &dir, 3, None, &Run::new(&s, Level::EXACT)).expect("start");
         for b in crate::storage::layer::decode_states(&st.frontier.new, &st.visited.keys, st.visited.shapes(), usize::MAX, &|_| true).expect("decode") {
             assert!(not_expanded(&b.1, 0, None, &s).expect("not expanded").iter().all(|&x| x), "frame 0: the berry is lost");
@@ -1458,7 +1459,7 @@ mod tests {
         let level = Level::parse("r0sx").expect("level");
         let run = Run::new(&s, level);
         let e = crate::compiled::FrameEngine::new(&run).expect("kernels");
-        let start = RefEngine::new(&s).expect("engine").initial().expect("init");
+        let start = ReferenceEngine::<P8>::new(&s).expect("engine").initial().expect("init");
         let init = || vec![start.clone_block().canonicalized()];
         let ends = 30;
         ForwardState::start(init(), &a, ends, None, &run).expect("start").extend(&e, &a, ends, None).expect("extend");
@@ -1552,7 +1553,7 @@ mod tests {
         let row = standing_row(&run);
         let ids = crate::compiled::ids();
         let with = |f: u32, axis: u32, v: P8| with_player_field(&row, f, axis, v);
-        let runs = |r: &Rt2| -> bool {
+        let runs = |r: &Rt2<P8>| -> bool {
             let cells = crate::storage::cells::block_cells(r).expect("cells");
             assert!(grid.of_cell(cells[0]).is_some(), "the lane has a region");
             kernel_runs(&registry, r, &s, &crate::storage::visited::VisitedSet::new())
@@ -1570,7 +1571,7 @@ mod tests {
 
     /// `row` with its player's table field `f`'s `axis` set to `v`; a number
     /// column or an interval one, as it was.
-    fn with_player_field(row: &Rt2, f: u32, axis: u32, v: P8) -> Rt2 {
+    fn with_player_field(row: &Rt2<P8>, f: u32, axis: u32, v: P8) -> Rt2<P8> {
         let mut r = row.clone_block();
         let pc = r.obj_field_cell(r.player_objects()[0], f).expect("the player's table field");
         let Col::U(AV::Ptr(t)) = r.cols[pc as usize] else { panic!("the player's field is not a table") };
@@ -1616,11 +1617,11 @@ mod tests {
         let s = Settings { room: (6, 0), split_frame: true, ..Default::default() };
         let level = Level::parse("r0sxf").expect("level");
         let registry = crate::compiled::asm_kernel::registry(&crate::settings::Run::new(&s, level), false);
-        let mut reference = RefEngine::new(&s).expect("ref engine");
+        let mut reference = ReferenceEngine::<P8>::new(&s).expect("ref engine");
         let start = reference.initial().expect("start");
         let one = reference.step_one(&start, 0).expect("step 1");
         let two = reference.step_one(&one, 0).expect("step 2");
-        let rows: Vec<Rt2> = [start, one, two]
+        let rows: Vec<Rt2<P8>> = [start, one, two]
             .into_iter()
             .map(|mut r| {
                 r.widen_to(level);
@@ -1660,7 +1661,7 @@ mod tests {
     #[test]
     fn a_dying_exit_is_no_win() {
         let s = Settings { room: (2, 2), ..Default::default() };
-        let mut reference = RefEngine::new(&s).expect("ref engine");
+        let mut reference = ReferenceEngine::<P8>::new(&s).expect("ref engine");
         let mut st = reference.initial().expect("initial state");
         while st.player_objects().is_empty() {
             st = reference.step_one(&st, 0).expect("the spawn");
@@ -1706,13 +1707,13 @@ mod tests {
     #[test]
     fn the_orb_deadline_is_below_the_carts_chest_to_orb_time() {
         let ids = crate::compiled::ids();
-        let num = |b: &Rt2, c: u32| match b.cols[c as usize].at(0) {
+        let num = |b: &Rt2<P8>, c: u32| match b.cols[c as usize].at(0) {
             AV::Num(n) => n,
             other => panic!("not a number: {other:?}"),
         };
-        let global = |b: &Rt2, name: &str| num(b, b.shape.globals()[celeste_names::global(name) as usize]);
-        let chest_state = |b: &Rt2| b.objects_of_type(ids.g_big_chest).first().map(|&o| num(b, b.obj_field_cell(o, ids.f_state).expect("a state")));
-        let orb_still = |b: &Rt2| {
+        let global = |b: &Rt2<P8>, name: &str| num(b, b.shape.globals()[celeste_names::global(name) as usize]);
+        let chest_state = |b: &Rt2<P8>| b.objects_of_type(ids.g_big_chest).first().map(|&o| num(b, b.obj_field_cell(o, ids.f_state).expect("a state")));
+        let orb_still = |b: &Rt2<P8>| {
             b.objects_of_type(celeste_names::global("orb")).iter().any(|&o| {
                 let AV::Ptr(spd) = b.cols[b.obj_field_cell(o, ids.f_spd).expect("spd") as usize].at(0) else { panic!("the orb's spd is no table") };
                 num(b, b.obj_field_cell(spd, ids.f_y).expect("spd.y")) == P8::from_i16(0)
@@ -1722,8 +1723,8 @@ mod tests {
         let mut bounds = Vec::new();
         for split_frame in [false, true] {
             let s = Settings { room: (5, 2), split_frame, ..Default::default() };
-            let mut eng = RefEngine::new(&s).expect("ref engine");
-            let frame = |eng: &mut RefEngine, b: &Rt2, input: u8| {
+            let mut eng = ReferenceEngine::<P8>::new(&s).expect("ref engine");
+            let frame = |eng: &mut ReferenceEngine<P8>, b: &Rt2<P8>, input: u8| {
                 let mut leaves = eng.frame(b, input).expect("a frame");
                 assert_eq!(leaves.len(), 1, "one leaf");
                 leaves.remove(0)
@@ -1776,7 +1777,7 @@ mod tests {
     /// mid-frame step 59 inside f30 (still opening in f30), not step 60.
     #[test]
     fn the_orb_cut_counts_frames_under_the_split_frame() {
-        let closed = RefEngine::new(&Settings { room: (5, 2), ..Default::default() }).expect("ref engine").initial().expect("the start");
+        let closed = ReferenceEngine::<P8>::new(&Settings { room: (5, 2), ..Default::default() }).expect("ref engine").initial().expect("the start");
         let skip = |step: u32, h: u32, per_frame: u32| orb_deadline_skip(&closed, step, h, crate::settings::Clock { per_frame })[0];
         assert!(!skip(29, 100, 1) && skip(30, 100, 1));
         assert!(!skip(58, 200, 2) && !skip(59, 200, 2) && skip(60, 200, 2));
@@ -1794,7 +1795,7 @@ mod tests {
             .flat_map(|l| l.split(',').filter(|t| !t.trim().is_empty()).map(|t| t.trim().parse::<u8>().expect("an input byte")).collect::<Vec<_>>())
             .collect();
         assert_eq!(inputs.len(), 55);
-        let mut reference = RefEngine::new(&s).expect("ref engine");
+        let mut reference = ReferenceEngine::<P8>::new(&s).expect("ref engine");
         let mut st = reference.initial().expect("initial state");
         for (i, &b) in inputs.iter().enumerate() {
             let next = reference.step_one(&st, b).expect("one concrete successor");

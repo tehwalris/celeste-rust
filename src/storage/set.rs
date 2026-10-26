@@ -15,6 +15,7 @@ use super::codec::{get_varint, get_varint128, narrow, put_varint, put_varint128,
 use super::visited::Key;
 use super::Sk;
 use crate::search::rem::Rem;
+#[cfg(test)]
 use celeste_core::pico8_num::Pico8Num as P8;
 
 
@@ -26,7 +27,7 @@ fn bytes_of(w: u128) -> usize {
 
 /// A state's LAYER (the frame that first reached and expanded it), HULL so far.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct StateInfo<N: Rem = P8> {
+pub(crate) struct StateInfo<N: Rem> {
     pub(crate) hull: HullOf<N>,
     pub(crate) layer: u16,
 }
@@ -97,7 +98,7 @@ impl Block {
 
 /// A packed block DECODED: per entry its key, cells, bare cells and its
 /// first info's place (`at`, one more at the end); the infos by entry, cell.
-pub(crate) struct Rows<N: Rem = P8> {
+pub(crate) struct Rows<N: Rem> {
     keys: Vec<u128>,
     masks: Vec<u64>,
     bare: Vec<u64>,
@@ -239,7 +240,7 @@ fn zstd_unpack(bytes: &[u8], raw: usize, out: &mut Vec<u8>) -> Result<()> {
 /// (`None`: a full hull, bare), and whether it is NEW (held already: an
 /// error the caller counts, `Upserted::held_new`).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Change<N: Rem = P8> {
+pub(crate) struct Change<N: Rem> {
     pub(crate) key: Key,
     pub(crate) cell: u8,
     pub(crate) info: Option<StateInfo<N>>,
@@ -268,7 +269,7 @@ impl std::ops::AddAssign for Upserted {
 }
 
 /// An entry as a `Cursor` finds it: cells, bare cells, the others' infos.
-pub(crate) struct Entry<'r, N: Rem = P8> {
+pub(crate) struct Entry<'r, N: Rem> {
     pub(crate) mask: u64,
     pub(crate) bare: u64,
     pub(crate) infos: &'r [StateInfo<N>],
@@ -284,7 +285,7 @@ impl<N: Rem> Entry<'_, N> {
 }
 
 /// A packed table WALKED by ascending keys: each block decoded once, if hit.
-pub(crate) struct Cursor<'a, N: Rem = P8> {
+pub(crate) struct Cursor<'a, N: Rem> {
     blocks: &'a [Block],
     b: usize,
     loaded: usize,
@@ -794,6 +795,7 @@ impl RegionSet<PlainTable> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use celeste_core::arith::Fixed;
     use crate::search::hull::Hull;
 
     fn rng(seed: u64) -> impl FnMut() -> u64 {
@@ -832,14 +834,14 @@ mod tests {
     #[test]
     fn a_packed_table_upserts_as_a_model() {
         let mut next = rng(0x2545_f491_4f6c_dd1d);
-        let mut model: std::collections::BTreeMap<(u128, u8), Option<StateInfo>> = Default::default();
+        let mut model: std::collections::BTreeMap<(u128, u8), Option<StateInfo<Fixed>>> = Default::default();
         let mut t = PackedTable::default();
         let hull = |x: u64| Hull::from_bytes(&x.to_le_bytes());
         let full = Hull::full();
         for round in 0..12u64 {
             // Changes: new keys, new cells of held keys, updates (some to full).
             let held: Vec<u128> = model.keys().map(|k| k.0).collect();
-            let mut ch: std::collections::BTreeMap<(u128, u8), (Option<StateInfo>, bool)> = Default::default();
+            let mut ch: std::collections::BTreeMap<(u128, u8), (Option<StateInfo<Fixed>>, bool)> = Default::default();
             for _ in 0..(if round == 0 { 5000 } else { 1500 }) {
                 let key = if held.is_empty() || next() % 3 == 0 { ((next() % 4) as u128) << 64 | (next() % 200_000) as u128 } else { held[(next() % held.len() as u64) as usize] };
                 let cell = (next() % 64) as u8;
@@ -851,7 +853,7 @@ mod tests {
                 let new = !model.contains_key(&(key, cell)) && next() % 2 == 0;
                 ch.insert((key, cell), (info, new));
             }
-            let changes: Vec<Change> = ch.iter().map(|(&(k, c), &(info, new))| Change { key: narrow(k), cell: c, info, new }).collect();
+            let changes: Vec<Change<Fixed>> = ch.iter().map(|(&(k, c), &(info, new))| Change { key: narrow(k), cell: c, info, new }).collect();
             let want = (ch.keys().filter(|k| !model.contains_key(k)).count() as u64, ch.iter().filter(|(k, v)| v.1 && model.contains_key(k)).count() as u64);
             let got = t.upsert::<P8>(&changes).unwrap();
             assert_eq!((got.added, got.held_new), want, "round {round}");
@@ -861,7 +863,7 @@ mod tests {
             assert_eq!(t.states(), model.len() as u64);
             assert_eq!(t.infos(), model.values().filter(|i| i.is_some()).count() as u64);
             assert!(t.blocks().iter().all(|b| b.entries as usize <= PACK_ENTRIES));
-            let mut by_key: std::collections::BTreeMap<u128, Vec<(u8, Option<StateInfo>)>> = Default::default();
+            let mut by_key: std::collections::BTreeMap<u128, Vec<(u8, Option<StateInfo<Fixed>>)>> = Default::default();
             for (&(k, c), &i) in &model {
                 by_key.entry(k).or_default().push((c, i));
             }

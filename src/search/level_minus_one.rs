@@ -2217,7 +2217,7 @@ mod tests {
             let run = crate::settings::Run::new(&s, crate::abstraction::Level::EXACT);
             let lw = crate::trace::walk::room_constant_lattice::<celeste_core::arith::Fixed>(&crate::trace::walk::Walk { run: &run, only: None }).expect("the walk");
             for st in lw.reps.values() {
-                let b: celeste_engine::Rt2 = crate::trace::block::skeleton(st, lw.room).expect("a block");
+                let b: celeste_engine::Rt2<P8> = crate::trace::block::skeleton(st, lw.room).expect("a block");
                 let located = located_object(st).map(|p| celeste_engine::slots::deref(&b, crate::trace::bind::resolve(&b, &p).expect("the path resolves")).expect("an object"));
                 let anchors = Anchors::of(&b);
                 assert_eq!(located, anchors.position.map(|p| p.obj), "room {:?}: level -1 locates another object than the anchors' position", s.room);
@@ -2230,7 +2230,7 @@ mod tests {
         assert!(players > 0 && spawns > 0, "{players} representatives with a player, {spawns} with only a spawn");
     }
 
-    fn num(lo: i32, hi: i32) -> Val {
+    fn num(lo: i32, hi: i32) -> Val<P8> {
         Val::Num(Pico8NumInterval::new(P8::from_raw(lo), P8::from_raw(hi)))
     }
 
@@ -2239,10 +2239,10 @@ mod tests {
     #[test]
     fn a_select_of_literal_phases_keeps_its_full_period_width() {
         let period = 0xffff;
-        let build = |what: Option<Lift>| -> (Graph, NodeId) {
+        let build = |what: Option<Lift>| -> (Graph<P8>, NodeId) {
             let mut g = Graph::default();
             let mut memo = HashMap::new();
-            let mut mk = |g: &mut Graph, op: Op, args: Vec<NodeId>| match what {
+            let mut mk = |g: &mut Graph<P8>, op: Op<P8>, args: Vec<NodeId>| match what {
                 Some(w) => lift(g, op, args, w, &mut memo),
                 None => g.fold(op, args),
             };
@@ -2260,7 +2260,7 @@ mod tests {
             let full = mk(&mut g, Op::Ge, vec![width, p]);
             (g, full)
         };
-        let cells: HashMap<u32, Val> = [(0, num(-0x10000, 0x10000))].into_iter().collect();
+        let cells: HashMap<u32, Val<P8>> = [(0, num(-0x10000, 0x10000))].into_iter().collect();
         let (g, full) = build(None);
         assert_eq!(g.eval(&cells, Eval::NarrowTop, None).unwrap()[full as usize], Val::Bool(None), "joined, the width is undecided");
         for w in [Lift::Ends, Lift::All] {
@@ -2273,16 +2273,16 @@ mod tests {
     /// decides it (two tiles per lane), `Lift::Ends` does not.
     #[test]
     fn lifting_keeps_a_tile_loop_over_one_x_two_tiles_wide() {
-        let build = |what: Lift| -> (Graph, NodeId) {
+        let build = |what: Lift| -> (Graph<P8>, NodeId) {
             let mut g = Graph::default();
             let mut memo = HashMap::new();
-            let mut mk = |g: &mut Graph, op: Op, args: Vec<NodeId>| lift(g, op, args, what, &mut memo);
+            let mut mk = |g: &mut Graph<P8>, op: Op<P8>, args: Vec<NodeId>| lift(g, op, args, what, &mut memo);
             let moved = g.leaf(Op::Cell(0));
             let zero = g.leaf(Op::Const(0, 0));
             let c = mk(&mut g, Op::Gt, vec![moved, zero]);
             let (a, b) = (g.leaf(Op::Const(44 << 16, 44 << 16)), g.leaf(Op::Const(52 << 16, 52 << 16)));
             let x = mk(&mut g, Op::Sel, vec![c, a, b]);
-            let k = |g: &mut Graph, v: i32| g.leaf(Op::Const(v << 16, v << 16));
+            let k = |g: &mut Graph<P8>, v: i32| g.leaf(Op::Const(v << 16, v << 16));
             let (one, five, eight, two) = (k(&mut g, 1), k(&mut g, 5), k(&mut g, 8), k(&mut g, 2));
             let x1 = mk(&mut g, Op::Add, vec![x, one]);
             let sd = mk(&mut g, Op::Div, vec![x1, eight]);
@@ -2294,7 +2294,7 @@ mod tests {
             let more = mk(&mut g, Op::Le, vec![third, end]);
             (g, more)
         };
-        let cells: HashMap<u32, Val> = [(0, num(-0x10000, 0x10000))].into_iter().collect();
+        let cells: HashMap<u32, Val<P8>> = [(0, num(-0x10000, 0x10000))].into_iter().collect();
         let (g, more) = build(Lift::Ends);
         assert_eq!(g.eval(&cells, Eval::NarrowTop, None).unwrap()[more as usize], Val::Bool(None));
         let (g, more) = build(Lift::All);
