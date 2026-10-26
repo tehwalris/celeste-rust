@@ -284,6 +284,7 @@ t2_platforms() {
     # The widening table's two sides, a boundary and a mid-frame step
     # (stored rows only: the emissions would build the kernels again).
     step widen-r60s widen60
+    step reference60f reference60f
 }
 
 # The pinned room (1,0) oracles (CLAUDE.md "Gates"): the forward's states,
@@ -366,6 +367,14 @@ hull10() {
 forward60() {
     ./safe-run.sh --memory "$MEM" -- "$B" forward --room 6,0 --level r0sxf --steps 71 --split-frame --tree "$C/t2/p60" > /dev/null || return 1
     ./safe-run.sh --memory "$MEM" -- "$B" ckhash --tree "$C/t2/p60" --steps 71 --edges --hulls 2> /dev/null | diff "$G/r60s.ckhash" - >&2
+}
+
+# THE REFERENCE FORWARD'S TREE IS THE KERNELS' AT THE FRUIT LEVEL: the r60s
+# fixture (room (6,0) `r0sxf`, split) to step 48, the fly fruit widened from
+# step 1 and the player's spawn at 48 (`check reference`; past it the
+# reference's fork paths take 20 GB by step 50).
+reference60f() {
+    ./safe-run.sh --memory "$MEM" -- "$B" check reference --tree "$F/r60s" --steps 48 --threads 8
 }
 
 widen60() {

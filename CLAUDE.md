@@ -225,12 +225,13 @@ A cargo workspace; the dependency order is load-bearing: `celeste-core`
 `celeste-names` (frozen tables) <- `celeste-engine` (`Rt2` blocks and
 `Template`s, exact keys, the shape `shape`: interned structure, signature,
 `Anchors`, key `Layout`; the widening table) <- `celeste-rust` (`src/frame.rs` the
-forward, `src/storage/`, `src/search/` the backward, the concrete search
+forward, `src/prune.rs` its pruning (filters and cuts, one `Prune`
+interface), `src/storage/`, `src/search/` the backward, the concrete search
 and level -1, `src/trace/` the tracer, `src/engines/` the reference
 engine, `src/transpile/` graph IR and assembler, `src/compiled/` the kernel
 registry, `src/settings.rs`, the `rewrite` binary in `src/bin/rewrite/`).
 The checks and diagnostics are TOOLS, not core: `src/check/` (the
-differential harness, check arcs, check replay, check keys through the one
+differential harness, check arcs, check replay, check reference, check keys through the one
 observer seam `frame::RowCheck`, the gate's fingerprints, the census,
 explain) and `src/ui_export.rs` (the UI export); the core names none of
 them (a conventions test).
@@ -273,8 +274,9 @@ frame under `--split-frame`: `settings::Clock`). The most common:
 # THE DUAL SEARCH: the shortest file valid in both arithmetics (plans/float.md).
 ./safe-run.sh --memory 40G -- ./target/release/rewrite dual --room 0,3 --category gemskip100 \
     --loading-jank 1 --level r0sxn,r0sx --level-minus-one 150,5 --frames 150 --search-dir DIR
-# A known solution against every pruning step of a finished search (its
-# settings, levels and horizon from its records).
+# A known solution against every pruning step of a finished search (every
+# prune of the forward, `Prunes::each`, and the arc phase's checks; a failure
+# names the prune and the step; settings, levels and horizon from its records).
 ./safe-run.sh -- ./target/quick/rewrite check known --search-dir DIR --inputs tas/FILE.txt
 # One forward at one level; then its fingerprint (a command that reads a
 # tree takes its settings from the tree's records: no --room, --level, ...).

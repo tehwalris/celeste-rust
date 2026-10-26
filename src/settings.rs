@@ -193,7 +193,7 @@ pub struct Settings {
     pub region: std::option::Option<(i32, i32)>,
     /// The level -1 filter "H,S": H in game frames (the search's horizon),
     /// S the table's speed bound (the tree records it, H in steps, as
-    /// `frame::TreeL1`: `minus_one`).
+    /// `prune::TreeL1`: `minus_one`).
     #[arg(long, global = true, value_parser = parse_minus_one)]
     pub level_minus_one: Option<(u32, i32)>,
     /// The balloons' phases of the concrete phase only (a tasdatabase file's
@@ -277,6 +277,12 @@ impl Settings {
         ]
     }
 
+    /// Setting `key`'s text, as the record holds it (`rows`; a prune's
+    /// record line, `prune::Prune::record`).
+    pub(crate) fn row(&self, key: &str) -> String {
+        self.rows().into_iter().find(|r| r.key == key).unwrap_or_else(|| panic!("no setting {key:?}")).text
+    }
+
     /// The settings the flags give, validated and resolved: Celia's loading
     /// jank by default its IL load's.
     pub fn resolved(mut self) -> Result<Settings> {
@@ -348,8 +354,8 @@ impl Settings {
 
     /// The run's level -1 filter (`--level-minus-one H,S`), if given: H in
     /// search steps (`Clock`).
-    pub fn minus_one(&self) -> Option<crate::frame::MinusOne> {
-        self.level_minus_one.map(|(h, speed)| crate::frame::MinusOne { h: self.clock().steps(h), speed })
+    pub fn minus_one(&self) -> Option<crate::prune::MinusOne> {
+        self.level_minus_one.map(|(h, speed)| crate::prune::MinusOne { h: self.clock().steps(h), speed })
     }
 
     /// The record's lines, `(key, value)`, in a fixed order: what changes a
@@ -414,7 +420,7 @@ impl Run {
 
     /// THE RUN OF A FINISHED TREE, for a command that reads it: its record
     /// read back (each line its flag's text; the level) and its level -1
-    /// filter (`frame::TreeL1`), with the run's own settings from `run`
+    /// filter (`prune::TreeL1`), with the run's own settings from `run`
     /// (the threads, the concrete phase's seeds, `--phases`).
     pub fn of_tree(dir: &Path, run: &Settings) -> Result<Run> {
         let rec = read_record(dir)?;
@@ -433,7 +439,7 @@ impl Run {
         // The filter's H, recorded in steps, as `--level-minus-one` takes it
         // (frames).
         let per_frame = flags.s.clock().per_frame;
-        let minus_one = match crate::frame::TreeL1::recorded(dir)? {
+        let minus_one = match crate::prune::TreeL1::recorded(dir)? {
             Some((m, _)) => {
                 anyhow::ensure!(m.h % per_frame == 0, "{}: the level -1 horizon {} steps is no whole frame", dir.display(), m.h);
                 Some((m.h / per_frame, m.speed))

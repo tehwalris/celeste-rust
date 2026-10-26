@@ -181,7 +181,7 @@ chain (re-searched from the real-play starts J 3 and J 4: 113 both).
 `--category 100`: the exit counts only with the room's berry taken (an
 unknown `got_fruit` at a coarse level counts as taken; the concrete search
 decides). Two exact cuts made rooms fit: a row whose berry is lost is not
-expanded (`frame::berry_lost`), and level -1 drops exits that leave the
+expanded (`prune::berry_lost`), and level -1 drops exits that leave the
 berry behind. Runs `--ceiling REF`, level -1 at (REF, 5),
 `--concrete-balloon-seeds` the file's seeds. The search takes every chest
 draw; the runner tries the file's chest seed, then each class of draws,

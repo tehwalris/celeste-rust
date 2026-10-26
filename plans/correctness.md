@@ -4,23 +4,62 @@ Open soundness and verification questions. Philippe wants to handle these
 hands-on: refactors must NOT change the code paths below until each item is
 settled here. Evidence is file:line at develop 19869c5d.
 
-## C1. Pruning is not first-class; the known-route check misses cuts
-- `search::known` (known.rs:320-392) lists the pruning steps by hand:
-  level -1 `too_late`, the ladder's `allowed`, the hull claim, W's support,
-  W at the exact remainder, the reach marks.
-- `frame::not_expanded` (frame.rs:327-347, applied at wave.rs:333) also cuts:
-  exits, `berry_lost`, `orb_deadline_skip`, out-of-room under `--win-at`. None
-  is a named step: a route a wrong cut drops shows only as "NOT IN THE TREE"
-  (known.rs:366-374), unattributed.
-- Proposal (audit architecture.md M1): one `Prune` interface (filters and
-  cuts, each with its projection, its tree-record line and its horizon);
-  `check known` iterates it, so it is complete by construction.
-
+## C1. Pruning is not first-class; the known-route check misses cuts (FIXED, branch correctness-2)
+- Was: `search::known` listed the pruning steps by hand (level -1
+  `too_late`, the ladder's `allowed`, the hull claim, W's support, W at the
+  exact remainder, the reach marks); `frame::not_expanded`'s cuts (exits,
+  `berry_lost`, `orb_deadline_skip`, out-of-room under `--win-at`) were no
+  named step: a route a wrong cut drops showed only as "NOT IN THE TREE",
+  unattributed, a step later.
+- FIXED: ONE interface, `prune::Prune` (`About`: name, kind - FILTER, dropped
+  where made, or CUT, kept unexpanded - and projection; its tree-record
+  line; its horizon; per lane `prunes`, and `why`). `prune::Prunes` holds a
+  forward's: the tree's (`Recorded`: `TreeL1`, `OrbCut`), the ladder's
+  `MarkFilter`, the cuts its settings imply (`Exit`, `OutOfRoom`,
+  `BerryLost`). It replaces `Filters` and the `orb` parameter in `WaveCtx`.
+  The hot forms are concrete: level -1 per lane (`TreeL1::drops`) and the
+  ladder per batch (`MarkFilter::allowed`) as fields of the sink, the cuts
+  once a unit through `Prunes::not_expanded`, which applies exactly the cuts
+  `Prunes::each` lists (one `dyn` call per cut per unit, none per lane).
+  `each` destructures every field. Prunes reach neither the backward, the
+  reach nor the concrete search.
+- `check known` / `search --prefer` iterate `Prunes::each` on the level's row
+  (`lookup_view` widened as the tree holds it): every filter at every step
+  past the start AND on the winning leaf (new: an exit row a filter drops
+  was blamed on W), every cut at every step before the exit (a cut's
+  report beats "not in W's support", which it causes). A failure names the
+  prune, its projection, its record line and the step (the error message
+  too). Two guards: each prune's record line is the tree's (the ladder's
+  marks recomputed by the check must be the ones the tree was filtered
+  for, but for a lower `--frames`, a stricter filter, noted), and no
+  prune's horizon is below the check's. `check known` also reads a tree
+  that ENDED on an empty frontier (`frame::tree_ends_by`: a cut that takes
+  every row), which it refused before.
+- Proof (2026-10-26): every pin of `./check.sh t0 t1 t2 big` identical; the
+  31 `[asm build]` kernel-text digests of those runs identical to the base
+  959d669b's; `--prefer` passes on the t2 gates (arc10, arc10f, dual10) and
+  search42 (its ladder level: "the ladder's filter (`filtered_for steps 50
+  level-1 off marks 241 2f8fd886e0cf30be`)", the tree's record line).
+  `check known` on finished searches with each kind of cut: arc10 (exit,
+  out-of-room), s42 (the ladder), room (5,2) any% `r0sx`, (150,5), h150
+  (level -1, exit, the orb cut `orb_cut h 150`: optimum 150, the stored
+  witness, 66.6 s, 7.1 GB), room (0,0) 100% `r0sx`, (115,5), h115 (level -1,
+  exit, the lost-berry cut: optimum 115, the stored witness, 50.3 s, 9.2
+  GB). NEW TEST `known::tests::check_known_names_a_wrong_cut_and_its_step`
+  (t2): a test-only fault on the exit cut (`prune::FAULT`) at the known
+  route's cell at step 30 drops it, and `check known` fails "PRUNED ... by
+  step 30: the exit cut does NOT EXPAND it at step 30"; at step 20 the
+  fault ends the tree and the check names it alike. The record guard,
+  shown by hand: a copy of s42 with its `filtered_for` fingerprint changed
+  is refused. Perf (instructions a rep, release, base -> C1): r62h
+  16.815G -> 16.812G (-0.02%), r62h57 43.919G -> 43.931G (+0.03%), f42n
+  5.0123G -> 5.0125G (+0.00%).
 - Unblocks native level -1 (assessment, 2026-10-20): feasible but a design
   decision: per-shape inductive ranges carried by the kernels, a loud
   widen-and-retrace path for declined lanes, and a position-only level whose
   backward computes distances; about -1,000 lines net; every level -1 result
-  re-verified. The known-route check must cover it first (this item).
+  re-verified. The known-route check covers it now: it would be one more
+  `Prune` (set aside by Philippe).
 
 ## C2. The orb deadline: a hand-derived bound nothing checks (FIXED, branch correctness-batch)
 - CHECKED: `ORB_MIN_FRAMES_AFTER_CHEST = 70` against the cart
@@ -51,11 +90,43 @@ settled here. Evidence is file:line at develop 19869c5d.
   tas/room_5_2_exit_frame_150.txt`: arc bound 150, concrete optimum 150,
   the known route survives every pruning step (5.6 min, peak 7 GB).
 
-## C3. Room (2,1): the split frame reaches FEWER states than unsplit at `p`
-- Noted in architecture.md ("unexplained"). Fewer states is the direction a
-  soundness bug shows. Find a state reached unsplit but not split and explain
-  it (a legitimate projection difference, or a bug). Blocks any further split-
-  frame refactor (audit M6).
+## C3. Room (2,1): the split frame reaches FEWER states than unsplit (EXPLAINED: the hulls' precision, no bug; branch correctness-2)
+- Was: at `p` the split frame reached fewer states, "unexplained"; fewer
+  is the direction a soundness bug shows.
+- Re-checked with `p` gone, at `r0sxn` (2026-10-26, develop 959d669b + C1,
+  release): `forward --room 2,1 --level r0sxn --steps 60` (43 s, 4.5 GB)
+  against `--split-frame --steps 120` (25 s, 4.1 GB). Every boundary the
+  same states (count and content) through f29; from f30 the split frame
+  FEWER, cumulatively -26 at f30, -207 f35, -715 f41, -38,957 f57,
+  -29,131 f60 (87,212,592 against 87,241,723, -0.03%). At f30 the split
+  states a strict subset (26 missing, none extra); 223 missing by f33.
+- THE EXACT REACH (`reach::exact`: exact in the remainder over each tree's
+  recorded graph) is IDENTICAL in the two trees at every boundary f0-f33,
+  states and remainder sets (17,433 states at f30, 75,514 at f33), every
+  split one inside its hull; NONE of the missing states is exactly reached
+  in the unsplit graph (past f33 the oracle passes its 1024-segment cap).
+- So they are the unsplit hulls' over-approximation, not states of the
+  game: a hull is one arc per axis, which holds no union, and its arc
+  depends on what was merged (the split frame merges at the mid-frame
+  node). One of them: f30, `player.x = -2, y = 112`, a right dash just
+  begun (`move_x`'s loop from 0 takes 2 px at rem.x -0.5; the dash's
+  freeze skips the draw's clamp), from x = 0, y = 112, spd.x -0.2, grace 3
+  at f29, whose unsplit hull's x arc is [45876, 19661] across the end
+  (index 0..19661 in it) and split one [19661, 65535]: the edge's guard x
+  [0, 13108) meets only the unsplit arc. Both hulls hold the state's exact
+  set; neither holds the other.
+- A LEGITIMATE PRECISION DIFFERENCE (the hull representation), not a
+  soundness bug: the split frame is not a superset in hull trees, and the
+  same in the exact reach. The slow test
+  `frame::tests::split_frame_reaches_the_unsplit_frontier_at_a_near_level`
+  now states it to f30 (both forwards; the exact reaches equal at every
+  boundary, the hull trees through f29, at f30 the split one a subset by
+  26, no missing state exactly reached). Its doc's old claim that the
+  boundaries' hulls are the unsplit frame's was wrong. As far as this item
+  goes, a further split-frame refactor (audit M6) is unblocked.
+- Not shown past f33 (the exact oracle's cap); the probe was a throwaway
+  test (/var/tmp/correctness-2-scripts/frame-with-c3-probe.rs, not
+  committed).
 
 ## C4. The minimal cart's move guard: UNREACHABLE (proven); the player unguarded (DECIDED, branch jump-buffer)
 - Original: `obj.move(obj.spd.x,obj.spd.y)` unconditionally (celeste.lua:1195);
@@ -92,10 +163,26 @@ settled here. Evidence is file:line at develop 19869c5d.
 
 ## C5. Verification gaps at the object levels
 - (`p` is gone, C13: platforms are exact and the reference runs them.)
-- `check reference` cannot compare at `f`: in room (6,0) at `r0sxhf` the
-  kernels make 2 states a step, the reference 1 (the reference widens only
-  the held buttons, the kernels the fruit too; plans/architecture.md "Open
-  issues"). The fruit level is checked only by pins and the concrete search.
+- (a) FIXED (branch correctness-2): `check reference` at `f`. Was: in room
+  (6,0) at `r0sxf` the kernels made 2 states a step, the reference 1. TWO
+  causes: the reference STORED its rows widened at `Level::EXACT`
+  (`UnitSink::row_key`), not at the level; and it READ the start as stored
+  (unwidened: the tree holds the start as the engine made it), where the
+  kernels read the fly fruit's `fly` as an atom and its `step`, `y` as
+  unknowns whatever the row holds - their extra state at step 1 is the
+  branch where the unknown `y` passes -16 and the fruit is destroyed. Now
+  `RefFrameStep` reads and stores at the run's level through the widening
+  table's block side (`Rt2::widen_to` on the input block; `emit_row`'s
+  level), and refuses a near level under the split frame (the block side's
+  near floors are not the kernels' mid-frame ones). Evidence: `check
+  reference --tree r60s --steps 48` 0 of 146 lines differ (70 s, 1.5 GB;
+  to step 50, 0 of 152, but 161 s and 23 GB), a new t2 step
+  `reference60f`; t2's `reference10[f]` (r0sx) unchanged. LIVE: the slow
+  test `check::reference::tests::the_reference_widens_as_the_kernels_do_at_the_fruit_level`
+  runs room (6,0) `r0sxf` to step 6, kernels against the reference (0 of
+  20 lines differ), then the reference widened at the exact level (a
+  test-only fault, `RefFrameStep::widened_at`): all 18 lines of steps 1-6
+  differ. `check reference` moved into `src/check/reference.rs`.
 - At `n`, `check ref` and `check arcs` skip most rows over the reference's
   path cap; room (7,0) `check arcs` is an open issue.
 - Proposals: a reachable-sample soundness check at every level (audit

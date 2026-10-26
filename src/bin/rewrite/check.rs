@@ -256,7 +256,7 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
             let to = t.frame(a.steps)?;
             let scratch = PathBuf::from(format!("/var/tmp/celeste-check-reference-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&scratch);
-            let res = celeste_rust::with_arith!(t.run.settings.arith, N => reference_check::<N>(&t, to, &scratch));
+            let res = celeste_rust::with_arith!(t.run.settings.arith, N => celeste_rust::check::reference::run::<N>(&t.dir, &t.run, to, &scratch));
             let _ = std::fs::remove_dir_all(&scratch);
             res
         }
@@ -448,26 +448,4 @@ fn widen_check<N: Rem + KernelLanes>(t: &TreeDir, frame: u32, emitted: usize) ->
     }
     println!("[check widen] step {frame} at {level}: {stored} stored rows, {emitted_rows} emitted from {emitted}; {moved} moved by the block side's widening");
     differential::verdict(stored + emitted_rows, moved, || format!("check widen: {moved} rows the block side's widening changes (the table's two sides disagree)"))
-}
-
-/// `check reference` of `t` to step `to` in arithmetic `N`, the reference
-/// engine's tree grown in `scratch`.
-fn reference_check<N: Rem>(t: &TreeDir, to: u32, scratch: &std::path::Path) -> Result<()> {
-    use celeste_rust::engines::reference::{RefFrameStep, ReferenceEngine};
-    let cfg = &*t.run.settings;
-    let tm = std::time::Instant::now();
-    let engine: Box<dyn FrameStep<N>> = Box::new(RefFrameStep::<N>::new(&t.run)?);
-    celeste_rust::frame::grow_tree(scratch, to, cfg.minus_one(), None, &t.run, || Ok(engine), || Ok(vec![ReferenceEngine::<N>::new(cfg)?.initial()?.canonicalized()]))?;
-    let kernels = celeste_rust::storage::fingerprint::<N>(&t.dir, to, true, true, cfg.threads())?;
-    let reference = celeste_rust::storage::fingerprint::<N>(scratch, to, true, true, cfg.threads())?;
-    let mut bad = 0;
-    for (k, r) in kernels.iter().zip(&reference) {
-        if k != r {
-            bad += 1;
-            println!("[check reference] the kernels' {k}\n[check reference] the reference's {r}");
-        }
-    }
-    bad += kernels.len().abs_diff(reference.len());
-    println!("[check reference] {}: steps 0-{to} at {}, {} fingerprint lines, {bad} differ ({:.1} s)", t.dir.display(), t.run.level, kernels.len(), tm.elapsed().as_secs_f64());
-    differential::verdict(kernels.len(), bad, || format!("check reference: {bad} of the kernels' fingerprint lines are not the reference engine's"))
 }

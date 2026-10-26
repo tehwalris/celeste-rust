@@ -20,8 +20,9 @@ use super::unit::UnitSink;
 use super::visited::{Key, VisitedSet};
 use super::Sk;
 use super::stats::{Lap, Stats, S};
-use crate::frame::{Filters, FrameStep};
+use crate::frame::FrameStep;
 use crate::par::collect_freed;
+use crate::prune::Prunes;
 use crate::search::rem::{Pair, Rem};
 use celeste_engine::exact::{KeyAdditions, MissKey, Provisional};
 
@@ -288,7 +289,9 @@ const WORKER_STACK: usize = 512 << 20;
 pub(crate) struct WaveCtx<'a, N: Rem> {
     pub(crate) visited: &'a mut VisitedSet<N>,
     pub(crate) xfers: &'a mut XferTable<N>,
-    pub(crate) filters: Filters<'a, N>,
+    /// What the frame prunes by (the hot forms: level -1 and the ladder in
+    /// the sinks, the cuts in `run_unit`, the ladder at the frame's end).
+    pub(crate) prunes: &'a Prunes<'a, N>,
     pub(crate) frame: u32,
     /// The level's `edges/` dir: edges are recorded only with one.
     pub(crate) edges_dir: Option<&'a std::path::Path>,
@@ -309,11 +312,11 @@ struct UnitScratch {
     live: Vec<usize>,
 }
 
-/// ONE KERNEL UNIT: its states DECODED, `frame::not_expanded` (decided here,
-/// fresh or resumed; `orb`: the tree's orb cut, `frame::OrbCut`) left
-/// out, the rest through the engine with their hulls.
+/// ONE KERNEL UNIT: its states DECODED, the cuts' (`Prunes::not_expanded`,
+/// decided here, fresh or resumed) left out, the rest through the engine
+/// with their hulls.
 #[allow(clippy::too_many_arguments)]
-fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<usize>, state: usize, layer: &Layer<N>, hulls: &[HullOf<N>], starts: &[usize], shapes: &[u64], sink: &mut UnitSink<'_, N>, sc: &mut UnitScratch, layer_frame: u32, orb: Option<crate::frame::OrbCut>, s: &crate::settings::Settings) -> Result<()> {
+fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<usize>, state: usize, layer: &Layer<N>, hulls: &[HullOf<N>], starts: &[usize], shapes: &[u64], sink: &mut UnitSink<'_, N>, sc: &mut UnitScratch, layer_frame: u32, prunes: &Prunes<N>) -> Result<()> {
     let t_dec = sink.stats.tick_start();
     sink.begin(u);
     sc.rows.clear();
@@ -343,7 +346,7 @@ fn run_unit<N: Rem>(engine: &dyn FrameStep<N>, u: u32, entries: std::ops::Range<
     let shape = *shapes.get((region / crate::storage::cells::SLOTS) as usize).ok_or_else(|| anyhow!("a frontier region of no shape"))?;
     let skel = layer.skeletons.get(&shape).ok_or_else(|| anyhow!("ROWS FROM KEYS: the frontier holds no skeleton of shape {shape:016x}"))?;
     let block = super::decode::decode_rows(sink.keys(), skel, &sc.rows)?;
-    let skip = crate::frame::not_expanded(&block, layer_frame, orb, s)?;
+    let skip = prunes.not_expanded(&block, layer_frame)?;
     sc.live.clear();
     sc.live.extend((0..block.width).filter(|&l| !skip[l]));
     sink.stats.tick(S::PhDecode, t_dec);
@@ -387,7 +390,6 @@ impl Plan {
 /// What every wave worker reads.
 struct Shared<'a, N: Rem> {
     engine: &'a dyn FrameStep<N>,
-    s: &'a crate::settings::Settings,
     cx: &'a WaveCtx<'a, N>,
     plan: &'a Plan,
     front: &'a Frontier<N>,
@@ -455,7 +457,7 @@ fn worker<N: Rem>(sh: &Shared<N>, sink: &mut UnitSink<N>, sc: &mut super::route:
             let t = Instant::now();
             match &plan.units[u] {
                 UnitSpec::Kernel { entries, state, .. } => {
-                    run_unit(sh.engine, u as u32, entries.clone(), *state, &sh.front.new, &sh.front.hulls, &plan.starts, sh.shapes, sink, &mut us, frame - 1, sh.cx.filters.orb, sh.s)?;
+                    run_unit(sh.engine, u as u32, entries.clone(), *state, &sh.front.new, &sh.front.hulls, &plan.starts, sh.shapes, sink, &mut us, frame - 1, sh.cx.prunes)?;
                 }
                 UnitSpec::Repush { layer, frame: f, segs, .. } => {
                     let tr = sink.stats.tick_start();
@@ -513,7 +515,7 @@ fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, cx: &WaveCtx<N>, front: &Frontier
     // frame's end; the gather numbers the workers' new pairs (`Gather::fresh`).
     let xtabs: Vec<std::sync::RwLock<Vec<Pair<N>>>> = (0..workers).map(|_| Default::default()).collect();
     let xfers_before = base.pairs.len();
-    let mut sinks: Vec<UnitSink<N>> = (0..workers).map(|w| UnitSink::new(visited, &routes, cx.skeletons, prov, cx.filters, cx.frame, w as u32, base, &xtabs[w], s).observed_by(cx.check)).collect();
+    let mut sinks: Vec<UnitSink<N>> = (0..workers).map(|w| UnitSink::new(visited, &routes, cx.skeletons, prov, cx.prunes, cx.frame, w as u32, base, &xtabs[w], s).observed_by(cx.check)).collect();
     let mut scratch: Vec<super::route::JobScratch> = (0..workers).map(|_| super::route::JobScratch::default()).collect();
     let pipe: Pipe<N> = Pipe {
         xtabs: &xtabs,
@@ -530,7 +532,7 @@ fn pipeline<N: Rem>(engine: &dyn FrameStep<N>, cx: &WaveCtx<N>, front: &Frontier
     };
     let shapes: Vec<u64> = visited.shapes().to_vec();
     let index = grown_index(&front.old);
-    let sh = Shared { engine, s, cx, plan, front, pipe: &pipe, routes: &routes, shapes: &shapes, index: &index, spool, xfers_before: xfers_before as u32 };
+    let sh = Shared { engine, cx, plan, front, pipe: &pipe, routes: &routes, shapes: &shapes, index: &index, spool, xfers_before: xfers_before as u32 };
     std::thread::scope(|scope| -> Result<()> {
         let handles: Vec<_> = sinks
             .iter_mut()
@@ -747,7 +749,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     }
     let t_pipeline = Instant::now();
     let Piped { mut states, fresh, stats } = pipeline(engine, &cx, &front, &plan, &prov, spool.as_deref())?;
-    let WaveCtx { visited, xfers, filters, edges_dir, skeletons, check, .. } = cx;
+    let WaveCtx { visited, xfers, prunes, edges_dir, skeletons, check, .. } = cx;
     st.add_time(S::Wave, t_pipeline.elapsed());
     st.merge(&stats);
     st.set_idle(workers);
@@ -805,7 +807,7 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
         Some(dir) => Some(edge_file_writer::<N>(dir.to_path_buf(), frame, xfers.take_flush(), routes_segs, src_index, finals.clone(), spool.clone(), s.threads())?),
         None => None,
     };
-    if let Some(f) = filters.marks {
+    if let Some(f) = prunes.ladder {
         mark_filter(&mut new, f, visited, skeletons, frame)?;
     }
     st.lap(S::EndFilter, &mut lap);
@@ -855,10 +857,10 @@ pub(crate) fn run_wave<N: Rem>(engine: &dyn FrameStep<N>, front: Frontier<N>, cx
     Ok(Wave { frontier: next, wins, stats: st, shapes: shapes_numbered, keys: adds })
 }
 
-/// THE OBJECTS LADDER's filter (`frame::MarkFilter`) on the new and grown
+/// THE OBJECTS LADDER's filter (`prune::MarkFilter`) on the new and grown
 /// states: a re-push reaches a state along an edge recorded earlier, whose
 /// verdict does not hold now; every state kept is checked at this frame.
-fn mark_filter<N: Rem>(sealed: &mut [super::route::Sealed<N>], f: &crate::frame::MarkFilter<N>, visited: &VisitedSet<N>, skeletons: &Skeletons<N>, frame: u32) -> Result<()> {
+fn mark_filter<N: Rem>(sealed: &mut [super::route::Sealed<N>], f: &crate::prune::MarkFilter<N>, visited: &VisitedSet<N>, skeletons: &Skeletons<N>, frame: u32) -> Result<()> {
     for sl in sealed.iter_mut() {
         let shape = visited.shape_hash(sl.region / crate::storage::cells::SLOTS);
         let slot = sl.region % crate::storage::cells::SLOTS;
@@ -1354,7 +1356,9 @@ pub fn one_frame<N: Rem>(engine: &dyn FrameStep<N>, rows: Vec<Rt2<N>>, frame: u3
     let s = &*engine.run().settings;
     let start = seed(&mut visited, &rows, HullOf::<N>::full(), &s)?.frontier;
     visited.forget_states();
-    let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, filters: Filters::default(), frame, edges_dir: None, edges: None, skeletons: &skeletons, check: None };
+    // The settings' cuts alone: no tree, so none of its prunes.
+    let prunes = Prunes::of(s, Default::default(), None);
+    let cx = WaveCtx { visited: &mut visited, xfers: &mut xfers, prunes: &prunes, frame, edges_dir: None, edges: None, skeletons: &skeletons, check: None };
     let wave = run_wave(engine, start, cx)?;
     let rows = super::layer::decode_states(&wave.frontier.new, &visited.keys, visited.shapes(), usize::MAX, &|_| true)?.into_iter().map(|(_, rt2)| rt2).collect();
     Ok((rows, wave.stats))

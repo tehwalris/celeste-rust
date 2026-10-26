@@ -18,7 +18,8 @@ use super::rem::{start_point, Rem};
 use super::result::{DualResult, LevelResult, Marks, SearchResult, Verdict};
 use crate::abstraction::Level;
 use crate::compiled::KernelLanes;
-use crate::frame::{MarkFilter, Visited};
+use crate::frame::Visited;
+use crate::prune::MarkFilter;
 use crate::settings::{Run, Settings};
 
 pub struct SearchSpec<'a> {
@@ -197,13 +198,13 @@ enum Finish {
 }
 
 /// THE LEVEL LOOP of a search and of `check known`: per level `(level,
-/// clock)` (coarsest first) `step(li, last, filter)`, `filter` the previous
-/// level's arc marks (`MarkFilter`); a level's marks (`Some`) go to the
-/// next, `None` ends the loop.
-fn for_levels<N: Rem>(levels: &[(Level, crate::settings::Clock)], mut step: impl FnMut(usize, bool, Option<&MarkFilter<N>>) -> Result<Option<Visited<N>>>) -> Result<()> {
+/// clock, horizon in steps)` (coarsest first) `step(li, last, filter)`,
+/// `filter` the previous level's arc marks (`MarkFilter`); a level's marks
+/// (`Some`) go to the next, `None` ends the loop.
+fn for_levels<N: Rem>(levels: &[(Level, crate::settings::Clock, u32)], mut step: impl FnMut(usize, bool, Option<&MarkFilter<N>>) -> Result<Option<Visited<N>>>) -> Result<()> {
     let mut prev: Option<Visited<N>> = None;
-    for (li, &(_, clock)) in levels.iter().enumerate() {
-        let filter = prev.as_ref().map(|m| MarkFilter::new(m, levels[li - 1].0, clock));
+    for (li, &(_, clock, steps)) in levels.iter().enumerate() {
+        let filter = prev.as_ref().map(|m| MarkFilter::new(m, levels[li - 1].0, clock, steps));
         match step(li, li + 1 == levels.len(), filter.as_ref())? {
             Some(marks) => prev = Some(marks),
             None => break,
@@ -230,7 +231,7 @@ fn run_levels<N: KernelLanes>(
     res: &mut SearchResult,
 ) -> Result<Option<Solved<N>>> {
     let mut solved = None;
-    let clocked: Vec<(Level, crate::settings::Clock)> = levels.iter().map(|&l| (l, cfg.clock())).collect();
+    let clocked: Vec<(Level, crate::settings::Clock, u32)> = levels.iter().map(|&l| (l, cfg.clock(), steps)).collect();
     for_levels::<N>(&clocked, |li, last, filter| {
         let (lvl, dir) = (levels[li], base.join(format!("level{li:02}")));
         // THE FORWARD. Level 0's tree is reused or extended (`grow_tree`
@@ -241,15 +242,14 @@ fn run_levels<N: KernelLanes>(
         let want = cfg.minus_one();
         if let Some(f) = filter {
             // The tree's record says what its forward was filtered for.
-            let m = f.marked();
-            let key = format!("steps {steps} level-1 {} marks {} {:016x}", crate::frame::MinusOne::text(want.as_ref()), m.len(), m.filter_fingerprint());
-            let have = crate::storage::record::Record::read(&dir).ok().flatten().and_then(|r| r.get("filtered_for").map(str::to_string));
+            let key = f.record_line(cfg);
+            let have = crate::storage::record::Record::read(&dir).ok().flatten().and_then(|r| r.get(MarkFilter::<N>::KEY).map(str::to_string));
             if have.as_deref() != Some(key.as_str()) {
                 if dir.exists() {
                     eprintln!("[search] {}: filtered for other marks or another horizon: built again", dir.display());
                     std::fs::remove_dir_all(&dir)?;
                 }
-                crate::storage::record::update(&dir, "filtered_for", key)?;
+                crate::storage::record::update(&dir, MarkFilter::<N>::KEY, key)?;
             }
         }
         let run = Run::new(cfg, lvl);
@@ -486,12 +486,12 @@ pub fn check_known(dir: &Path, inputs: &[u8], horizon: Option<u32>, run: &Settin
 
 fn check_known_in<N: KernelLanes>(trees: &[(std::path::PathBuf, Run)], inputs: &[u8], horizon: u32) -> Result<()> {
     let t0 = std::time::Instant::now();
-    let clocked: Vec<(Level, crate::settings::Clock)> = trees.iter().map(|(_, r)| (r.level, r.settings.clock())).collect();
+    let clocked: Vec<(Level, crate::settings::Clock, u32)> = trees.iter().map(|(_, r)| (r.level, r.settings.clock(), r.settings.clock().steps(horizon))).collect();
     for_levels::<N>(&clocked, |li, last, filter| {
         let (dir, tree) = &trees[li];
         let (cfg, lvl) = (&*tree.settings, tree.level);
         let steps = cfg.clock().steps(horizon);
-        anyhow::ensure!(crate::frame::tree_first_win_through::<N>(dir, steps)?.is_some(), "{}: no tree through step {steps} (run the search first)", dir.display());
+        anyhow::ensure!(crate::frame::tree_ends_by::<N>(dir, steps, cfg.threads())?.is_some(), "{}: no tree through step {steps} (run the search first)", dir.display());
         let route = super::known::Route { inputs, filter, hulls: true };
         let (arcs, marks, known) = arc_level::<N>(dir, tree, steps, !last, None, Some(&route))?;
         let f = known.ok_or_else(|| anyhow::anyhow!("the known route does not exit by f{horizon}: nothing to check"))?;

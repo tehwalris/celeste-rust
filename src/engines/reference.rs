@@ -436,18 +436,41 @@ where
 
 /// THE REFERENCE ENGINE AS THE FORWARD'S `FrameStep` (`rewrite forward
 /// --reference`): one engine a worker, every fork leaf one row with its
-/// source lane's cell and its transfer - so its tree is the kernels'.
+/// source lane's cell and its transfer - so its tree is the kernels'. Both
+/// sides of the level's widening are the widening table's block side
+/// (`Rt2::widen_to`): a row is READ widened (the kernels read a widened
+/// slot as the level's input says - an unknown, an atom, the stored range -
+/// whatever the row holds: the start's, stored as the engine made it,
+/// differs) and its successors STORED widened, as the kernels store them.
 pub struct RefFrameStep<N: Rem> {
     engines: Vec<std::sync::Mutex<ReferenceEngine<N>>>,
     run: crate::settings::Run,
+    /// The level rows are read and stored widened at: the run's.
+    widening: crate::abstraction::Level,
 }
 
 impl<N: Rem> RefFrameStep<N> {
-    /// `run`'s threads' worth of engines at its level.
+    /// `run`'s threads' worth of engines at its level. Refused at a near
+    /// level under the split frame: the block side's near floors are not the
+    /// kernels' mid-frame ones (`widening::Hook::NearFloor`), so its rows
+    /// could not be stored as theirs.
     pub fn new(run: &crate::settings::Run) -> Result<Self> {
         let s = &*run.settings;
+        ensure!(
+            !(s.split_frame && run.level.floors_near),
+            "the reference forward stores its rows by the widening table's block side, whose near floors are not the kernels' mid split frame (`Hook::NearFloor`): no reference forward at {} under --split-frame",
+            run.level
+        );
         let engines = (0..s.threads().max(1)).map(|_| Ok(std::sync::Mutex::new(ReferenceEngine::<N>::new(s)?.at_level(run.level)))).collect::<Result<_>>()?;
-        Ok(RefFrameStep { engines, run: run.clone() })
+        Ok(RefFrameStep { engines, run: run.clone(), widening: run.level })
+    }
+
+    /// TESTS ONLY, A FAULT: rows read and stored widened at `level` instead
+    /// (a check of the reference against the kernels must catch it).
+    #[cfg(test)]
+    pub(crate) fn widened_at(mut self, level: crate::abstraction::Level) -> Self {
+        self.widening = level;
+        self
     }
 
     /// An engine no other worker holds (there are as many as workers; a
@@ -474,6 +497,10 @@ impl<N: Rem> crate::frame::FrameStep<N> for RefFrameStep<N> {
         lanes: &[usize],
         sink: &mut crate::storage::unit::UnitSink<N>,
     ) -> Result<()> {
+        // The rows as the kernels read them.
+        let mut wide = block.clone_block();
+        wide.widen_to(self.widening);
+        let block = &wide;
         // The lanes in parallel, each on an engine of the pool, emitted in order a
         // chunk at a time (a lane's leaves are hundreds of rows: a whole unit's at
         // once would be gigabytes).
@@ -482,7 +509,7 @@ impl<N: Rem> crate::frame::FrameStep<N> for RefFrameStep<N> {
             let rows = crate::par::map(chunk, n, |&lane| self.engine().run_lane(block, lane));
             for (&lane, rows) in chunk.iter().zip(rows) {
                 for (b, pair) in rows? {
-                    sink.emit_row(&b, lane, crate::storage::cells::block_cells(&b)?[0], pair)?;
+                    sink.emit_row(&b, self.widening, lane, crate::storage::cells::block_cells(&b)?[0], pair)?;
                 }
             }
         }
