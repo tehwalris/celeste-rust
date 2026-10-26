@@ -560,9 +560,10 @@ fn read_tree<N: crate::search::rem::Rem>(dir: &Path, sets: &[MarkedSet], threads
                 rb.blocks.push((f, bi));
             }
         }
+        // The largest region first, ties by region.
         let mut regions: Vec<RegionBlocks> = by_region.into_values().collect();
-        regions.sort_unstable_by_key(|r| (std::cmp::Reverse(r.states), r.region));
-        let won = crate::par::Pool::new(threads).map(regions.len(), |i| count_region(&tree, &regions[i], sets, &sums))?;
+        regions.sort_unstable_by_key(|r| r.region);
+        let won = crate::par::Pool::new(threads).map_mut(&mut regions, |r| r.states, |_, r| count_region(&tree, r, sets, &sums))?;
         let mut win_regions: Vec<u32> = regions.iter().zip(won).filter(|x| x.1).map(|x| x.0.region).collect();
         win_regions.sort_unstable();
         graph = sources_into::<N>(dir, n as u32 - 1, &win_regions, threads)?;

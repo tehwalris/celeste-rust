@@ -1333,7 +1333,7 @@ impl Drop for BuildPurgeDelay {
         if b.0 == 0 {
             super::set_purge_delay(b.1);
             // Purge what the (exited) builder threads freed under the delay.
-            unsafe { libmimalloc_sys::mi_collect(true) };
+            crate::par::collect_freed();
         }
     }
 }

@@ -552,7 +552,7 @@ impl<N: Rem> EdgeStore<N> {
         let mut targets: Vec<u32> = regions.iter().flat_map(|&r| self.targets_of(frame, r)).collect();
         targets.sort_unstable();
         targets.dedup();
-        let parts = super::wave::par_map(&targets, threads, |&region| -> Result<Vec<(usize, Sk, u32)>> {
+        let parts = crate::par::map(&targets, threads, |&region| -> Result<Vec<(usize, Sk, u32)>> {
             let mut out = Vec::new();
             self.bundles_into(frame, region, &mut Decoder::default(), |b| {
                 let Some(cands) = wanted.get(&(b.s_shape, b.s_key)) else { return };

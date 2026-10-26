@@ -158,19 +158,16 @@ impl<N: Rem> VisitedSet<N> {
                 runs.push((count(i, lo, hi) + g.len() * super::set::PACK_ENTRIES, (i, k, (lo, hi), g)));
             }
         }
-        runs.sort_by_key(|r| std::cmp::Reverse(r.0));
-        let work: Vec<std::sync::Mutex<Option<Run>>> = runs.into_iter().map(|r| std::sync::Mutex::new(Some(r.1))).collect();
-        let done = super::wave::par_map(&work, threads, |w| -> Result<(usize, usize, Vec<Block>, Upserted)> {
-            let (i, k, (lo, hi), blocks) = w.lock().expect("a run").take().expect("a run taken once");
-            let changes = make(i, lo, hi)?;
-            let (out, n) = super::set::upsert_blocks(blocks, &changes)?;
-            Ok((i, k, out, n))
-        });
+        let done = crate::par::Pool::new(threads).map_mut(&mut runs, |r| r.0 as u64, |_, r| -> Result<(usize, usize, Vec<Block>, Upserted)> {
+            let (i, k, (lo, hi), blocks) = &mut r.1;
+            let changes = make(*i, *lo, *hi)?;
+            let (out, n) = super::set::upsert_blocks(std::mem::take(blocks), &changes)?;
+            Ok((*i, *k, out, n))
+        })?;
         // Each region's runs back in order.
         let mut parts: Vec<Vec<(usize, Vec<Block>)>> = (0..regions.len()).map(|_| Vec::new()).collect();
         let mut total = Upserted::default();
-        for d in done {
-            let (i, k, out, n) = d?;
+        for (i, k, out, n) in done {
             parts[i].push((k, out));
             total += n;
         }
@@ -195,7 +192,7 @@ impl<N: Rem> VisitedSet<N> {
     /// the new are new).
     pub(crate) fn absorb<G: Copy + Into<super::hulls::Grown<N>> + Sync>(&mut self, parts: &[Part<'_, N, G>], threads: usize) -> Result<Upserted> {
         // Per part its new entries' first states (their hulls' places).
-        let starts: Vec<Vec<u32>> = super::wave::par_map(parts, threads, |p| -> Result<Vec<u32>> {
+        let starts: Vec<Vec<u32>> = crate::par::map(parts, threads, |p| -> Result<Vec<u32>> {
             let mut at = Vec::with_capacity(p.new.len() + 1);
             let mut n = 0u32;
             for m in p.new.masks() {

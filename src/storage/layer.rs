@@ -429,7 +429,7 @@ impl<N: Arithmetic> FrameFile<N> {
     /// from `room` (`None`: none - a reader of keys and cells only).
     pub(crate) fn layer(&self, room: Option<(i16, i16)>, threads: usize) -> Result<(Layer<N>, Vec<(u32, u64)>)> {
         let n = self.header.regions.len();
-        let parts: Vec<Result<RegionEntries>> = super::wave::par_map(&(0..n).collect::<Vec<_>>(), threads, |&i| self.region(i));
+        let parts: Vec<Result<RegionEntries>> = crate::par::map(&(0..n).collect::<Vec<_>>(), threads, |&i| self.region(i));
         let mut layer = Layer::<N>::default();
         let mut wins = Vec::new();
         for (i, p) in parts.into_iter().enumerate() {
@@ -491,7 +491,7 @@ pub(crate) fn check_frame_file<N: crate::search::rem::Rem>(path: &Path, front: &
     let starts = layer.set.entry_starts();
     let differ = |what: String| anyhow!("{}: STORED STATES DIFFER from the forward's ({what})", path.display());
     ensure!(f.header.regions.len() == tables.len(), differ(format!("{} regions in memory, {} read back", tables.len(), f.header.regions.len())));
-    let parts: Vec<Result<()>> = super::wave::par_map(&(0..tables.len()).collect::<Vec<_>>(), threads, |&i| {
+    let parts: Vec<Result<()>> = crate::par::map(&(0..tables.len()).collect::<Vec<_>>(), threads, |&i| {
         let (region, t) = &tables[i];
         ensure!(f.header.regions[i].region == *region, differ(format!("region {} read back as {}", region, f.header.regions[i].region)));
         let e = f.region(i)?;

@@ -823,8 +823,7 @@ impl<'a, N: Rem> Backward<'a, N> {
         st.set(A::Nodes, self.cur.len() as u64);
         // The step's workers are gone: return their freed pages now
         // (mimalloc reclaims them lazily: ~3 GB held on a big room).
-        // SAFETY: mimalloc's documented API, callable from any thread.
-        unsafe { libmimalloc_sys::mi_collect(true) };
+        crate::par::collect_freed();
         st.lap(A::Merge, &mut lap);
         self.stats.merge(&st);
         eprintln!(

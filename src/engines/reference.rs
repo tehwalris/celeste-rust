@@ -479,7 +479,7 @@ impl<N: Rem> crate::frame::FrameStep<N> for RefFrameStep<N> {
         // once would be gigabytes).
         let n = self.engines.len();
         for chunk in lanes.chunks(4 * n) {
-            let rows = crate::storage::wave::par_map(chunk, n, |&lane| self.engine().run_lane(block, lane));
+            let rows = crate::par::map(chunk, n, |&lane| self.engine().run_lane(block, lane));
             for (&lane, rows) in chunk.iter().zip(rows) {
                 for (b, pair) in rows? {
                     sink.emit_row(&b, lane, crate::storage::cells::block_cells(&b)?[0], pair)?;
