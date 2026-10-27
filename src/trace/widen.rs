@@ -15,7 +15,8 @@ use super::domain::{Domain, Symbolic};
 use super::heap::Value;
 use super::iface::{self, Path, Step};
 use super::state::State;
-use crate::transpile::garith::{within, GraphArith};
+use crate::transpile::eval::within;
+use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{NodeId, Op};
 
 /// Write every `Stored::AbsentAsZero` field an object lacks as the number 0
@@ -471,7 +472,7 @@ mod tests {
     use crate::trace::cart;
     use crate::trace::interp::Interp;
     use crate::trace::frame::trace_frame;
-    use crate::transpile::graph::{Eval, Val};
+    use crate::transpile::eval::{Lanes, Val};
     use std::collections::HashMap;
 
     fn canonical(st: &State<Symbolic<P8>>, p: &Path) -> Option<Val<P8>> {
@@ -532,9 +533,9 @@ mod tests {
                     }
                 }
                 let f = trace_frame(&mut it, &chunks, st.clone(), &crate::trace::frame::TraceSpec { roots: &roots, concrete: true, ..Default::default() }).expect("trace");
-                // Everything a successor depends on, its booleans decided as far as a
-                // BDD over independent atoms can (a guard re-merged after a branch on
-                // `frames` is `c or not c`, true).
+                // Everything a successor depends on, decided as far as the
+                // interval fold can (a guard re-merged after a branch on `frames`,
+                // `c or not c`, folded to true as it was built: `Graph::fold`).
                 let mut roots_in = vec![f.raise];
                 let mut what = vec!["the raise".to_string()];
                 for (k, o) in f.outs.iter().enumerate() {
@@ -550,7 +551,7 @@ mod tests {
                         }
                     }
                 }
-                let (g, map, _) = crate::transpile::bdd::simplify_local(&it.d.graph, &roots_in, crate::transpile::bdd::LOCAL_CAP, crate::transpile::bdd::LOCAL_EXPAND);
+                let (g, map) = crate::transpile::eval::fold(&it.d.graph, &roots_in, None);
                 // Every input cell is a dead slot's; at its stored constant.
                 let stored: HashMap<u32, Val<P8>> = f
                     .iface
@@ -559,7 +560,7 @@ mod tests {
                     .enumerate()
                     .map(|(i, p)| (i as u32, canonical(&st, p).unwrap_or_else(|| panic!("{} is no dead slot", iface::show(p)))))
                     .collect();
-                let at_stored = g.eval(&stored, Eval::Lenient, None).expect("eval");
+                let at_stored = crate::transpile::eval::eval(&g, &stored, Lanes::Over, None);
                 for (r, w) in roots_in.iter().zip(&what) {
                     // Down to the cells, but not through an overflow check, which
                     // must hold at the stored constants instead.

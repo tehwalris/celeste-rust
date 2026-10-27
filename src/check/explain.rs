@@ -2,7 +2,7 @@
 //! command): the row's kernel REBUILT as the registry builds it (the walk's
 //! frame, its slots and symbol; the digest of `llc`'s text checked against
 //! the running kernel's, `Kernels::digest_of`), its fused graph evaluated on
-//! the row (`Eval::NarrowTop`), and per body that declines it (`live` and
+//! the row (`eval::eval`, one lane), and per body that declines it (`live` and
 //! `error` both may hold, as the kernel reads them) the error's disjuncts
 //! that are not false, each followed down to its first undecided condition,
 //! and its FAILING premises.
@@ -18,7 +18,8 @@ use crate::search::tree::TreeDir;
 use crate::settings::Run;
 use crate::storage::layer::Tree;
 use crate::storage::Sk;
-use crate::transpile::graph::{Eval, Graph, NodeId, Op, Val};
+use crate::transpile::eval::{Lanes, Val};
+use crate::transpile::graph::{Graph, NodeId, Op};
 
 /// State `state` of the tree `t` (a state of its layers through step
 /// `step`, where the forward ran it) explained: `explain_row` of its row.
@@ -71,7 +72,7 @@ fn rebuilt_explains<N: KernelLanes>(run: &Run, row: &Rt2<N>, key: (u64, Option<c
         };
         cells.insert(c, v);
     }
-    let vals = fused.eval(&cells, Eval::NarrowTop, Some(row.room)).with_context(|| format!("{sym}: evaluating its graph on the row"))?;
+    let vals = crate::transpile::eval::eval(fused, &cells, Lanes::One, Some(row.room));
     // As the kernel reads the masks: where they MAY hold.
     let may = |n: NodeId| vals[n as usize] != Val::Bool(Some(false));
     let mut out = String::new();

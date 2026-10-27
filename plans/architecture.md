@@ -66,8 +66,9 @@ celeste-rust (src/)
                         oracle and probe (test-only)
   engines/              the reference engine (`reference`: the interpreter
                         over RefDomain as a frame step)
-  transpile/            graph IR, garith, ival, bdd, lowering, asm (the
-                        LLVM IR emitter and its doubles, call-outs, jit)
+  transpile/            graph IR, eval (the one abstract evaluation), garith,
+                        lowering, asm (the LLVM IR emitter and its doubles,
+                        call-outs, jit)
   compiled/             FrameEngine, the kernel registry, emission, the
                         kernel cache
   check/                the tools outside the core, which names none of
@@ -203,6 +204,20 @@ constant (lattice constants; inputs read as a literal range so lanes merge:
 the fly fruit's `spd.y`/`rem.y`). No input cell
 carries a range; only a node does. The one assumption outside the family is
 open (below).
+
+**One abstract evaluation** (`transpile::eval`, 2026-10-27): per node what
+is known of its value - an interval or nothing, three values for a boolean,
+the tiles an `mget` may read - one rule per operator, read by every
+decision and fold: the tracer's static ranges (a comparison they decide, an
+overflow they rule out, a fork's arity), `Graph::fold` on literals, the
+lowering's fold (`eval::fold`, on the rebuilt graph as it is built) and one
+lane's evaluation (level -1, `explain`). A value covers what the CONSOLE
+computes on every lane (16.16 wraps and saturates), so a decision holds
+whatever the lane's errors; over the lanes a lane's own check (`FragOk`,
+`NoWrap`, `Known` of a set) is unknown unless the hull decides it for every
+lane. It replaced a piecewise range analysis, an interval evaluator with
+four modes, the interval fold and a local BDD (plans/lessons.md: each
+measured).
 
 **The map folds by range**: the lowering's fold reads `mget` over interval
 coordinates as the set of tiles in the rectangle, so a region with no
@@ -602,12 +617,12 @@ plans/refactor.md: `git show c4dd3241:plans/refactor.md`).
     level re-traces), the split pass replaced. These change behaviour.
   - `--category onlydiag` has no run yet (kept by Philippe).
 - Dropped, with the reason:
-  - Folding `widen::within` into `GraphArith::pieces_of` (the audit's
-    T12): `within`'s facts from a select's `x op k` condition would change
-    `range_of` wherever it is read (comparison folding, `bounded`, fork
-    arity), so the kernels and owed checks would move by construction,
-    not byte-identically; ~100 lines.
-  - `RefDomain` sharing `Graph::eval`'s interval rules (T10): they agree
+  - `widen::within`'s branch facts in every static range (the audit's
+    T12): a select's `x op k` condition would change `range_of` wherever
+    it is read (comparison folding, `bounded`, fork arity), so the kernels
+    and owed checks would move by construction, not byte-identically
+    (`eval::within` applies them to its own question alone).
+  - `RefDomain` sharing `transpile::eval`'s rules (T10): they agree
     case by case, and that agreement is a check - with one shared rule a
     wrong `Graph::compare` decision would pass both the lowering and the
     oracle `check ref` runs the kernels against; ~30 lines.

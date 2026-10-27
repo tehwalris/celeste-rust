@@ -133,7 +133,7 @@ fn successor_regions<A: GraphArith>(
         let mut p = pl.clone();
         p.push(iface::key(name));
         let Some(super::heap::Value::Num(n)) = iface::get(st, &p) else { anyhow::bail!("{}: not a number", iface::show(&p)) };
-        hull[axis] = match d.range_of(n).as_ref().and_then(A::floor_hull) {
+        hull[axis] = match d.range_of(n).map(A::floor_hull) {
             Some((lo, hi)) => (lo.max(window.0), hi.min(window.1)),
             None => window,
         };
@@ -657,7 +657,7 @@ impl<A: GraphArith> WalkState<A> {
                 // start's values, sound for level -1's lower bound.
                 let lit = match it.d.graph.get(n).op {
                     crate::transpile::graph::Op::Const(lo, hi) => Some((lo, hi)),
-                    _ => it.d.range_of(n).as_ref().and_then(A::lit_hull),
+                    _ => it.d.range_of(n).map(|iv| (A::lit(A::bounds(iv).0), A::lit(A::bounds(iv).1))),
                 };
                 start_ivals.insert(p.clone(), lit);
                 let zero = it.d.int(0);

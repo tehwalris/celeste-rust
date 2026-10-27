@@ -15,26 +15,6 @@ fn roots_under<A: GraphArith>(graph: &Graph<A>, cfg: &[u8], need: &[bool], want:
     want.iter().map(|r| map[*r as usize]).collect()
 }
 
-/// The roots of each configuration of `cfgs` DECIDED (the interval fold with
-/// the restrictions' ranges and the map), in one fresh arena so equal results
-/// are one node.
-fn decided_roots<A: GraphArith>(
-    graph: &Graph<A>,
-    cfgs: &[Vec<u8>],
-    (need, want): (&[bool], &[NodeId]),
-    room: Option<&celeste_core::room::Room>,
-) -> Vec<Vec<NodeId>> {
-    let mut probe = graph.like();
-    let mut decided = graph.like();
-    cfgs.iter()
-        .map(|c| {
-            let sig = roots_under(graph, c, need, want, &mut probe);
-            let (dm, _) = crate::transpile::ival::fold_into(&probe, &sig, room, &mut decided).expect("interval fold");
-            sig.iter().map(|r| dm[*r as usize]).collect()
-        })
-        .collect()
-}
-
 /// Specialize a traced frame's graph into ONE fused, hash-consed arena:
 /// every fork configuration resolved (`Fork`/`ForkValid` become
 /// `Frag`/`FragOk`), so no fork node survives and configurations that agree
@@ -50,7 +30,7 @@ pub(crate) fn specialize_frame<A: GraphArith>(
     let mut sp = graph.like();
     let mut cands = Vec::new();
     for (oi, out) in outs.iter().enumerate() {
-        cands.extend(configurations(graph, oi, out, forks, room, &mut sp));
+        cands.extend(configurations(graph, oi, out, forks, &mut sp));
     }
     let sp = decide(&sp, &mut cands, room);
     fuse(sp, cands)
@@ -68,15 +48,10 @@ pub(crate) fn specialize_frame<A: GraphArith>(
 /// * A fork that PARTITIONS the lanes (its validity is read). Per fork, with
 ///   every other fork standing, its dead-ness and its agreeing values are
 ///   decided (per outcome and per class of the first kind); the
-///   configurations are the product.
-fn configurations<A: GraphArith>(
-    graph: &Graph<A>,
-    oi: usize,
-    out: &Roots,
-    forks: u8,
-    room: Option<&celeste_core::room::Room>,
-    sp: &mut Graph<A>,
-) -> Vec<Body> {
+///   configurations are the product. Their roots are compared as built:
+///   compared decided (the interval fold) they find nothing more (measured,
+///   2026-10-27), and the fused bodies are decided once (`decide`).
+fn configurations<A: GraphArith>(graph: &Graph<A>, oi: usize, out: &Roots, forks: u8, sp: &mut Graph<A>) -> Vec<Body> {
     let mut cands = Vec::new();
     let want = out.flat();
     let need = graph.reachable(&want);
@@ -125,9 +100,9 @@ fn configurations<A: GraphArith>(
     // A DEAD fork (every fragment gives the same fields and error, and the
     // same `live` once its own validity is set aside) is taken once, validity
     // true (`graph::ANY_VALID`): the OR of its fragments' validities is the lane
-    // covered. Decided here once, compared decided: dead so, it is dead in every
-    // class. A fork this misses is checked per class below; one both miss is
-    // enumerated, which costs candidates and never a row.
+    // covered. Decided here once: dead so, it is dead in every class. A fork
+    // this misses is checked per class below; one both miss is enumerated,
+    // which costs candidates and never a row.
     let dead_everywhere: std::collections::BTreeSet<u8> = parts
         .iter()
         .copied()
@@ -141,10 +116,7 @@ fn configurations<A: GraphArith>(
                 })
                 .collect();
             let raw: Vec<Vec<NodeId>> = any.iter().map(|c| roots_under(graph, c, &need, &want, &mut probe)).collect();
-            raw.iter().all(|r| *r == raw[0]) || {
-                let dec = decided_roots(graph, &any, (&need, &want), room);
-                dec.iter().all(|r| *r == dec[0])
-            }
+            raw.iter().all(|r| *r == raw[0])
         })
         .collect();
     for m in classes {
@@ -152,7 +124,6 @@ fn configurations<A: GraphArith>(
         let mut probe = graph.like();
         // Move forks keep their traced arity, which their `ForkOk` premise checks.
         let valid: Vec<u8> = parts.iter().map(|&d| graph.fork_ways(d)).collect();
-        let this = (need.as_slice(), want.as_slice());
         let values: Vec<Vec<u8>> = parts
             .iter()
             .enumerate()
@@ -175,9 +146,8 @@ fn configurations<A: GraphArith>(
                 if valid[i] <= 2 {
                     return (0..valid[i]).collect();
                 }
-                // Per fork, its values that agree, compared decided as the body is.
-                let plain: Vec<Vec<u8>> = (0..valid[i]).map(with).collect();
-                let sigs = decided_roots(graph, &plain, this, room);
+                // Per fork, its values that agree.
+                let sigs: Vec<Vec<NodeId>> = (0..valid[i]).map(|v| roots_under(graph, &with(v), &need, &want, &mut probe)).collect();
                 (0..valid[i]).filter(|&v| !sigs[..v as usize].contains(&sigs[v as usize])).collect()
             })
             .collect();
@@ -197,21 +167,15 @@ fn configurations<A: GraphArith>(
     cands
 }
 
-/// DECIDE the boolean layer of the candidates, on the RESOLVED graph: the
-/// interval fold, the local BDD (`bdd::simplify_local`), the interval fold
-/// again; the candidates' roots follow into the result.
+/// DECIDE the candidates on the RESOLVED graph (`eval::fold`); their roots
+/// follow into the result.
 fn decide<A: GraphArith>(sp: &Graph<A>, cands: &mut [Body], room: Option<&celeste_core::room::Room>) -> Graph<A> {
     let all: Vec<NodeId> = cands.iter().flat_map(|c| c.roots.flat()).collect();
-    let (g1, m1, _) = crate::transpile::ival::fold(sp, &all, room).expect("interval fold");
-    let r1: Vec<NodeId> = all.iter().map(|x| m1[*x as usize]).collect();
-    // The boolean layer, simplified locally (`bdd::simplify_local`).
-    let (g2, m2, _) = crate::transpile::bdd::simplify_local(&g1, &r1, crate::transpile::bdd::LOCAL_CAP, crate::transpile::bdd::LOCAL_EXPAND);
-    let r2: Vec<NodeId> = r1.iter().map(|x| m2[*x as usize]).collect();
-    let (g3, m3, _) = crate::transpile::ival::fold(&g2, &r2, room).expect("interval fold 2");
+    let (g, m) = crate::transpile::eval::fold(sp, &all, room);
     for c in cands.iter_mut() {
-        c.roots = c.roots.map(|r| m3[m2[m1[r as usize] as usize] as usize]);
+        c.roots = c.roots.map(|r| m[r as usize]);
     }
-    g3
+    g
 }
 
 /// FUSE: candidates that write the same row are ONE body; a body live

@@ -9,7 +9,8 @@ use anyhow::{bail, Result};
 
 use celeste_core::arith::Arithmetic;
 use crate::transpile::garith::GraphArith;
-use crate::transpile::graph::{Cut, Eval, Graph, NodeId, Op, Ty, Unknown};
+use crate::transpile::eval::Known;
+use crate::transpile::graph::{Cut, Graph, NodeId, Op, Ty, Unknown};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arith {
@@ -372,14 +373,15 @@ pub struct FrameScratch<A: GraphArith> {
     /// bounded input, the only source of a static range) and `Op::Pin` (an input
     /// the body reads as a constant), each charged to every outcome.
     pub assumptions: Vec<NodeId>,
-    range_memo: std::collections::HashMap<NodeId, Option<Pieces<A>>>,
+    /// What the frame's graph is known to compute (`transpile::eval`): the
+    /// static ranges.
+    facts: crate::transpile::eval::Facts<'static, A>,
     /// The input cells this trace refuses merges on, sorted
     /// (`frame::trace_frame`'s `merge_refused_on`, `set_merge_refused`).
     merge_refused: Vec<u32>,
     merge_refused_memo: rustc_hash::FxHashMap<NodeId, bool>,
 }
 
-use crate::transpile::garith::Pieces;
 
 impl<A: GraphArith> Symbolic<A> {
     pub fn set_merge_refused(&mut self, mut cells: Vec<u32>) {
@@ -392,6 +394,7 @@ impl<A: GraphArith> Symbolic<A> {
 
     /// The input cells' types changed: the memos reading them no longer hold.
     pub fn forget_intervals(&mut self) {
+        self.frame.facts = Default::default();
         self.undecidable_memo.get_mut().clear();
         self.beneath_memo.get_mut().clear();
         self.may_memo.get_mut().clear();
@@ -466,16 +469,15 @@ impl<A: GraphArith> Symbolic<A> {
         go(self, &mut self.beneath_memo.borrow_mut(), n)
     }
 
-    /// The static range of `n`, from the restrictions.
-    pub fn range_of(&mut self, n: NodeId) -> Option<Pieces<A>> {
-        A::pieces_of(&self.graph, &mut self.frame.range_memo, n)
+    /// The static range of `n`, from the restrictions (`transpile::eval`).
+    pub fn range_of(&mut self, n: NodeId) -> Option<A::Ival> {
+        self.frame.facts.range(&self.graph, n)
     }
 
     /// Do the static ranges put every value of `n`'s EXACT result inside the
-    /// arithmetic's range (computed unwrapped: a result past it is unknown)?
-    /// Where true, `n` cannot overflow.
+    /// arithmetic's range? Where true, `n` cannot overflow.
     pub fn bounded(&mut self, n: NodeId) -> bool {
-        self.range_of(n).is_some_and(|pieces| A::bounded(&pieces))
+        self.frame.facts.fits(&self.graph, n)
     }
 
     /// Does anything give this frame a static range (a restriction)?
@@ -669,7 +671,7 @@ impl<A: GraphArith> Symbolic<A> {
             return true;
         }
         const EXACT: i64 = 1 << 53;
-        let small = self.range_of(sum).and_then(|p| A::floor_hull(&p)).is_some_and(|(lo, hi)| lo > -EXACT && hi < EXACT);
+        let small = self.range_of(sum).map(A::floor_hull).is_some_and(|(lo, hi)| lo > -EXACT && hi < EXACT);
         let whole = |l: A::Lit| {
             let v = A::from_lit(l);
             A::num_eq(A::flr(v), v)
@@ -814,37 +816,20 @@ impl<A: GraphArith> Symbolic<A> {
         !cone_any(&self.graph, &mut self.lane_memo, n, dependent)
     }
 
-    /// `op` over LITERAL operands (one an interval) in `Graph::eval`'s
-    /// semantics (one definition); `None` where eval does not model it.
-    fn eval_literal(&self, op: &Op<A>, args: &[NodeId]) -> Option<crate::transpile::graph::Val<A>> {
-        if !self.unknowns() {
+    /// `op` over LITERAL operands, one an interval (`eval::literal`: one
+    /// lane's rules, every lane holding them), with anything unknown.
+    fn eval_literal(&self, op: &Op<A>, args: &[NodeId]) -> Option<Known<A>> {
+        let literal = |a: &NodeId| matches!(self.graph.get(*a).op, Op::Const(..));
+        if !self.unknowns() || !args.iter().all(literal) || args.iter().all(|a| self.graph.point(*a).is_some()) {
             return None;
         }
-        let lits: Vec<(A::Lit, A::Lit)> = args
-            .iter()
-            .map(|a| match self.graph.get(*a).op {
-                Op::Const(lo, hi) => Some((lo, hi)),
-                _ => None,
-            })
-            .collect::<Option<_>>()?;
-        if lits.iter().all(|(lo, hi)| lo == hi) {
-            return None;
-        }
-        let mut g = Graph::<A>::default();
-        let leaves: Vec<NodeId> = lits.iter().map(|(lo, hi)| g.leaf(Op::Const(*lo, *hi))).collect();
-        let n = g.add(op.clone(), leaves);
-        g.eval(&std::collections::HashMap::new(), Eval::Exact, None).ok().map(|v| v[n as usize])
+        Some(crate::transpile::eval::literal(&self.graph, op, args))
     }
 
-    /// `eval_literal`'s number as a literal node.
+    /// `eval_literal`'s number, where known, as a literal node.
     fn literal_num(&mut self, op: Op<A>, args: &[NodeId]) -> Option<NodeId> {
-        match self.eval_literal(&op, args)? {
-            crate::transpile::graph::Val::Num(iv) => {
-                let (lo, hi) = A::bounds(iv);
-                Some(self.graph.leaf(Op::Const(A::lit(lo), A::lit(hi))))
-            }
-            crate::transpile::graph::Val::Bool(_) => None,
-        }
+        let (lo, hi) = A::bounds(self.eval_literal(&op, args)?.num()?);
+        Some(self.graph.leaf(Op::Const(A::lit(lo), A::lit(hi))))
     }
 
     /// The steps every operation on `args` takes first, in order: constants
@@ -955,16 +940,14 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         // Two literals: decided by their intervals, or a fresh atom of their own.
         let g: Op<A> = op.into();
         match self.eval_literal(&g, &[*a, *b]) {
-            Some(crate::transpile::graph::Val::Bool(Some(r))) => return Ok(self.graph.leaf(Op::ConstBool(r))),
-            Some(crate::transpile::graph::Val::Bool(None)) => return Ok(self.unknown_bool_atom()),
+            Some(Known::Bool(Some(r))) => return Ok(self.graph.leaf(Op::ConstBool(r))),
+            Some(Known::Bool(None)) => return Ok(self.unknown_bool_atom()),
             _ => {}
         }
-        // Decided by static ranges iff every pair of pieces agrees.
+        // Decided by the static ranges.
         if self.has_ranges() {
-            if let (Some(xs), Some(ys)) = (self.range_of(*a), self.range_of(*b)) {
-                if let Some(r) = A::decide_cmp(&g, &xs, &ys) {
-                    return Ok(self.graph.leaf(Op::ConstBool(r)));
-                }
+            if let Some(r) = self.frame.facts.compare(&self.graph, &g, *a, *b) {
+                return Ok(self.graph.leaf(Op::ConstBool(r)));
             }
         }
         Ok(self.graph.fold(g, vec![*a, *b]))
@@ -1043,10 +1026,10 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         }
         // At most `MOVE_WAYS`: the static range covers ALL lanes, but one lane
         // spans at most that many cells (too small declines via `ForkOk`). Level
-        // -1 takes the HULL: its lanes are ranges.
+        // -1 takes the whole range: its lanes are ranges.
         match self.range_of(*v) {
-            Some(ps) => {
-                let w = A::spanned(cut.grid(), &ps, self.uncapped_ways);
+            Some(iv) => {
+                let w = A::spanned(cut.grid(), iv);
                 (if self.uncapped_ways { w } else { w.min(MOVE_WAYS as i64) }) as u8
             }
             None => MOVE_WAYS,
@@ -1299,7 +1282,8 @@ mod tests {
     /// the cut below 1, where `0.5 - 2^-54 + 0.5` rounds up.
     #[test]
     fn a_round_fork_resolves_to_the_reference_fragments() {
-        use crate::transpile::graph::{Val, OPEN};
+        use crate::transpile::eval::Val;
+        use crate::transpile::graph::OPEN;
         use celeste_core::arith::Float;
         use celeste_core::lua_f64::{LuaF64, LuaF64Interval};
         let f = |v: f64| LuaF64::new(v).expect("finite");
@@ -1324,16 +1308,13 @@ mod tests {
                     splits[fork as usize] = c;
                     let mut g = d.graph.like();
                     let map = d.graph.specialize_subset_into(&splits, None, &mut g);
-                    // Strict, a lane spanning more values than the fork's
-                    // arity is an error of the evaluation (as `ForkOk`).
-                    let vals = match g.eval(&cells, Eval::Exact, None) {
-                        Ok(vals) => vals,
-                        Err(e) => {
-                            assert!(n > ways as u32 && format!("{e}").contains("ForkOk"), "ox {ox} [{lo}, {hi}] c {c}: {e}");
-                            continue;
-                        }
-                    };
-                    assert_eq!(vals[map[covered as usize] as usize], Val::Bool(Some(true)), "ox {ox} [{lo}, {hi}]: coverage");
+                    // A lane spanning more values than the fork's arity is not
+                    // covered (`ForkOk`).
+                    let vals = crate::transpile::eval::eval(&g, &cells, crate::transpile::eval::Lanes::One, None);
+                    if vals[map[covered as usize] as usize] != Val::Bool(Some(true)) {
+                        assert!(n > ways as u32, "ox {ox} [{lo}, {hi}] c {c}: {n} values, not covered by {ways}");
+                        continue;
+                    }
                     assert!(n <= ways as u32, "ox {ox} [{lo}, {hi}]: {n} values covered by {ways}");
                     let ok = (c as u32) < n;
                     assert_eq!(vals[map[valid as usize] as usize], Val::Bool(Some(ok)), "ox {ox} [{lo}, {hi}] c {c}: validity");
@@ -1371,9 +1352,9 @@ mod tests {
         assert!(d.literal_fragments(&point, true).expect("in range").is_none(), "a point is no split");
     }
 
-    /// The fake wall's `spd.x = -sign(spd.x)*1.5` before `move`: three pieces
-    /// two floors wide each; a kernel lane holds one (2-way), level -1 the
-    /// HULL (five floors).
+    /// The fake wall's `spd.x = -sign(spd.x)*1.5` before `move`: a range five
+    /// floors wide; a kernel lane spans at most two (2-way), level -1 the
+    /// whole range (five floors).
     #[test]
     fn level_minus_one_sizes_a_move_fork_by_the_hull_of_its_pieces() {
         let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
@@ -1390,7 +1371,7 @@ mod tests {
         let operand = d.graph.fold(Op::Add, vec![half, moved]);
         assert_eq!(d.split_ways(Cut::Floors, &operand), 2, "a kernel lane takes one piece");
         d.uncapped_ways = true;
-        d.frame.range_memo.clear();
+        d.frame.facts = Default::default();
         assert_eq!(d.split_ways(Cut::Floors, &operand), 5, "level -1 joins the pieces: floors -2..=2");
     }
 
@@ -1464,7 +1445,7 @@ mod tests {
     /// `r0sxfn`'s hidden near floor).
     #[test]
     fn an_equality_on_an_interval_may_answer_as_its_ends_allow() {
-        use crate::transpile::graph::Val;
+        use crate::transpile::eval::Val;
         let one = 1 << 16;
         for fruit_unknown in [false, true] {
             let answers = |lo: i32, hi: i32| {
@@ -1473,7 +1454,7 @@ mod tests {
                 let k = d.graph.leaf(Op::Const(one, one));
                 let eq = d.graph.fold(Op::Eq, vec![x, k]);
                 let (t, f) = d.may_answers(eq);
-                let v = d.graph.eval(&Default::default(), Eval::Exact, None).unwrap();
+                let v = crate::transpile::eval::eval(&d.graph, &Default::default(), crate::transpile::eval::Lanes::One, None);
                 let b = |n: NodeId| match v[n as usize] {
                     Val::Bool(b) => b,
                     Val::Num(_) => panic!("a number"),

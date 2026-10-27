@@ -228,7 +228,7 @@ A cargo workspace; the dependency order is load-bearing: `celeste-core`
 forward, `src/prune.rs` its pruning (filters and cuts, one `Prune`
 interface), `src/storage/`, `src/search/` the backward, the concrete search
 and level -1, `src/trace/` the tracer, `src/engines/` the reference
-engine, `src/transpile/` graph IR and the kernels' LLVM IR emitter, `src/compiled/` the kernel
+engine, `src/transpile/` graph IR, its one abstract evaluation (`eval`) and the kernels' LLVM IR emitter, `src/compiled/` the kernel
 registry, `src/settings.rs`, the `rewrite` binary in `src/bin/rewrite/`).
 The checks and diagnostics are TOOLS, not core: `src/check/` (the
 differential harness, check arcs, check replay, check reference, check keys through the one
