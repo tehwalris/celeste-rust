@@ -489,8 +489,8 @@ pub fn follower_violation<N: Arithmetic>(shape: u64, leader: u32, lcode: Code<N>
 
 /// THE POINTER TOPOLOGY IS THE SHAPE'S: a field holding a pointer holds
 /// no other code. A shape's signature names a value cell, never what it
-/// points at (`shape::sig`), and a kernel is bound by path against
-/// one representative of its shape (`trace::bind`): two states of one
+/// points at (`shape::sig`), and a kernel is bound to the cells of one
+/// representative of its shape (`trace::block::skeleton_bound`): two states of one
 /// shape whose pointers differ would run a kernel bound to the other's
 /// cells. FATAL (`check_pointer`).
 #[cold]
@@ -498,7 +498,7 @@ pub fn follower_violation<N: Arithmetic>(shape: u64, leader: u32, lcode: Code<N>
 fn pointer_violation<N: Arithmetic>(shape: u64, cell: u32, had: Code<N>, got: Code<N>, at: &str) -> ! {
     panic!(
         "exact keys: shape {shape:#x}: cell {cell} holds {:?} beside {:?} ({at}): a field holding a pointer holds exactly one code, \
-         but the POINTER TOPOLOGY, which a kernel binds by path against one representative, varies under one shape hash",
+         but the POINTER TOPOLOGY, which a kernel binds against one representative, varies under one shape hash",
         got.value(),
         had.value()
     );
@@ -1258,7 +1258,7 @@ mod tests {
         let mut globals = vec![NONE; celeste_names::GLOBAL_NAMES.len()];
         globals[celeste_names::global("objects") as usize] = 0;
         let cols = vec![Col::U(AV::Ptr(1)), Col::U(AV::Nil), Col::U(AV::Num(P8::from_i16(3)))];
-        let b = Rt2::<P8>::canonical_of(1, vec![Cell::Val, Cell::Obj(Box::new([(x, 2)])), Cell::Val], cols, globals, crate::runtime2::static_strings(), room);
+        let (b, _) = Rt2::<P8>::canonical_of(1, vec![Cell::Val, Cell::Obj(Box::new([(x, 2)])), Cell::Val], cols, globals, crate::runtime2::static_strings(), room);
         let (hash, words) = (b.shape_hash(), b.shape.sig().to_vec());
         let mut more = b.shape.globals().to_vec();
         more.push(NONE);

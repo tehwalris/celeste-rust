@@ -256,7 +256,8 @@ globals PRESENT, so appending a name to a table moves nothing.
 GLOBAL_NAMES' order is the cell numbering (the walk from the globals): a
 reordering is a different search. The signature names a value cell, never
 what it points at, nor a closure capture's target, yet a kernel is bound
-by path against one representative of its shape: THE POINTER TOPOLOGY IS
+to the cells of one representative of its shape (each traced slot to the
+cell the converter made for it, `block::skeleton_bound`): THE POINTER TOPOLOGY IS
 THE SHAPE'S, a premise guarded twice, FATAL - a key field holding a
 pointer holds exactly one code (`exact::check_pointer`), and every block
 `block::to_rt2` makes under one hash has one signature and one topology,

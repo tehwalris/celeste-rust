@@ -16,7 +16,18 @@ use super::domain::{Domain, Symbolic};
 use super::heap::Value;
 use super::state::State;
 
-pub use celeste_engine::slots::Step;
+/// One step of a path.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Step {
+    Key(String),
+    /// A slot of the ARRAY part, zero-based.
+    Idx(usize),
+    /// An integer key by its Lua key (1-based), written `[#n]`: a key outside
+    /// the array part (`Table::ints`, not measured by `#`). A block holds
+    /// integer keys in a dense array part (`block::dense_ints`), so `[#3]`
+    /// binds as `[2]`.
+    Int(i16),
+}
 
 pub type Path = Vec<Step>;
 
