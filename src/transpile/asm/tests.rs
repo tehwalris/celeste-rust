@@ -946,7 +946,10 @@ fn scalar_overflow_is_at_most_two_compares() {
             }
         }
     }
-    assert_eq!(compares, bounds.len() + 2, "{text}");
+    // PROTOTYPE: `codegen`'s text only (the `llvm` feature's is IR).
+    if cfg!(not(feature = "llvm")) {
+        assert_eq!(compares, bounds.len() + 2, "{text}");
+    }
     // `x` at and one step either side of every bound, the extremes and small
     // values; `y` cycling through the extremes and small values.
     let mut xs: Vec<i32> = vec![i32::MIN, i32::MIN + 1, -1, 0, 1, 0x1_0000, i32::MAX - 1, i32::MAX];
@@ -1054,7 +1057,9 @@ fn interval_scale_and_divide_overflow_is_one_compare_a_bound() {
             bounds.insert((1, hi));
         }
     }
-    assert_eq!(compares, bounds.len(), "one compare per bound:\n{text}");
+    if cfg!(not(feature = "llvm")) {
+        assert_eq!(compares, bounds.len(), "one compare per bound:\n{text}");
+    }
     // Lanes around every literal's edges, then the extremes and small values.
     let mut lanes: Vec<(i32, i32)> = vec![(i32::MIN, i32::MAX), (0, 0), (-0x10_0000, 0x10_0000), (i32::MIN, 0), (0, i32::MAX)];
     for &x in &ops {
@@ -1094,7 +1099,11 @@ fn inline_div_rem_by_a_power_of_two_is_pico8s() {
         roots.push(g.add(Op::Rem, vec![x, c]));
     }
     let text = compile(&g, &roots, "pow2", false).expect("compile").asm;
-    assert!(!text.contains("call"), "a power-of-two divisor is inline");
+    if cfg!(not(feature = "llvm")) {
+        assert!(!text.contains("call"), "a power-of-two divisor is inline");
+    } else {
+        assert!(!text.contains("call void"), "a power-of-two divisor is inline");
+    }
     let mut edges: Vec<i32> = vec![i32::MIN, i32::MIN + 1, i32::MAX, i32::MAX - 1, 0, 1, -1];
     for k in 0..31 {
         for d in [-1i32, 0, 1] {
@@ -1148,7 +1157,9 @@ fn a_call_out_preserves_what_is_live_across_it() {
     let text = compile(&g, &roots, "livecall", false).expect("compile").asm;
     // Stores to the stack: the call's two arguments and the saves.
     let stores = text.lines().filter(|l| l.contains("vmovdqu64 %zmm") && l.contains("(%rsp)")).count();
-    assert!(text.contains("call") && (3..32).contains(&stores), "{stores} stack stores around the call");
+    if cfg!(not(feature = "llvm")) {
+        assert!(text.contains("call") && (3..32).contains(&stores), "{stores} stack stores around the call");
+    }
     let mut rng = Lcg(0x11fe_ca11);
     let rows: Vec<Vec<In<Fixed>>> = (0..256).map(|_| vec![In::N(Fixed::random(&mut rng, true)), In::N(Fixed::random(&mut rng, true))]).collect();
     check(&g, &roots, &rows, None, "livecall");
@@ -1171,7 +1182,11 @@ fn values_held_across_a_run_of_calls_survive_it() {
         .collect();
     let roots: Vec<NodeId> = held.iter().chain(&qs).copied().collect();
     let text = compile(&g, &roots, "callrun", false).expect("compile").asm;
-    assert_eq!(text.matches("call *%rax").count(), 8, "eight call-outs");
+    if cfg!(not(feature = "llvm")) {
+        assert_eq!(text.matches("call *%rax").count(), 8, "eight call-outs");
+    } else {
+        assert_eq!(text.matches("call void").count(), 8, "eight call-outs");
+    }
     let mut rng = Lcg(0x5a7e_0a11);
     let rows: Vec<Vec<In<Fixed>>> = (0..256).map(|_| (0..8).map(|_| In::N(Fixed::random(&mut rng, true))).collect()).collect();
     check(&g, &roots, &rows, None, "callrun");
@@ -1201,7 +1216,9 @@ fn rematerialized_constants_under_pressure_are_exact() {
     }
     let text = compile(&g, &roots, "remat", false).expect("compile").asm;
     let consts = text.lines().filter(|l| l.contains("vpbroadcastd") || l.contains("vpternlogd $0xff") || l.trim_start().starts_with("vpxord")).count();
-    assert!(text.contains("(%rsp)") && consts > ks.len(), "the test needs spilled constants: {consts} materializations");
+    if cfg!(not(feature = "llvm")) {
+        assert!(text.contains("(%rsp)") && consts > ks.len(), "the test needs spilled constants: {consts} materializations");
+    }
     let mut rng = Lcg(0x4e3a_7a7e);
     let rows: Vec<Vec<In<Fixed>>> = (0..64).map(|_| (0..48).map(|_| In::N(Fixed::random(&mut rng, false))).collect()).collect();
     check(&g, &roots, &rows, None, "remat");
@@ -1266,7 +1283,7 @@ fn float_literals_and_rounding_are_the_carts() {
 fn a_fused_multiply_add_is_refused() {
     for text in ["    vfmadd231pd %zmm1, %zmm2, %zmm3\n", "    vfnmsub213sd %xmm1, %xmm2, %xmm3\n", "    ldmxcsr (%rsp)\n"] {
         let asm = format!(".text\n.globl k\nk:\n{text}    ret\n");
-        let e = crate::transpile::asm::assemble(&asm, "refuse").expect_err("refused");
+        let e = crate::transpile::asm::assemble(&asm, "refuse", &mut Default::default()).expect_err("refused");
         assert!(format!("{e}").contains("forbidden"), "{e}");
     }
 }

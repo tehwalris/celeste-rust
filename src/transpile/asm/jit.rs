@@ -29,7 +29,7 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// process runs (profiles attribute samples to its path), and nothing
 /// unlinks it on a kill or an OOM, so the first call removes the directory
 /// of every pid no longer running and empties this pid's own.
-fn scratch_dir() -> &'static Path {
+pub(super) fn scratch_dir() -> &'static Path {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
     DIR.get_or_init(|| {
         let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -52,7 +52,7 @@ fn scratch_dir() -> &'static Path {
     })
 }
 
-fn unique_stem(tag: &str) -> String {
+pub(super) fn unique_stem(tag: &str) -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("k_{}_{}", tag, n)
 }
@@ -63,7 +63,7 @@ fn unique_stem(tag: &str) -> String {
 /// handling are the process's, checked, never set). The text is ours and
 /// gcc only assembles it (`-x assembler`, no compiler, no contraction), so
 /// this scan of the text is the whole guarantee.
-fn refuse_forbidden(asm: &str) -> Result<()> {
+pub(super) fn refuse_forbidden(asm: &str) -> Result<()> {
     for (n, line) in asm.lines().enumerate() {
         let mn = line.split_whitespace().next().unwrap_or("");
         if mn.starts_with("vfm") || mn.starts_with("vfnm") || mn.starts_with("ldmxcsr") || mn.starts_with("vldmxcsr") {
@@ -77,32 +77,65 @@ fn refuse_forbidden(asm: &str) -> Result<()> {
 /// `gcc -x assembler -shared -fPIC` (assembled, never compiled). Returns the
 /// `.so` path. The `.s` (the bulk of the scratch) is removed once it has
 /// assembled, kept on failure for the error. A text holding a forbidden
-/// instruction is refused (`refuse_forbidden`).
-pub fn assemble(asm: &str, tag: &str) -> Result<PathBuf> {
+/// instruction is refused (`refuse_forbidden`). `times`: gcc's wall and CPU.
+pub fn assemble(asm: &str, tag: &str, times: &mut ToolTimes) -> Result<PathBuf> {
     refuse_forbidden(asm)?;
     let dir = scratch_dir();
     let stem = unique_stem(tag);
     let src = dir.join(format!("{stem}.s"));
     let obj = dir.join(format!("{stem}.so"));
     std::fs::write(&src, asm)?;
-    let out = std::process::Command::new("gcc")
-        .arg("-x")
-        .arg("assembler")
-        .arg("-shared")
-        .arg("-fPIC")
-        .arg("-o")
-        .arg(&obj)
-        .arg(&src)
-        .output()?;
-    if !out.status.success() {
-        bail!(
-            "gcc failed to assemble {}:\n{}",
-            src.display(),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    run_tool("gcc", std::process::Command::new("gcc").args(["-x", "assembler", "-shared", "-fPIC", "-o"]).arg(&obj).arg(&src), times)
+        .map_err(|e| anyhow::anyhow!("gcc failed to assemble {}: {e}", src.display()))?;
+    keep(&[&src]);
     let _ = std::fs::remove_file(&src);
     Ok(obj)
+}
+
+/// TEMPORARY (the LLVM prototype's measurements): with `LLVM_PROTO_KEEP=DIR`,
+/// copy a build's files there.
+pub(super) fn keep(files: &[&Path]) {
+    if let Some(dir) = std::env::var_os("LLVM_PROTO_KEEP") {
+        for f in files {
+            let _ = std::fs::copy(f, Path::new(&dir).join(f.file_name().expect("a file")));
+        }
+    }
+}
+
+/// What building one kernel cost: per tool, its wall and its CPU (user and
+/// system) seconds. TEMPORARY: the prototype's measurement.
+#[derive(Default, Clone, Debug)]
+pub struct ToolTimes {
+    pub steps: Vec<(&'static str, f64, f64)>,
+}
+
+/// Run `cmd` to completion (stderr kept for the error), its wall and CPU
+/// seconds (`wait4`'s usage of the child alone).
+pub(super) fn run_tool(name: &'static str, cmd: &mut std::process::Command, times: &mut ToolTimes) -> Result<()> {
+    use std::io::Read;
+    let t0 = std::time::Instant::now();
+    let mut child = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn()?;
+    let mut err = String::new();
+    child.stderr.take().expect("piped").read_to_string(&mut err)?;
+    let mut status: libc::c_int = 0;
+    // SAFETY: an all-zero `rusage` is valid; `wait4` reaps our own child.
+    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        let r = unsafe { libc::wait4(child.id() as libc::pid_t, &mut status, 0, &mut ru) };
+        if r >= 0 {
+            break;
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            bail!("wait4 for {name}: {e}");
+        }
+    }
+    let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
+    times.steps.push((name, t0.elapsed().as_secs_f64(), tv(ru.ru_utime) + tv(ru.ru_stime)));
+    if !(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0) {
+        bail!("{name} failed ({status:#x}):\n{err}");
+    }
+    Ok(())
 }
 
 /// THE DOUBLES' FLOATING-POINT ENVIRONMENT: round to nearest, FTZ and DAZ

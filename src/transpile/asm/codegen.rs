@@ -28,13 +28,13 @@ const N_ALLOC: u8 = 26; // homes zmm0..=zmm25
 
 // Call-out ABI: callee-saved r13 (inputs), r14 (outputs), r15 (AsmCtx), so a
 // `call` may clobber rdi/rsi. AsmCtx offsets: lockstep with callout.rs.
-const CTX_DIV: u32 = 0;
-const CTX_REM: u32 = 8;
-const CTX_SIN: u32 = 16;
-const CTX_MGET: u32 = 24;
-const CTX_TILE: u32 = 32;
-const CTX_TILE_LANES: u32 = 40;
-const CTX_ENV: u32 = 48;
+pub(super) const CTX_DIV: u32 = 0;
+pub(super) const CTX_REM: u32 = 8;
+pub(super) const CTX_SIN: u32 = 16;
+pub(super) const CTX_MGET: u32 = 24;
+pub(super) const CTX_TILE: u32 = 32;
+pub(super) const CTX_TILE_LANES: u32 = 40;
+pub(super) const CTX_ENV: u32 = 48;
 // The offsets ARE `AsmCtx`'s layout, in both arithmetics.
 const _: () = {
     use super::callout::AsmCtx;
@@ -1289,7 +1289,7 @@ impl Lower<'_, Fixed> {
 
 /// A node lowering order over BATCHES of roots: each batch's unplaced cone
 /// depth-major (ILP) while only ~`batch` roots' temporaries are live.
-fn schedule<A: GraphArith>(g: &Graph<A>, live: &[bool], roots: &[NodeId], batch: usize) -> Vec<NodeId> {
+pub(super) fn schedule<A: GraphArith>(g: &Graph<A>, live: &[bool], roots: &[NodeId], batch: usize) -> Vec<NodeId> {
     // ALAP depth (consumers have larger ids; operands are strictly shallower,
     // so depth-major is a valid order) keeps shared live ranges short.
     let maxd = g.len() as u32;
@@ -2156,7 +2156,7 @@ fn constant_key(mn: &str, ops: &str, a: &str) -> Option<String> {
 /// The input buffer's layout: the input cells `live` reads, ascending,
 /// each one's type and byte offset (by type, `input_bytes`), and the
 /// buffer's size.
-fn input_layout<A: GraphArith>(g: &Graph<A>, live: &[bool]) -> (Vec<u32>, Vec<Ty>, Vec<u32>, u32) {
+pub(super) fn input_layout<A: GraphArith>(g: &Graph<A>, live: &[bool]) -> (Vec<u32>, Vec<Ty>, Vec<u32>, u32) {
     let mut cells: Vec<u32> = (0..g.len() as NodeId)
         .filter(|id| live[*id as usize])
         .filter_map(|id| match g.get(id).op {
@@ -2179,7 +2179,7 @@ fn input_layout<A: GraphArith>(g: &Graph<A>, live: &[bool]) -> (Vec<u32>, Vec<Ty
 /// The output buffer's layout: each root's byte offset, booleans first (4
 /// B), then 64-aligned numbers (64 B) and intervals (128 B); and the
 /// buffer's size.
-fn output_layout(kinds: &[Ty]) -> (Vec<u32>, u32) {
+pub(super) fn output_layout(kinds: &[Ty]) -> (Vec<u32>, u32) {
     let mut offsets: Vec<u32> = vec![0; kinds.len()];
     let mut next = 0u32;
     for (ri, k) in kinds.iter().enumerate() {
@@ -2421,7 +2421,7 @@ fn wrap(sym: &str, body: &str, pool: &Pool, frame: u32, halves: Option<(u32, u32
 
 /// A kernel text's digest, its `#@k` provenance comments aside
 /// (`Compiled::text_digest`).
-fn text_digest(asm: &str) -> u64 {
+pub(super) fn text_digest(asm: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     for line in asm.lines().filter(|l| !l.starts_with("#@")) {

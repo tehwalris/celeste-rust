@@ -75,6 +75,10 @@ fn toolchain() -> &'static str {
         let gcc = std::process::Command::new("gcc").arg("-dumpfullversion").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_else(|e| format!("gcc unavailable: {e}"));
         // SAFETY: glibc returns a static NUL-terminated string.
         let glibc = unsafe { std::ffi::CStr::from_ptr(libc::gnu_get_libc_version()) }.to_string_lossy().into_owned();
+        // PROTOTYPE: the LLVM backend's version, passes and flags.
+        #[cfg(feature = "llvm")]
+        return format!("gcc {gcc}, glibc {glibc}, {}", crate::transpile::asm::llvm_pipeline());
+        #[cfg(not(feature = "llvm"))]
         format!("gcc {gcc}, glibc {glibc}")
     })
 }

@@ -41,6 +41,12 @@ memmap2 = "0.9"
 # The edge blocks at rest (`storage::bundle`), zstd -1 each.
 zstd = "0.13"
 
+# PROTOTYPE (branch llvm-backend): the kernels as LLVM IR built by `opt` +
+# `llc` (`transpile::asm::llvm`) instead of `codegen`'s text. TEMPORARY: the
+# A/B's build-time switch, removed with the prototype.
+[features]
+llvm = []
+
 [[bin]]
 name = "rewrite"
 path = "src/bin/rewrite/main.rs"
