@@ -43,6 +43,31 @@ sounds like one of these. The full write-ups are in git history.
 - **Diagnostics as `#[test] #[ignore]`**: five zero-assertion tests that
   only printed; nothing failed when their answer changed. Diagnostics are
   `rewrite` subcommands.
+- **The hand-written AVX-512 backend** (`transpile/asm/codegen.rs` and
+  `codegen/float.rs`, 3,020 lines: SSA over vregs with a GVN memo, a
+  pressure-aware list scheduler, a linear scan, call saves, a text
+  peephole; deleted 2026-10-27, branch `llvm-backend`), replaced by LLVM
+  IR built by `llc -O2` + `as` + `ld` (`asm::llvm`, 1,520 lines). The A/B
+  (release, the perf tier's frames, 16 threads, back to back; every tree
+  byte-identical): kernel instructions -24 / -16 / -9% and kernel time -17
+  / -18 / -32% on r62h f50 / r62h57 f56 / f42n f60, the frames -0.05 /
+  -0.05 / -1.51% (BENCHMARK_DATA.md); static instructions -46% (r10's set
+  873k -> 470k, r60s's 3.21M -> 1.71M). The price is the build: `llc` is linear at ~45-50 us a fused node
+  against codegen's 1-2 us and gcc's ~13 ms a kernel, so a cold set took
+  3.6-5x the CPU (r10 2.1 -> 10.3, r62h 5.7 -> 28.5, r60s 14.8 -> 53.5
+  CPU-s), +0.6-1.5 s of wall at 16 workers, where the trace dominates.
+  Measured on the way: SelectionDAG's own CSE and combiner make `opt
+  -passes=early-cse` redundant (output within 1%, +13% cost);
+  `instcombine` saves 9% of the instructions for 5x `opt`'s cost; `-O1` and
+  `-O3` emit what `-O2` does; `-O0`, `-regalloc=fast` and `-regalloc=basic`
+  cost 15-26% more instructions and twice the spills; `-combiner-disabled
+  -enable-misched=false -pre-RA-sched=list-burr` cut `llc`'s time 35-42% at
+  the same kernel speed with the ladder green, but `-combiner-disabled` is
+  a debugging flag: kept off, for robustness. The gcc driver was 13.6 of
+  the old r60s build's 15.6 CPU-s; `as` + `ld -shared` do its work in 4.8.
+  (The generated kernel crates' minutes were rustc's whole pipeline over
+  ~923k lines; `llc` alone takes 0.03-0.25 s a kernel.) The two entries
+  below are the hand-written backend's.
 - **A register allocator for spills**: spills are 21.6% of the kernels'
   instructions but the kernels are ~2% of a frame (~0.4% of the wave).
 - **Kernel regions of 8 px** (2026-10-10): -20% instructions a slice, no

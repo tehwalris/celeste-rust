@@ -15,10 +15,11 @@ level -1 table at startup) are in plans/devloop.md.
 
 ## The pinned frames (exact)
 
-`bench frame --metrics` of the fixtures (`check.sh` t1 and big; the pins
-in `gates/fixtures/NAME.metrics` and `NAME.frame`). The kernels are
-straight-line code, so their dynamic instruction count is exact (call-outs'
-callees aside). "in" is the frame's expanded states.
+The fixtures' frames (`check.sh` t1 and big pin their f/h/e/b lines,
+`gates/fixtures/NAME.frame`). The counts were read from the kernel census
+(`bench frame --metrics`), deleted 2026-10-27 with the hand-written
+backend: the kernel instructions are that backend's (the next section has
+the LLVM kernels'). "in" is the frame's expanded states.
 
 | fixture | room, level | frame | in | emissions | new states | edges | edge bytes | kernel instructions | slices | pinned |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -30,8 +31,42 @@ callees aside). "in" is the frame's expanded states.
 
 The kernels are ~2-3% of a hot frame's work; the rest is emission, unit
 ends, re-pushes and the region phase (`bench frame`'s `[cost]` lines).
-The float twins (`f10`, `f42n`) are pinned by their f/h/e lines only (the
-kernel census is 16.16's); plans/float.md has their costs.
+The float twins (`f10`, `f42n`) are pinned by their f/h/e lines;
+plans/float.md has their costs.
+
+## The kernels' backend (2026-10-27, LLVM IR + `llc`)
+
+The hand-written backend (2a639ea7) against the LLVM one (the branch
+`llvm-backend`'s head), release binaries, the perf tier's method (`--reps
+3` less `--reps 1`, over 2), 16 threads, back to back at load 10-20; every
+frame's f/h/e lines the pinned ones. The kernels' share is a sampled `perf
+record -e instructions:u` of the 3-rep run by DSO (the `k_*.so`, +-2%),
+the kernel time `[cost] kernel_s`'s minimum (ns per input lane).
+
+| frame | instructions a rep | kernels' instructions a rep | kernel ns / lane in |
+|---|---|---|---|
+| r62h f50 | 16.884 -> 16.876 G (-0.05%) | 0.178 -> 0.136 G (-24%) | 105.0 -> 87.0 |
+| r62h57 f56 | 44.122 -> 44.101 G (-0.05%) | 0.394 -> 0.332 G (-16%) | 99.8 -> 81.6 |
+| f42n f60 | 5.040 -> 4.964 G (-1.51%) | 0.260 -> 0.236 G (-9%) | 650.4 -> 441.0 |
+
+The kernels are 0.6-3% of a frame's instructions; the rest of the binary
+measured +0.2% (r62h, r62h57) against the base, the tier's run-to-run band.
+`gates/perf.txt` re-pinned at the replacement: r62h 16.878 G, r62h57
+44.091 G, f42n 4.964 G. Static instructions of a kernel set: r10 873k ->
+470k, r60s 3.21M -> 1.71M.
+
+A COLD kernel set (its cache entry removed), 16 workers, CPU seconds per
+tool (the children's `wait4` usage, the emitting thread's clock):
+
+| set | kernels, fused nodes | trace | hand-written: codegen + gcc | LLVM: emit + llc + as + ld | assemble wall |
+|---|---|---|---|---|---|
+| r10 | 102, 210k | 1.1 s | 0.35 + 1.71 = 2.1 CPU-s | 0.11 + 9.65 + 0.37 + 0.18 = 10.3 CPU-s | 0.21 -> 0.76 s |
+| r62h | 306, 522k | 4.6 s | 0.88 + 4.84 = 5.7 CPU-s | 0.30 + 26.65 + 1.01 + 0.55 = 28.5 CPU-s | 0.56 -> 2.07 s |
+| r60s | 918, 1.17M | ~14 s | 1.76 + 13.08 = 14.8 CPU-s | 0.65 + 49.0 + 2.20 + 1.63 = 53.5 CPU-s | 1.27 -> 3.78 s |
+
+The largest kernels (2.7-3.8k fused nodes): 23-31 ms -> 126-238 ms.
+`llc` is linear, ~45-50 us a fused node. plans/lessons.md has the flags
+measured on the way.
 
 ## Whole searches (2026-10-13, the hull forward)
 
