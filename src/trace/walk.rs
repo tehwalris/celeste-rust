@@ -527,7 +527,7 @@ mod tests {
                 .iter()
                 .map(|(node, f)| (*node, f.frame.in_rt2.shape_hash(), f.frame.iface.slots.clone(), f.frame.in_cells.clone(), f.bounds.clone(), f.frame.outs.len(), f.frame.fork_ways.clone()))
                 .collect();
-            let kernels = crate::compiled::asm_kernel::Registry::<Fixed>::build_with(&run, None, false).unwrap_or_else(|e| panic!("{e:#}"));
+            let kernels = crate::compiled::asm_kernel::Registry::<Fixed>::build_with(&run, None).unwrap_or_else(|e| panic!("{e:#}"));
             ((lw.lattice, reps, nodes, lw.start_key, lw.start_ivals, lw.ival_extra), (kernels.len(), kernels.text_digest(), kernels.key_layouts()))
         };
         let (one, eight) = (at(1), at(8));

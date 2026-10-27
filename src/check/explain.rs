@@ -1,8 +1,8 @@
 //! WHY A KERNEL DECLINES A ROW (`rewrite explain`, the decline report's
 //! command): the row's kernel REBUILT as the registry builds it (the walk's
-//! frame, its slots and symbol; the text's digest checked against the
-//! running kernel's, `Kernels::digest_of`), its fused graph evaluated on the
-//! row (`Eval::NarrowTop`), and per body that declines it (`live` and
+//! frame, its slots and symbol; the digest of `llc`'s text checked against
+//! the running kernel's, `Kernels::digest_of`), its fused graph evaluated on
+//! the row (`Eval::NarrowTop`), and per body that declines it (`live` and
 //! `error` both may hold, as the kernel reads them) the error's disjuncts
 //! that are not false, each followed down to its first undecided condition,
 //! and its FAILING premises.
@@ -58,7 +58,7 @@ fn rebuilt_explains<N: KernelLanes>(run: &Run, row: &Rt2<N>, key: (u64, Option<c
     let (fused, bodies) = (&r.lowered.fused, &r.lowered.bodies);
     let (flat_roots, _) = crate::compiled::asm_kernel::root_slots(bodies);
     let sym = crate::compiled::asm_kernel::kernel_sym(key.0, si);
-    let compiled = crate::transpile::asm::compile(fused, &flat_roots, &sym, false)?;
+    let (compiled, _) = crate::transpile::asm::compile_and_load(fused, &flat_roots, &sym)?;
     anyhow::ensure!(compiled.text_digest == digest, "{sym}: the rebuilt kernel's text ({:016x}) is not the running one's ({digest:016x})", compiled.text_digest);
     let mut cells: HashMap<u32, Val<N>> = HashMap::new();
     for &c in &compiled.input_cells {

@@ -3,8 +3,8 @@
 ## What this project is
 
 An abstract interpreter for PICO-8 Celeste, used to search for provably
-optimal per-room TASes. It traces the cart's Lua into a graph IR, assembles
-that into branch-free AVX-512 kernels at startup, and searches in three
+optimal per-room TASes. It traces the cart's Lua into a graph IR, emits
+that as LLVM IR and builds it into branch-free AVX-512 kernels at startup, and searches in three
 steps (`rewrite search`; plans/architecture.md "The search"):
 
 1. a FORWARD over abstract states (the room's objects optionally widened),
@@ -228,20 +228,21 @@ A cargo workspace; the dependency order is load-bearing: `celeste-core`
 forward, `src/prune.rs` its pruning (filters and cuts, one `Prune`
 interface), `src/storage/`, `src/search/` the backward, the concrete search
 and level -1, `src/trace/` the tracer, `src/engines/` the reference
-engine, `src/transpile/` graph IR and assembler, `src/compiled/` the kernel
+engine, `src/transpile/` graph IR and the kernels' LLVM IR emitter, `src/compiled/` the kernel
 registry, `src/settings.rs`, the `rewrite` binary in `src/bin/rewrite/`).
 The checks and diagnostics are TOOLS, not core: `src/check/` (the
 differential harness, check arcs, check replay, check reference, check keys through the one
-observer seam `frame::RowCheck`, the gate's fingerprints, the census,
+observer seam `frame::RowCheck`, the gate's fingerprints,
 explain) and `src/ui_export.rs` (the UI export); the core names none of
 them (a conventions test).
 Details: plans/architecture.md.
 
 There is NO checked-in kernel artifact: the registry retraces the start
-room's shapes at startup, specializes them for the level and assembles
-them with gcc + dlopen. What runs is what the tracer makes of this
+room's shapes at startup, specializes them for the level, emits them as
+LLVM IR and builds them with `llc -O2` (exactly `transpile::asm::jit::LLC_FLAGS`;
+no opt passes), `as` and `ld -shared`, loaded with dlopen. What runs is what the tracer makes of this
 checkout's Lua. A set built before from the same sources (the whole tree),
-profile, toolchain, cart and settings loads from `/var/tmp/celeste-kernels`
+profile, toolchain (llc's version and flags, as, ld), cart and settings loads from `/var/tmp/celeste-kernels`
 instead (`compiled::cache`; files hash-checked); the `[asm build]` line says
 HIT or MISS.
 
@@ -306,4 +307,6 @@ committed.
 
 ## Installing packages
 
-Feel free to install pacman packages when needed (e.g. `perf`).
+Feel free to install pacman packages when needed (e.g. `perf`). The kernels
+need LLVM's `llc` at runtime (`pacman -S llvm`; measured with 23.1.4) and
+binutils' `as` and `ld`; gcc builds no kernel.

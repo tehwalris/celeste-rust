@@ -240,7 +240,7 @@ pub enum Unknown {
 }
 
 /// A lane's value type: what a node computes on one lane, and how a cell or
-/// a root is laid out in a kernel's buffers (`asm::codegen`).
+/// a root is laid out in a kernel's buffers (`asm::llvm`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Ty {
     Num,
@@ -369,7 +369,7 @@ impl<A: GraphArith> Graph<A> {
     }
 
     /// Does the kernel compute `op` over `args` on EXACT operands only
-    /// (`asm::codegen` takes a number's operand as `as_num`)? `Mul`/`Div`
+    /// (`asm::llvm` takes a number's operand as `as_num`)? `Mul`/`Div`
     /// also take an interval times (over) a positive literal.
     pub fn exact_operands_only(&self, op: &Op<A>, args: &[NodeId]) -> bool {
         let pos = |n: NodeId| matches!(self.get(n).op, Op::Const(lo, hi) if lo == hi && A::lt(A::from_i16(0), A::from_lit(lo)));

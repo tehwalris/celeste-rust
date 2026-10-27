@@ -95,8 +95,6 @@ pub fn ids() -> &'static BoundaryIds {
 /// (`asm_kernel::registry`, built on first use), in the arithmetic of `N`.
 pub struct Kernels<N: KernelLanes> {
     run: crate::settings::Run,
-    /// Each kernel counts the slices it runs (`counting`).
-    counting: bool,
     registry: std::sync::OnceLock<Arc<asm_kernel::Registry<N>>>,
 }
 
@@ -106,29 +104,11 @@ pub type FrameEngine = Kernels<celeste_core::pico8_num::Pico8Num>;
 impl<N: KernelLanes> Kernels<N> {
     /// The engine of `run` (its start room, its frames at its level).
     pub fn new(run: &crate::settings::Run) -> Result<Self> {
-        Ok(Kernels { run: run.clone(), counting: false, registry: std::sync::OnceLock::new() })
-    }
-
-    /// The same kernels, each COUNTING the slices it runs (`slice_counts`:
-    /// the census's dynamic instructions, `check::census`). The same code
-    /// and cache entry as `new`'s; the counters are attached at load.
-    pub fn counting(run: &crate::settings::Run) -> Result<Self> {
-        Ok(Kernels { counting: true, ..Kernels::new(run)? })
+        Ok(Kernels { run: run.clone(), registry: std::sync::OnceLock::new() })
     }
 
     fn registry(&self) -> &asm_kernel::Registry<N> {
-        self.registry.get_or_init(|| asm_kernel::registry::<N>(&self.run, self.counting))
-    }
-
-    /// Per kernel its (shape, region), symbol and the slices it ran since
-    /// the last `reset_slices` (none unless `counting`), by key.
-    pub fn slice_counts(&self) -> Vec<((u64, Option<crate::trace::walk::Region>), String, u64)> {
-        self.registry().slice_counts()
-    }
-
-    /// Zero the slice counters (a bench's warm-up done).
-    pub fn reset_slices(&self) {
-        self.registry().reset_slices()
+        self.registry.get_or_init(|| asm_kernel::registry::<N>(&self.run))
     }
 
     /// Kernel `k`'s text digest: a rebuilding tool's identity check.

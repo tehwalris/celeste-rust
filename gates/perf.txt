@@ -4,6 +4,6 @@
 # Pinned at the out files' removal (simp-s, 2026-10-20). More than 2% over
 # its pin FAILS. Re-pin (./check.sh perf --pin) only on evidence - an intended
 # speedup, or a change that has to cost - and say why in the commit.
-r62h 16837148892
-r62h57 43964704435
-f42n 5017677742
+r62h 16878066992
+r62h57 44090834134
+f42n 4963852695

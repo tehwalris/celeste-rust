@@ -195,9 +195,6 @@ struct AsmKernel<N: KernelLanes> {
     /// The start room (the emission's cells are relative to it).
     room: &'static Room,
     fused_nodes: usize,
-    /// The slices this kernel ran, in a COUNTING set (`Kernels::counting`:
-    /// the census's dynamic instructions, `check::census`).
-    slices: Option<std::sync::atomic::AtomicU64>,
 }
 
 impl<N: KernelLanes> AsmKernel<N> {
@@ -232,9 +229,6 @@ impl<N: KernelLanes> AsmKernel<N> {
         let t_setup = sink.stats.tick_start();
         let n = lanes.len();
         debug_assert!((1..=16).contains(&n));
-        if let Some(c) = &self.slices {
-            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         let views = self.input_views(chunk);
         let env = CollisionEnv { room: chunk.room };
         let ctx = AsmCtx::<N>::new(&env as *const CollisionEnv as *const c_void);
@@ -671,21 +665,6 @@ impl<N: KernelLanes> Registry<N> {
         self.kernels.len()
     }
 
-    /// Per kernel of a COUNTING set (`registry`'s `counting`) its key,
-    /// symbol and the slices it ran; none in a set that is not counting.
-    pub(crate) fn slice_counts(&self) -> Vec<((u64, Option<Region>), String, u64)> {
-        let mut out: Vec<_> = self.kernels.iter().filter_map(|(k, v)| Some((*k, v.compiled.sym.clone(), v.slices.as_ref()?.load(std::sync::atomic::Ordering::Relaxed)))).collect();
-        out.sort_unstable();
-        out
-    }
-
-    /// Zero every kernel's slice counter (a bench's warm-up done).
-    pub(crate) fn reset_slices(&self) {
-        for c in self.kernels.values().filter_map(|v| v.slices.as_ref()) {
-            c.store(0, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
     /// Kernel `k`'s text digest (`Compiled::text_digest`): what a tool that
     /// rebuilds it checks its own against.
     pub(crate) fn digest_of(&self, k: (u64, Option<Region>)) -> Option<u64> {
@@ -779,18 +758,17 @@ impl<N: KernelLanes> Registry<N> {
         }
     }
 
-    /// Retrace the start room and assemble every shape for `run`
-    /// (`counting`: each kernel counts the slices it runs).
-    pub fn build_for_start_room(run: &crate::settings::Run, counting: bool) -> Result<Registry<N>> {
+    /// Retrace the start room and build every shape's kernel for `run`.
+    pub fn build_for_start_room(run: &crate::settings::Run) -> Result<Registry<N>> {
         match run.settings.region_grid() {
             Some(g) => eprintln!("[region] kernels keyed on a {} px grid, player speed asserted within [-{}, {}] px", g.px, g.speed, g.speed),
             None => eprintln!("[region] no region key (--region off)"),
         }
-        Registry::build_with(run, Some(&super::cache::Store::default()), counting)
+        Registry::build_with(run, Some(&super::cache::Store::default()))
     }
 
     /// `build_for_start_room` with the kernel cache `store` (none: build).
-    pub(crate) fn build_with(run: &crate::settings::Run, store: Option<&super::cache::Store>, counting: bool) -> Result<Registry<N>> {
+    pub(crate) fn build_with(run: &crate::settings::Run, store: Option<&super::cache::Store>) -> Result<Registry<N>> {
         let t0 = std::time::Instant::now();
         let key = store.map(|_| super::cache::key::<N>(run)).transpose()?;
         let room = run.room();
@@ -800,7 +778,7 @@ impl<N: KernelLanes> Registry<N> {
                 for (i, (recipe, so)) in entry.into_iter().enumerate() {
                     let loaded = Loaded::from_bytes(&so, &format!("cached_{i}"), &recipe.compiled.sym)?;
                     let k = (recipe.shape, recipe.region);
-                    anyhow::ensure!(kernels.insert(k, AsmKernel::of(recipe, loaded, room, counting)?).is_none(), "the kernel cache's entry {} holds kernel {k:?} twice", key.name);
+                    anyhow::ensure!(kernels.insert(k, AsmKernel::of(recipe, loaded, room)?).is_none(), "the kernel cache's entry {} holds kernel {k:?} twice", key.name);
                 }
                 unify(&mut kernels)?;
                 eprintln!("[asm build] {} kernels: kernel cache HIT {}, {:.2}s; kernel text {:016x}", kernels.len(), key.name, t0.elapsed().as_secs_f64(), text_digest(&kernels));
@@ -820,7 +798,7 @@ impl<N: KernelLanes> Registry<N> {
             let (recipe, loaded) = build_one_shape::<N>(r, (r.frame.in_rt2.shape_hash(), *region), si)?;
             let stored = store.is_some().then(|| Ok::<_, anyhow::Error>((recipe.clone(), loaded.bytes()?))).transpose()?;
             let key = (recipe.shape, recipe.region);
-            Ok((key, AsmKernel::of(recipe, loaded, room, counting)?, stored))
+            Ok((key, AsmKernel::of(recipe, loaded, room)?, stored))
         })?;
         let mut kernels = HashMap::new();
         let mut first: HashMap<(u64, Option<Region>), usize> = HashMap::new();
@@ -1068,7 +1046,7 @@ pub(crate) fn kernel_sym(shape: u64, si: usize) -> String {
     format!("kernel_k{shape:016x}_{si}")
 }
 
-/// Assemble ONE lowered frame (the set's `si`-th; gcc + dlopen) as kernel
+/// Build ONE lowered frame (the set's `si`-th; `llc` + dlopen) as kernel
 /// `key`'s recipe and its loaded code.
 fn build_one_shape<N: KernelLanes>(
     r: &crate::trace::lower::LoweredFrame<N>,
@@ -1125,11 +1103,11 @@ fn build_one_shape<N: KernelLanes>(
 }
 
 impl<N: KernelLanes> AsmKernel<N> {
-    /// The kernel of `recipe`, its code `loaded`, in `room`
-    /// (`counting`: it counts its slices): its accumulator templates, its
+    /// The kernel of `recipe`, its code `loaded`, in `room`: its
+    /// accumulator templates, its
     /// bodies on their slots with what each reads at emission
     /// (`emit::Plan`), the earlier bodies each repeats.
-    fn of(recipe: Recipe<N>, loaded: Loaded, room: &'static Room, counting: bool) -> Result<AsmKernel<N>> {
+    fn of(recipe: Recipe<N>, loaded: Loaded, room: &'static Room) -> Result<AsmKernel<N>> {
         let Recipe { shape: recipe_shape, compiled, forks, fused_nodes, may_unknown, bodies, outcomes, .. } = recipe;
         let acc_templates: Vec<AccTemplate<N>> = outcomes.iter().map(|o| AccTemplate::of(o.template(room))).collect::<Result<_>>()?;
         let off = |s: u32| compiled.root_offsets[s as usize] as usize;
@@ -1181,7 +1159,6 @@ impl<N: KernelLanes> AsmKernel<N> {
             forks,
             body_cols: Vec::new(),
             fused_nodes,
-            slices: counting.then(|| std::sync::atomic::AtomicU64::new(0)),
             room,
         })
     }
@@ -1282,22 +1259,20 @@ fn pos_sources<N: Arithmetic>(template: &Template<N>, fields: &[AsmField]) -> Re
     Ok(Some([px, py, rx, ry]))
 }
 
-/// An arithmetic's resident kernel set and what it was built under (the
-/// run, whether it counts its slices).
-pub type Resident<N> = Option<(crate::settings::Run, bool, std::sync::Arc<Registry<N>>)>;
+/// An arithmetic's resident kernel set and the run it was built under.
+pub type Resident<N> = Option<(crate::settings::Run, std::sync::Arc<Registry<N>>)>;
 
-/// `run`'s kernel set (`counting`: its kernels count their slices), built
-/// on first use. ONE set an arithmetic is resident (GBs), keyed on the run
-/// it was built under and whether it counts: another key replaces it;
-/// callers hold theirs by `Arc`.
-pub(crate) fn registry<N: KernelLanes>(run: &crate::settings::Run, counting: bool) -> std::sync::Arc<Registry<N>> {
+/// `run`'s kernel set, built on first use. ONE set an arithmetic is
+/// resident (GBs), keyed on the run it was built under: another run
+/// replaces it; callers hold theirs by `Arc`.
+pub(crate) fn registry<N: KernelLanes>(run: &crate::settings::Run) -> std::sync::Arc<Registry<N>> {
     let mut set = N::resident().lock().unwrap();
     match &*set {
-        Some((k, c, r)) if k == run && *c == counting => r.clone(),
+        Some((k, r)) if k == run => r.clone(),
         _ => {
             *set = None;
-            let built = std::sync::Arc::new(build_registry_for_level::<N>(run, counting));
-            *set = Some((run.clone(), counting, built.clone()));
+            let built = std::sync::Arc::new(build_registry_for_level::<N>(run));
+            *set = Some((run.clone(), built.clone()));
             built
         }
     }
@@ -1338,13 +1313,13 @@ impl Drop for BuildPurgeDelay {
     }
 }
 
-fn build_registry_for_level<N: KernelLanes>(run: &crate::settings::Run, counting: bool) -> Registry<N> {
+fn build_registry_for_level<N: KernelLanes>(run: &crate::settings::Run) -> Registry<N> {
     let _purge = BuildPurgeDelay::start();
     let level = run.level;
     let run = run.clone();
     let built = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
-        .spawn(move || Registry::<N>::build_for_start_room(&run, counting))
+        .spawn(move || Registry::<N>::build_for_start_room(&run))
         .expect("spawn asm-kernel builder")
         .join()
         .expect("asm-kernel builder panicked");

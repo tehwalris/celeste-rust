@@ -1,5 +1,5 @@
-//! Assemble a GAS `.s` string with `gcc` and load it with `dlopen`. `as`
-//! assembles AVX-512 natively (a JIT crate would have to hand-encode EVEX).
+//! Build a kernel's LLVM IR into a shared object (`llc`, GNU `as`, `ld`) and
+//! load it with `dlopen`.
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
@@ -19,12 +19,12 @@ extern "C" {
 const RTLD_NOW: c_int = 2;
 
 /// The ABI every emitted kernel has: read packed input columns, write
-/// packed output columns. See `codegen::Compiled` for the layouts.
+/// packed output columns. See `llvm::Compiled` for the layouts.
 pub type KernelFn = unsafe extern "C" fn(*const u8, *mut u8, *const std::os::raw::c_void);
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// This process's scratch directory for the `.s` / `.so` pairs,
+/// This process's scratch directory for a build's files,
 /// `target/asm-scratch/<pid>/`. A loaded `.so` stays on disk while the
 /// process runs (profiles attribute samples to its path), and nothing
 /// unlinks it on a kill or an OOM, so the first call removes the directory
@@ -57,13 +57,53 @@ fn unique_stem(tag: &str) -> String {
     format!("k_{}_{}", tag, n)
 }
 
+/// THE CODE GENERATOR, `llc` on the emitted IR (no IR passes: the kernel is
+/// one straight-line block, and SelectionDAG builds it hash-consed and folds
+/// it; `opt -passes=early-cse` before it changed the output by under 1% for
+/// 13% more cost). Each flag's reason:
+/// - `-O2`: SelectionDAG instruction selection with its combiner (the
+///   peephole), the machine scheduler and the greedy register allocator
+///   (rematerialization, live ranges split around the call-outs);
+/// - `-mattr`: AVX-512 F/BW/DQ/VL, what the kernels need, on any CPU's
+///   scheduling model alike (`-mcpu=znver4` or `x86-64-v4` emitted the same);
+/// - `-relocation-model=pic`: a shared object;
+/// - `-x86-use-vzeroupper=false`: no `vzeroupper` before each call-out
+///   (the epilogue's stays);
+/// - `-no-integrated-as`: text for GNU as, without LLVM-only directives
+///   (`.prefalign`).
+/// No `-fp-contract`: the X86 backend fuses only what IR flags allow
+/// (`contract`), which the emitter never sets; `refuse_forbidden` checks
+/// the text. Measured 2026-10-27: `-O1` and `-O3` emit what `-O2` does;
+/// `-O0`, `-regalloc=fast` and `-regalloc=basic` cost 15-26% more
+/// instructions; `-combiner-disabled` (a debugging flag) saved 35-42% of
+/// `llc`'s time at the same speed (plans/lessons.md).
+pub(crate) const LLC_FLAGS: &[&str] = &["-O2", "-mattr=+avx512f,+avx512bw,+avx512dq,+avx512vl", "-relocation-model=pic", "-x86-use-vzeroupper=false", "-no-integrated-as"];
+
+/// The toolchain the kernels are built by, for the kernel cache's key:
+/// `llc`'s version and flags, `as`'s and `ld`'s versions; read once.
+pub(crate) fn toolchain() -> &'static str {
+    static T: OnceLock<String> = OnceLock::new();
+    T.get_or_init(|| {
+        let version = |tool: &str, arg: &str, pick: fn(&str) -> bool| {
+            std::process::Command::new(tool)
+                .arg(arg)
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).lines().find(|l| pick(l)).unwrap_or("").trim().to_string())
+                .unwrap_or_else(|e| format!("{tool} unavailable: {e}"))
+        };
+        let llc = version("llc", "--version", |l| l.contains("LLVM version"));
+        let gas = version("as", "--version", |_| true);
+        let ld = version("ld", "--version", |_| true);
+        format!("{llc}, llc {}; {gas}; {ld}", LLC_FLAGS.join(" "))
+    })
+}
+
 /// What no kernel may hold: a FUSED multiply-add (one rounding where the
 /// cart rounds twice; `vfmadd*`, `vfmsub*`, `vfnmadd*`, `vfnmsub*`, the FMA4
 /// forms) or an MXCSR write (`ldmxcsr`: the rounding mode and subnormal
-/// handling are the process's, checked, never set). The text is ours and
-/// gcc only assembles it (`-x assembler`, no compiler, no contraction), so
-/// this scan of the text is the whole guarantee.
-fn refuse_forbidden(asm: &str) -> Result<()> {
+/// handling are the process's, checked, never set). The emitter sets no
+/// flag that lets `llc` fuse; this scan of `llc`'s text is the check.
+pub(crate) fn refuse_forbidden(asm: &str) -> Result<()> {
     for (n, line) in asm.lines().enumerate() {
         let mn = line.split_whitespace().next().unwrap_or("");
         if mn.starts_with("vfm") || mn.starts_with("vfnm") || mn.starts_with("ldmxcsr") || mn.starts_with("vldmxcsr") {
@@ -73,36 +113,58 @@ fn refuse_forbidden(asm: &str) -> Result<()> {
     Ok(())
 }
 
-/// Write `asm` to a `.s` file and assemble it into a shared object with
-/// `gcc -x assembler -shared -fPIC` (assembled, never compiled). Returns the
-/// `.so` path. The `.s` (the bulk of the scratch) is removed once it has
-/// assembled, kept on failure for the error. A text holding a forbidden
-/// instruction is refused (`refuse_forbidden`).
-pub fn assemble(asm: &str, tag: &str) -> Result<PathBuf> {
-    refuse_forbidden(asm)?;
-    let dir = scratch_dir();
-    let stem = unique_stem(tag);
-    let src = dir.join(format!("{stem}.s"));
-    let obj = dir.join(format!("{stem}.so"));
-    std::fs::write(&src, asm)?;
-    let out = std::process::Command::new("gcc")
-        .arg("-x")
-        .arg("assembler")
-        .arg("-shared")
-        .arg("-fPIC")
-        .arg("-o")
-        .arg(&obj)
-        .arg(&src)
-        .output()?;
+/// A built kernel: its shared object, the digest of `llc`'s text, and its
+/// stack frame's bytes.
+pub(super) struct Built {
+    pub so: PathBuf,
+    pub text_digest: u64,
+    pub frame_bytes: u32,
+}
+
+/// Run `cmd`; its stderr in the error.
+fn run(tool: &str, cmd: &mut std::process::Command) -> Result<()> {
+    let out = cmd.output().map_err(|e| anyhow::anyhow!("{tool}: {e}"))?;
     if !out.status.success() {
-        bail!(
-            "gcc failed to assemble {}:\n{}",
-            src.display(),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        bail!("{tool} failed ({}):\n{}", out.status, String::from_utf8_lossy(&out.stderr));
     }
-    let _ = std::fs::remove_file(&src);
-    Ok(obj)
+    Ok(())
+}
+
+/// Build the IR `ll` (the kernel `sym`) into a shared object: `llc` with
+/// `LLC_FLAGS`, its text scanned (`refuse_forbidden`), GNU `as`, `ld
+/// -shared` (no C runtime: a kernel calls only through `AsmCtx`). The
+/// scratch files are removed once built, kept on a failure for its error.
+pub(super) fn build(ll: &str, sym: &str) -> Result<Built> {
+    use std::process::Command;
+    let dir = scratch_dir();
+    let stem = unique_stem(sym);
+    let [src, asm, obj, so] = ["ll", "s", "o", "so"].map(|e| dir.join(format!("{stem}.{e}")));
+    std::fs::write(&src, ll)?;
+    run("llc", Command::new("llc").args(LLC_FLAGS).arg("-o").arg(&asm).arg(&src))?;
+    let text = std::fs::read_to_string(&asm)?;
+    refuse_forbidden(&text)?;
+    run("as", Command::new("as").arg("-o").arg(&obj).arg(&asm))?;
+    run("ld", Command::new("ld").args(["-shared", "-o"]).arg(&so).arg(&obj))?;
+    for f in [&src, &asm, &obj] {
+        let _ = std::fs::remove_file(f);
+    }
+    Ok(Built { so, text_digest: text_digest(&text), frame_bytes: frame_of(&text) })
+}
+
+/// A text's digest (`Compiled::text_digest`; the module names its source
+/// by the kernel's symbol, so the text is a function of the kernel).
+fn text_digest(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// `llc`'s stack frame, for the caller's stack check: its prologue's `subq
+/// $N, %rsp`, a realignment's 64 bytes and the pushes'.
+fn frame_of(text: &str) -> u32 {
+    let sub = text.lines().find_map(|l| l.trim().strip_prefix("subq\t$").and_then(|r| r.strip_suffix(", %rsp")).and_then(|v| v.parse::<u32>().ok()));
+    sub.unwrap_or(0) + 64 + 8 * 8
 }
 
 /// THE DOUBLES' FLOATING-POINT ENVIRONMENT: round to nearest, FTZ and DAZ
