@@ -122,16 +122,18 @@ One axis, one frame: `r1 = fl(r + ox)`, `k = floor(fl(r1 + 0.5))`,
 
 ## The kernels' safety
 
-The float kernels are the same graph, lowered to `vaddpd`-class AVX-512 on
-8 doubles a zmm (the body runs twice per 16 lanes).
+The float kernels are the same graph, emitted as LLVM IR on `<8 x double>`
+(`vaddpd`-class AVX-512, 8 doubles a zmm; the body runs twice per 16
+lanes).
 
 - **MXCSR** is read before every float kernel call: round to nearest, no
   FTZ, no DAZ (`asm::check_mxcsr`), else fatal.
-- **No FMA**: the assembled text is scanned for `vfm*`/`vfnm*` and
-  `ldmxcsr` and refused (`jit::refuse_forbidden`); gcc assembles it, never
-  compiles it.
-- **min/max**: compare and blend, the second operand on a tie (LuaJIT's
-  `min`/`max`, not `vminpd`'s).
+- **No FMA**: no IR operation carries a fast-math flag (the X86 backend
+  fuses only under `contract`), and `llc`'s text is scanned for
+  `vfm*`/`vfnm*` and `ldmxcsr` and refused (`jit::refuse_forbidden`).
+- **min/max**: compare and select, the second operand on a tie (LuaJIT's
+  `min`/`max`; `llc` may select `vminpd`, whose x86 semantics are exactly
+  that, and the tie tests hold it to them).
 - **sin**: a per-lane call-out to the reference's `LuaF64::lua_sin` (the
   same glibc symbol).
 - `NoWrap` is FINITE: an operation that can leave the finite doubles is
@@ -139,8 +141,7 @@ The float kernels are the same graph, lowered to `vaddpd`-class AVX-512 on
 - Checked as in fixed: `check ref`, `check keys`, `check widen`,
   `check arcs`, `missed 0`; the float trees of (1,0) to f44 and (1,3) to f46
   equal the float reference engine's, frame by frame (`ckhash --edges
-  --hulls`). The kernel census (`bench frame --metrics`,
-  `check::census`) is 16.16's only.
+  --hulls`).
 
 ## The dual search and rule (b)
 
@@ -202,7 +203,7 @@ tool file starts on the player's first frame.
 ## Checks
 
 - t0: `lua_f64`'s tests (cut points, ties, `-0`, the `sin` call, the nudged
-  `sin`), the goldens (both tools, and the local ones), the codegen's
+  `sin`), the goldens (both tools, and the local ones), the kernels'
   bit-exact op tests and FMA refusal, the float table of room (1,0) (an
   ignored test).
 - t1: the float twins of the fixtures (`f10`, `f42n`, `f42x`, `f10arc`):
@@ -214,7 +215,6 @@ tool file starts on the player's first frame.
 
 ## Open gaps
 
-- The kernel mix census (`--metrics`) is 16.16's: no float metrics pins.
 - Level -1 tables do not build for the platform rooms (6,0), (2,1), (1,2),
   in fixed either; `l1 check` ran over the 94 Celia goldens outside them,
   and over one UCT golden only.

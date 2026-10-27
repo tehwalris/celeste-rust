@@ -1,9 +1,24 @@
-//! The doubles' ops as LLVM IR (`codegen::float`'s, bit for bit): IEEE
-//! `fadd`..`fdiv` without fast-math flags (one rounding each, never fused:
-//! `LLC_FLAGS`' `-fp-contract=off`), `flr` as `llvm.floor`, LuaJIT's
-//! `min`/`max` as a compare and a select (the SECOND argument on a tie),
-//! negation and `abs` on the sign bit, `sin` a call-out; an interval's ends
-//! as the reference takes them.
+//! THE DOUBLES' LOWERING (plans/float.md, "The kernels' safety"): a graph in
+//! `Float` to 8 `f64` lanes a zmm, each operation the reference engine's
+//! (`refdomain` over `LuaF64`/`LuaF64Interval`), bit for bit:
+//! - IEEE `fadd`..`fdiv` without fast-math flags, one rounding each, in the
+//!   cart's order. No fused multiply-add: no instruction carries the
+//!   `contract` flag the X86 backend fuses by, and `jit::build` refuses a
+//!   text holding one;
+//! - `flr` as `llvm.floor` (`vrndscalepd` round-down, exact);
+//! - `%` as LuaJIT's `a - flr(a / b) * b`, three rounded operations;
+//! - `min`/`max` as LuaJIT's: a compare and a select, the SECOND argument on
+//!   a tie (`-0` against `0` included; `llc` may select `vminpd`, whose x86
+//!   semantics are exactly that);
+//! - negation and `abs` on the sign bit;
+//! - `sin` a per-lane call-out to `LuaF64::lua_sin` (glibc's `sin`);
+//! - an interval's ends as the reference takes them: sums and differences
+//!   end by end, products and quotients the least and most corner in the
+//!   total order (`-0` below `0`), the forks' fragments operation by
+//!   operation.
+//! An operation's own error (`NoWrap`) is "the result is finite", and a
+//! quotient's divisor must exclude zero. `asm::tests` checks every operation
+//! against `LuaF64`, `-0`, ties and subnormals included.
 
 use super::*;
 

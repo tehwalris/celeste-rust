@@ -5,7 +5,6 @@
 //! (`conventions`).
 #![warn(unreachable_pub)]
 pub mod arcs;
-pub mod census;
 pub mod differential;
 pub mod explain;
 pub mod gate;

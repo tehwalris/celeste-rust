@@ -40,8 +40,7 @@ fn main() {
         std::fs::read(p).unwrap_or_else(|e| panic!("{}: {e}", p.display())).hash(&mut h);
     }
     // The profile: one checkout's quick and release builds are other code.
-    // PROTOTYPE: the backend switch (`--features llvm`) is other code too.
-    for var in ["PROFILE", "OPT_LEVEL", "DEBUG", "CARGO_FEATURE_LLVM"] {
+    for var in ["PROFILE", "OPT_LEVEL", "DEBUG"] {
         std::env::var(var).unwrap_or_default().hash(&mut h);
     }
     println!("cargo:rustc-env=KERNEL_SOURCES={:016x} ({} files)", h.finish(), all.len());

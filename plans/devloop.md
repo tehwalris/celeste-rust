@@ -37,11 +37,6 @@ byte-identical, or re-pins them on evidence.
 - **A platform room** (t2): its forward to step 71. Big has its frame.
 - **The instruction budget** (perf).
 
-The metrics (`bench frame --metrics`: the kernel census, the dynamic kernel
-instructions, lanes, edges; t1, big) are exact too, but coupled to the
-tracer and the codegen: a change there moves them. Re-pin them with the
-counts as the evidence.
-
 ## The ladder
 
 | tier | runs | wall |
@@ -76,7 +71,7 @@ Unit tests are kept only for the basics:
 - the arcs' set operations and the backward and reach DP against their
   definitions (`arcs`, `backward`, `reach`, `hull`), the decode against
   the cart (`rem`);
-- what no pin reaches. These cover the tracer's and the codegen's edge
+- what no pin reaches. These cover the tracer's and the emitter's edge
   cases (overflow declines, error ownership, folding exactness), the
   console's corpora (`probe`), the CLI and the tools (`src/tools/`).
 
@@ -102,8 +97,8 @@ them from its records (and refuse them as flags).
 
 | steps | what |
 |---|---|
-| frame-r10, -r62h, -r42n | `bench frame --edges --checkpoint --expect --metrics` of r10 f55, r62h f50, r42n f60: the f/h/e/b lines and the exact metrics against their pins |
-| frame-f10, -f42n | the same in float (no metrics) |
+| frame-r10, -r62h, -r42n | `bench frame --edges --checkpoint --expect` of r10 f55, r62h f50, r42n f60: the f/h/e/b lines against their pins |
+| frame-f10, -f42n | the same in float |
 | keycheck-r10, -r42n, -f42n | `check keys`: every emitted row's key recomputed from its fields, and decoded back; every stored row's key the boundary's; the f/h/e lines against the frame pins |
 | refcheck-r10, -r42x, -f10, -f42x | `check ref`: 32 rows through the kernels and the reference engine; the converters agree |
 | arccheck-, arcfault- (r10, f10; arccheck also r42x, f42x) | `check arcs`: 32 recorded transfers against the reference; with `--fault action` it must fail |
@@ -143,7 +138,7 @@ The steps run in four lanes:
 
 - **big**: frame-r62h57 (the reference frame (6,2) 100% f56 -> f57: 800,821
   new states, 27M edges re-pushed) and frame-r60s (the platform frame step
-  70 -> 71), with their b lines and metrics.
+  70 -> 71), with their b lines.
 - **perf, the instruction budget** (`gates/perf.txt`): one rep's user-space
   instructions on three bench frames, of the RELEASE binary (fat LTO, one
   codegen unit; the tier builds it): r62h f50 (18.86 G), r62h57 f56
@@ -203,14 +198,14 @@ heap at the phases' boundaries.
 The tree is a fixture (`tools/fixtures.sh ensure NAME`; a new one is a
 `spec` case there) or any forward's (`rewrite forward --steps F --tree
 DIR ...`): a tree serves any step up to its last. The run checks itself
-against pins of its own: `--expect FILE` (the lines) and `--metrics FILE`
-(the exact metrics), each written by a first run with `--pin`; a later
-run that differs FAILS and shows every difference.
+against a pin of its own: `--expect FILE` (the lines), written by a first
+run with `--pin`; a later run that differs FAILS and shows every
+difference.
 
 ```bash
 ./safe-run.sh -- target/release/rewrite forward --room X,Y --level LEVEL [--level-minus-one H,S] --steps F --tree DIR
 ./safe-run.sh -- target/release/rewrite bench frame --tree DIR --step F --edges --checkpoint --reps 3 --threads 16 \
-    --expect DIR.lines --metrics DIR.metrics [--pin]
+    --expect DIR.lines [--pin]
 ```
 
 Wall times need a quiet machine:
@@ -275,7 +270,7 @@ marked count, first win and optimum identical. Or give the reason they did.
 Say which in the commit.
 
 - `tools/fixtures.sh pin NAME...`: a fixture's own frames;
-- `./check.sh t1 --pin`, `t2 --pin`, `big --pin`: frame lines, metrics, gate
+- `./check.sh t1 --pin`, `t2 --pin`, `big --pin`: frame lines, gate
   lines (the room (1,0) oracles and their float and dual twins too), the UI
   digests: every comparison of a tier goes through check.sh's `same`, so
   `--pin` re-pins exactly what the tier compares. The one exception is t2's

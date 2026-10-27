@@ -1,87 +1,195 @@
-//! PROTOTYPE (branch `llvm-backend`, the TEMPORARY cargo feature `llvm`):
-//! `transpile::graph::Graph` -> LLVM IR, built into the shared object the
-//! runtime loads (`build`) by an explicit pipeline: `llc` with `LLC_FLAGS`
-//! (after `opt` with `OPT_PASSES`, none by default), its text scanned for a
-//! fused multiply-add (`jit::refuse_forbidden`), GNU `as` and `ld -shared`.
-//! The kernels' ABI and buffer layouts are `codegen`'s (`Compiled`), so
-//! `compiled::asm_kernel` calls them unchanged; each op computes what
-//! `codegen` computes, bit for bit (`super::tests` checks both backends
-//! alike).
+//! `transpile::graph::Graph` -> LLVM IR: numeric, interval and tri-state
+//! boolean ops, bit for bit the arithmetic's own (checked by
+//! `super::tests`); `jit` builds the IR into the kernel's shared object.
 //!
 //! The IR is the graph's ops in vector types: 16.16 as `<16 x i32>`, the
-//! doubles as `<8 x double>` (the body runs twice per call, a loop over the
-//! halves); a tri-state boolean is two `<N x i1>` planes `[val, known]`
-//! (k-registers, where `codegen` keeps vector masks), an interval two
-//! number planes `[lo, hi]`. Value numbering, dead code, scheduling,
-//! register allocation and the peephole are LLVM's (`OPT_PASSES`,
-//! `LLC_FLAGS`); the emitter folds only constant planes (`Mask::Const`,
-//! `Num`'s literals), so a literal stays one where the lowering requires
-//! one (`tile_flag_at`'s box).
+//! doubles (`float`) as `<8 x double>`, the body running twice per 16-lane
+//! call (a loop over the halves); a tri-state boolean is two `<N x i1>`
+//! planes `[val, known]` (k-registers), an interval two number planes `[lo,
+//! hi]`. Value numbering, dead code, scheduling, register allocation and
+//! the peephole are `llc`'s (`jit::LLC_FLAGS`); the emitter folds only
+//! constant planes (`Mask::Const`, `Num`'s literals), so a literal stays one
+//! where the lowering requires one (`tile_flag_at`'s box). The call-outs
+//! (`callout`) go through stack buffers to `AsmCtx`'s function pointers.
 
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 
 use celeste_core::arith::{Arithmetic, Fixed, Float};
 
-use super::codegen::{input_layout, output_layout, schedule, text_digest, Compiled, CTX_DIV, CTX_ENV, CTX_MGET, CTX_REM, CTX_SIN, CTX_TILE, CTX_TILE_LANES};
 use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{self, Cut, Graph, NodeId, Op, Ty};
 
-/// THE IR PASSES (`opt -passes`): none. The kernel is one straight-line
-/// block, and SelectionDAG builds it hash-consed (value numbering) and
-/// folds it (its combiner), dropping what no root reads; `early-cse` before
-/// it (`codegen`'s GVN memo and identity folds as an IR pass) left `llc`'s
-/// output the same within 1% and cost 13% more (r10's largest kernels). An
-/// empty list: `llc` reads the emitted text itself.
-pub(crate) const OPT_PASSES: &str = "";
+// `AsmCtx`'s offsets (callout.rs), the same in both arithmetics.
+const CTX_DIV: u32 = 0;
+const CTX_REM: u32 = 8;
+const CTX_SIN: u32 = 16;
+const CTX_MGET: u32 = 24;
+const CTX_TILE: u32 = 32;
+const CTX_TILE_LANES: u32 = 40;
+const CTX_ENV: u32 = 48;
+const _: () = {
+    use super::callout::AsmCtx;
+    use celeste_core::{lua_f64::LuaF64, pico8_num::Pico8Num};
+    use std::mem::offset_of;
+    macro_rules! layout {
+        ($l:ty) => {
+            assert!(offset_of!(AsmCtx<$l>, div) == CTX_DIV as usize);
+            assert!(offset_of!(AsmCtx<$l>, rem) == CTX_REM as usize);
+            assert!(offset_of!(AsmCtx<$l>, sin) == CTX_SIN as usize);
+            assert!(offset_of!(AsmCtx<$l>, mget) == CTX_MGET as usize);
+            assert!(offset_of!(AsmCtx<$l>, tile_flag) == CTX_TILE as usize);
+            assert!(offset_of!(AsmCtx<$l>, tile_flag_lanes) == CTX_TILE_LANES as usize);
+            assert!(offset_of!(AsmCtx<$l>, env) == CTX_ENV as usize);
+        };
+    }
+    layout!(Pico8Num);
+    layout!(LuaF64);
+};
 
-/// THE CODE GENERATOR (`llc`), each flag's reason:
-/// - `-O2`: SelectionDAG instruction selection with its combiner (the
-///   peephole), the machine scheduler (`codegen::reschedule`'s list
-///   scheduler) and the greedy register allocator with rematerialization
-///   and spill placement (`allocate`, `call_saves`, `drop_redundant_reloads`);
-/// - `-mattr`: AVX-512 F/BW/DQ/VL, what `codegen`'s text uses;
-/// - `-relocation-model=pic`: a shared object;
-/// - no `-fp-contract`: the X86 backend ignores it and fuses only what IR
-///   flags allow (`contract`, `reassoc`), which the emitter never sets; the
-///   scan of `llc`'s text refuses a fused multiply-add all the same;
-/// - `-x86-use-vzeroupper=false`: no `vzeroupper` before each call-out
-///   (`codegen` emits none; the epilogue's stays);
-/// - `-no-integrated-as`: text for GNU as (it assembles it after the scan,
-///   as `codegen`'s), without LLVM-only directives (`.prefalign`).
-///
-/// Measured alternatives (2026-10-27): adding `-combiner-disabled
-/// -enable-misched=false -pre-RA-sched=list-burr` cut `llc`'s CPU by 35-42%
-/// (r10, r62h, r60s) with the kernels' speed unchanged within noise and the
-/// check ladder green; `-O1` and `-O3` emit what `-O2` does; `-O0`,
-/// `-regalloc=fast` and `-regalloc=basic` cost 15-26% more instructions and
-/// twice the spills; `opt -passes=early-cse,instcombine` saves 9% of the
-/// instructions for 5x `opt`'s cost.
-pub(crate) const LLC_FLAGS: &[&str] = &["-O2", "-mattr=+avx512f,+avx512bw,+avx512dq,+avx512vl", "-relocation-model=pic", "-x86-use-vzeroupper=false", "-no-integrated-as"];
-
-/// The pipeline the builds run: `OPT_PASSES` and `LLC_FLAGS`, or
-/// TEMPORARY overrides for the A/B of passes and flags without a rebuild
-/// (`LLVM_PROTO_OPT`: the passes, empty for none; `LLVM_PROTO_LLC`: the
-/// flags, space-separated). The kernel cache keys on it (`describe`).
-fn pipeline() -> &'static (Option<String>, Vec<String>) {
-    static P: std::sync::OnceLock<(Option<String>, Vec<String>)> = std::sync::OnceLock::new();
-    P.get_or_init(|| {
-        let passes = std::env::var("LLVM_PROTO_OPT").unwrap_or_else(|_| OPT_PASSES.to_string());
-        let llc = std::env::var("LLVM_PROTO_LLC").map(|s| s.split_whitespace().map(str::to_string).collect()).unwrap_or_else(|_| LLC_FLAGS.iter().map(|s| s.to_string()).collect());
-        ((!passes.is_empty()).then_some(passes), llc)
-    })
+/// A kernel's buffer layouts (what a caller packs and reads) and its code's
+/// identity.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct Compiled {
+    /// The digest of `llc`'s text (`jit::build`): what the `[asm build]`
+    /// line fingerprints a kernel set by, and a rebuilding tool checks.
+    pub text_digest: u64,
+    /// Input cells, in ascending order (layout: by type, `input_bytes`).
+    pub input_cells: Vec<u32>,
+    /// Byte offset of each input cell (parallel to `input_cells`).
+    pub input_offsets: Vec<u32>,
+    /// Each input cell's type (the graph's `cell_kind`).
+    pub input_types: Vec<Ty>,
+    pub input_bytes: u32,
+    pub n_roots: usize,
+    /// Root byte offsets: bools first (4 B: `val` u16, `known` at +2), then
+    /// numbers (64 B) and intervals (128 B: `lo`, `hi` at +64), 64-aligned.
+    pub root_offsets: Vec<u32>,
+    pub out_bytes: u32,
+    /// Each root's type (never `UBool`: a boolean root is two planes).
+    pub root_kinds: Vec<Ty>,
+    pub sym: String,
+    /// The stack frame in bytes, for the caller's stack check.
+    pub frame_bytes: u32,
+    /// The doubles' kernels: the body computes 8 lanes and runs TWICE per call,
+    /// lanes 8..16 reading and writing past lanes 0..8 (the buffers are twice
+    /// `input_bytes`/`out_bytes`). A boolean is an 8-bit mask per half.
+    pub halves: bool,
 }
 
-/// The toolchain and pipeline, for the kernel cache's key: `llc`'s version,
-/// the passes and the flags.
-pub(crate) fn describe() -> String {
-    let version = std::process::Command::new("llc").arg("--version").output().map(|o| String::from_utf8_lossy(&o.stdout).lines().find(|l| l.contains("version")).unwrap_or("").trim().to_string()).unwrap_or_else(|e| format!("llc unavailable: {e}"));
-    let (passes, llc) = pipeline();
-    let link = std::env::var("LLVM_PROTO_LINK").unwrap_or_else(|_| "as+ld".to_string());
-    format!("{version}; opt -passes={}; llc {}; link {link}", passes.as_deref().unwrap_or("(none)"), llc.join(" "))
+/// The bytes an input cell of type `ty` takes (its layout, by type):
+/// `Num` 16 x i32 (64 B; the doubles' 8 x f64 a half); `Bool` a u16 `val`
+/// mask (the doubles' u8 a half) at +0 of 64 B (known); `UBool` `val` at
+/// +0, `known` at +2 of 64 B; `Ival` `lo` at +0, `hi` at +64.
+fn input_bytes(ty: Ty) -> u32 {
+    match ty {
+        Ty::Num | Ty::Bool | Ty::UBool => 64,
+        Ty::Ival => 128,
+    }
+}
+
+/// The input buffer's layout: the input cells `live` reads, ascending,
+/// each one's type and byte offset (by type, `input_bytes`), and the
+/// buffer's size.
+fn input_layout<A: GraphArith>(g: &Graph<A>, live: &[bool]) -> (Vec<u32>, Vec<Ty>, Vec<u32>, u32) {
+    let mut cells: Vec<u32> = (0..g.len() as NodeId)
+        .filter(|id| live[*id as usize])
+        .filter_map(|id| match g.get(id).op {
+            Op::Cell(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    cells.sort_unstable();
+    cells.dedup();
+    let types: Vec<Ty> = cells.iter().map(|c| g.cell_kind(*c)).collect();
+    let mut offsets: Vec<u32> = Vec::with_capacity(cells.len());
+    let mut off = 0u32;
+    for t in &types {
+        offsets.push(off);
+        off += input_bytes(*t);
+    }
+    (cells, types, offsets, off)
+}
+
+/// The output buffer's layout: each root's byte offset, booleans first (4
+/// B), then 64-aligned numbers (64 B) and intervals (128 B); and the
+/// buffer's size.
+fn output_layout(kinds: &[Ty]) -> (Vec<u32>, u32) {
+    let mut offsets: Vec<u32> = vec![0; kinds.len()];
+    let mut next = 0u32;
+    for (ri, k) in kinds.iter().enumerate() {
+        if *k == Ty::Bool {
+            offsets[ri] = next;
+            next += 4;
+        }
+    }
+    next = next.div_ceil(64) * 64;
+    for (ri, k) in kinds.iter().enumerate() {
+        match k {
+            Ty::Num => {
+                offsets[ri] = next;
+                next += 64;
+            }
+            Ty::Ival => {
+                offsets[ri] = next;
+                next += 128;
+            }
+            Ty::Bool | Ty::UBool => {}
+        }
+    }
+    (offsets, next.max(64))
+}
+
+/// The emission order over BATCHES of roots: each batch's unplaced cone
+/// depth-major while only ~`batch` roots' temporaries are live (`llc`'s
+/// instruction selection keeps the block's order where it is free to).
+fn schedule<A: GraphArith>(g: &Graph<A>, live: &[bool], roots: &[NodeId], batch: usize) -> Vec<NodeId> {
+    // ALAP depth (consumers have larger ids; operands are strictly shallower,
+    // so depth-major is a valid order) keeps shared live ranges short.
+    let maxd = g.len() as u32;
+    let mut depth = vec![maxd; g.len()];
+    for id in (0..g.len() as NodeId).rev() {
+        if !live[id as usize] {
+            continue;
+        }
+        let d = depth[id as usize];
+        for a in &g.get(id).args {
+            let e = &mut depth[*a as usize];
+            *e = (*e).min(d.saturating_sub(1));
+        }
+    }
+    let batch = batch.max(1);
+    let mut scheduled = vec![false; g.len()];
+    let mut order: Vec<NodeId> = Vec::new();
+    let mut stack: Vec<NodeId> = Vec::new();
+    for chunk in roots.chunks(batch) {
+        let mut mine: Vec<NodeId> = Vec::new();
+        stack.extend_from_slice(chunk);
+        let mut seen_local = vec![false; g.len()];
+        while let Some(n) = stack.pop() {
+            if seen_local[n as usize] {
+                continue;
+            }
+            seen_local[n as usize] = true;
+            if scheduled[n as usize] {
+                continue; // already placed by an earlier batch (shared)
+            }
+            if live[n as usize] {
+                mine.push(n);
+            }
+            stack.extend(g.get(n).args.iter().copied());
+        }
+        mine.sort_by_key(|id| (depth[*id as usize], *id));
+        for id in mine {
+            if !scheduled[id as usize] {
+                scheduled[id as usize] = true;
+                order.push(id);
+            }
+        }
+    }
+    order
 }
 
 /// A number plane: an SSA value or a literal (in every lane).
@@ -188,7 +296,27 @@ impl<A: LlArith> Emit<'_, A> {
     fn as_num(&self, id: NodeId) -> Result<Num> {
         match self.vals[id as usize] {
             Some(Value::Num(v)) => Ok(v),
-            _ => bail!("node {}: not a numeric value where one was needed", crate::transpile::why::Explain::of(self.g).with_args(id)),
+            _ => bail!(
+                "node {} is not a numeric value where one was needed; interval source: {}",
+                crate::transpile::why::Explain::of(self.g).with_args(id),
+                self.interval_source(id)
+            ),
+        }
+    }
+
+    /// The chain of interval operands that made `id` an interval (a select's
+    /// arm; where no arm is, its condition).
+    fn interval_source(&self, id: NodeId) -> String {
+        let why = crate::transpile::why::Explain::of(self.g);
+        let chain = why.chain(id, 64, |n| {
+            let node = self.g.get(n);
+            let from = if node.op == Op::Sel { 1 } else { 0 };
+            node.args[from..].iter().copied().find(|&x| self.wide(x))
+        });
+        let last = self.g.get(chain[chain.len() - 1]);
+        match last.op {
+            Op::Sel if chain.len() <= 64 => format!("{} <- condition {}", why.show_chain(&chain), why.tree(last.args[0], 5)),
+            _ => why.show_chain(&chain),
         }
     }
 
@@ -234,7 +362,8 @@ impl<A: LlArith> Emit<'_, A> {
     }
 
     // Constant planes fold by identities that hold in every lane (`x & 1 =
-    // x`, `c ? t : t = t`, ...), as `codegen`'s.
+    // x`, `c ? t : t = t`, ...), so the folded kernel computes what the
+    // unfolded one would.
 
     fn m_and(&mut self, p: Mask, q: Mask) -> Mask {
         match (p, q) {
@@ -345,7 +474,8 @@ impl<A: LlArith> Emit<'_, A> {
         }
     }
 
-    /// The ops every arithmetic lowers alike (`codegen`'s `lower_common`);
+    /// The ops every arithmetic lowers alike (the boolean layer, selects,
+    /// interval ends, pass-throughs, the map's call-outs);
     /// `None` for the arithmetic's own.
     fn lower_common(&mut self, id: NodeId) -> Result<Option<Value>> {
         let node = self.g.get(id);
@@ -504,7 +634,9 @@ impl Emit<'_, Fixed> {
         Num::Reg(ins!(self, "trunc <16 x i64> %v{s} to <16 x i32>"))
     }
 
-    /// PICO-8 `x / 2^s` (`codegen::div_pow2`): the arithmetic shift of `x`
+    /// PICO-8 `x / 2^s` (raw divisor `2^(16+s)`, `0 <= s <= 14`):
+    /// `Pico8Num`'s division TRUNCATES toward zero and never saturates for
+    /// these divisors, so it is the arithmetic shift of `x`
     /// biased by `2^s - 1` where `x` is negative.
     fn div_pow2(&mut self, x: Num, s: u8) -> Num {
         if s == 0 {
@@ -800,23 +932,31 @@ impl Emit<'_, Fixed> {
     }
 }
 
-/// 16.16's kernel as LLVM IR (`Compiled::asm`; `build` makes its code).
-pub(crate) fn compile_fixed(g: &Graph<Fixed>, roots: &[NodeId], sym: &str, _provenance: bool) -> Result<Compiled> {
+/// 16.16's kernel: its layouts and its IR (`GraphArith::compile_kernel`).
+pub(crate) fn compile_fixed(g: &Graph<Fixed>, roots: &[NodeId], sym: &str) -> Result<(Compiled, String)> {
     compile_with(g, roots, sym, false, |e, id| e.lower_node(id))
 }
 
 /// The doubles' kernel, its body over two halves of eight lanes.
-pub(crate) fn compile_float(g: &Graph<Float>, roots: &[NodeId], sym: &str, _provenance: bool) -> Result<Compiled> {
+pub(crate) fn compile_float(g: &Graph<Float>, roots: &[NodeId], sym: &str) -> Result<(Compiled, String)> {
     compile_with(g, roots, sym, true, |e, id| e.lower_node_f64(id))
 }
 
-fn compile_with<A: LlArith>(g: &Graph<A>, roots: &[NodeId], sym: &str, halves: bool, mut lower: impl FnMut(&mut Emit<'_, A>, NodeId) -> Result<()>) -> Result<Compiled> {
+/// The kernel computing `roots` of `g` as the function `sym`, its layouts
+/// and its IR (the text digest and frame are `jit::build`'s, unset here).
+pub fn compile<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], sym: &str) -> Result<(Compiled, String)> {
+    A::compile_kernel(g, roots, sym)
+}
+
+/// `compile` with the arithmetic's lowering (`lower`, one node) and lane
+/// layout (`halves`).
+fn compile_with<A: LlArith>(g: &Graph<A>, roots: &[NodeId], sym: &str, halves: bool, mut lower: impl FnMut(&mut Emit<'_, A>, NodeId) -> Result<()>) -> Result<(Compiled, String)> {
     let live = g.reachable(roots);
     let (cells, input_types, input_offsets, input_bytes) = input_layout(g, &live);
     let cell_off: HashMap<u32, u32> = cells.iter().zip(&input_offsets).map(|(c, o)| (*c, *o)).collect();
     let mut e = Emit { g, vals: vec![None; g.len()], body: String::new(), next: 0, cell_off, has_calls: false };
     // Each root's store goes right after its node (spliced in below, once the
-    // roots' types give the output layout), in `codegen`'s batched order.
+    // roots' types give the output layout), in the batched order.
     let mut root_at: HashMap<NodeId, Vec<usize>> = HashMap::new();
     for (ri, r) in roots.iter().enumerate() {
         root_at.entry(*r).or_default().push(ri);
@@ -870,9 +1010,8 @@ fn compile_with<A: LlArith>(g: &Graph<A>, roots: &[NodeId], sym: &str, halves: b
     }
     body.push_str(&e.body[from..]);
     let ll = module(sym, &body, e.has_calls, A::NUM, halves.then_some((input_bytes, out_bytes)));
-    Ok(Compiled {
-        text_digest: text_digest(&ll),
-        asm: ll,
+    let compiled = Compiled {
+        text_digest: 0,
         input_cells: cells,
         input_offsets,
         input_types,
@@ -882,11 +1021,10 @@ fn compile_with<A: LlArith>(g: &Graph<A>, roots: &[NodeId], sym: &str, halves: b
         out_bytes,
         root_kinds,
         sym: sym.to_string(),
-        spill_slots: 0,
         frame_bytes: 0,
-        prov: Vec::new(),
         halves,
-    })
+    };
+    Ok((compiled, ll))
 }
 
 /// The module: the kernel `sym(in, out, ctx)` around `body` (with call-outs,
@@ -894,7 +1032,7 @@ fn compile_with<A: LlArith>(g: &Graph<A>, roots: &[NodeId], sym: &str, halves: b
 /// halves, each buffer's size its step).
 fn module(sym: &str, body: &str, calls: bool, num: &str, halves: Option<(u32, u32)>) -> String {
     let mut ll = String::with_capacity(body.len() + 1024);
-    let _ = writeln!(ll, "target triple = \"x86_64-unknown-linux-gnu\"\n");
+    let _ = writeln!(ll, "source_filename = \"{sym}\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n");
     let (inp, outp) = if halves.is_some() { ("%in0", "%out0") } else { ("%inp", "%outp") };
     let _ = writeln!(ll, "define void @{sym}(ptr noalias readonly {inp}, ptr noalias {outp}, ptr readonly %ctx) #0 {{\nentry:");
     if calls {
@@ -921,66 +1059,4 @@ fn module(sym: &str, body: &str, calls: bool, num: &str, halves: Option<(u32, u3
     }
     let _ = writeln!(ll, "\nattributes #0 = {{ nounwind \"min-legal-vector-width\"=\"512\" \"frame-pointer\"=\"none\" }}\n!0 = !{{}}");
     ll
-}
-
-/// Build `ll` (the kernel `sym`) into a shared object: `llc` (after `opt`
-/// where the pipeline has passes; its text scanned for a fused
-/// multiply-add or an MXCSR write), GNU `as`, `ld -shared` (no C runtime: a
-/// kernel calls only through `AsmCtx`; TEMPORARY `LLVM_PROTO_LINK=gcc`: the
-/// gcc driver, as `jit::assemble`). Returns the `.so`, the stack frame's
-/// bytes (the caller's stack check: `llc`'s frame, its realignment and its
-/// pushes) and the 64-byte spill slots `llc` reports.
-pub(super) fn build(ll: &str, sym: &str, times: &mut super::jit::ToolTimes) -> Result<(PathBuf, u32, usize)> {
-    use std::process::Command;
-    let dir = super::jit::scratch_dir();
-    let stem = super::jit::unique_stem(sym);
-    let [src, bc, asm, obj, so] = ["ll", "bc", "s", "o", "so"].map(|e| dir.join(format!("{stem}.{e}")));
-    std::fs::write(&src, ll)?;
-    let (passes, llc) = pipeline();
-    let input = match passes {
-        Some(p) => {
-            super::jit::run_tool("opt", Command::new("opt").arg(format!("-passes={p}")).arg("-o").arg(&bc).arg(&src), times)?;
-            &bc
-        }
-        None => &src,
-    };
-    super::jit::run_tool("llc", Command::new("llc").args(llc).arg("-o").arg(&asm).arg(input), times)?;
-    let text = std::fs::read_to_string(&asm)?;
-    super::jit::refuse_forbidden(&text)?;
-    let (frame, spills) = frame_of(&text);
-    if std::env::var("LLVM_PROTO_LINK").is_ok_and(|v| v == "gcc") {
-        super::jit::run_tool("gcc", Command::new("gcc").args(["-x", "assembler", "-shared", "-fPIC", "-o"]).arg(&so).arg(&asm), times)?;
-    } else {
-        super::jit::run_tool("as", Command::new("as").arg("-o").arg(&obj).arg(&asm), times)?;
-        super::jit::run_tool("ld", Command::new("ld").args(["-shared", "-o"]).arg(&so).arg(&obj), times)?;
-    }
-    super::jit::keep(&[&src, &asm]);
-    for f in [&src, &bc, &asm, &obj] {
-        let _ = std::fs::remove_file(f);
-    }
-    Ok((so, frame, spills))
-}
-
-/// `llc`'s stack frame: the `subq $N, %rsp` of its prologue, plus a
-/// realignment's 64 bytes and the pushes; and its 64-byte spill slots
-/// (`# 64-byte Spill` lines' distinct offsets).
-fn frame_of(text: &str) -> (u32, usize) {
-    let mut frame = 64 + 8 * 8;
-    let mut slots = std::collections::BTreeSet::new();
-    for line in text.lines() {
-        let t = line.trim();
-        if let Some(rest) = t.strip_prefix("subq\t$") {
-            if let Some((v, reg)) = rest.split_once(", ") {
-                if reg.starts_with("%rsp") {
-                    frame += v.trim().parse::<u32>().unwrap_or(0);
-                }
-            }
-        }
-        if t.contains("64-byte Spill") {
-            if let Some(slot) = t.split(", ").nth(1).and_then(|s| s.split_whitespace().next()) {
-                slots.insert(slot.to_string());
-            }
-        }
-    }
-    (frame, slots.len())
 }

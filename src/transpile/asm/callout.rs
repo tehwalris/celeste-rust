@@ -4,8 +4,8 @@
 //! argument. Operands are marshalled through a stack buffer and the wrappers
 //! compute the arithmetic's own operation lane by lane (`Pico8Num`'s
 //! saturating `/`, `%` and `sin`; `LuaF64::lua_sin`; the map), so the result
-//! is the scalar operation's by construction. The emitted code saves and
-//! restores the registers live across the call (`codegen::call_saves`).
+//! is the scalar operation's by construction. `llc` keeps what is live
+//! across the call (every vector and mask register is the caller's to save).
 //!
 //! The doubles' kernels (8 `f64` lanes) call their own `sin` (the tools'
 //! `LuaF64::lua_sin`, glibc's, lane by lane); the collision look-ups are
@@ -199,7 +199,7 @@ fn not_whole(v: f64, i: usize, what: &str) -> ! {
 /// The kernel's third argument: the call-out function pointers plus the
 /// collision environment, one layout for both arithmetics. Field ORDER is
 /// load-bearing - the emitter reads each pointer at a fixed byte offset
-/// (`codegen::CTX_*`).
+/// (`llvm::CTX_*`).
 #[repr(C)]
 pub struct AsmCtx<L: CallLanes> {
     pub div: Option<unsafe extern "C" fn(*mut L::Lane, *const L::Lane, *const L::Lane)>,

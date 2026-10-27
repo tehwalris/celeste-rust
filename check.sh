@@ -22,8 +22,8 @@
 # big, perf): only on evidence, and say why in the commit. Builds the quick binary first (perf:
 # the release one too). Env: CARGO_TARGET_DIR, CELESTE_FIXTURES, CHECK_DIR
 # (the scratch, default per checkout: /var/tmp/celeste-check-NAME-HASH, so
-# two worktrees' runs never share it), THREADS (default 16; the metrics
-# are the same at every thread count). The fixtures are shared and
+# two worktrees' runs never share it), THREADS (default 16; the frame
+# lines are the same at every thread count). The fixtures are shared and
 # READ-ONLY (tools/fixtures.sh): a step that writes into one fails.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -135,14 +135,12 @@ t0() {
 # records (`search::tree::TreeDir`): only the frame and the run's own flags
 # are given.
 
-# frame NAME STEP [--metrics]: one forward step from a fixture, checkpointed
-# as the forward does, against its pins (`bench frame --expect`: the f/h/e
-# lines, the b line over the bytes of every file it wrote; with --metrics
-# the exact metrics, 16.16's kernel census); timings shown.
+# frame NAME STEP: one forward step from a fixture, checkpointed as the
+# forward does, against its pins (`bench frame --expect`: the f/h/e lines,
+# the b line over the bytes of every file it wrote); timings shown.
 frame() {
-    local name=$1 f=$2 m=()
-    [[ ${3:-} == --metrics ]] && m=(--metrics "$G/$name.metrics")
-    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --step "$f" --edges --checkpoint --threads "$TH" --expect "$G/$name.frame" "${m[@]}" $PIN > "$C/$name.frame"
+    local name=$1 f=$2
+    ./safe-run.sh --memory "$MEM" -- "$B" bench frame --tree "$F/$name" --step "$f" --edges --checkpoint --threads "$TH" --expect "$G/$name.frame" $PIN > "$C/$name.frame"
 }
 
 # keycheck NAME STEP: the step's rows' keys recomputed at the boundary
@@ -209,7 +207,7 @@ t1() {
     for s in arccheck-r10 arccheck-r42x arccheck-f10 arccheck-f42x; do grep -h '^agreement' "$C/$s.out" | sed "s/^/    /" | cut -c1-200; done
 }
 t1_r10() {
-    step frame-r10 frame r10 55 --metrics
+    step frame-r10 frame r10 55
     step keycheck-r10 keycheck r10 55
     step refcheck-r10 refcheck r10 55
     step arccheck-r10 arccheck r10
@@ -218,11 +216,11 @@ t1_r10() {
     step backward-r10arc backward r10arc
 }
 t1_r62h() {
-    step frame-r62h frame r62h 50 --metrics
+    step frame-r62h frame r62h 50
     step widen-r62h widencheck r62h 50
 }
 t1_r42() {
-    step frame-r42n frame r42n 60 --metrics
+    step frame-r42n frame r42n 60
     step keycheck-r42n keycheck r42n 60
     step widen-r42n widencheck r42n 60
     step refcheck-r42x refcheck r42x 55
@@ -234,7 +232,7 @@ t1_r42() {
 t1_r60() {
     step keycheck-r60s keycheck r60s 70
 }
-# The same in FLOAT (`--arith float`, Celia's start), without the metrics.
+# The same in FLOAT (`--arith float`, Celia's start).
 t1_f10() {
     step frame-f10 frame f10 55
     step refcheck-f10 refcheck f10 55
@@ -386,11 +384,11 @@ widen60() {
 big() {
     build
     step fixtures-big tools/fixtures.sh ensure r62h57 r60s
-    step frame-r62h57 frame r62h57 56 --metrics
+    step frame-r62h57 frame r62h57 56
     grep -hE '^\[bench\] (kernels|rep)|^\[phases\]' "$C/frame-r62h57.err" | sed 's/^/    /' | cut -c1-220
-    # The platform kernels' frame (step 70 -> 71) and exact metrics: its
-    # lines are t2's forward60's too; their build is ~20-40 s of tracing.
-    step frame-r60s frame r60s 70 --metrics
+    # The platform kernels' frame (step 70 -> 71): its lines are t2's
+    # forward60's too; their build is ~20-40 s of tracing.
+    step frame-r60s frame r60s 70
     grep -hE '^\[bench\] (kernels|rep)' "$C/frame-r60s.err" | sed 's/^/    /' | cut -c1-200
 }
 

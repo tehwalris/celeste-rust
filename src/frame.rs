@@ -1227,7 +1227,7 @@ mod tests {
         let s = Settings::default();
         let run = crate::settings::Run::new(&s, Level::parse("r0sx").expect("level"));
         let grid = s.region_grid().expect("the default region grid");
-        let registry = crate::compiled::asm_kernel::registry(&run, false);
+        let registry = crate::compiled::asm_kernel::registry(&run);
         let row = standing_row(&run);
         let ids = crate::compiled::ids();
         let with = |f: u32, axis: u32, v: P8| with_player_field(&row, f, axis, v);
@@ -1294,7 +1294,7 @@ mod tests {
     fn the_kernels_emission_checks_the_followers() {
         let s = Settings { room: (6, 0), split_frame: true, ..Default::default() };
         let level = Level::parse("r0sxf").expect("level");
-        let registry = crate::compiled::asm_kernel::registry(&crate::settings::Run::new(&s, level), false);
+        let registry = crate::compiled::asm_kernel::registry(&crate::settings::Run::new(&s, level));
         let mut reference = ReferenceEngine::<P8>::new(&s).expect("ref engine");
         let start = reference.initial().expect("start");
         let one = reference.step_one(&start, 0).expect("step 1");

@@ -66,8 +66,8 @@ celeste-rust (src/)
                         oracle and probe (test-only)
   engines/              the reference engine (`reference`: the interpreter
                         over RefDomain as a frame step)
-  transpile/            graph IR, garith, ival, bdd, lowering, asm (codegen,
-                        float codegen, call-outs, jit)
+  transpile/            graph IR, garith, ival, bdd, lowering, asm (the
+                        LLVM IR emitter and its doubles, call-outs, jit)
   compiled/             FrameEngine, the kernel registry, emission, the
                         kernel cache
   check/                the tools outside the core, which names none of
@@ -76,9 +76,8 @@ celeste-rust (src/)
                         against the reference), replay (the tree from its
                         recorded graph), keys (the keys against the
                         boundary, through `frame::RowCheck`), gate (the arc
-                        gate's fingerprints, the arc phase rerun), census
-                        (the kernel census, rebuilt), explain (a kernel's
-                        decline, rebuilt)
+                        gate's fingerprints, the arc phase rerun), explain
+                        (a kernel's decline, rebuilt)
   settings.rs           the run's settings (flags), the tree's record
   starts.rs             the feasible loading-jank J's and their classes
   par.rs, metrics.rs, concrete.rs, game_runner.rs
@@ -107,13 +106,14 @@ reference for semantics only.
    A transient: the forward holds states as keys, a block exists only
    inside a wave's unit (decoded right before the kernels) and in readers.
 3. **The kernel set** (`compiled::asm_kernel::Registry`): one assembled
-   kernel per (shape, region), built at startup with gcc + dlopen. Nothing
-   is checked in; what runs is what the tracer makes of this checkout's Lua.
-   A set built once is kept in the KERNEL CACHE (`compiled::cache`,
-   `/var/tmp/celeste-kernels`), keyed on every source file, the build
-   profile, gcc and glibc, the program, the arithmetic, the level and the
-   settings: only the same build of the same sources loads it again (the
-   `[asm build]` line says HIT or MISS).
+   kernel per (shape, region), built at startup (LLVM IR, `llc`, `as`,
+   `ld`) and loaded with dlopen. Nothing is checked in; what runs is what
+   the tracer makes of this checkout's Lua. A set built once is kept in the
+   KERNEL CACHE (`compiled::cache`, `/var/tmp/celeste-kernels`), keyed on
+   every source file, the build profile, the toolchain (`llc`'s version and
+   flags, `as`, `ld`) and glibc, the program, the arithmetic, the level and
+   the settings: only the same build of the same sources loads it again
+   (the `[asm build]` line says HIT or MISS).
 
 To the outer loop a state is opaque: `(shape, key, cell)`.
 
@@ -210,12 +210,16 @@ reachable spike tile folds the death test away. Exact: the map is
 constant, the hull covers every lane's coordinate, and a lane outside a
 restriction is in error by the restriction's own check.
 
-**The codegen** (`transpile::asm`): hand-written GAS, gcc only assembles.
-Decided mask planes fold at lowering (bit identities); a call-out saves
-exactly the registers live across it (a run of calls keeps values in their
-save slots); `/2^s` and `%2^m` are inline; constants rematerialize; the
-register allocator is deliberately simple (spills are ~0.4% of a frame).
-The kernels are ~2-3% of a hot frame; the rest is emission and storage.
+**The kernels' code** (`transpile::asm`): the fused graph as LLVM IR
+(`asm::llvm`: `<16 x i32>` lanes, the doubles' `<8 x double>` over two
+halves, booleans as `<N x i1>` planes), built by `llc -O2` with a fixed
+flag list (`jit::LLC_FLAGS`, each flag's reason there; no IR passes), its
+text scanned for a fused multiply-add or an MXCSR write, then GNU `as` and
+`ld -shared`. Decided mask planes fold at emission (bit identities);
+`/2^s` and `%2^m` are inline; value numbering, scheduling, register
+allocation and the peephole are `llc`'s. The kernels are 1-3% of a hot
+frame's instructions; the rest is emission and storage. The hand-written
+backend it replaced: plans/lessons.md.
 
 ## Keys
 
@@ -535,12 +539,11 @@ own W, for the shortest run valid in both (plans/float.md).
 
 The check ladder is `./check.sh t0 t1 t2 big` (plans/devloop.md). The
 verification surface behind it. Every check is a TOOL (`src/check/`,
-`rewrite check ...`, `gate`, `explain`, `bench frame --metrics`' census): it
+`rewrite check ...`, `gate`, `explain`): it
 reads trees and records or rebuilds through the core's entry points, and the
 core names none (`conventions`); the core keeps only its guards (fatal,
-always on) and the seams a tool asks for: `--phases`' timers, the kernels'
-slice counters (`Kernels::counting`, the census) and the forward's row
-observer (`frame::RowCheck`, `check keys`).
+always on) and the seams a tool asks for: `--phases`' timers and the
+forward's row observer (`frame::RowCheck`, `check keys`).
 
 - **The pinned room (1,0) gates** (`gates/`): each frame's states, edges
   (with their transfers) and hulls f0-f44 (`ckhash --edges --hulls`), the
@@ -626,7 +629,7 @@ still cite the old names; the originals are in git history (`git show
 | old doc | its live content now |
 |---|---|
 | storage-v2, storage-unify, rows-from-keys, keys-only, exact-keys, edges-target, emit-batch, arc-memory | this file ("Keys", "The forward", "The recorded graph", "The search"); measurements: plans/lessons.md |
-| format-study, forward, fwd-bench, kernel-mix, kernel-opt-decisions | this file ("The codegen"); the benchmark: plans/devloop.md |
+| format-study, forward, fwd-bench, kernel-mix, kernel-opt-decisions | this file ("The kernels' code"); the benchmark: plans/devloop.md |
 | footguns | CLAUDE.md (the rules); this file ("Per-tree records") |
 | widen-table | plans/abstractions.md; its open to-do: "Open issues" above |
 | jank-trace, jank-tools | "Open issues" above (`git show c4dd3241:plans/refactor.md`) |

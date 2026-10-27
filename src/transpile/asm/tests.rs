@@ -931,25 +931,29 @@ fn scalar_overflow_is_at_most_two_compares() {
     }
     let oks: Vec<NodeId> = ops.iter().map(|&o| g.add(Op::NoWrap, vec![o])).collect();
     let roots: Vec<NodeId> = ops.iter().chain(&oks).copied().collect();
-    // One compare per distinct bound a literal form puts on `x`, and one
-    // sign test per two-cell `+`/`-`; nothing else compares.
-    let text = compile(&g, &roots, "scalarovf", false).expect("compile").asm;
-    let compares = text.lines().filter(|l| l.trim_start().starts_with("vpcmpd")).count();
-    let mut bounds = std::collections::BTreeSet::new();
+    // In the emitted IR, one compare per bound a literal form puts on `x`
+    // (none where every value fits), one sign test per two-cell `+`/`-`;
+    // nothing else compares.
+    let ir = compile(&g, &roots, "scalarovf").expect("compile").1;
+    let compares = ir.lines().filter(|l| l.contains(" = icmp ")).count();
+    let (mut bounds, mut want) = (std::collections::BTreeSet::new(), 0);
     for &o in &ops {
-        if let Some(f) = one_operand(&g, o).and_then(|o| o.fits) {
-            if f.0 != i32::MIN {
-                bounds.insert((0, f.0));
+        match one_operand(&g, o) {
+            Some(oo) => {
+                if let Some(f) = oo.fits {
+                    want += (f.0 != i32::MIN) as usize + (f.1 != i32::MAX) as usize;
+                    if f.0 != i32::MIN {
+                        bounds.insert((0, f.0));
+                    }
+                    if f.1 != i32::MAX {
+                        bounds.insert((1, f.1));
+                    }
+                }
             }
-            if f.1 != i32::MAX {
-                bounds.insert((1, f.1));
-            }
+            None => want += 1,
         }
     }
-    // PROTOTYPE: `codegen`'s text only (the `llvm` feature's is IR).
-    if cfg!(not(feature = "llvm")) {
-        assert_eq!(compares, bounds.len() + 2, "{text}");
-    }
+    assert_eq!(compares, want, "{ir}");
     // `x` at and one step either side of every bound, the extremes and small
     // values; `y` cycling through the extremes and small values.
     let mut xs: Vec<i32> = vec![i32::MIN, i32::MIN + 1, -1, 0, 1, 0x1_0000, i32::MAX - 1, i32::MAX];
@@ -1042,24 +1046,17 @@ fn interval_scale_and_divide_overflow_is_one_compare_a_bound() {
     }
     let oks: Vec<NodeId> = ops.iter().map(|&x| g.add(Op::NoWrap, vec![x])).collect();
     let roots: Vec<NodeId> = ops.iter().chain(&oks).copied().collect();
-    let text = compile(&g, &roots, "ivalscale", false).expect("compile").asm;
-    let compares = text.lines().filter(|l| l.trim_start().starts_with("vpcmpd")).count();
-    // One per distinct bound a literal can cross (`*2` and `/0.5` share
-    // theirs, `*1.00002` and `/0.99998` their low one), none for the rest.
-    let mut bounds = std::collections::BTreeSet::new();
+    let ir = compile(&g, &roots, "ivalscale").expect("compile").1;
+    let compares = ir.lines().filter(|l| l.contains(" = icmp ")).count();
+    // In the emitted IR, one compare per bound a form's literal can cross,
+    // none for the rest (`llc` merges the shared ones: `*2` and `/0.5`).
+    let mut want = 0;
     for (f, &x) in ops.iter().enumerate() {
         let (lo, hi) = fits(&g, x);
         assert_eq!(lo != i32::MIN && hi != i32::MAX, forms[f].3, "{:?}: both ends or neither", forms[f]);
-        if lo != i32::MIN {
-            bounds.insert((0, lo));
-        }
-        if hi != i32::MAX {
-            bounds.insert((1, hi));
-        }
+        want += (lo != i32::MIN) as usize + (hi != i32::MAX) as usize;
     }
-    if cfg!(not(feature = "llvm")) {
-        assert_eq!(compares, bounds.len(), "one compare per bound:\n{text}");
-    }
+    assert_eq!(compares, want, "one compare per bound:\n{ir}");
     // Lanes around every literal's edges, then the extremes and small values.
     let mut lanes: Vec<(i32, i32)> = vec![(i32::MIN, i32::MAX), (0, 0), (-0x10_0000, 0x10_0000), (i32::MIN, 0), (0, i32::MAX)];
     for &x in &ops {
@@ -1098,12 +1095,8 @@ fn inline_div_rem_by_a_power_of_two_is_pico8s() {
         let c = g.leaf(Op::Const(d, d));
         roots.push(g.add(Op::Rem, vec![x, c]));
     }
-    let text = compile(&g, &roots, "pow2", false).expect("compile").asm;
-    if cfg!(not(feature = "llvm")) {
-        assert!(!text.contains("call"), "a power-of-two divisor is inline");
-    } else {
-        assert!(!text.contains("call void"), "a power-of-two divisor is inline");
-    }
+    let ir = compile(&g, &roots, "pow2").expect("compile").1;
+    assert!(!ir.contains("call void"), "a power-of-two divisor is inline (no call-out)");
     let mut edges: Vec<i32> = vec![i32::MIN, i32::MIN + 1, i32::MAX, i32::MAX - 1, 0, 1, -1];
     for k in 0..31 {
         for d in [-1i32, 0, 1] {
@@ -1143,8 +1136,8 @@ fn call_outs_are_the_arithmetics() {
 }
 
 /// Only the registers live across a call-out are saved and restored: a value
-/// computed before a call and read after it survives it, fewer than all 32
-/// are saved, and `ZERO` is zero again after the call.
+/// computed before a call and read after it survives it (every vector and
+/// mask register is the caller's to save).
 #[test]
 fn a_call_out_preserves_what_is_live_across_it() {
     let mut g = Graph::<Fixed>::default();
@@ -1152,21 +1145,15 @@ fn a_call_out_preserves_what_is_live_across_it() {
     let three = g.leaf(Op::Const(3 << 16, 3 << 16));
     let before = g.add(Op::Add, vec![x, y]); // live across the call
     let q = g.add(Op::Div, vec![before, three]); // a call-out, after `before`
-    let n = g.add(Op::Neg, vec![q]); // reads ZERO after the call
+    let n = g.add(Op::Neg, vec![q]); // after the call
     let roots = vec![g.add(Op::Add, vec![before, n]), before];
-    let text = compile(&g, &roots, "livecall", false).expect("compile").asm;
-    // Stores to the stack: the call's two arguments and the saves.
-    let stores = text.lines().filter(|l| l.contains("vmovdqu64 %zmm") && l.contains("(%rsp)")).count();
-    if cfg!(not(feature = "llvm")) {
-        assert!(text.contains("call") && (3..32).contains(&stores), "{stores} stack stores around the call");
-    }
     let mut rng = Lcg(0x11fe_ca11);
     let rows: Vec<Vec<In<Fixed>>> = (0..256).map(|_| vec![In::N(Fixed::random(&mut rng, true)), In::N(Fixed::random(&mut rng, true))]).collect();
     check(&g, &roots, &rows, None, "livecall");
 }
 
-/// Values live across a RUN of call-outs and read only after it stay in the
-/// save area between the calls (eight call-outs, four values held across).
+/// Values live across a RUN of call-outs and read only after it survive it
+/// (eight call-outs, four values held across).
 #[test]
 fn values_held_across_a_run_of_calls_survive_it() {
     let mut g = Graph::<Fixed>::default();
@@ -1181,22 +1168,18 @@ fn values_held_across_a_run_of_calls_survive_it() {
         })
         .collect();
     let roots: Vec<NodeId> = held.iter().chain(&qs).copied().collect();
-    let text = compile(&g, &roots, "callrun", false).expect("compile").asm;
-    if cfg!(not(feature = "llvm")) {
-        assert_eq!(text.matches("call *%rax").count(), 8, "eight call-outs");
-    } else {
-        assert_eq!(text.matches("call void").count(), 8, "eight call-outs");
-    }
+    let ir = compile(&g, &roots, "callrun").expect("compile").1;
+    assert_eq!(ir.matches("call void").count(), 8, "eight call-outs");
     let mut rng = Lcg(0x5a7e_0a11);
     let rows: Vec<Vec<In<Fixed>>> = (0..256).map(|_| (0..8).map(|_| In::N(Fixed::random(&mut rng, true))).collect()).collect();
     check(&g, &roots, &rows, None, "callrun");
 }
 
 /// Constants under register pressure: 48 select chains over broadcast
-/// constants, still live at the end, are spilled and REMATERIALIZED at their
-/// uses, exact.
+/// constants, still live at the end (more than the 32 vector registers),
+/// exact wherever the allocator keeps them.
 #[test]
-fn rematerialized_constants_under_pressure_are_exact() {
+fn constants_under_register_pressure_are_exact() {
     let mut g = Graph::<Fixed>::default();
     let cs: Vec<NodeId> = (0..48u32).map(|c| g.leaf(Op::Cell(c))).collect();
     let ks: Vec<NodeId> = [-1i32, 0, 1, 0x10000, -0x8000, 7, 0x7fff_ffff, i32::MIN].iter().map(|&k| g.leaf(Op::Const(k, k))).collect();
@@ -1213,11 +1196,6 @@ fn rematerialized_constants_under_pressure_are_exact() {
     for (i, &s) in firsts.iter().enumerate() {
         let ge = g.add(Op::Ge, vec![cs[i], min]);
         roots.push(g.add(Op::Sel, vec![ge, ks[(i + 5) % ks.len()], s]));
-    }
-    let text = compile(&g, &roots, "remat", false).expect("compile").asm;
-    let consts = text.lines().filter(|l| l.contains("vpbroadcastd") || l.contains("vpternlogd $0xff") || l.trim_start().starts_with("vpxord")).count();
-    if cfg!(not(feature = "llvm")) {
-        assert!(text.contains("(%rsp)") && consts > ks.len(), "the test needs spilled constants: {consts} materializations");
     }
     let mut rng = Lcg(0x4e3a_7a7e);
     let rows: Vec<Vec<In<Fixed>>> = (0..64).map(|_| (0..48).map(|_| In::N(Fixed::random(&mut rng, false))).collect()).collect();
@@ -1278,12 +1256,13 @@ fn float_literals_and_rounding_are_the_carts() {
 }
 
 /// A kernel text holding a fused multiply-add or an MXCSR write is refused
-/// before it is assembled.
+/// before it is assembled (`llc`'s tab-separated text included).
 #[test]
 fn a_fused_multiply_add_is_refused() {
-    for text in ["    vfmadd231pd %zmm1, %zmm2, %zmm3\n", "    vfnmsub213sd %xmm1, %xmm2, %xmm3\n", "    ldmxcsr (%rsp)\n"] {
-        let asm = format!(".text\n.globl k\nk:\n{text}    ret\n");
-        let e = crate::transpile::asm::assemble(&asm, "refuse", &mut Default::default()).expect_err("refused");
+    for text in ["\tvfmadd231pd\t%zmm1, %zmm2, %zmm3\n", "    vfnmsub213sd %xmm1, %xmm2, %xmm3\n", "\tldmxcsr\t(%rsp)\n"] {
+        let asm = format!("\t.text\n\t.globl\tk\nk:\n{text}\tretq\n");
+        let e = super::jit::refuse_forbidden(&asm).expect_err("refused");
         assert!(format!("{e}").contains("forbidden"), "{e}");
     }
+    super::jit::refuse_forbidden("\tvmulpd\t%zmm1, %zmm2, %zmm3\n\tvaddpd\t%zmm3, %zmm4, %zmm5\n").expect("a multiply and an add are no fused multiply-add");
 }
