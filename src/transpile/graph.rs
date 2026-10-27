@@ -488,99 +488,36 @@ impl<A: GraphArith> Graph<A> {
                 _ => None,
             })
         };
+        // What the one evaluation decides of literal operands
+        // (`eval::literal`): an operation on literal POINTS exactly (the
+        // arithmetic's own, bit for bit, so a select on it folds instead of
+        // being split both ways), a literal's fragment, span, coverage or
+        // bits, a `NoWrap` its operands' literals or weakest values decide
+        // (`x * 0.5`, `x / 0`). A literal operation past the arithmetic
+        // panics with its operands (`overflow`): `fold` has no error to
+        // return, the traced Lua's constant arithmetic errs in the domain
+        // (`Symbolic::arith`), and what a specialization or a substitution
+        // folds overflows nowhere.
+        let points = !args.is_empty() && args.iter().all(|a| self.point(*a).is_some());
+        let literals = !args.is_empty() && args.iter().all(|a| matches!(self.nodes[*a as usize].op, Op::Const(..)));
+        let evaluated = match op {
+            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Min | Op::Max | Op::Neg | Op::Abs | Op::Flr | Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq | Op::Same => points,
+            Op::Span | Op::Frag(Cut::Ints, _) | Op::ForkOk(..) => literals,
+            Op::FragOk(_, 0) | Op::NoWrap => true,
+            _ => false,
+        };
+        if evaluated {
+            let known = super::eval::literal(self, &op, &args);
+            let (lo, hi) = match (known.boolean(), &op, known.num(), known.point()) {
+                (Some(b), ..) => return self.leaf(Op::ConstBool(b)),
+                (_, Op::Span, Some(iv), _) => A::bounds(iv),
+                (_, _, _, Some(p)) => (p, p),
+                _ if points && A::range_error(&op) => overflow::<A>(&op, args.iter().map(|a| self.point(*a).expect("a point")).collect()),
+                _ => return self.add(op, args),
+            };
+            return self.leaf(Op::Const(A::lit(lo), A::lit(hi)));
+        }
         match op {
-            // Fragment 0 is never empty, so `FragOk(0)` is true (as in `eval`).
-            Op::FragOk(_, 0) => return self.leaf(Op::ConstBool(true)),
-            // The span premise over a LITERAL is decided once (the floors': the
-            // kernel's `zi_span_ok`, wraps included).
-            Op::ForkOk(Cut::Floors, n) => {
-                if let Op::Const(lo, hi) = self.nodes[args[0] as usize].op {
-                    return self.leaf(Op::ConstBool(A::lit_split_ok(lo, hi, n)));
-                }
-            }
-            Op::ForkOk(Cut::Rounds, n) => {
-                if let Op::Const(lo, hi) = self.nodes[args[0] as usize].op {
-                    let cells = A::cells(Cut::Rounds, A::ival(A::from_lit(lo), A::from_lit(hi)));
-                    if cells != i64::MAX {
-                        return self.leaf(Op::ConstBool(cells < n as i64));
-                    }
-                }
-            }
-            // Two literal points are the same bits or not.
-            Op::Same => {
-                if let (Some(x), Some(y)) = (self.point(args[0]), self.point(args[1])) {
-                    return self.leaf(Op::ConstBool(A::bits(x) == A::bits(y)));
-                }
-            }
-            // An `Ints` fragment of a literal is a constant (as in `eval`).
-            Op::Frag(Cut::Ints, c) if matches!(self.nodes[args[0] as usize].op, Op::Const(..)) => {
-                let Op::Const(lo, _) = self.nodes[args[0] as usize].op else { unreachable!("guarded above") };
-                let v = A::lit_int_frag(lo, c);
-                return self.leaf(Op::Const(v, v));
-            }
-            // No-wrap decided where the arithmetic can (`GraphArith::fold_no_wrap`).
-            Op::NoWrap => {
-                if let Some(b) = A::fold_no_wrap(self, args[0]) {
-                    return self.leaf(Op::ConstBool(b));
-                }
-            }
-            // Arithmetic on literal POINTS folds EXACTLY (the arithmetic's own
-            // operation, bit for bit), so a select on it folds instead of being
-            // split both ways. A result past the arithmetic panics with the
-            // operands (`checked`): `fold` has no error to return, the traced
-            // Lua's constant arithmetic errs in the domain (`Symbolic::arith`),
-            // and what a specialization or a substitution folds overflows
-            // nowhere.
-            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Min | Op::Max => {
-                if let (Some(x), Some(y)) = (self.point(args[0]), self.point(args[1])) {
-                    let r = match op {
-                        Op::Add => checked::<A>("+", A::add(x, y), x, y),
-                        Op::Sub => checked::<A>("-", A::sub(x, y), x, y),
-                        Op::Mul => checked::<A>("*", A::mul(x, y), x, y),
-                        Op::Div => checked::<A>("/", A::div(x, y), x, y),
-                        Op::Min => A::min(x, y),
-                        _ => A::max(x, y),
-                    };
-                    let l = A::lit(r);
-                    return self.leaf(Op::Const(l, l));
-                }
-            }
-            Op::Neg | Op::Abs | Op::Flr => {
-                if let Some(x) = self.point(args[0]) {
-                    let r = match op {
-                        Op::Neg => checked::<A>("unary -", A::neg(x), x, x),
-                        Op::Abs => checked::<A>("abs", A::abs(x), x, x),
-                        _ => A::flr(x),
-                    };
-                    let l = A::lit(r);
-                    return self.leaf(Op::Const(l, l));
-                }
-            }
-            // A comparison of two literal POINTS is a constant.
-            Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => {
-                if let (Some(x), Some(y)) = (self.point(args[0]), self.point(args[1])) {
-                    let r = match op {
-                        Op::Lt => A::lt(x, y),
-                        Op::Le => A::le(x, y),
-                        Op::Gt => A::lt(y, x),
-                        Op::Ge => A::le(y, x),
-                        _ => A::num_eq(x, y),
-                    };
-                    return self.leaf(Op::ConstBool(r));
-                }
-            }
-            // A span of two literals IS a literal interval (as in `eval`).
-            Op::Span => {
-                let lit = |g: &Graph<A>, i: usize| match g.nodes[args[i] as usize].op {
-                    Op::Const(lo, hi) => Some((lo, hi)),
-                    _ => None,
-                };
-                if let (Some((lo, _)), Some((_, hi))) = (lit(self, 0), lit(self, 1)) {
-                    // Tolerant of `lo > hi` (an unreached table-fork fragment).
-                    let (lo, hi) = if A::lt(A::from_lit(hi), A::from_lit(lo)) { (hi, lo) } else { (lo, hi) };
-                    return self.leaf(Op::Const(lo, hi));
-                }
-            }
             // A decided condition picks its arm.
             Op::Sel => {
                 if let Some(c) = cbool(self, 0) {
@@ -722,10 +659,6 @@ mod tests {
     use crate::transpile::eval::{eval, Lanes, Val};
     use celeste_core::pico8_num::Pico8NumInterval;
     use std::collections::HashMap;
-
-    fn pieces_of(g: &Graph<Fixed>, memo: &mut HashMap<NodeId, Option<crate::transpile::garith::Pieces<Fixed>>>, n: NodeId) -> Option<crate::transpile::garith::Pieces<Fixed>> {
-        <Fixed as GraphArith>::pieces_of(g, memo, n)
-    }
 
     fn n(v: i16) -> Pico8Num {
         Pico8Num::from_i16(v)
@@ -1246,74 +1179,21 @@ mod tests {
         g.fold(Op::Abs, vec![min]);
     }
 
-    /// A product's range is computed unwrapped: one past the 16.16 range is
-    /// unknown, not PICO-8's wrapped endpoints (which bound nothing).
-    #[test]
-    fn a_product_range_that_overflows_is_unknown() {
-        let mut g = Graph::<Fixed>::default();
-        let raw = g.leaf(Op::Cell(0));
-        let s = g.add(Op::Restrict(0, i32::MAX), vec![raw]);
-        let two = g.leaf(Op::Const(0x2_0000, 0x2_0000));
-        let m = g.add(Op::Mul, vec![s, two]);
-        assert_eq!(pieces_of(&g, &mut HashMap::new(), m), None);
-        let t = g.add(Op::Restrict(0, 0x3fff_ffff), vec![raw]);
-        let m = g.add(Op::Mul, vec![t, two]);
-        assert_eq!(pieces_of(&g, &mut HashMap::new(), m), Some(vec![(0, 0x7fff_fffe)]));
-    }
-
-    /// A select on a non-constant condition is the UNION of its arms.
-    #[test]
-    fn pieces_keep_a_select_as_a_union() {
-        let mut g = Graph::<Fixed>::default();
-        let raw = g.leaf(Op::Cell(0));
-        let s = g.add(Op::Restrict(-(1 << 16), 1 << 16), vec![raw]);
-        let five = g.leaf(Op::Const(5 << 16, 5 << 16));
-        let cond = g.leaf(Op::Cell(1));
-        let sel = g.add(Op::Sel, vec![cond, five, s]);
-        let neg = g.add(Op::Neg, vec![sel]);
-        let mut memo = HashMap::new();
-        assert_eq!(pieces_of(&g, &mut memo, sel), Some(vec![(-(1 << 16), 1 << 16), (5 << 16, 5 << 16)]));
-        assert_eq!(pieces_of(&g, &mut memo, neg), Some(vec![(-(5 << 16), -(5 << 16)), (-(1 << 16), 1 << 16)]));
-        // A cell is unknown, and so is anything over it.
-        let other = g.leaf(Op::Cell(2));
-        let sum = g.add(Op::Add, vec![s, other]);
-        assert_eq!(pieces_of(&g, &mut memo, sum), None);
-        assert_eq!(pieces_of(&g, &mut memo, raw), None);
-    }
-
-    /// `Lo`/`Hi` of a hull are not points, so nothing may decide a comparison
-    /// one lane could fail.
-    #[test]
-    fn the_ends_of_a_hull_are_not_points() {
-        let mut g = Graph::<Fixed>::default();
-        let v = g.leaf(Op::Cell(0));
-        let hi = g.add(Op::Hi, vec![v]);
-        let one = g.leaf(Op::Const(1 << 16, 1 << 16));
-        let le = g.add(Op::Le, vec![hi, one]);
-        let hull = Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(0), Pico8Num::from_raw(3 << 16)));
-        let vals = eval(&g, &HashMap::from([(0u32, hull)]), Lanes::Over, None);
-        assert_eq!(vals[hi as usize], hull, "Hi of a hull is the hull");
-        assert_eq!(vals[le as usize], Val::Bool(None), "a lane [0, 0.5] has Hi <= 1, a lane [2, 3] does not");
-        let r = g.add(Op::Restrict(0, 3 << 16), vec![v]);
-        let hi_r = g.add(Op::Hi, vec![r]);
-        assert_eq!(pieces_of(&g, &mut HashMap::new(), hi_r), Some(vec![(0, 3 << 16)]));
-        let le_r = g.add(Op::Le, vec![hi_r, one]);
-        let (out, map) = crate::transpile::eval::fold(&g, &[le_r], None);
-        assert_eq!(out.get(map[le_r as usize]).op, Op::Le, "the fold leaves it to the lanes");
-    }
 }
 
-/// `Graph::fold`'s literal arithmetic: the exact result, or a panic naming
-/// the operation (`fold` cannot return an error; see there).
-fn checked<A: Arithmetic>(op: &str, r: Option<A>, x: A, y: A) -> A {
-    r.unwrap_or_else(|| {
-        panic!(
-            "constant fold overflow: {op} of the literals {} and {} leaves {} (overflow is an error)",
-            A::show(x),
-            A::show(y),
-            A::RANGE_NOTE
-        )
-    })
+/// `Graph::fold`'s literal arithmetic past the arithmetic: a panic naming
+/// the operation and its operands (`fold` cannot return an error; see there).
+fn overflow<A: Arithmetic>(op: &Op<A>, xs: Vec<A>) -> ! {
+    let sym = match op {
+        Op::Add => "+",
+        Op::Sub => "-",
+        Op::Mul => "*",
+        Op::Div => "/",
+        Op::Neg => "unary -",
+        _ => "abs",
+    };
+    let (x, y) = (xs[0], *xs.last().expect("an operand"));
+    panic!("constant fold overflow: {sym} of the literals {} and {} leaves {} (overflow is an error)", A::show(x), A::show(y), A::RANGE_NOTE)
 }
 
 /// A numeric operation whose operands are literal POINTS but one, `operand`

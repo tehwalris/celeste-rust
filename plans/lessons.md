@@ -57,6 +57,16 @@ sounds like one of these. The full write-ups are in git history.
   +3.9%) - the kernels are ~2-3% of a frame. Its one catch the tracer makes
   (a branch re-merged with no other guard, `c or not c`) is `Graph::fold`'s
   complement rule now.
+- **Seven ways of reasoning about the graph** (merged 2026-10-27 into one
+  abstract evaluation, `transpile::eval`): the tracer's piecewise static
+  ranges (`GraphArith::pieces_of`, unions of up to 64 intervals), a second
+  interval evaluator with four modes (`Graph::eval`), the interval fold,
+  the lowering's per-configuration fold, the literal folds. Measured on
+  2a639ea7 (`bench frame --metrics`, r10 / r42n / r62h / r60s, f10 / f42n
+  for the trees): pieces as one hull, `abs` "defined" only in the fold, a
+  cell's static range the whole range, the per-configuration fold off
+  (`decided_roots`), the absorption of the split pass off: trees and
+  kernels identical, every metric 0.0%.
 - **Deleting the list scheduler or the text peephole** (audit N4,
   2026-10-22, each the identity in a local build; trees, frame lines and
   kernel coverage unchanged in every case; dynamic kernel instructions of
@@ -208,6 +218,17 @@ sounds like one of these. The full write-ups are in git history.
   stay their own kind.
 
 ## Measurements behind design rules
+
+- **Where a decision is made is free; what is decided is not** (2a639ea7,
+  each off alone, trees identical wherever the frame finished): the
+  lowering's interval fold +21-340% kernel instructions; the tracer's range
+  decisions: r42n out of memory at 16 GB, r60s's walk 36 s -> killed at 9
+  min (traced nodes +8-44% where it finished); the overflow its ranges rule
+  out +11-35% traced nodes (kernels identical); `Graph::fold`'s re-merge
+  +105-230% traced nodes; the fruit level's literal folding: coverage gaps.
+  `MayErr`'s case-split errors: traced nodes -3..-12% and error terms
+  -43..-80% without it, kernels -1.3..+3.3% (kept: three-valued errors
+  could decline lanes in rooms the fixtures do not hold).
 
 - **Lane type as a register** (`ZN`): as `[Pico8Num; 16]` the kernel was
   61% scalar; changing only the lane type was 20x.

@@ -15,7 +15,8 @@ use super::domain::{Domain, Symbolic};
 use super::heap::Value;
 use super::iface::{self, Path, Step};
 use super::state::State;
-use crate::transpile::garith::{within, GraphArith};
+use crate::transpile::eval::within;
+use crate::transpile::garith::GraphArith;
 use crate::transpile::graph::{NodeId, Op};
 
 /// Write every `Stored::AbsentAsZero` field an object lacks as the number 0

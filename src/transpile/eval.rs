@@ -1,12 +1,18 @@
 //! THE ONE ABSTRACT EVALUATION of the graph IR: per node what is KNOWN of
 //! its value (`Known`: an interval for a number, or nothing; three values for
 //! a boolean; the tiles an `mget` may read) from what is known of its inputs,
-//! one rule per operator (`rule`). The decisions and folds made on a graph
-//! read it:
+//! one rule per operator (`rule`). Every decision and fold made on a graph
+//! reads it:
 //!
+//! - the TRACER's static ranges (`Symbolic::range_of`, `Facts::default`:
+//!   over the lanes, nothing known of an input but its restriction, no
+//!   map): the comparisons they decide, the overflow they rule out
+//!   (`trace::error`), a fork's arity, the walk's regions, a widening's
+//!   containment (`within`, under a select's branch facts);
+//! - `Graph::fold` and the tracer on LITERAL operands (`literal`: every
+//!   lane holds a literal; an operand not one is any number);
 //! - the LOWERING's fold (`fold`: over the lanes, `mget` over intervals read
 //!   as the set of tiles the rectangle holds);
-//! - the tracer's literal folding (`literal`: every lane holds the literals);
 //! - ONE LANE (`eval` with `Lanes::One`: a row, as level -1 and `explain`
 //!   read it).
 //!
@@ -83,6 +89,14 @@ impl<A: Arithmetic> Known<A> {
     pub fn point(self) -> Option<A> {
         self.num().and_then(A::as_point)
     }
+    /// What any value of type `ty` is known to be: a boolean nothing, a
+    /// number one of the arithmetic's (a stored number is).
+    fn weakest(ty: Ty) -> Self {
+        match ty {
+            Ty::Bool | Ty::UBool => Known::Bool(None),
+            _ => Known::Num(Some(A::unknown())),
+        }
+    }
     /// As a lane's value: a number nothing is known of is the whole range.
     fn val(self) -> Val<A> {
         match self {
@@ -108,15 +122,16 @@ pub enum Lanes {
     One,
 }
 
-impl<A: Arithmetic> Known<A> {
-    /// What any value of type `ty` is known to be: a boolean nothing, a
-    /// number one of the arithmetic's (a stored number is).
-    fn weakest(ty: Ty) -> Self {
-        match ty {
-            Ty::Bool | Ty::UBool => Known::Bool(None),
-            _ => Known::Num(Some(A::unknown())),
-        }
-    }
+/// What the inputs are known to be.
+#[derive(Clone, Copy)]
+pub enum Inputs<'c, A: Arithmetic> {
+    /// Nothing (the tracer: a number has a range only through its
+    /// restriction).
+    Unknown,
+    /// Any of their type's values (the lowering's fold).
+    Weakest,
+    /// These values; a cell not given is any of its type's.
+    Cells(&'c HashMap<u32, Val<A>>),
 }
 
 /// THE EVALUATION of one graph: what is known of each node it was asked
@@ -126,15 +141,25 @@ impl<A: Arithmetic> Known<A> {
 #[derive(Clone)]
 pub struct Facts<'a, A: GraphArith> {
     lanes: Lanes,
-    /// The inputs' values (a cell not given, or none: its weakest).
-    cells: Option<&'a HashMap<u32, Val<A>>>,
+    inputs: Inputs<'a, A>,
     room: Option<&'a Room>,
     known: Vec<Option<Known<A>>>,
+    /// `within`'s branch facts: a node narrowed to an interval; the nodes no
+    /// lane reaches under them (contradicting facts, or an operand that is).
+    narrowed: Vec<(NodeId, A::Ival)>,
+    unreached: rustc_hash::FxHashSet<NodeId>,
+}
+
+/// The tracer's: over the lanes, nothing known of the inputs, no map.
+impl<A: GraphArith> Default for Facts<'_, A> {
+    fn default() -> Self {
+        Facts::new(Lanes::Over, Inputs::Unknown, None)
+    }
 }
 
 impl<'a, A: GraphArith> Facts<'a, A> {
-    pub fn new(lanes: Lanes, cells: Option<&'a HashMap<u32, Val<A>>>, room: Option<&'a Room>) -> Self {
-        Facts { lanes, cells, room, known: Vec::new() }
+    pub fn new(lanes: Lanes, inputs: Inputs<'a, A>, room: Option<&'a Room>) -> Self {
+        Facts { lanes, inputs, room, known: Vec::new(), narrowed: Vec::new(), unreached: Default::default() }
     }
 
     /// What is known of node `n` of `g`.
@@ -164,27 +189,100 @@ impl<'a, A: GraphArith> Facts<'a, A> {
         self.known[n as usize].expect("evaluated")
     }
 
-    /// Node `n`, its operands known: `rule`, a cell its input's.
+    /// What `op` over `args` (nodes of `g`) is known to be, the node not
+    /// built.
+    fn of_op(&mut self, g: &Graph<A>, op: &Op<A>, args: &[NodeId]) -> Known<A> {
+        for a in args {
+            self.of(g, *a);
+        }
+        let known = &self.known;
+        let arg = |i: usize| known[args[i] as usize].expect("an operand is known");
+        let deep = |m: NodeId| known[m as usize].expect("an operand's operand is known");
+        rule(self.lanes, self.room, g, op, args, arg, deep)
+    }
+
+    /// The interval `n` is known to lie in.
+    pub fn range(&mut self, g: &Graph<A>, n: NodeId) -> Option<A::Ival> {
+        self.of(g, n).num()
+    }
+
+    /// The comparison `op` of `a` and `b` (no node made), where decided.
+    pub fn compare(&mut self, g: &Graph<A>, op: &Op<A>, a: NodeId, b: NodeId) -> Option<bool> {
+        let (x, y) = (self.of(g, a), self.of(g, b));
+        compare(op, x, y).boolean()
+    }
+
+    /// Does `n`'s exact result (an operation that can leave the arithmetic's
+    /// range, `GraphArith::range_error`) lie inside the range on every lane:
+    /// its `NoWrap`, decided true?
+    pub fn fits(&mut self, g: &Graph<A>, n: NodeId) -> bool {
+        let node = g.get(n);
+        let k: Vec<Known<A>> = node.args.iter().map(|a| self.of(g, *a)).collect();
+        no_wrap(self.lanes, &node.op, |i| k[i]) == Some(true)
+    }
+
+    /// Node `n`, its operands known: `rule`, a cell its input's, and
+    /// `within`'s facts.
     fn step(&mut self, g: &Graph<A>, n: NodeId) -> Known<A> {
         let node = g.get(n);
+        let facts = !self.narrowed.is_empty();
+        if facts && node.op != Op::Sel && node.args.iter().any(|a| self.unreached.contains(a)) {
+            self.unreached.insert(n);
+            return Known::Num(None);
+        }
         let known = &self.known;
         let arg = |i: usize| known[node.args[i] as usize].expect("an operand is known before its reader");
         let deep = |m: NodeId| known[m as usize].expect("an operand's operand is known");
         let k = match node.op {
-            Op::Cell(c) => match self.cells.and_then(|cells| cells.get(&c)) {
-                Some(v) => (*v).into(),
-                None => Known::weakest(g.ty(n)),
+            Op::Cell(c) => match self.inputs {
+                Inputs::Cells(cells) if cells.contains_key(&c) => cells[&c].into(),
+                Inputs::Unknown if !g.ty(n).is_bool() => Known::Num(None),
+                _ => Known::weakest(g.ty(n)),
             },
-            _ => rule(self.lanes, self.room, g, &node.op, &node.args, &arg, &deep),
+            // An arm no lane reaches is no arm.
+            Op::Sel if facts => {
+                let unreached = |i: usize| self.unreached.contains(&node.args[i]);
+                match (arg(0).boolean(), unreached(1), unreached(2)) {
+                    (Some(true), true, _) | (Some(false), _, true) | (None, true, true) => {
+                        self.unreached.insert(n);
+                        return Known::Num(None);
+                    }
+                    (None, true, false) => arg(2),
+                    (None, false, true) => arg(1),
+                    _ => rule(self.lanes, self.room, g, &node.op, &node.args, arg, deep),
+                }
+            }
+            _ => rule(self.lanes, self.room, g, &node.op, &node.args, arg, deep),
         };
         // One lane: a number nothing is known of is the whole range (as the
         // lane holds one of the arithmetic's).
-        match k {
+        let k = match k {
             Known::Num(None) if self.lanes == Lanes::One => Known::Num(Some(A::unknown())),
             k => k,
+        };
+        if facts {
+            return self.narrow(n, k);
         }
+        k
     }
 
+    /// `k` under `within`'s facts on `n`: narrowed (nothing known: the
+    /// fact's interval); disjoint, no lane reaches `n`.
+    fn narrow(&mut self, n: NodeId, mut k: Known<A>) -> Known<A> {
+        for &(_, f) in self.narrowed.iter().filter(|(m, _)| *m == n) {
+            k = match k.num() {
+                None => Known::Num(Some(f)),
+                Some(v) => match intersect::<A>(v, f) {
+                    Some(i) => Known::Num(Some(i)),
+                    None => {
+                        self.unreached.insert(n);
+                        return Known::Num(None);
+                    }
+                },
+            };
+        }
+        k
+    }
 }
 
 /// Two intervals' common part.
@@ -198,11 +296,11 @@ fn intersect<A: Arithmetic>(x: A::Ival, y: A::Ival) -> Option<A::Ival> {
 /// form on their intervals - fits: true; does not: false on one lane,
 /// unknown over the lanes (a lane inside may fit). True of an operation
 /// that cannot leave the range.
-fn no_wrap<A: GraphArith>(lanes: Lanes, op: &Op<A>, k: &dyn Fn(usize) -> Known<A>) -> Option<bool> {
+fn no_wrap<A: GraphArith>(lanes: Lanes, op: &Op<A>, k: impl Fn(usize) -> Known<A>) -> Option<bool> {
     let arg = |i: usize| k(i).num();
     let fits = match op {
-        // A divisor 0 on every lane fits nowhere.
-        Op::Div if k(1).point().is_some_and(|q| A::num_eq(q, A::from_i16(0))) => false,
+        // A divisor 0 on every lane fits on none.
+        Op::Div if k(1).point().is_some_and(|q| A::num_eq(q, A::from_i16(0))) => return Some(false),
         Op::Add => A::ival_add(arg(0)?, arg(1)?).is_some(),
         Op::Sub => A::ival_sub(arg(0)?, arg(1)?).is_some(),
         Op::Mul => A::ival_mul(arg(0)?, arg(1)?).is_some(),
@@ -224,8 +322,8 @@ fn rule<A: GraphArith>(
     g: &Graph<A>,
     op: &Op<A>,
     args: &[NodeId],
-    arg: &dyn Fn(usize) -> Known<A>,
-    deep: &dyn Fn(NodeId) -> Known<A>,
+    arg: impl Fn(usize) -> Known<A>,
+    deep: impl Fn(NodeId) -> Known<A>,
 ) -> Known<A> {
     use Known::{Bool as B, Num as N};
     let over = lanes == Lanes::Over;
@@ -317,7 +415,7 @@ fn rule<A: GraphArith>(
         }
         Op::NoWrap => {
             let x = g.get(args[0]);
-            B(no_wrap(lanes, &x.op, &|i| deep(x.args[i])))
+            B(no_wrap(lanes, &x.op, |i| deep(x.args[i])))
         }
         Op::Add => N(num(0).zip(num(1)).and_then(|(x, y)| A::ival_add(x, y).or_else(wrapped))),
         Op::Sub => N(num(0).zip(num(1)).and_then(|(x, y)| A::ival_sub(x, y).or_else(wrapped))),
@@ -437,17 +535,22 @@ fn join<A: Arithmetic>(x: Known<A>, y: Known<A>) -> Known<A> {
     }
 }
 
-/// Every node of `g` evaluated from `cells` (a cell not given: unknown),
-/// as `lanes` says (`room`: the map, for `mget` and `tile_flag_at`); a number
-/// nothing is known of is the arithmetic's whole range.
+/// Every node of `g` evaluated from `cells` (a cell not given: any value of
+/// its type), as `lanes` says (`room`: the map, for `mget` and
+/// `tile_flag_at`); a number nothing is known of is the arithmetic's whole
+/// range, and `mget`'s tiles their hull (a lane's values, not the fold's
+/// sets).
 pub fn eval<A: GraphArith>(g: &Graph<A>, cells: &HashMap<u32, Val<A>>, lanes: Lanes, room: Option<&Room>) -> Vec<Val<A>> {
-    let mut f = Facts::new(lanes, Some(cells), room);
-    f.known = Vec::with_capacity(g.len());
+    let mut out: Vec<Val<A>> = Vec::with_capacity(g.len());
     for n in 0..g.len() as NodeId {
-        let k = f.step(g, n);
-        f.known.push(Some(k));
+        let node = g.get(n);
+        let k = match node.op {
+            Op::Cell(c) => cells.get(&c).map_or_else(|| Known::weakest(g.ty(n)), |v| (*v).into()),
+            _ => rule(lanes, room, g, &node.op, &node.args, |i| out[node.args[i] as usize].into(), |m| out[m as usize].into()),
+        };
+        out.push(k.val());
     }
-    f.known.into_iter().map(|k| k.expect("every node").val()).collect()
+    out
 }
 
 /// THE LOWERING'S FOLD: `g` rebuilt over the nodes `roots` reach, every
@@ -458,43 +561,118 @@ pub fn eval<A: GraphArith>(g: &Graph<A>, cells: &HashMap<u32, Val<A>>, lanes: La
 pub fn fold<A: GraphArith>(g: &Graph<A>, roots: &[NodeId], room: Option<&Room>) -> (Graph<A>, Vec<NodeId>) {
     let need = g.reachable(roots);
     let mut out = g.like();
-    let mut facts = Facts::new(Lanes::Over, None, room);
+    let mut facts = Facts::new(Lanes::Over, Inputs::Weakest, room);
+    // A constant for what is known to be one, a node built for nothing.
+    let konst = |k: Known<A>, out: &mut Graph<A>| match (k.boolean(), k.point()) {
+        (Some(b), _) => Some(out.leaf(Op::ConstBool(b))),
+        // A point whose bits its value fixes (not a double's zero: a lane may
+        // hold the other one, `GraphArith::alone_in_its_value`).
+        (_, Some(p)) if A::alone_in_its_value(p) => Some(out.leaf(Op::Const(A::lit(p), A::lit(p)))),
+        _ => None,
+    };
     let map = g.rebuild_into(Some(&need), &mut out, |_, node, args, out| {
+        if let Some(c) = konst(facts.of_op(out, &node.op, args), out) {
+            return Some(c);
+        }
+        // `Graph::fold`'s own rules may find more (a branch re-merge is its
+        // guard).
         let n = out.fold(node.op.clone(), args.to_vec());
-        let k = facts.of(out, n);
-        Some(match (k.boolean(), k.point(), &out.get(n).op) {
-            (Some(b), _, op) if !matches!(op, Op::ConstBool(_)) => out.leaf(Op::ConstBool(b)),
-            // A point whose bits its value fixes (not a double's zero: a lane
-            // may hold the other one, `GraphArith::alone_in_its_value`).
-            (_, Some(p), op) if !matches!(op, Op::Const(..)) && A::alone_in_its_value(p) => {
-                let raw = A::lit(p);
-                out.leaf(Op::Const(raw, raw))
-            }
-            _ => n,
-        })
+        Some(konst(facts.of(out, n), out).unwrap_or(n))
     });
     (out, map)
 }
 
 /// `op` over `args` in `g`, known from the literals among them (every lane
 /// holds each: one lane's rules) and nothing of the rest (over the lanes,
-/// each at its weakest), where the operation cannot err: the tracer's
-/// literal folding.
+/// each at its weakest), where the operation cannot err: `Graph::fold`'s and
+/// the tracer's literal folding.
 pub fn literal<A: GraphArith>(g: &Graph<A>, op: &Op<A>, args: &[NodeId]) -> Known<A> {
     let known = |a: NodeId| match g.get(a).op {
         Op::Const(lo, hi) => Known::Num(Some(A::ival(A::from_lit(lo), A::from_lit(hi)))),
         Op::ConstBool(b) => Known::Bool(Some(b)),
         _ => Known::weakest(g.ty(a)),
     };
+    // Literals alone (a `NoWrap`'s: its operation's operands) are every
+    // lane's: one lane's rules.
     let lit = |a: &NodeId| matches!(g.get(*a).op, Op::Const(..) | Op::ConstBool(_));
-    let lanes = if args.iter().all(lit) { Lanes::One } else { Lanes::Over };
+    let lanes = match op {
+        Op::NoWrap if g.get(args[0]).args.iter().all(lit) => Lanes::One,
+        _ if args.iter().all(lit) => Lanes::One,
+        _ => Lanes::Over,
+    };
     let arg = |i: usize| known(args[i]);
     // A fold must not drop an owed error: an operation that may leave the
     // range on these operands is not known.
-    if A::range_error(op) && no_wrap(lanes, op, &arg) != Some(true) {
+    if A::range_error(op) && no_wrap(lanes, op, arg) != Some(true) {
         return Known::Num(None);
     }
-    rule(lanes, None, g, op, args, &arg, &known)
+    rule(lanes, None, g, op, args, arg, known)
+}
+
+/// Does `v` provably lie in `[lo, hi]`? Its range, and through select arms
+/// on `x op k` (`k` a literal) with what each answer says about `x` (so a
+/// wrap `x < -16 ? 128 : ...` is bounded). `false` if unsure.
+pub fn within<A: GraphArith>(g: &Graph<A>, v: NodeId, lo: A, hi: A) -> bool {
+    within_under(g, v, A::ival(lo, hi), &mut Vec::new())
+}
+
+fn within_under<A: GraphArith>(g: &Graph<A>, v: NodeId, bound: A::Ival, narrowed: &mut Vec<(NodeId, A::Ival)>) -> bool {
+    let mut f = Facts::default();
+    f.narrowed = narrowed.clone();
+    let k = f.of(g, v);
+    let (lo, hi) = A::bounds(bound);
+    if f.unreached.contains(&v) || k.num().is_some_and(|iv| A::le(lo, A::bounds(iv).0) && A::le(A::bounds(iv).1, hi)) {
+        return true;
+    }
+    let node = g.get(v);
+    if node.op != Op::Sel {
+        return false;
+    }
+    let (c, t, e) = (node.args[0], node.args[1], node.args[2]);
+    let Some((x, yes, no)) = comparison_facts(g, c) else {
+        return within_under(g, t, bound, narrowed) && within_under(g, e, bound, narrowed);
+    };
+    narrowed.push((x, yes));
+    let a = within_under(g, t, bound, narrowed);
+    narrowed.pop();
+    narrowed.push((x, no));
+    let b = within_under(g, e, bound, narrowed);
+    narrowed.pop();
+    a && b
+}
+
+/// `c` as `x op k` (`k` a literal point, either side): `x` and where it lies
+/// `(when true, when false)`; `k`'s neighbours are the arithmetic's
+/// (`Arithmetic::below`, and above as `-below(-k)`).
+fn comparison_facts<A: GraphArith>(g: &Graph<A>, c: NodeId) -> Option<(NodeId, A::Ival, A::Ival)> {
+    let node = g.get(c);
+    if !matches!(node.op, Op::Lt | Op::Le | Op::Gt | Op::Ge) {
+        return None;
+    }
+    // `k op x` is `x op' k` with the operator mirrored.
+    let (x, k, op) = match (g.point(node.args[0]), g.point(node.args[1])) {
+        (None, Some(k)) => (node.args[0], k, node.op.clone()),
+        (Some(k), None) => (
+            node.args[1],
+            k,
+            match node.op {
+                Op::Lt => Op::Gt,
+                Op::Le => Op::Ge,
+                Op::Gt => Op::Lt,
+                _ => Op::Le,
+            },
+        ),
+        _ => return None,
+    };
+    let pred = A::below(k)?;
+    let succ = A::below(A::neg(k)?).and_then(A::neg)?;
+    let (min, max) = A::bounds(A::unknown());
+    Some(match op {
+        Op::Lt => (x, A::ival(min, pred), A::ival(k, max)),
+        Op::Le => (x, A::ival(min, k), A::ival(succ, max)),
+        Op::Gt => (x, A::ival(succ, max), A::ival(min, k)),
+        _ => (x, A::ival(k, max), A::ival(min, pred)),
+    })
 }
 
 /// `tile_flag_at` over INTERVALS: FALSE if the UNION of the rectangles holds
@@ -578,6 +756,7 @@ impl TileSet {
 mod tests {
     use super::*;
     use celeste_core::arith::Fixed;
+    use celeste_core::pico8_num::Pico8NumInterval;
     use crate::pico8_num::Pico8Num;
 
     /// A box with both ends zero holds lanes of either zero: `min(0, x)`
@@ -885,5 +1064,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A range computed past the 16.16 range is the whole range (where the
+    /// console's wrapped result lies), not PICO-8's wrapped endpoints
+    /// (which bound nothing), and the operation does not fit.
+    #[test]
+    fn a_product_range_that_overflows_is_the_whole_range() {
+        let mut g = Graph::<Fixed>::default();
+        let raw = g.leaf(Op::Cell(0));
+        let s = g.add(Op::Restrict(0, i32::MAX), vec![raw]);
+        let two = g.leaf(Op::Const(0x2_0000, 0x2_0000));
+        let m = g.add(Op::Mul, vec![s, two]);
+        let mut f = Facts::default();
+        assert_eq!(f.range(&g, m), Some(<Fixed as Arithmetic>::unknown()));
+        assert!(!f.fits(&g, m));
+        let t = g.add(Op::Restrict(0, 0x3fff_ffff), vec![raw]);
+        let m = g.add(Op::Mul, vec![t, two]);
+        assert_eq!(f.range(&g, m), Some(Pico8NumInterval::new(Pico8Num::from_raw(0), Pico8Num::from_raw(0x7fff_fffe))));
+        assert!(f.fits(&g, m));
+    }
+
+    /// A select on an undecided condition is the hull of its arms; the
+    /// tracer knows nothing of a cell but through its restriction.
+    #[test]
+    fn a_select_on_an_undecided_condition_is_the_hull_of_its_arms() {
+        let mut g = Graph::<Fixed>::default();
+        let raw = g.leaf(Op::Cell(0));
+        let s = g.add(Op::Restrict(-(1 << 16), 1 << 16), vec![raw]);
+        let five = g.leaf(Op::Const(5 << 16, 5 << 16));
+        let cond = g.leaf(Op::Cell(1));
+        g.set_cell_kind(1, crate::transpile::graph::Ty::Bool);
+        let sel = g.add(Op::Sel, vec![cond, five, s]);
+        let neg = g.add(Op::Neg, vec![sel]);
+        let p = |v: i32| Pico8Num::from_raw(v);
+        let mut f = Facts::default();
+        assert_eq!(f.range(&g, sel), Some(Pico8NumInterval::new(p(-(1 << 16)), p(5 << 16))));
+        assert_eq!(f.range(&g, neg), Some(Pico8NumInterval::new(p(-(5 << 16)), p(1 << 16))));
+        let other = g.leaf(Op::Cell(2));
+        let sum = g.add(Op::Add, vec![s, other]);
+        assert_eq!(f.range(&g, sum), None);
+        assert_eq!(f.range(&g, raw), None);
+    }
+
+    /// `Lo`/`Hi` of a hull are not points, so nothing may decide a comparison
+    /// one lane could fail.
+    #[test]
+    fn the_ends_of_a_hull_are_not_points() {
+        let mut g = Graph::<Fixed>::default();
+        let v = g.leaf(Op::Cell(0));
+        let hi = g.add(Op::Hi, vec![v]);
+        let one = g.leaf(Op::Const(1 << 16, 1 << 16));
+        let le = g.add(Op::Le, vec![hi, one]);
+        let hull = Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(0), Pico8Num::from_raw(3 << 16)));
+        let vals = eval(&g, &HashMap::from([(0u32, hull)]), Lanes::Over, None);
+        assert_eq!(vals[hi as usize], hull, "Hi of a hull is the hull");
+        assert_eq!(vals[le as usize], Val::Bool(None), "a lane [0, 0.5] has Hi <= 1, a lane [2, 3] does not");
+        let r = g.add(Op::Restrict(0, 3 << 16), vec![v]);
+        let hi_r = g.add(Op::Hi, vec![r]);
+        assert_eq!(Facts::default().range(&g, hi_r), Some(Pico8NumInterval::new(Pico8Num::from_raw(0), Pico8Num::from_raw(3 << 16))));
+        let le_r = g.add(Op::Le, vec![hi_r, one]);
+        let (out, map) = fold(&g, &[le_r], None);
+        assert_eq!(out.get(map[le_r as usize]).op, Op::Le, "the fold leaves it to the lanes");
     }
 }

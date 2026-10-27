@@ -373,14 +373,15 @@ pub struct FrameScratch<A: GraphArith> {
     /// bounded input, the only source of a static range) and `Op::Pin` (an input
     /// the body reads as a constant), each charged to every outcome.
     pub assumptions: Vec<NodeId>,
-    range_memo: std::collections::HashMap<NodeId, Option<Pieces<A>>>,
+    /// What the frame's graph is known to compute (`transpile::eval`): the
+    /// static ranges.
+    facts: crate::transpile::eval::Facts<'static, A>,
     /// The input cells this trace refuses merges on, sorted
     /// (`frame::trace_frame`'s `merge_refused_on`, `set_merge_refused`).
     merge_refused: Vec<u32>,
     merge_refused_memo: rustc_hash::FxHashMap<NodeId, bool>,
 }
 
-use crate::transpile::garith::Pieces;
 
 impl<A: GraphArith> Symbolic<A> {
     pub fn set_merge_refused(&mut self, mut cells: Vec<u32>) {
@@ -393,6 +394,7 @@ impl<A: GraphArith> Symbolic<A> {
 
     /// The input cells' types changed: the memos reading them no longer hold.
     pub fn forget_intervals(&mut self) {
+        self.frame.facts = Default::default();
         self.undecidable_memo.get_mut().clear();
         self.beneath_memo.get_mut().clear();
         self.may_memo.get_mut().clear();
@@ -467,16 +469,15 @@ impl<A: GraphArith> Symbolic<A> {
         go(self, &mut self.beneath_memo.borrow_mut(), n)
     }
 
-    /// The static range of `n`, from the restrictions.
-    pub fn range_of(&mut self, n: NodeId) -> Option<Pieces<A>> {
-        A::pieces_of(&self.graph, &mut self.frame.range_memo, n)
+    /// The static range of `n`, from the restrictions (`transpile::eval`).
+    pub fn range_of(&mut self, n: NodeId) -> Option<A::Ival> {
+        self.frame.facts.range(&self.graph, n)
     }
 
     /// Do the static ranges put every value of `n`'s EXACT result inside the
-    /// arithmetic's range (computed unwrapped: a result past it is unknown)?
-    /// Where true, `n` cannot overflow.
+    /// arithmetic's range? Where true, `n` cannot overflow.
     pub fn bounded(&mut self, n: NodeId) -> bool {
-        self.range_of(n).is_some_and(|pieces| A::bounded(&pieces))
+        self.frame.facts.fits(&self.graph, n)
     }
 
     /// Does anything give this frame a static range (a restriction)?
@@ -670,7 +671,7 @@ impl<A: GraphArith> Symbolic<A> {
             return true;
         }
         const EXACT: i64 = 1 << 53;
-        let small = self.range_of(sum).and_then(|p| A::floor_hull(&p)).is_some_and(|(lo, hi)| lo > -EXACT && hi < EXACT);
+        let small = self.range_of(sum).map(A::floor_hull).is_some_and(|(lo, hi)| lo > -EXACT && hi < EXACT);
         let whole = |l: A::Lit| {
             let v = A::from_lit(l);
             A::num_eq(A::flr(v), v)
@@ -943,12 +944,10 @@ impl<A: GraphArith> Domain for Symbolic<A> {
             Some(Known::Bool(None)) => return Ok(self.unknown_bool_atom()),
             _ => {}
         }
-        // Decided by static ranges iff every pair of pieces agrees.
+        // Decided by the static ranges.
         if self.has_ranges() {
-            if let (Some(xs), Some(ys)) = (self.range_of(*a), self.range_of(*b)) {
-                if let Some(r) = A::decide_cmp(&g, &xs, &ys) {
-                    return Ok(self.graph.leaf(Op::ConstBool(r)));
-                }
+            if let Some(r) = self.frame.facts.compare(&self.graph, &g, *a, *b) {
+                return Ok(self.graph.leaf(Op::ConstBool(r)));
             }
         }
         Ok(self.graph.fold(g, vec![*a, *b]))
@@ -1027,10 +1026,10 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         }
         // At most `MOVE_WAYS`: the static range covers ALL lanes, but one lane
         // spans at most that many cells (too small declines via `ForkOk`). Level
-        // -1 takes the HULL: its lanes are ranges.
+        // -1 takes the whole range: its lanes are ranges.
         match self.range_of(*v) {
-            Some(ps) => {
-                let w = A::spanned(cut.grid(), &ps, self.uncapped_ways);
+            Some(iv) => {
+                let w = A::spanned(cut.grid(), iv);
                 (if self.uncapped_ways { w } else { w.min(MOVE_WAYS as i64) }) as u8
             }
             None => MOVE_WAYS,
@@ -1353,9 +1352,9 @@ mod tests {
         assert!(d.literal_fragments(&point, true).expect("in range").is_none(), "a point is no split");
     }
 
-    /// The fake wall's `spd.x = -sign(spd.x)*1.5` before `move`: three pieces
-    /// two floors wide each; a kernel lane holds one (2-way), level -1 the
-    /// HULL (five floors).
+    /// The fake wall's `spd.x = -sign(spd.x)*1.5` before `move`: a range five
+    /// floors wide; a kernel lane spans at most two (2-way), level -1 the
+    /// whole range (five floors).
     #[test]
     fn level_minus_one_sizes_a_move_fork_by_the_hull_of_its_pieces() {
         let mut d = Symbolic::<celeste_core::arith::Fixed>::default();
@@ -1372,7 +1371,7 @@ mod tests {
         let operand = d.graph.fold(Op::Add, vec![half, moved]);
         assert_eq!(d.split_ways(Cut::Floors, &operand), 2, "a kernel lane takes one piece");
         d.uncapped_ways = true;
-        d.frame.range_memo.clear();
+        d.frame.facts = Default::default();
         assert_eq!(d.split_ways(Cut::Floors, &operand), 5, "level -1 joins the pieces: floors -2..=2");
     }
 
