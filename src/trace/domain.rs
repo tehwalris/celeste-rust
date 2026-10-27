@@ -179,6 +179,24 @@ pub trait Domain: Clone + Default {
     /// A number known only to lie in `[lo, hi]` (`rnd`).
     fn range_num(&mut self, lo: Self::A, hi: Self::A) -> Result<Self::Num>;
 
+    // How a widened slot is READ (`widen::read_inputs`): the kernels' reads,
+    // or each case on the reference's cursor.
+
+    /// `Input::BothWays`: both values on every lane (`origin` names the fork).
+    fn read_both_ways(&mut self, origin: &str) -> Result<Self::Bool>;
+    /// `Input::Atom`: an undecided boolean atom.
+    fn read_atom(&mut self) -> Result<Self::Bool>;
+    /// `Input::Unknown`: the unknown number (`countdown`: a countdown's).
+    fn read_unknown(&mut self, countdown: bool) -> Self::Num;
+    /// `Input::Literal`: `v` read as the literal `[lo, hi]`, owed inside it.
+    fn read_literal(&mut self, v: &Self::Num, lo: Self::A, hi: Self::A) -> Result<Self::Num>;
+    /// A near floor's `state` by cases: the tracer's split pass splits what
+    /// reads it, the reference takes each whole number in it.
+    fn read_by_cases(&mut self, v: &Self::Num) -> Result<Self::Num>;
+    /// Mid split frame, a near floor's `collideable` `c`: where the lane
+    /// knows it, it; else both values (`origin` names the fork).
+    fn read_known_else_both(&mut self, c: &Self::Bool, origin: &str) -> Result<Self::Bool>;
+
     fn node_count(&self) -> usize {
         0
     }
@@ -874,6 +892,32 @@ impl<A: GraphArith> Domain for Symbolic<A> {
     type A = A;
     type Num = NodeId;
     type Bool = NodeId;
+
+    fn read_both_ways(&mut self, origin: &str) -> Result<NodeId> {
+        Ok(self.both_values(origin))
+    }
+    fn read_atom(&mut self) -> Result<NodeId> {
+        Ok(self.unknown_bool_atom())
+    }
+    fn read_unknown(&mut self, countdown: bool) -> NodeId {
+        self.unknown_num(countdown)
+    }
+    /// `Op::Pin`ned to it, unless the graph proves the input inside.
+    fn read_literal(&mut self, v: &NodeId, lo: A, hi: A) -> Result<NodeId> {
+        if !crate::transpile::eval::within(&self.graph, *v, lo, hi) {
+            self.pin(*v, crate::transpile::graph::Pinned::Num(A::lit(lo), A::lit(hi)));
+        }
+        Ok(self.graph.leaf(Op::Const(A::lit(lo), A::lit(hi))))
+    }
+    fn read_by_cases(&mut self, v: &NodeId) -> Result<NodeId> {
+        Ok(*v)
+    }
+    /// A boolean cell reads an unknown as false: hence `Op::Known`.
+    fn read_known_else_both(&mut self, c: &NodeId, origin: &str) -> Result<NodeId> {
+        let known = self.graph.fold(Op::Known, vec![*c]);
+        let both = self.both_values(origin);
+        Ok(self.sel_bool(&known, c, &both))
+    }
 
     fn num(&mut self, v: A) -> NodeId {
         self.konst(v)

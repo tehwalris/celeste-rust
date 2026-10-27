@@ -223,14 +223,14 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     }
     // The engine numbering for the INPUT shape.
     let Some(room) = it.room else { bail!("tracing a frame needs the room's tiles") };
-    let in_rt2 = super::block::skeleton(&st, room)?;
     // The canonical cell of each `Op::Cell(i)`. Inputs only: outputs bind
     // against their own shape.
-    let in_cells = super::bind::resolve_all(&in_rt2, &iface.slots)?;
+    let (in_rt2, in_cells) = super::block::skeleton_bound(&st, room, &iface.slots)?;
     let mut st = st;
     // The level's widened slots read as the table says, after the input
     // shape, before any read.
-    super::widen::read_inputs(&mut st, &mut it.d)?;
+    let level = it.d.level;
+    super::widen::read_inputs(&mut st, &mut it.d, level)?;
     // THE KERNEL'S ADMISSIBLE INPUTS: every pin holds; a lane outside is an
     // error of the whole frame.
     let admissible = super::error::pins_hold(&mut it.d);
@@ -336,10 +336,9 @@ fn finish_outcome<A: GraphArith>(
         .iter()
         .filter(|(p, _)| fields.iter().any(|(q, _, _)| q == p))
         .fold(it.d.graph.fold(crate::transpile::graph::Op::Or, vec![global, s.ended]), |e, (_, w)| it.d.graph.fold(crate::transpile::graph::Op::Or, vec![e, *w]));
-    let rt2 = super::block::skeleton(&s, room)?;
     let paths: Vec<Path> =
         fields.iter().map(|(p, _, _)| p.clone()).chain(ubool.iter().cloned()).collect();
-    let all = super::bind::resolve_all(&rt2, &paths)?;
+    let (rt2, all) = super::block::skeleton_bound(&s, room, &paths)?;
     let (cells, ubool_cells) = all.split_at(fields.len());
     let (guard, shape) = (s.guard.clone(), s.shape()?);
     Ok(FrameOut {

@@ -3,7 +3,9 @@
 //! skeletons (over `Symbolic`) and the reference engine's rows (over
 //! `RefDomain`) - so a kernel row and a reference row of one state have one
 //! structure and one key; the domain supplies only what a number and a
-//! boolean become. `from_block` is the inverse, one lane as a state.
+//! boolean become. `from_block` is the inverse, one lane as a state. A
+//! traced slot binds to the cell the converter made for it
+//! (`skeleton_bound`).
 //!
 //! A block BOXES every slot: each global, field and array element is a `Val`
 //! cell. A table or a closure is ONE cell (every slot holding it points at
@@ -15,9 +17,10 @@
 //! `FIELD_NAMES` fields (`from_block` restores the dropped builtins from its
 //! base state); integer keys past an array part as a dense array with
 //! explicit nils (a frame's outcomes hold them so, `dense_ints`); a closure's captures, tables only. The buttons are
-//! written `UBool`, as the kernels write them; `from_block` reads a `UBool`
-//! button as a placeholder `false` (overwritten before it is read) and
-//! returns any other unknown boolean for the driver to fork.
+//! written `UBool`, as the kernels write them; `from_block` reads every
+//! `UBool` as a placeholder `false`: a button is reset before it is read,
+//! and any other is a slot the widening table widens, which the level's
+//! input side reads (`widen::read_inputs`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,6 +35,7 @@ use celeste_names as gen;
 use crate::builtins::BUILTIN_NAMES;
 use crate::trace::domain::Domain;
 use crate::trace::heap::{BodyId, ClosureId, Heap, Table, TableId, Value};
+use crate::trace::iface::{self, show, Path, Step};
 use crate::trace::state::State;
 
 
@@ -44,21 +48,37 @@ pub fn to_rt2<D: Domain, N: Arithmetic>(
     num: impl Fn(&D::Num) -> Result<AV<N>>,
     boolean: impl Fn(&D::Bool) -> Result<AV<N>>,
 ) -> Result<Rt2<N>> {
+    Ok(converted(st, room, num, boolean)?.0)
+}
+
+/// A slot of the heap: its table and its key there (an array item's
+/// `Step::Idx`).
+type Slot = (TableId, Step);
+
+/// `to_rt2`, and the canonical cell it made for each slot of `st`.
+fn converted<D: Domain, N: Arithmetic>(
+    st: &State<D>,
+    room: &'static Room,
+    num: impl Fn(&D::Num) -> Result<AV<N>>,
+    boolean: impl Fn(&D::Bool) -> Result<AV<N>>,
+) -> Result<(Rt2<N>, HashMap<Slot, u32>)> {
     let globals = &st.heap.tables[&st.globals].hash;
     let buttons = match globals.get(super::game::BUTTONS) {
         Some(Value::Table(t)) => Some(*t),
         _ => None,
     };
     let static_strings = gen::STRINGS.iter().map(|s| s.to_string()).collect();
-    let mut cx = ToRt2 { st, cells: Vec::new(), cols: Vec::new(), strings: static_strings, tables: HashMap::new(), closures: HashMap::new(), buttons, num, boolean };
+    let mut cx = ToRt2 { st, cells: Vec::new(), cols: Vec::new(), strings: static_strings, tables: HashMap::new(), closures: HashMap::new(), buttons, num, boolean, slots: HashMap::new() };
     let mut cell_of_global = vec![NONE; gen::GLOBAL_NAMES.len()];
     for (g, name) in gen::GLOBAL_NAMES.iter().enumerate() {
         if let Some(v) = globals.get(*name) {
             cell_of_global[g] = cx.slot(v, false, None)?;
+            cx.slots.insert((st.globals, iface::key(name)), cell_of_global[g]);
         }
     }
     let (old, statics) = (cx.strings, gen::STRINGS.len());
-    let mut rt2 = Rt2::canonical_of(1, cx.cells, cx.cols, cell_of_global, Arc::from(&old[..statics]), room);
+    let (mut rt2, new_id) = Rt2::canonical_of(1, cx.cells, cx.cols, cell_of_global, Arc::from(&old[..statics]), room);
+    let slots = cx.slots.into_iter().filter(|(_, c)| new_id[*c as usize] != NONE).map(|(s, c)| (s, new_id[c as usize])).collect();
     // A string's id (part of the key) is its occurrence in canonical order
     // after the static ones.
     let mut strings: Vec<String> = old[..statics].to_vec();
@@ -70,7 +90,7 @@ pub fn to_rt2<D: Domain, N: Arithmetic>(
     }
     rt2.strings = strings.into();
     the_topology_is_the_shapes(&rt2);
-    Ok(rt2)
+    Ok((rt2, slots))
 }
 
 /// A shape's POINTER TOPOLOGY in a block: each value cell's target
@@ -80,8 +100,8 @@ type Topology = Box<[(u32, u32)]>;
 /// THE POINTER TOPOLOGY IS THE SHAPE'S, process-wide: every block made
 /// under one shape has one `Topology` (its captures' targets are its
 /// shape's: `Shape::intern`). The signature names no value cell's target,
-/// and a kernel is bound by path against one representative of its shape
-/// (`trace::bind`): a block whose pointers differ under the hash would run
+/// and a kernel is bound to one representative's cells (`skeleton_bound`):
+/// a block whose pointers differ under the hash would run
 /// a kernel bound to the other's cells. FATAL (`exact`'s
 /// `pointer_violation` is the key space's side).
 fn the_topology_is_the_shapes<N: Arithmetic>(rt2: &Rt2<N>) {
@@ -102,7 +122,7 @@ fn the_topology_is_the_shapes<N: Arithmetic>(rt2: &Rt2<N>) {
     if let Some((a, b)) = had.iter().zip(&topology).find(|(a, b)| a != b) {
         panic!(
             "block: shape {:#x}: cell {} points at {} where an earlier block of the shape's cell {} points at {} (u32::MAX: no pointer): \
-             the POINTER TOPOLOGY, which a kernel binds by path against one representative, varies under one shape hash",
+             the POINTER TOPOLOGY, which a kernel binds against one representative, varies under one shape hash",
             hash, b.0, b.1, a.0, a.1
         );
     }
@@ -114,6 +134,38 @@ fn the_topology_is_the_shapes<N: Arithmetic>(rt2: &Rt2<N>) {
 /// against.
 pub fn skeleton<D: Domain, N: Arithmetic>(st: &State<D>, room: &'static Room) -> Result<Rt2<N>> {
     to_rt2(st, room, |_| Ok(AV::Nil), |_| Ok(AV::Nil))
+}
+
+/// `skeleton`, and the cell each of `paths` (scalar slots of `st`, by
+/// path) lands on: the one the converter made for the slot, so a kernel
+/// binds where its block holds the slot (`Op::Cell(i)` of `paths[i]`). A
+/// path to no slot the block holds (a name the boundary drops, an absent
+/// one), one landing on a cell that is not a value's, and two landing on
+/// one cell (two outputs in one column: a silently well-formed wrong
+/// block) are REFUSED.
+pub fn skeleton_bound<D: Domain, N: Arithmetic>(st: &State<D>, room: &'static Room, paths: &[Path]) -> Result<(Rt2<N>, Vec<u32>)> {
+    let (rt2, slots) = converted(st, room, |_| Ok(AV::Nil), |_| Ok(AV::Nil))?;
+    let mut seen: HashMap<u32, usize> = HashMap::new();
+    let mut cells = Vec::with_capacity(paths.len());
+    for (i, p) in paths.iter().enumerate() {
+        let (last, init) = p.split_last().ok_or_else(|| anyhow!("_G is no slot"))?;
+        let t = match iface::get(st, init) {
+            Some(Value::Table(t)) => t,
+            _ => bail!("{}: not a slot of a table", show(p)),
+        };
+        // A block holds an integer key in its dense array part.
+        let key = match last {
+            Step::Int(k) if *k >= 1 => Step::Idx(*k as usize - 1),
+            s => s.clone(),
+        };
+        let c = *slots.get(&(t, key)).ok_or_else(|| anyhow!("{}: no slot of the block (absent, or a name the boundary drops)", show(p)))?;
+        ensure!(rt2.cells()[c as usize] == Cell::Val, "{} lands on a {}, not a value cell", show(p), rt2.cells()[c as usize].kind_name());
+        if let Some(j) = seen.insert(c, i) {
+            bail!("{} and {} both land on cell {c} - the structure merged two slots", show(&paths[j]), show(p));
+        }
+        cells.push(c);
+    }
+    Ok((rt2, cells))
 }
 
 /// A table's array part as a block holds it: integer keys past it
@@ -162,6 +214,8 @@ struct ToRt2<'a, D: Domain, E: Arithmetic, N, B> {
     buttons: Option<TableId>,
     num: N,
     boolean: B,
+    /// The cell made for each slot (`skeleton_bound`).
+    slots: HashMap<Slot, u32>,
 }
 
 impl<D: Domain, E: Arithmetic, N, B> ToRt2<'_, D, E, N, B>
@@ -217,14 +271,18 @@ where
             let mut fields = Vec::new();
             for (name, v) in &table.hash {
                 if let Some(f) = gen::field_id(name) {
-                    fields.push((f, self.slot(v, button, Some(t))?));
+                    let c = self.slot(v, button, Some(t))?;
+                    self.slots.insert((t, Step::Key(name.clone())), c);
+                    fields.push((f, c));
                 }
             }
             Cell::Obj(fields.into_boxed_slice())
         } else if !arr.is_empty() {
             let mut items = Vec::with_capacity(arr.len());
-            for v in &arr {
-                items.push(self.slot(v, button, Some(t))?);
+            for (i, v) in arr.iter().enumerate() {
+                let c = self.slot(v, button, Some(t))?;
+                self.slots.insert((t, Step::Idx(i)), c);
+                items.push(c);
             }
             Cell::Arr(items.into_boxed_slice())
         } else {
@@ -287,26 +345,16 @@ pub fn fn_info_of<D: Domain>(base: &State<D>) -> Result<FnInfo> {
 }
 
 /// Lane `lane` of a block as a state in domain `d` (plus the builtins of
-/// `base`'s globals, which a block drops), and its unknown-boolean fields
-/// except the buttons, for the driver to fork.
-pub fn from_block<N: Arithmetic, D: Domain<A = N>, E: Domain>(
-    d: &mut D,
-    rt2: &Rt2<N>,
-    lane: usize,
-    fn_info: &FnInfo,
-    base: &State<E>,
-) -> Result<(State<D>, Vec<(TableId, String)>)> {
+/// `base`'s globals, which a block drops).
+pub fn from_block<N: Arithmetic, D: Domain<A = N>, E: Domain>(d: &mut D, rt2: &Rt2<N>, lane: usize, fn_info: &FnInfo, base: &State<E>) -> Result<State<D>> {
     ensure!(lane < rt2.width, "lane {lane} of a {}-lane block", rt2.width);
-    let mut cx = FromBlock { d, rt2, lane, fn_info, heap: Heap::default(), memo: HashMap::new(), unknown: Vec::new() };
+    let mut cx = FromBlock { d, rt2, lane, fn_info, heap: Heap::default(), memo: HashMap::new() };
     let globals = cx.heap.new_table();
     let scope = cx.heap.new_scope(None);
     let mut named: Vec<(&str, u32)> =
         gen::GLOBAL_NAMES.iter().zip(rt2.shape.globals()).filter(|(_, &c)| c != NONE).map(|(n, &c)| (*n, c)).collect();
     named.sort();
     for (name, c) in named {
-        if cx.is_unknown(c) {
-            cx.unknown.push((globals, name.to_string()));
-        }
         let v = cx.slot(c)?;
         cx.heap.tables.get_mut(&globals).expect("just made").hash.insert(name.to_string(), v);
     }
@@ -315,11 +363,6 @@ pub fn from_block<N: Arithmetic, D: Domain<A = N>, E: Domain>(
             cx.heap.tables.get_mut(&globals).expect("just made").hash.entry(k.clone()).or_insert(Value::Builtin(n));
         }
     }
-    let buttons = match cx.heap.tables[&globals].hash.get(super::game::BUTTONS) {
-        Some(Value::Table(t)) => Some(*t),
-        _ => None,
-    };
-    let unknown = cx.unknown.into_iter().filter(|(t, _)| Some(*t) != buttons).collect();
     let (guard, ended) = (cx.d.boolean(true), cx.d.boolean(false));
     let st = State {
         heap: cx.heap,
@@ -332,7 +375,7 @@ pub fn from_block<N: Arithmetic, D: Domain<A = N>, E: Domain>(
         frag: Vec::new(),
         arc: None,
     };
-    Ok((st, unknown))
+    Ok(st)
 }
 
 struct FromBlock<'a, N: Arithmetic, D: Domain> {
@@ -342,14 +385,9 @@ struct FromBlock<'a, N: Arithmetic, D: Domain> {
     fn_info: &'a FnInfo,
     heap: Heap<D>,
     memo: HashMap<u32, Value<D>>,
-    unknown: Vec<(TableId, String)>,
 }
 
 impl<N: Arithmetic, D: Domain<A = N>> FromBlock<'_, N, D> {
-    fn is_unknown(&self, cell: u32) -> bool {
-        matches!(self.rt2.cells()[cell as usize], Cell::Val) && self.rt2.cols[cell as usize].at(self.lane) == AV::UBool
-    }
-
     fn slot(&mut self, cell: u32) -> Result<Value<D>> {
         match self.rt2.cells()[cell as usize] {
             Cell::Val => self.value(self.rt2.cols[cell as usize].at(self.lane)),
@@ -386,9 +424,6 @@ impl<N: Arithmetic, D: Domain<A = N>> FromBlock<'_, N, D> {
                 let mut named: Vec<(&str, u32)> = fields.iter().map(|&(f, c)| (gen::FIELD_NAMES[f as usize], c)).collect();
                 named.sort();
                 for (name, c) in named {
-                    if self.is_unknown(c) {
-                        self.unknown.push((t, name.to_string()));
-                    }
                     let v = self.slot(c)?;
                     self.heap.tables.get_mut(&t).expect("just made").hash.insert(name.to_string(), v);
                 }

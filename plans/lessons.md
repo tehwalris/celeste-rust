@@ -268,6 +268,32 @@ sounds like one of these. The full write-ups are in git history.
 - **Near floors store the cart's invariant where overlapped**: storing the
   computed value made room (6,1) 3,638 outcomes and 344k bodies against 108
   and 5,454.
+- **Widening only at the boundary** (the state-models study, 2026-10-27,
+  branch `state-models-study` 1a2be422, `STUDY_NO_OUT_WIDEN`): the kernels
+  storing every widened slot's UNWIDENED value, the boundary to widen the
+  row, the walk still on the widened states. The unknown number cannot be
+  a kernel value at all (the bind refuses "an unknown number reaches the
+  kernel"), so it stayed the tracer's; `ranges` also left the unknown
+  booleans and the near floors' hook to it. Per room (outcomes / bodies /
+  per-row output fields / trace / peak):
+
+  | room, level | today | unwidened but the unknown number | only ranges, bands, phases, dead constants |
+  |---|---|---|---|
+  | (1,0) `r0sx` | 325 / 14,941 / 5,489 / 1.1 s / 0.45 GB | 325 / 58,141 (3.9x) / 6,572 / 1.4 s | 325 / 14,941 / 6,170 / 1.2 s |
+  | (5,3) `r0sxn` | 2,081 / 105,832 / 31,163 / 7.9 s / 1.8 GB | out of memory at 40 GB in the walk | 52,117 / 2,742,988 / 1,341,182 / 66 s; out of memory at 20 GB |
+  | (7,0) `r0sxn` | 712 / 33,472 / 31,941 / 9.1 s / 1.1 GB | fatal: over 4096 outcomes splitting undecided selects | the same |
+  | (2,1) `r0sxn` | 504 / 23,318 / 12,256 / 4.4 s / 0.85 GB | out of memory at 40 GB | 1,451 / 68,378 / 43,078 / 9.4 s / 1.3 GB |
+
+  The split pass splits a select in an outcome's ROW, never in its error:
+  the graph side's widening is what takes a spring's or balloon's phase,
+  a held button and a floor's `state` out of the rows (the buttons alone
+  are (1,0)'s 3.9x). It also charges no error to a widened slot's own
+  arithmetic, which moved to a root becomes declines. The block side is
+  load-bearing too: the ladder's filter projects every emitted batch
+  column-wise, and through the heap a row costs ~110 us (from_block 52,
+  to_block 40, canonicalize 20 us in (5,3)). So the widening table keeps
+  its two evaluators, one in the graph, one over columns, with one
+  declaration and one interpreter (`widening::widen_level`).
 - **The overflow checks** (2026-10-11): +1.9-3.0% kernel instructions,
   outputs identical.
 - **What multiplies in an object room** (`coarse-census --erase`, now `census --erase`): room

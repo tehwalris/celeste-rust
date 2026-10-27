@@ -301,10 +301,11 @@ impl<N: Arithmetic> Rt2<N> {
     }
 
     /// The block of `cells`, `cols` and `globals` in any numbering, made
-    /// CANONICAL (`canonicalize_ids`) and its shape interned.
-    pub fn canonical_of(width: usize, cells: Vec<Cell>, cols: Vec<Col<N>>, globals: Vec<u32>, strings: Arc<[String]>, room: &'static Room) -> Rt2<N> {
-        let (cells, cols, globals) = canonical_ids(&cells, &cols, &globals);
-        Rt2::new(width, Shape::intern(cells, globals), cols, strings, room)
+    /// CANONICAL (`canonicalize_ids`) and its shape interned; and each
+    /// given cell's canonical id (`NONE`: unreachable, dropped).
+    pub fn canonical_of(width: usize, cells: Vec<Cell>, cols: Vec<Col<N>>, globals: Vec<u32>, strings: Arc<[String]>, room: &'static Room) -> (Rt2<N>, Vec<u32>) {
+        let (cells, cols, globals, new_id) = canonical_ids(&cells, &cols, &globals);
+        (Rt2::new(width, Shape::intern(cells, globals), cols, strings, room), new_id)
     }
 
     /// The shape's cells.
@@ -325,8 +326,8 @@ impl<N: Arithmetic> Rt2<N> {
 /// unreachable dropped, every pointer remapped - so isomorphic heaps are
 /// identical and row keys block-independent; a value column compressed
 /// (`N`/`I`) and collapsed where uniform (`collapse_uniform`), a non-value
-/// cell's column `Nil`.
-fn canonical_ids<N: Arithmetic>(cells: &[Cell], cols: &[Col<N>], globals: &[u32]) -> (Vec<Cell>, Vec<Col<N>>, Vec<u32>) {
+/// cell's column `Nil`. Last, each old cell's new id (`NONE`: dropped).
+fn canonical_ids<N: Arithmetic>(cells: &[Cell], cols: &[Col<N>], globals: &[u32]) -> (Vec<Cell>, Vec<Col<N>>, Vec<u32>, Vec<u32>) {
     // Fields sorted by name, or creation order changes the shape (most
     // objects are already).
     let by_name = |f: &(u32, u32)| celeste_names::FIELD_NAMES[f.0 as usize];
@@ -426,7 +427,7 @@ fn canonical_ids<N: Arithmetic>(cells: &[Cell], cols: &[Col<N>], globals: &[u32]
         });
     }
     let new_globals = globals.iter().map(|&g| if g == NONE { NONE } else { new_id[g as usize] }).collect();
-    (new_cells, new_cols, new_globals)
+    (new_cells, new_cols, new_globals, new_id)
 }
 
 impl<N: Arithmetic> Rt2<N> {
@@ -502,7 +503,7 @@ impl<N: Arithmetic> Rt2<N> {
     /// Renumber every cell into CANONICAL order (`canonical_ids`), the
     /// block's shape the canonical one's.
     pub fn canonicalize_ids(&mut self) {
-        let (cells, cols, globals) = canonical_ids(self.cells(), &self.cols, self.shape.globals());
+        let (cells, cols, globals, _) = canonical_ids(self.cells(), &self.cols, self.shape.globals());
         self.shape = Shape::intern(cells, globals);
         self.cols = cols;
     }

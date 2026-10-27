@@ -53,9 +53,12 @@ checks that they agree. The table below is GENERATED
   eager point split made every outcome's `live` read every comparison
   (room (6,0) `r0sxp`: 2^70 bodies an outcome). Forks happen only where an
   undecided select survives folding (`split::split_undecided_selects`).
-- **The reference engine as a frame step** forks the buttons' memory, `f`
-  and `n` per path. The concrete search's own steps are exact whatever the
-  level: the buttons and the jump buffer as the cart keeps them.
+- **The reference engine as a frame step** reads a row as the level's
+  kernels do, through the same input side (`widen::read_inputs` over its
+  domain: `Domain::read_both_ways` ..., each case on the path's cursor):
+  the buttons' memory, `f` and `n` forked per path. The concrete search's
+  own steps read no level: the buttons and the jump buffer as the cart
+  keeps them.
 
 ## The table
 

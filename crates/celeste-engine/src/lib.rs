@@ -6,7 +6,6 @@
 pub mod exact;
 pub mod runtime2;
 pub mod shape;
-pub mod slots;
 pub mod widening;
 
 pub use runtime2::{Col, ColRepr, Rt2, Template, AV, NONE};

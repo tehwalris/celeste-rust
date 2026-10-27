@@ -110,9 +110,7 @@ impl<A: GraphArith> Reps<A> {
 
     /// A representative as a state in `d`'s arena.
     fn state(&self, rep: &celeste_engine::runtime2::Rt2<A>, d: &mut super::domain::Symbolic<A>) -> Result<super::state::State<super::domain::Symbolic<A>>> {
-        let (st, unknown) = super::block::from_block(d, rep, 0, &self.fn_info, &self.base)?;
-        anyhow::ensure!(unknown.is_empty(), "a representative holds unknown booleans: {unknown:?}");
-        Ok(st)
+        super::block::from_block(d, rep, 0, &self.fn_info, &self.base)
     }
 }
 
