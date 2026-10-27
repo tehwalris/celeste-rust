@@ -197,21 +197,15 @@ fn configurations<A: GraphArith>(
     cands
 }
 
-/// DECIDE the boolean layer of the candidates, on the RESOLVED graph: the
-/// interval fold, the local BDD (`bdd::simplify_local`), the interval fold
-/// again; the candidates' roots follow into the result.
+/// DECIDE the candidates on the RESOLVED graph (the interval fold); their
+/// roots follow into the result.
 fn decide<A: GraphArith>(sp: &Graph<A>, cands: &mut [Body], room: Option<&celeste_core::room::Room>) -> Graph<A> {
     let all: Vec<NodeId> = cands.iter().flat_map(|c| c.roots.flat()).collect();
-    let (g1, m1, _) = crate::transpile::ival::fold(sp, &all, room).expect("interval fold");
-    let r1: Vec<NodeId> = all.iter().map(|x| m1[*x as usize]).collect();
-    // The boolean layer, simplified locally (`bdd::simplify_local`).
-    let (g2, m2, _) = crate::transpile::bdd::simplify_local(&g1, &r1, crate::transpile::bdd::LOCAL_CAP, crate::transpile::bdd::LOCAL_EXPAND);
-    let r2: Vec<NodeId> = r1.iter().map(|x| m2[*x as usize]).collect();
-    let (g3, m3, _) = crate::transpile::ival::fold(&g2, &r2, room).expect("interval fold 2");
+    let (g, m, _) = crate::transpile::ival::fold(sp, &all, room).expect("interval fold");
     for c in cands.iter_mut() {
-        c.roots = c.roots.map(|r| m3[m2[m1[r as usize] as usize] as usize]);
+        c.roots = c.roots.map(|r| m[r as usize]);
     }
-    g3
+    g
 }
 
 /// FUSE: candidates that write the same row are ONE body; a body live

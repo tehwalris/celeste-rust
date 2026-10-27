@@ -521,13 +521,14 @@ impl<A: GraphArith> Graph<A> {
     }
 
     /// Add `op(args)`, normalizing and folding. Every rule is EXACT w.r.t.
-    /// `eval`, not merely sound: a refining rule (`x and not x` -> false)
-    /// would change which lanes are in error
-    /// (`folding_is_exact_not_merely_sound`). One exception: the two-term
-    /// re-merge `(g and c) or (g and not c)` -> `g` is exact concretely but
-    /// refines in Kleene (at `g` true, `c` unknown: true, not unknown), the
-    /// case `bdd::simplify_local`'s collapse argument covers; that test's pool
-    /// does not reach it.
+    /// `eval`, not merely sound (`folding_is_exact_not_merely_sound`), but
+    /// the COMPLEMENT rules - `c or not c` -> true, `c and not c` -> false,
+    /// the branch re-merge `(g and c) or (g and not c)` -> `g` - which are
+    /// exact concretely and REFINE in Kleene (at `c` unknown: decided, not
+    /// unknown): the value no longer reads `c`, and depends on it on no lane,
+    /// so no error `c` would owe is lost (errors are derived from the folded
+    /// graph, `trace::error`), and a lane is only ever more decided
+    /// (`a_complement_rule_only_refines`).
     pub fn fold(&mut self, op: Op<A>, mut args: Vec<NodeId>) -> NodeId {
         if args.len() == 2 {
             if Self::commutes(&op) {
@@ -704,6 +705,9 @@ impl<A: GraphArith> Graph<A> {
                 if args[0] == args[1] {
                     return args[0];
                 }
+                if self.complements(args[0], args[1]) {
+                    return self.leaf(Op::ConstBool(false));
+                }
                 let (x, y) = (cbool(self, 0), cbool(self, 1));
                 // `false AND anything` is false.
                 if x == Some(false) || y == Some(false) {
@@ -720,6 +724,9 @@ impl<A: GraphArith> Graph<A> {
                 if args[0] == args[1] {
                     return args[0];
                 }
+                if self.complements(args[0], args[1]) {
+                    return self.leaf(Op::ConstBool(true));
+                }
                 let (x, y) = (cbool(self, 0), cbool(self, 1));
                 // `true OR anything` is true.
                 if x == Some(true) || y == Some(true) {
@@ -731,12 +738,10 @@ impl<A: GraphArith> Graph<A> {
                     (None, Some(_)) => return args[0],
                     _ => {}
                 }
-                // `(g and c) or (g and not c)` is `g` (a refinement, `fold`'s
-                // doc); otherwise `live` would pull every split fork into the
-                // configuration product. It drops no owed raise: errors are
-                // derived from the folded graph (`trace::error`), and a `c`
-                // nothing else reads owes nothing, as any unread value - the
-                // result is `g` for every value of `c`, a wrapped one included.
+                // `(g and c) or (g and not c)` is `g` (a complement rule,
+                // `fold`'s doc); otherwise `live` would pull every split fork
+                // into the configuration product. The result is `g` for every
+                // value of `c`, a wrapped one included.
                 let and_args = |g: &Graph<A>, n: NodeId| -> Option<[NodeId; 2]> {
                     let node = &g.nodes[n as usize];
                     (node.op == Op::And).then(|| [node.args[0], node.args[1]])
@@ -1301,7 +1306,9 @@ mod tests {
     #[test]
     fn folding_is_exact_not_merely_sound() {
         // Every `fold` rule must be EXACT: `fold` and `add` evaluate alike at
-        // every leaf assignment (hence no `x and not x -> false`).
+        // every leaf assignment, but where a complement rule refines (the
+        // folded value decided, the unfolded unknown: `fold`'s doc), which
+        // only an unknown leaf allows.
         let mut g = Graph::<Fixed>::default();
         let b: Vec<NodeId> = (0..3).map(|i| g.leaf(Op::Cell(i))).collect();
         let nums: Vec<NodeId> = (10..12).map(|i| g.leaf(Op::Cell(i))).collect();
@@ -1361,7 +1368,7 @@ mod tests {
             Pico8NumInterval::from_number(n(1)),
             Pico8NumInterval::new(n(0), n(2)),
         ];
-        let mut checked = 0usize;
+        let (mut checked, mut refinements) = (0usize, 0usize);
         for p0 in tri {
             for p1 in tri {
                 for p2 in tri {
@@ -1375,14 +1382,12 @@ mod tests {
                                 (11u32, Val::Num(i1)),
                             ]);
                             let out = g.eval(&cells, Eval::Exact, None).expect("every op in the pool evaluates");
+                            let unknown_leaf = [p0, p1, p2].contains(&None) || [i0, i1].iter().any(|i| <Fixed as Arithmetic>::as_point(*i).is_none());
                             for (f, p) in &pairs {
-                                assert_eq!(
-                                    out[*f as usize],
-                                    out[*p as usize],
-                                    "fold changed the value of {:?} at {:?}",
-                                    g.get(*p),
-                                    cells
-                                );
+                                let (folded, plain) = (out[*f as usize], out[*p as usize]);
+                                let refined = unknown_leaf && plain == Val::Bool(None) && matches!(folded, Val::Bool(Some(_)));
+                                assert!(folded == plain || refined, "fold changed the value of {:?} at {:?}: {plain:?} -> {folded:?}", g.get(*p), cells);
+                                refinements += refined as usize;
                                 checked += 1;
                             }
                         }
@@ -1393,12 +1398,55 @@ mod tests {
         assert!(pairs.len() > 1_000, "pool collapsed to {} pairs", pairs.len());
         let fired = pairs.iter().filter(|(f, p)| f != p).count();
         assert!(fired > 500, "only {} of {} pairs were folded", fired, pairs.len());
-        eprintln!(
-            "[fold] {} pairs, {} folded, {} value comparisons",
-            pairs.len(),
-            fired,
-            checked
-        );
+        assert!(refinements > 0 && refinements < checked / 50, "{refinements} of {checked} values refined: the complement rules fire, and only there");
+    }
+
+    /// The complement rules (`fold`'s doc) only REFINE: at every tri-state
+    /// assignment the folded form equals the unfolded one or is decided
+    /// where it is unknown, and it reads no `c`. Over ancestors `g` that
+    /// are compounds too.
+    #[test]
+    fn a_complement_rule_only_refines() {
+        let mut g = Graph::<Fixed>::default();
+        let cells: Vec<NodeId> = (0..3).map(|i| g.leaf(Op::Cell(i))).collect();
+        let tt = g.leaf(Op::ConstBool(true));
+        let ancestors = vec![tt, cells[0], g.fold(Op::And, vec![cells[0], cells[1]]), g.fold(Op::Or, vec![cells[1], cells[2]])];
+        let lt = {
+            let (x, y) = (g.leaf(Op::Cell(10)), g.leaf(Op::Cell(11)));
+            g.fold(Op::Lt, vec![x, y])
+        };
+        // (unfolded, folded, `c`, what the result may read `c` through)
+        let mut forms: Vec<(NodeId, NodeId, NodeId, NodeId)> = Vec::new();
+        for c in [cells[2], g.fold(Op::Not, vec![cells[0]]), lt] {
+            let nc = g.fold(Op::Not, vec![c]);
+            for a in &ancestors {
+                let (l, r) = (g.add(Op::And, vec![*a, c]), g.add(Op::And, vec![*a, nc]));
+                let plain = g.add(Op::Or, vec![l, r]);
+                let (l, r) = (g.fold(Op::And, vec![*a, c]), g.fold(Op::And, vec![*a, nc]));
+                forms.push((plain, g.fold(Op::Or, vec![l, r]), c, *a));
+            }
+            forms.push((g.add(Op::Or, vec![c, nc]), g.fold(Op::Or, vec![c, nc]), c, tt));
+            forms.push((g.add(Op::And, vec![c, nc]), g.fold(Op::And, vec![c, nc]), c, tt));
+        }
+        for (_, folded, c, a) in &forms {
+            assert!(!g.reachable(&[*folded])[*c as usize] || g.reachable(&[*a])[*c as usize], "{:?} still reads its complement", g.get(*folded));
+        }
+        let tri = [Some(true), Some(false), None];
+        let ivals = [Pico8NumInterval::new(n(0), n(1)), Pico8NumInterval::new(n(2), n(3))];
+        let mut refined = 0;
+        let assignments: Vec<[Option<bool>; 3]> = (0..27).map(|k| [tri[k % 3], tri[k / 3 % 3], tri[k / 9]]).collect();
+        for [b0, b1, b2] in assignments {
+            for (x, y) in [(ivals[0], ivals[0]), (ivals[0], ivals[1])] {
+                let cells = HashMap::from([(0u32, Val::Bool(b0)), (1, Val::Bool(b1)), (2, Val::Bool(b2)), (10, Val::Num(x)), (11, Val::Num(y))]);
+                let out = g.eval(&cells, Eval::Exact, None).expect("eval");
+                for (plain, folded, _, _) in &forms {
+                    let (p, f) = (out[*plain as usize], out[*folded as usize]);
+                    assert!(p == f || (p == Val::Bool(None) && f != Val::Bool(None)), "{:?} at {cells:?}: {p:?} folded to {f:?}", g.get(*plain));
+                    refined += (p != f) as usize;
+                }
+            }
+        }
+        assert!(refined > 0, "the rules refine somewhere");
     }
 
     #[test]

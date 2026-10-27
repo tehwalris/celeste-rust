@@ -66,7 +66,7 @@ celeste-rust (src/)
                         oracle and probe (test-only)
   engines/              the reference engine (`reference`: the interpreter
                         over RefDomain as a frame step)
-  transpile/            graph IR, garith, ival, bdd, lowering, asm (codegen,
+  transpile/            graph IR, garith, ival, lowering, asm (codegen,
                         float codegen, call-outs, jit)
   compiled/             FrameEngine, the kernel registry, emission, the
                         kernel cache

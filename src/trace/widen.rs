@@ -532,9 +532,9 @@ mod tests {
                     }
                 }
                 let f = trace_frame(&mut it, &chunks, st.clone(), &crate::trace::frame::TraceSpec { roots: &roots, concrete: true, ..Default::default() }).expect("trace");
-                // Everything a successor depends on, its booleans decided as far as a
-                // BDD over independent atoms can (a guard re-merged after a branch on
-                // `frames` is `c or not c`, true).
+                // Everything a successor depends on, decided as far as the
+                // interval fold can (a guard re-merged after a branch on `frames`,
+                // `c or not c`, folded to true as it was built: `Graph::fold`).
                 let mut roots_in = vec![f.raise];
                 let mut what = vec!["the raise".to_string()];
                 for (k, o) in f.outs.iter().enumerate() {
@@ -550,7 +550,7 @@ mod tests {
                         }
                     }
                 }
-                let (g, map, _) = crate::transpile::bdd::simplify_local(&it.d.graph, &roots_in, crate::transpile::bdd::LOCAL_CAP, crate::transpile::bdd::LOCAL_EXPAND);
+                let (g, map, _) = crate::transpile::ival::fold(&it.d.graph, &roots_in, None).expect("the interval fold");
                 // Every input cell is a dead slot's; at its stored constant.
                 let stored: HashMap<u32, Val<P8>> = f
                     .iface
