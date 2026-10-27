@@ -9,7 +9,8 @@ use anyhow::{bail, Result};
 
 use celeste_core::arith::Arithmetic;
 use crate::transpile::garith::GraphArith;
-use crate::transpile::graph::{Cut, Eval, Graph, NodeId, Op, Ty, Unknown};
+use crate::transpile::eval::Known;
+use crate::transpile::graph::{Cut, Graph, NodeId, Op, Ty, Unknown};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arith {
@@ -814,37 +815,20 @@ impl<A: GraphArith> Symbolic<A> {
         !cone_any(&self.graph, &mut self.lane_memo, n, dependent)
     }
 
-    /// `op` over LITERAL operands (one an interval) in `Graph::eval`'s
-    /// semantics (one definition); `None` where eval does not model it.
-    fn eval_literal(&self, op: &Op<A>, args: &[NodeId]) -> Option<crate::transpile::graph::Val<A>> {
-        if !self.unknowns() {
+    /// `op` over LITERAL operands, one an interval (`eval::literal`: one
+    /// lane's rules, every lane holding them), with anything unknown.
+    fn eval_literal(&self, op: &Op<A>, args: &[NodeId]) -> Option<Known<A>> {
+        let literal = |a: &NodeId| matches!(self.graph.get(*a).op, Op::Const(..));
+        if !self.unknowns() || !args.iter().all(literal) || args.iter().all(|a| self.graph.point(*a).is_some()) {
             return None;
         }
-        let lits: Vec<(A::Lit, A::Lit)> = args
-            .iter()
-            .map(|a| match self.graph.get(*a).op {
-                Op::Const(lo, hi) => Some((lo, hi)),
-                _ => None,
-            })
-            .collect::<Option<_>>()?;
-        if lits.iter().all(|(lo, hi)| lo == hi) {
-            return None;
-        }
-        let mut g = Graph::<A>::default();
-        let leaves: Vec<NodeId> = lits.iter().map(|(lo, hi)| g.leaf(Op::Const(*lo, *hi))).collect();
-        let n = g.add(op.clone(), leaves);
-        g.eval(&std::collections::HashMap::new(), Eval::Exact, None).ok().map(|v| v[n as usize])
+        Some(crate::transpile::eval::literal(&self.graph, op, args))
     }
 
-    /// `eval_literal`'s number as a literal node.
+    /// `eval_literal`'s number, where known, as a literal node.
     fn literal_num(&mut self, op: Op<A>, args: &[NodeId]) -> Option<NodeId> {
-        match self.eval_literal(&op, args)? {
-            crate::transpile::graph::Val::Num(iv) => {
-                let (lo, hi) = A::bounds(iv);
-                Some(self.graph.leaf(Op::Const(A::lit(lo), A::lit(hi))))
-            }
-            crate::transpile::graph::Val::Bool(_) => None,
-        }
+        let (lo, hi) = A::bounds(self.eval_literal(&op, args)?.num()?);
+        Some(self.graph.leaf(Op::Const(A::lit(lo), A::lit(hi))))
     }
 
     /// The steps every operation on `args` takes first, in order: constants
@@ -955,8 +939,8 @@ impl<A: GraphArith> Domain for Symbolic<A> {
         // Two literals: decided by their intervals, or a fresh atom of their own.
         let g: Op<A> = op.into();
         match self.eval_literal(&g, &[*a, *b]) {
-            Some(crate::transpile::graph::Val::Bool(Some(r))) => return Ok(self.graph.leaf(Op::ConstBool(r))),
-            Some(crate::transpile::graph::Val::Bool(None)) => return Ok(self.unknown_bool_atom()),
+            Some(Known::Bool(Some(r))) => return Ok(self.graph.leaf(Op::ConstBool(r))),
+            Some(Known::Bool(None)) => return Ok(self.unknown_bool_atom()),
             _ => {}
         }
         // Decided by static ranges iff every pair of pieces agrees.
@@ -1299,7 +1283,8 @@ mod tests {
     /// the cut below 1, where `0.5 - 2^-54 + 0.5` rounds up.
     #[test]
     fn a_round_fork_resolves_to_the_reference_fragments() {
-        use crate::transpile::graph::{Val, OPEN};
+        use crate::transpile::eval::Val;
+        use crate::transpile::graph::OPEN;
         use celeste_core::arith::Float;
         use celeste_core::lua_f64::{LuaF64, LuaF64Interval};
         let f = |v: f64| LuaF64::new(v).expect("finite");
@@ -1324,16 +1309,13 @@ mod tests {
                     splits[fork as usize] = c;
                     let mut g = d.graph.like();
                     let map = d.graph.specialize_subset_into(&splits, None, &mut g);
-                    // Strict, a lane spanning more values than the fork's
-                    // arity is an error of the evaluation (as `ForkOk`).
-                    let vals = match g.eval(&cells, Eval::Exact, None) {
-                        Ok(vals) => vals,
-                        Err(e) => {
-                            assert!(n > ways as u32 && format!("{e}").contains("ForkOk"), "ox {ox} [{lo}, {hi}] c {c}: {e}");
-                            continue;
-                        }
-                    };
-                    assert_eq!(vals[map[covered as usize] as usize], Val::Bool(Some(true)), "ox {ox} [{lo}, {hi}]: coverage");
+                    // A lane spanning more values than the fork's arity is not
+                    // covered (`ForkOk`).
+                    let vals = crate::transpile::eval::eval(&g, &cells, crate::transpile::eval::Lanes::One, None);
+                    if vals[map[covered as usize] as usize] != Val::Bool(Some(true)) {
+                        assert!(n > ways as u32, "ox {ox} [{lo}, {hi}] c {c}: {n} values, not covered by {ways}");
+                        continue;
+                    }
                     assert!(n <= ways as u32, "ox {ox} [{lo}, {hi}]: {n} values covered by {ways}");
                     let ok = (c as u32) < n;
                     assert_eq!(vals[map[valid as usize] as usize], Val::Bool(Some(ok)), "ox {ox} [{lo}, {hi}] c {c}: validity");
@@ -1464,7 +1446,7 @@ mod tests {
     /// `r0sxfn`'s hidden near floor).
     #[test]
     fn an_equality_on_an_interval_may_answer_as_its_ends_allow() {
-        use crate::transpile::graph::Val;
+        use crate::transpile::eval::Val;
         let one = 1 << 16;
         for fruit_unknown in [false, true] {
             let answers = |lo: i32, hi: i32| {
@@ -1473,7 +1455,7 @@ mod tests {
                 let k = d.graph.leaf(Op::Const(one, one));
                 let eq = d.graph.fold(Op::Eq, vec![x, k]);
                 let (t, f) = d.may_answers(eq);
-                let v = d.graph.eval(&Default::default(), Eval::Exact, None).unwrap();
+                let v = crate::transpile::eval::eval(&d.graph, &Default::default(), crate::transpile::eval::Lanes::One, None);
                 let b = |n: NodeId| match v[n as usize] {
                     Val::Bool(b) => b,
                     Val::Num(_) => panic!("a number"),

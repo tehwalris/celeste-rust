@@ -471,7 +471,7 @@ mod tests {
     use crate::trace::cart;
     use crate::trace::interp::Interp;
     use crate::trace::frame::trace_frame;
-    use crate::transpile::graph::{Eval, Val};
+    use crate::transpile::eval::{Lanes, Val};
     use std::collections::HashMap;
 
     fn canonical(st: &State<Symbolic<P8>>, p: &Path) -> Option<Val<P8>> {
@@ -550,7 +550,7 @@ mod tests {
                         }
                     }
                 }
-                let (g, map, _) = crate::transpile::ival::fold(&it.d.graph, &roots_in, None).expect("the interval fold");
+                let (g, map) = crate::transpile::eval::fold(&it.d.graph, &roots_in, None);
                 // Every input cell is a dead slot's; at its stored constant.
                 let stored: HashMap<u32, Val<P8>> = f
                     .iface
@@ -559,7 +559,7 @@ mod tests {
                     .enumerate()
                     .map(|(i, p)| (i as u32, canonical(&st, p).unwrap_or_else(|| panic!("{} is no dead slot", iface::show(p)))))
                     .collect();
-                let at_stored = g.eval(&stored, Eval::Lenient, None).expect("eval");
+                let at_stored = crate::transpile::eval::eval(&g, &stored, Lanes::Over, None);
                 for (r, w) in roots_in.iter().zip(&what) {
                     // Down to the cells, but not through an overflow check, which
                     // must hold at the stored constants instead.

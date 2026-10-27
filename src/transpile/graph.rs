@@ -4,72 +4,12 @@
 //! has a lane TYPE (`Ty`: a boolean, a number, an interval), set by its op's
 //! signature (`Graph::type_of`) and an input cell's kind.
 
-use std::collections::HashMap;
-
-
-use anyhow::{anyhow, bail, Result};
-
-use celeste_core::cart_data::CART;
-
 use celeste_core::arith::{Arithmetic, Fixed};
 use celeste_core::pico8_num::Pico8Num;
-use celeste_core::room::Room;
 
 pub use super::garith::GraphArith;
 
-/// An abstract value for ONE lane: an exact number is a singleton interval,
-/// a known boolean is `Some`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Val<A: Arithmetic> {
-    Num(A::Ival),
-    /// `None` = unknown, the abstract interpreter's third boolean.
-    Bool(Option<bool>),
-}
-
-impl<A: Arithmetic> Val<A> {
-    pub fn exact_num(n: A) -> Self {
-        Val::Num(A::point(n))
-    }
-    fn as_exact(self) -> Option<A> {
-        match self {
-            Val::Num(i) => A::as_point(i),
-            Val::Bool(_) => None,
-        }
-    }
-    fn as_num(self, op: &str) -> Result<A::Ival> {
-        match self {
-            Val::Num(i) => Ok(i),
-            Val::Bool(_) => bail!("{}: expected a number, got a boolean", op),
-        }
-    }
-    fn as_bool(self, op: &str) -> Result<Option<bool>> {
-        match self {
-            Val::Bool(b) => Ok(b),
-            Val::Num(_) => bail!("{}: expected a boolean, got a number", op),
-        }
-    }
-}
-
 pub type NodeId = u32;
-
-/// How `Graph::eval` reads what it cannot compute exactly.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Eval {
-    /// Every node exact, or an error (inputs at points).
-    Exact,
-    /// Over hulls (lanes): a fork's operand covers it, an undecided check is
-    /// unknown, an unmodelled node TOP for its kind (sound; the same match as
-    /// `Exact`, so the two cannot diverge).
-    Lenient,
-    /// `Lenient`, `mget` over interval coordinates read as the SET of tiles
-    /// the rectangle holds (`TileSet::over`), and `defined` (`Graph::eval`):
-    /// the interval fold (`transpile::ival`).
-    Fold,
-    /// Forks resolved via `Frag`, an unmodelled node (`Mget`, roomless
-    /// `TileFlagAt`) TOP, and `defined`: level -1 takes the kernels' premises
-    /// as holding.
-    NarrowTop,
-}
 
 /// In a `splits` vector: leave this fork standing.
 pub const OPEN: u8 = u8::MAX;
@@ -774,442 +714,14 @@ impl<A: GraphArith> Graph<A> {
         opposite && nx.args == ny.args
     }
 
-    /// Evaluate every node from the input cells in one forward pass, as
-    /// `mode` says (`room`: the map, for `mget` and `tile_flag_at`).
-    ///
-    /// `defined` (`Eval::Fold`, `Eval::NarrowTop`): an operation's value need
-    /// cover only the lanes where it is DEFINED (`abs` of a hull holding MIN
-    /// is `[0, MAX]`, the MIN lane in error). Sound where that error is
-    /// charged to whatever reads the value: once the outcomes' errors are
-    /// derived and are roots of the graph evaluated (the lowering's fold), or
-    /// where the premises are taken as holding (level -1). NOT in the tracer,
-    /// which decides comparisons BEFORE the errors are derived: a decided one
-    /// would no longer reach the `abs`.
-    pub fn eval(&self, cells: &HashMap<u32, Val<A>>, mode: Eval, room: Option<&Room>) -> Result<Vec<Val<A>>> {
-        let (lenient, defined) = (matches!(mode, Eval::Lenient | Eval::Fold), matches!(mode, Eval::Fold | Eval::NarrowTop));
-        let (strict_err, mget_sets) = (mode == Eval::Exact, mode == Eval::Fold);
-        // Per `Mget` node read as a set: the tiles its coordinates' rectangle holds.
-        let mut tiles: HashMap<NodeId, TileSet> = HashMap::new();
-        let full = Val::Num(A::unknown());
-        let mut out: Vec<Val<A>> = Vec::with_capacity(self.nodes.len());
-        for (i, node) in self.nodes.iter().enumerate() {
-            macro_rules! a {
-                ($k:expr) => {
-                    out[node.args[$k] as usize]
-                };
-            }
-            let computed = (|| -> Result<Val<A>> {
-                Ok(match &node.op {
-                Op::Const(lo, hi) => Val::Num(A::ival(A::from_lit(*lo), A::from_lit(*hi))),
-                Op::ConstBool(b) => Val::Bool(Some(*b)),
-                Op::UnknownBool(_) => Val::Bool(None),
-                // No interval holds it: unmodelled (TOP when lenient).
-                Op::UnknownNum { .. } => bail!("node {}: an unknown number has no interval", i),
-                // No data output: its uses read the constant.
-                Op::Pin(_) => bail!("node {}: a pin has no value (its uses read the constant)", i),
-                // The hull (`fold`'s two-constant rule agrees). Tolerant of `lo > hi`.
-                Op::Span => {
-                    let (lo, hi) = (A::bounds(a!(0).as_num("Span")?).0, A::bounds(a!(1).as_num("Span")?).1);
-                    Val::Num(if A::lt(hi, lo) { A::ival(hi, lo) } else { A::ival(lo, hi) })
-                }
-                // The operand inside the assumed range: a lane outside is in error (the
-                // node's own), so the value need not cover it; disjoint, every lane is in
-                // error: the operand, as the kernel.
-                Op::Restrict(lo, hi) => {
-                    let x = a!(0).as_num("Restrict")?;
-                    let (xl, xh) = A::bounds(x);
-                    let (rl, rh) = (A::from_lit(*lo), A::from_lit(*hi));
-                    let (lo, hi) = (if A::lt(xl, rl) { rl } else { xl }, if A::lt(rh, xh) { rh } else { xh });
-                    Val::Num(if A::le(lo, hi) { A::ival(lo, hi) } else { x })
-                }
-                // A fork RESTRICTS its operand: lenient, the operand covers it.
-                Op::Fork(..) if lenient => a!(0),
-                Op::Fork(_, d) | Op::ForkValid(_, d) => {
-                    bail!("node {}: fork {} has no value outside an outcome", i, d)
-                }
-                // At most `n` cells of the grid (the floors': the kernel's
-                // `zi_span_ok`). On a hull: fits => every lane fits, else unknown.
-                Op::ForkOk(grid, n) => {
-                    let iv = a!(0).as_num("ForkOk")?;
-                    if A::cells(*grid, iv) < *n as i64 {
-                        Val::Bool(Some(true))
-                    } else if !strict_err {
-                        Val::Bool(None)
-                    } else {
-                        bail!("node {}: ForkOk of an interval that may not fit", i)
-                    }
-                }
-                // An `Ints` fragment: its cell's low end, exact (lenient: its hull
-                // over lanes).
-                Op::Frag(Cut::Ints, c) => Val::Num(A::fragment(Cut::Ints, a!(0).as_num("Frag")?, *c, lenient)?),
-                // The RESOLVED fork (the floors': the kernel's `zi_fork_flr`).
-                Op::Frag(cut, c) | Op::FragOk(cut, c) => {
-                    let iv = a!(0).as_num("Frag")?;
-                    // Cells spanned past the low end's.
-                    let n = A::cells(*cut, iv);
-                    let c = *c as i64;
-                    // Lenient, the operand is a HULL over lanes: a lane in a wide hull may
-                    // still span two cells, so `FragOk(c)` is decided only where the hull
-                    // rules it out.
-                    if lenient {
-                        return Ok(match (&node.op, c) {
-                            (Op::Frag(..), _) => a!(0),
-                            (_, 0) => Val::Bool(Some(true)),
-                            // Too few cells: no lane reaches fragment `c`.
-                            _ if n < c => Val::Bool(Some(false)),
-                            _ => Val::Bool(None),
-                        });
-                    }
-                    // Valid iff the interval reaches cell `c`; an invalid fragment
-                    // keeps the whole value (never taken).
-                    let valid = n >= c;
-                    match &node.op {
-                        Op::Frag(..) if valid => Val::Num(A::fragment(*cut, iv, c as u8, false)?),
-                        Op::Frag(..) => a!(0),
-                        _ => Val::Bool(Some(valid)),
-                    }
-                }
-                // Bits: decided only on two points, or two values apart.
-                Op::Same => {
-                    let (x, y) = (a!(0).as_num("Same")?, a!(1).as_num("Same")?);
-                    match (A::as_point(x), A::as_point(y)) {
-                        (Some(p), Some(q)) => Val::Bool(Some(A::bits(p) == A::bits(q))),
-                        _ => {
-                            let ((xl, xh), (yl, yh)) = (A::bounds(x), A::bounds(y));
-                            if A::lt(xh, yl) || A::lt(yh, xl) {
-                                Val::Bool(Some(false))
-                            } else {
-                                Val::Bool(None)
-                            }
-                        }
-                    }
-                }
-                // ONE lane's end, over the lanes: anywhere in the hull (except a span's
-                // or a literal's), never the hull's end as a point, or the fold decides
-                // premises on it.
-                Op::Lo | Op::Hi => {
-                    let low = matches!(node.op, Op::Lo);
-                    let arg = &self.nodes[node.args[0] as usize];
-                    match arg.op {
-                        Op::Span => Val::Num(out[arg.args[if low { 0 } else { 1 }] as usize].as_num("Lo/Hi of Span")?),
-                        Op::Const(l, h) => Val::Num(A::point(A::from_lit(if low { l } else { h }))),
-                        _ => Val::Num(a!(0).as_num("Lo/Hi")?),
-                    }
-                }
-                // The operation's checked form (points and intervals alike). On a hull:
-                // no wrap is no wrap on any lane (the operations are monotone or
-                // bilinear); a wrap is unknown per lane.
-                Op::NoWrap => {
-                    let x = &self.nodes[node.args[0] as usize];
-                    let arg = |k: usize| out[x.args[k] as usize].as_num("NoWrap");
-                    let fits = match x.op {
-                        Op::Add => A::ival_add(arg(0)?, arg(1)?).is_some(),
-                        Op::Sub => A::ival_sub(arg(0)?, arg(1)?).is_some(),
-                        Op::Mul => A::ival_mul(arg(0)?, arg(1)?).is_some(),
-                        Op::Div => A::ival_div(arg(0)?, arg(1)?).is_some(),
-                        Op::Neg => A::ival_neg(arg(0)?).is_some(),
-                        Op::Abs => A::ival_abs(arg(0)?).is_some(),
-                        // `%` (a double's own error, `GraphArith::range_error`):
-                        // on points only.
-                        Op::Rem => match (A::as_point(arg(0)?), A::as_point(arg(1)?)) {
-                            (Some(p), Some(q)) => A::rem(p, q).is_some(),
-                            _ => bail!("node {}: NoWrap of `%` over an interval is not modelled", i),
-                        },
-                        _ => true,
-                    };
-                    Val::Bool(if fits || !lenient { Some(fits) } else { None })
-                }
-                Op::Cell(c) => match cells.get(c) {
-                    Some(v) => *v,
-                    None => bail!("node {}: input cell {} was not supplied", i, c),
-                },
-                // CHECKED: inputs run at TOP on purpose, so a wrap is expected.
-                Op::Add => Val::Num(A::ival_add(a!(0).as_num("Add")?, a!(1).as_num("Add")?).ok_or_else(|| anyhow!("node {}: Add wrapped", i))?),
-                Op::Sub => Val::Num(A::ival_sub(a!(0).as_num("Sub")?, a!(1).as_num("Sub")?).ok_or_else(|| anyhow!("node {}: Sub wrapped", i))?),
-                Op::Neg => Val::Num(A::ival_neg(a!(0).as_num("Neg")?).ok_or_else(|| anyhow!("node {}: Neg wrapped", i))?),
-                Op::Mul | Op::Div | Op::Rem => Self::arith(&node.op, a!(0), a!(1))?,
-                // `defined`: a lane where `abs` fails is in error, so the value need not
-                // cover it.
-                Op::Abs => Val::Num(A::ev_abs(a!(0).as_num("Abs")?, defined).ok_or_else(|| anyhow!("node {}: Abs saturated", i))?),
-                // flr is monotone, so endpoints suffice.
-                Op::Flr => {
-                    let (lo, hi) = A::bounds(a!(0).as_num("Flr")?);
-                    Val::Num(A::ival(A::flr(lo), A::flr(hi)))
-                }
-                // sin is NOT monotone; only exact inputs are sound here.
-                Op::Sin => match a!(0).as_exact() {
-                    Some(n) => Val::exact_num(A::sin(n).ok_or_else(|| anyhow!("node {}: sin failed", i))?),
-                    None => bail!("Sin over a non-exact interval is not modelled"),
-                },
-                // Monotone in each operand: the ends' (the arithmetic's own
-                // `min`/`max`, its tie rule included).
-                Op::Min | Op::Max => {
-                    let ((xl, xh), (yl, yh)) = (A::bounds(a!(0).as_num("MinMax")?), A::bounds(a!(1).as_num("MinMax")?));
-                    let pick = |p: A, q: A| if matches!(node.op, Op::Min) { A::min(p, q) } else { A::max(p, q) };
-                    Val::Num(A::ival(pick(xl, yl), pick(xh, yh)))
-                }
-                // A tile against a literal, decided by the SET of tiles.
-                Op::Eq if node.args.iter().any(|m| tiles.contains_key(m)) => {
-                    let m = if tiles.contains_key(&node.args[0]) { 0 } else { 1 };
-                    match a!(1 - m).as_exact() {
-                        Some(k) => Val::Bool(tiles[&node.args[m]].eq::<A>(k)),
-                        None => Self::compare(&node.op, a!(0), a!(1))?,
-                    }
-                }
-                Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Eq => {
-                    Self::compare(&node.op, a!(0), a!(1))?
-                }
-                Op::Not => Val::Bool(a!(0).as_bool("Not")?.map(|b| !b)),
-                Op::And => {
-                    let (x, y) = (a!(0).as_bool("And")?, a!(1).as_bool("And")?);
-                    // Short-circuit: `false AND unknown` is false.
-                    Val::Bool(match (x, y) {
-                        (Some(p), Some(q)) => Some(p && q),
-                        (Some(false), None) | (None, Some(false)) => Some(false),
-                        (Some(_), None) | (None, Some(_)) | (None, None) => None,
-                    })
-                }
-                Op::Or => {
-                    let (x, y) = (a!(0).as_bool("Or")?, a!(1).as_bool("Or")?);
-                    // Short-circuit on a decided true, mirroring And.
-                    Val::Bool(match (x, y) {
-                        (Some(p), Some(q)) => Some(p || q),
-                        (Some(true), None) | (None, Some(true)) => Some(true),
-                        (Some(_), None) | (None, Some(_)) | (None, None) => None,
-                    })
-                }
-                Op::Sel => match a!(0).as_bool("Sel")? {
-                    Some(true) => a!(1),
-                    Some(false) => a!(2),
-                    // Undecided: the lane is in error (the select's own), so the
-                    // join serves.
-                    None => Self::join(a!(1), a!(2))?,
-                },
-                // Per-LANE decidedness. On a hull: decided means every lane is;
-                // undecided says nothing (unknown, NOT false).
-                Op::Known => {
-                    let decided = match a!(0) {
-                        Val::Bool(b) => b.is_some(),
-                        Val::Num(i) => A::as_point(i).is_some(),
-                    };
-                    if decided {
-                        Val::Bool(Some(true))
-                    } else if lenient {
-                        Val::Bool(None)
-                    } else {
-                        Val::Bool(Some(false))
-                    }
-                }
-                Op::TileFlagAt if room.is_some() => {
-                    Self::tile_flag_over(room.unwrap(), a!(0), a!(1), a!(2), a!(3), a!(4))?
-                }
-                // `mget` on EXACT coordinates, as in the kernels; over an
-                // interval, the tiles the rectangle holds (`mget_sets`).
-                Op::Mget if room.is_some() => {
-                    let (x, y) = (a!(0).as_num("Mget")?, a!(1).as_num("Mget")?);
-                    let (Some(xp), Some(yp)) = (A::as_point(x), A::as_point(y)) else {
-                        if !mget_sets {
-                            bail!("node {}: mget over an interval coordinate", i);
-                        }
-                        let set = TileSet::over::<A>(x, y);
-                        tiles.insert(i as NodeId, set);
-                        return Ok(set.hull());
-                    };
-                    let whole = |v: A, what: &str| A::as_i16(v).ok_or_else(|| anyhow!("mget: {what} is not an integer"));
-                    let t = CART.mget_whole(whole(xp, "x")?, whole(yp, "y")?);
-                    Val::exact_num(A::from_i16(t as i16))
-                }
-                Op::Mget | Op::TileFlagAt => {
-                    bail!("{:?} needs the cart; not supported by the pure evaluator yet", node.op)
-                }
-                })
-            })();
-            // What it cannot compute is TOP for its type (sound), but `Exact`.
-            let v = match computed {
-                Ok(v) => v,
-                Err(e) if strict_err => return Err(e),
-                Err(_) if self.ty(i as NodeId).is_bool() => Val::Bool(None),
-                Err(_) => full,
-            };
-            out.push(v);
-        }
-        Ok(out)
-    }
-
-    /// `tile_flag_at` over INTERVALS: FALSE if the UNION of the rectangles holds
-    /// no flagged tile, TRUE if their INTERSECTION holds one, unknown between.
-    fn tile_flag_over(room: &Room, x: Val<A>, y: Val<A>, w: Val<A>, h: Val<A>, flag: Val<A>) -> Result<Val<A>> {
-        // The size and flag must be exact.
-        let ex = |v: Val<A>, what: &str| -> Result<i32> {
-            v.as_exact()
-                .and_then(A::as_i16)
-                .map(|n| n as i32)
-                .ok_or_else(|| anyhow!("tile_flag_at: {} is not an exact integer", what))
-        };
-        let (w, h) = (ex(w, "w")?, ex(h, "h")?);
-        let flag = ex(flag, "flag")? as i16;
-        // Every integer from floor(low) to floor(high); non-integers fail
-        // concretely, so covering them is conservative.
-        let span = |v: Val<A>, what: &str| -> Result<(i32, i32)> {
-            let (lo, hi) = A::bounds(v.as_num(what)?);
-            let lo = A::as_i16(A::flr(lo)).ok_or_else(|| anyhow!("{}: unbounded", what))? as i32;
-            let hi = A::as_i16(A::flr(hi)).ok_or_else(|| anyhow!("{}: unbounded", what))? as i32;
-            Ok((lo, hi))
-        };
-        let (xlo, xhi) = span(x, "x")?;
-        let (ylo, yhi) = span(y, "y")?;
-        // Clamp the rectangle's EDGES to the 16-tile room, never corner and
-        // size apart: at TOP that leaves only row 0, reading "nothing solid".
-        let edges = |lo: i32, size: i32| -> (i16, i16) {
-            let hi = lo + size - 1;
-            let (lo, hi) = (lo.clamp(-4096, 4096), hi.clamp(-4096, 4096));
-            (lo as i16, (hi - lo + 1) as i16)
-        };
-        let (dx, dy) = (xhi - xlo, yhi - ylo);
-        let solid = |px: i32, py: i32, pw: i32, ph: i32| -> Result<bool> {
-            let ((px, pw), (py, ph)) = (edges(px, pw), edges(py, ph));
-            room.flag_at(px, py, pw, ph, flag)
-        };
-        if !solid(xlo, ylo, w + dx, h + dy)? {
-            return Ok(Val::Bool(Some(false)));
-        }
-        if dx < w && dy < h && solid(xhi, yhi, w - dx, h - dy)? {
-            return Ok(Val::Bool(Some(true)));
-        }
-        Ok(Val::Bool(None))
-    }
-
-    fn arith(op: &Op<A>, x: Val<A>, y: Val<A>) -> Result<Val<A>> {
-        // Exact op exact is exact, or an error where it leaves the range.
-        if let (Some(p), Some(q)) = (x.as_exact(), y.as_exact()) {
-            let r = match op {
-                Op::Mul => A::mul(p, q),
-                Op::Div => A::div(p, q),
-                Op::Rem => A::rem(p, q),
-                _ => unreachable!(),
-            };
-            return Ok(Val::exact_num(r.ok_or_else(|| anyhow!("{:?} of {:?} and {:?} wrapped", op, p, q))?));
-        }
-        let xi = x.as_num("arith")?;
-        let scalar = match y.as_exact() {
-            Some(q) => q,
-            None => bail!("{:?} of two non-exact intervals is not modelled", op),
-        };
-        // The interval helpers are monotone only for a positive scalar.
-        if A::le(scalar, A::from_i16(0)) {
-            bail!("{:?} by a non-positive scalar is not modelled", op);
-        }
-        // Checked, as for `Add`: at TOP a scale wraps.
-        let k = A::point(scalar);
-        Ok(Val::Num(match op {
-            Op::Mul => A::ival_mul(xi, k).ok_or_else(|| anyhow!("Mul over an interval wrapped"))?,
-            Op::Div => A::ival_div(xi, k).ok_or_else(|| anyhow!("Div over an interval wrapped"))?,
-            Op::Rem => bail!("Rem over an interval is not modelled"),
-            _ => unreachable!(),
-        }))
-    }
-
-    fn compare(op: &Op<A>, x: Val<A>, y: Val<A>) -> Result<Val<A>> {
-        // Booleans only compare with Eq.
-        if let (Val::Bool(p), Val::Bool(q)) = (x, y) {
-            if !matches!(op, Op::Eq) {
-                bail!("{:?} is not defined on booleans", op);
-            }
-            return Ok(Val::Bool(match (p, q) {
-                (Some(a), Some(b)) => Some(a == b),
-                _ => None,
-            }));
-        }
-        let ((al, ah), (bl, bh)) = (A::bounds(x.as_num("compare")?), A::bounds(y.as_num("compare")?));
-        // Decided iff the answer is the same for every pair in the boxes.
-        let all = |f: &dyn Fn(A, A) -> bool| -> Option<bool> {
-            let corners = [f(al, bl), f(al, bh), f(ah, bl), f(ah, bh)];
-            // Order comparisons: corners bound the box; equality needs disjointness.
-            if corners.iter().all(|c| *c) {
-                Some(true)
-            } else if corners.iter().all(|c| !*c) {
-                Some(false)
-            } else {
-                None
-            }
-        };
-        Ok(Val::Bool(match op {
-            Op::Lt => all(&|p, q| A::lt(p, q)),
-            Op::Le => all(&|p, q| A::le(p, q)),
-            Op::Gt => all(&|p, q| A::lt(q, p)),
-            Op::Ge => all(&|p, q| A::le(q, p)),
-            Op::Eq => {
-                if A::lt(bh, al) || A::lt(ah, bl) {
-                    Some(false) // disjoint
-                } else if let (Some(p), Some(q)) = (A::as_point(x.as_num("compare")?), A::as_point(y.as_num("compare")?)) {
-                    Some(A::num_eq(p, q))
-                } else {
-                    None // overlapping, at least one inexact
-                }
-            }
-            _ => unreachable!(),
-        }))
-    }
-
-    fn join(x: Val<A>, y: Val<A>) -> Result<Val<A>> {
-        Ok(match (x, y) {
-            (Val::Num(a), Val::Num(b)) => {
-                let ((al, ah), (bl, bh)) = (A::bounds(a), A::bounds(b));
-                Val::Num(A::ival(A::min(al, bl), A::max(ah, bh)))
-            }
-            (Val::Bool(a), Val::Bool(b)) => Val::Bool(if a == b { a } else { None }),
-            _ => bail!("cannot join a number with a boolean"),
-        })
-    }
-}
-
-/// The tiles `mget` can return over a rectangle of coordinates: one bit per
-/// tile number (`mget` returns a byte).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct TileSet([u64; 4]);
-
-impl TileSet {
-    /// Every tile `mget(x, y)` returns for `x` in `xs`, `y` in `ys`: a lane's
-    /// coordinate is an integer inside its hull (`mget` of a fraction raises),
-    /// and outside the map `mget` is 0, so the rectangle is clipped to the map
-    /// plus one row of "outside" on each side.
-    fn over<A: GraphArith>(xs: A::Ival, ys: A::Ival) -> TileSet {
-        let ((x0, x1), (y0, y1)) = (A::tile_span(xs, 128), A::tile_span(ys, 64));
-        let mut set = TileSet([0; 4]);
-        for x in x0..=x1 {
-            for y in y0..=y1 {
-                let t = CART.mget_whole(x as i16, y as i16) as usize;
-                set.0[t / 64] |= 1 << (t % 64);
-            }
-        }
-        set
-    }
-
-    fn contains(&self, t: usize) -> bool {
-        t < 256 && self.0[t / 64] & (1 << (t % 64)) != 0
-    }
-
-    fn hull<A: Arithmetic>(&self) -> Val<A> {
-        let mut it = (0..256).filter(|t| self.contains(*t));
-        let lo = it.next().expect("a rectangle holds a tile") as i16;
-        let hi = it.last().map_or(lo, |t| t as i16);
-        Val::Num(A::ival(A::from_i16(lo), A::from_i16(hi)))
-    }
-
-    /// `mget == k` over the set: false if no tile is `k`, true if every one is.
-    fn eq<A: Arithmetic>(&self, k: A) -> Option<bool> {
-        let t = A::as_i16(k).filter(|t| (0..256).contains(t)).map(|t| t as usize);
-        match t {
-            Some(t) if self.contains(t) => (self.0.iter().map(|w| w.count_ones()).sum::<u32>() == 1).then_some(true),
-            _ => Some(false),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transpile::eval::{eval, Lanes, Val};
     use celeste_core::pico8_num::Pico8NumInterval;
+    use std::collections::HashMap;
 
     fn pieces_of(g: &Graph<Fixed>, memo: &mut HashMap<NodeId, Option<crate::transpile::garith::Pieces<Fixed>>>, n: NodeId) -> Option<crate::transpile::garith::Pieces<Fixed>> {
         <Fixed as GraphArith>::pieces_of(g, memo, n)
@@ -1240,7 +752,7 @@ mod tests {
         let k = g.leaf(Op::Const(n(3).as_raw_u32() as i32, n(3).as_raw_u32() as i32));
         let sum = g.add(Op::Add, vec![a, k]);
         let cells = HashMap::from([(1u32, Val::exact_num(n(4)))]);
-        let out = g.eval(&cells, Eval::Exact, None).unwrap();
+        let out = eval(&g, &cells, Lanes::One, None);
         assert_eq!(out[sum as usize], Val::exact_num(n(7)));
     }
 
@@ -1255,13 +767,13 @@ mod tests {
             (1u32, Val::Num(Pico8NumInterval::new(n(0), n(10)))),
             (2u32, Val::Num(Pico8NumInterval::new(n(5), n(15)))),
         ]);
-        assert_eq!(g.eval(&cells, Eval::Exact, None).unwrap()[lt as usize], Val::Bool(None));
+        assert_eq!(eval(&g, &cells, Lanes::One, None)[lt as usize], Val::Bool(None));
         // Disjoint boxes decide it.
         let cells = HashMap::from([
             (1u32, Val::Num(Pico8NumInterval::new(n(0), n(3)))),
             (2u32, Val::Num(Pico8NumInterval::new(n(5), n(15)))),
         ]);
-        assert_eq!(g.eval(&cells, Eval::Exact, None).unwrap()[lt as usize], Val::Bool(Some(true)));
+        assert_eq!(eval(&g, &cells, Lanes::One, None)[lt as usize], Val::Bool(Some(true)));
     }
 
     #[test]
@@ -1278,13 +790,13 @@ mod tests {
 
         // Decided condition: the lane is valid and picks an arm.
         let cells = HashMap::from([(1u32, Val::Bool(Some(true)))]);
-        let out = g.eval(&cells, Eval::Exact, None).unwrap();
+        let out = eval(&g, &cells, Lanes::One, None);
         assert_eq!(out[valid as usize], Val::Bool(Some(true)));
         assert_eq!(out[sel as usize], Val::exact_num(n(1)));
 
         // Undecided: the lane is INVALID, and the value is the sound join.
         let cells = HashMap::from([(1u32, Val::Bool(None))]);
-        let out = g.eval(&cells, Eval::Exact, None).unwrap();
+        let out = eval(&g, &cells, Lanes::One, None);
         assert_eq!(out[valid as usize], Val::Bool(Some(false)));
         assert_eq!(
             out[sel as usize],
@@ -1300,7 +812,7 @@ mod tests {
         let and = g.add(Op::And, vec![a, b]);
         // false AND unknown is FALSE, not unknown.
         let cells = HashMap::from([(1u32, Val::Bool(Some(false))), (2u32, Val::Bool(None))]);
-        assert_eq!(g.eval(&cells, Eval::Exact, None).unwrap()[and as usize], Val::Bool(Some(false)));
+        assert_eq!(eval(&g, &cells, Lanes::One, None)[and as usize], Val::Bool(Some(false)));
     }
 
     #[test]
@@ -1381,7 +893,7 @@ mod tests {
                                 (10u32, Val::Num(i0)),
                                 (11u32, Val::Num(i1)),
                             ]);
-                            let out = g.eval(&cells, Eval::Exact, None).expect("every op in the pool evaluates");
+                            let out = eval(&g, &cells, Lanes::One, None);
                             let unknown_leaf = [p0, p1, p2].contains(&None) || [i0, i1].iter().any(|i| <Fixed as Arithmetic>::as_point(*i).is_none());
                             for (f, p) in &pairs {
                                 let (folded, plain) = (out[*f as usize], out[*p as usize]);
@@ -1438,7 +950,7 @@ mod tests {
         for [b0, b1, b2] in assignments {
             for (x, y) in [(ivals[0], ivals[0]), (ivals[0], ivals[1])] {
                 let cells = HashMap::from([(0u32, Val::Bool(b0)), (1, Val::Bool(b1)), (2, Val::Bool(b2)), (10, Val::Num(x)), (11, Val::Num(y))]);
-                let out = g.eval(&cells, Eval::Exact, None).expect("eval");
+                let out = eval(&g, &cells, Lanes::One, None);
                 for (plain, folded, _, _) in &forms {
                     let (p, f) = (out[*plain as usize], out[*folded as usize]);
                     assert!(p == f || (p == Val::Bool(None) && f != Val::Bool(None)), "{:?} at {cells:?}: {p:?} folded to {f:?}", g.get(*plain));
@@ -1594,20 +1106,21 @@ mod tests {
         }
     }
 
+    /// One lane, an operation its kernel computes on EXACT operands only is
+    /// unknown on a set - never approximated; over the lanes the product of
+    /// two hulls bounds every lane's.
     #[test]
-    fn unmodelled_operations_are_loud() {
-        // An op we cannot evaluate EXACTLY must error, never approximate.
+    fn an_exact_only_operation_on_a_lanes_set_is_unknown() {
         let mut g = Graph::<Fixed>::default();
         let a = g.leaf(Op::Cell(1));
         let b = g.leaf(Op::Cell(2));
         let m = g.add(Op::Mul, vec![a, b]);
-        let _ = m;
         let cells = HashMap::from([
             (1u32, Val::Num(Pico8NumInterval::new(n(0), n(10)))),
             (2u32, Val::Num(Pico8NumInterval::new(n(2), n(3)))),
         ]);
-        let err = g.eval(&cells, Eval::Exact, None).unwrap_err().to_string();
-        assert!(err.contains("not modelled"), "unexpected error: {}", err);
+        assert_eq!(eval(&g, &cells, Lanes::One, None)[m as usize], Val::Num(<Fixed as Arithmetic>::unknown()));
+        assert_eq!(eval(&g, &cells, Lanes::Over, None)[m as usize], Val::Num(Pico8NumInterval::new(n(0), n(30))));
     }
 
     /// `NoWrap` of an operation with one operand not a literal point, every
@@ -1654,7 +1167,7 @@ mod tests {
                 assert_eq!(g.get(nw).op == Op::ConstBool(true), everywhere, "{op:?} {k:#x}: decided iff every value fits");
                 let at = |a: i32, b: i32| {
                     let cells = HashMap::from([(0u32, Val::Num(Pico8NumInterval::new(p(a), p(b))))]);
-                    g.eval(&cells, Eval::Lenient, None).expect("lenient")[nw as usize]
+                    eval(&g, &cells, Lanes::Over, None)[nw as usize]
                 };
                 assert_eq!(at(lo, hi), Val::Bool(Some(true)), "{op:?} {k:#x}: the whole fitting range");
                 if lo > i32::MIN {
@@ -1662,9 +1175,9 @@ mod tests {
                 }
                 if hi < i32::MAX {
                     assert_eq!(at(lo, hi + 1), Val::Bool(None), "{op:?} {k:#x}: one past the high end");
-                    // A point past it: the operation itself is the error.
+                    // A point past it: the lane's check fails.
                     let cells = HashMap::from([(0u32, Val::exact_num(p(hi + 1)))]);
-                    assert!(g.eval(&cells, Eval::Exact, None).unwrap_err().to_string().contains("wrapped"), "{op:?} {k:#x}");
+                    assert_eq!(eval(&g, &cells, Lanes::One, None)[nw as usize], Val::Bool(Some(false)), "{op:?} {k:#x}");
                 }
                 checked_forms += !everywhere as usize;
             }
@@ -1778,14 +1291,14 @@ mod tests {
         let one = g.leaf(Op::Const(1 << 16, 1 << 16));
         let le = g.add(Op::Le, vec![hi, one]);
         let hull = Val::Num(Pico8NumInterval::new(Pico8Num::from_raw(0), Pico8Num::from_raw(3 << 16)));
-        let vals = g.eval(&HashMap::from([(0u32, hull)]), Eval::Lenient, None).expect("eval");
+        let vals = eval(&g, &HashMap::from([(0u32, hull)]), Lanes::Over, None);
         assert_eq!(vals[hi as usize], hull, "Hi of a hull is the hull");
         assert_eq!(vals[le as usize], Val::Bool(None), "a lane [0, 0.5] has Hi <= 1, a lane [2, 3] does not");
         let r = g.add(Op::Restrict(0, 3 << 16), vec![v]);
         let hi_r = g.add(Op::Hi, vec![r]);
         assert_eq!(pieces_of(&g, &mut HashMap::new(), hi_r), Some(vec![(0, 3 << 16)]));
         let le_r = g.add(Op::Le, vec![hi_r, one]);
-        let (out, map, _) = crate::transpile::ival::fold(&g, &[le_r], None).expect("fold");
+        let (out, map) = crate::transpile::eval::fold(&g, &[le_r], None);
         assert_eq!(out.get(map[le_r as usize]).op, Op::Le, "the fold leaves it to the lanes");
     }
 }

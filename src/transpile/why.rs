@@ -7,7 +7,8 @@
 use std::collections::HashSet;
 
 use super::garith::GraphArith;
-use super::graph::{Graph, NodeId, Op, Val};
+use super::eval::Val;
+use super::graph::{Graph, NodeId, Op};
 
 /// A graph, and its nodes' values from one evaluation where there is one.
 pub(crate) struct Explain<'a, A: GraphArith> {

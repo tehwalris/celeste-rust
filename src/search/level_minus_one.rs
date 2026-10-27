@@ -38,7 +38,8 @@ use crate::trace::walk::{LatticeWalk, ShapeKey, Tracer};
 use crate::trace::state::State;
 use crate::trace::widen::field;
 use crate::transpile::garith::{value_box, GraphArith};
-use crate::transpile::graph::{Cut, Eval, Graph, NodeId, Op, Val};
+use crate::transpile::eval::{eval, Lanes, Val};
+use crate::transpile::graph::{Cut, Graph, NodeId, Op};
 use celeste_core::room::Room;
 
 /// A report line, to the report and at once to stderr (a run is minutes).
@@ -747,7 +748,7 @@ fn eval_node<A: GraphArith>(shapes: &[Shape<A>], room: &Room, id: usize, xy: (i1
         cells.insert(i as u32, v);
     }
     // Plain first, precise on violation (both over-approximate: either is sound).
-    let vals = t.plain.graph.eval(&cells, Eval::NarrowTop, Some(room))?;
+    let vals = eval(&t.plain.graph, &cells, Lanes::One, Some(room));
     let (sp, vals) = if in_violation(&t.plain, &vals) {
         let precise = t.precise.get_or_init(|| {
             let t0 = std::time::Instant::now();
@@ -756,7 +757,7 @@ fn eval_node<A: GraphArith>(shapes: &[Shape<A>], room: &Room, id: usize, xy: (i1
             p
         });
         acc.precise += 1;
-        (precise, precise.graph.eval(&cells, Eval::NarrowTop, Some(room))?)
+        (precise, eval(&precise.graph, &cells, Lanes::One, Some(room)))
     } else {
         (&t.plain, vals)
     };
@@ -2262,10 +2263,10 @@ mod tests {
         };
         let cells: HashMap<u32, Val<P8>> = [(0, num(-0x10000, 0x10000))].into_iter().collect();
         let (g, full) = build(None);
-        assert_eq!(g.eval(&cells, Eval::NarrowTop, None).unwrap()[full as usize], Val::Bool(None), "joined, the width is undecided");
+        assert_eq!(eval(&g, &cells, Lanes::One, None)[full as usize], Val::Bool(None), "joined, the width is undecided");
         for w in [Lift::Ends, Lift::All] {
             let (g, full) = build(Some(w));
-            assert_eq!(g.eval(&cells, Eval::NarrowTop, None).unwrap()[full as usize], Val::Bool(Some(true)), "lifted, each arm is a full period");
+            assert_eq!(eval(&g, &cells, Lanes::One, None)[full as usize], Val::Bool(Some(true)), "lifted, each arm is a full period");
         }
     }
 
@@ -2296,9 +2297,9 @@ mod tests {
         };
         let cells: HashMap<u32, Val<P8>> = [(0, num(-0x10000, 0x10000))].into_iter().collect();
         let (g, more) = build(Lift::Ends);
-        assert_eq!(g.eval(&cells, Eval::NarrowTop, None).unwrap()[more as usize], Val::Bool(None));
+        assert_eq!(eval(&g, &cells, Lanes::One, None)[more as usize], Val::Bool(None));
         let (g, more) = build(Lift::All);
-        assert_eq!(g.eval(&cells, Eval::NarrowTop, None).unwrap()[more as usize], Val::Bool(Some(false)), "per lane, no third tile");
+        assert_eq!(eval(&g, &cells, Lanes::One, None)[more as usize], Val::Bool(Some(false)), "per lane, no third tile");
     }
 }
 

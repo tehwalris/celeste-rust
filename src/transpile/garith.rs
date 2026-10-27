@@ -30,6 +30,10 @@ pub trait GraphArith: Arithmetic {
     /// Is the cart's `==` on numbers bit identity (16.16: yes; a double's
     /// `-0 == 0`)? Where not, a pin checks `Op::Same`.
     const EQ_IS_IDENTITY: bool;
+    /// Does the console's result of an operation that leaves the range stay
+    /// one of the arithmetic's numbers (16.16 wraps or saturates; a double
+    /// may become non-finite)?
+    const CLOSED: bool;
     /// A static range's piece end (`End`).
     type End: End;
 
@@ -63,9 +67,10 @@ pub trait GraphArith: Arithmetic {
     }
     /// `NoWrap(x)` decided at a fold, where it can be (`None`: it stays).
     fn fold_no_wrap(g: &Graph<Self>, x: NodeId) -> Option<bool>;
-    /// `abs` of `x` (`defined`: a lane where it fails is in error, so the
-    /// value need not cover it); `None` where it fails everywhere.
-    fn ev_abs(x: Self::Ival, defined: bool) -> Option<Self::Ival>;
+    /// `abs` of `x` as the console computes it (16.16's `abs(-32768)`
+    /// saturates to the greatest number, `abs(-32767.99998)`'s); `None` of
+    /// that one point alone, the error a literal fold must not hide.
+    fn console_abs(x: Self::Ival) -> Option<Self::Ival>;
     /// The whole numbers a coordinate interval covers, clipped to `-1 ..=
     /// size` (`mget`'s rectangle).
     fn tile_span(iv: Self::Ival, size: i32) -> (i32, i32);
@@ -464,6 +469,7 @@ impl GraphArith for Fixed {
     const MINMAX_COMMUTE: bool = true;
     const EXACT_ADDITION: bool = true;
     const EQ_IS_IDENTITY: bool = true;
+    const CLOSED: bool = true;
     type End = i64;
 
     fn end(l: i32) -> i64 {
@@ -530,11 +536,9 @@ impl GraphArith for Fixed {
         }
     }
 
-    // `defined`: a lane holding MIN is in error (`abs`'s own), so the value
-    // is the hull over the others, in [0, MAX].
-    fn ev_abs(mut x: Pico8NumInterval, defined: bool) -> Option<Pico8NumInterval> {
+    fn console_abs(mut x: Pico8NumInterval) -> Option<Pico8NumInterval> {
         let min = Pico8Num::from_raw(i32::MIN);
-        if defined && x.low == min && x.high > min {
+        if x.low == min && x.high > min {
             x.low = Pico8Num::from_raw(i32::MIN + 1);
         }
         x.checked_abs()
@@ -630,6 +634,7 @@ impl GraphArith for Float {
     const MINMAX_COMMUTE: bool = false;
     const EXACT_ADDITION: bool = false;
     const EQ_IS_IDENTITY: bool = false;
+    const CLOSED: bool = false;
     type End = f64;
 
     fn end(l: u64) -> f64 {
@@ -675,7 +680,7 @@ impl GraphArith for Float {
         }
     }
 
-    fn ev_abs(x: LuaF64Interval, _defined: bool) -> Option<LuaF64Interval> {
+    fn console_abs(x: LuaF64Interval) -> Option<LuaF64Interval> {
         Some(x.abs())
     }
 
