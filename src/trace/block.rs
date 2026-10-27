@@ -17,9 +17,10 @@
 //! `FIELD_NAMES` fields (`from_block` restores the dropped builtins from its
 //! base state); integer keys past an array part as a dense array with
 //! explicit nils (a frame's outcomes hold them so, `dense_ints`); a closure's captures, tables only. The buttons are
-//! written `UBool`, as the kernels write them; `from_block` reads a `UBool`
-//! button as a placeholder `false` (overwritten before it is read) and
-//! returns any other unknown boolean for the driver to fork.
+//! written `UBool`, as the kernels write them; `from_block` reads every
+//! `UBool` as a placeholder `false`: a button is reset before it is read,
+//! and any other is a slot the widening table widens, which the level's
+//! input side reads (`widen::read_inputs`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -344,26 +345,16 @@ pub fn fn_info_of<D: Domain>(base: &State<D>) -> Result<FnInfo> {
 }
 
 /// Lane `lane` of a block as a state in domain `d` (plus the builtins of
-/// `base`'s globals, which a block drops), and its unknown-boolean fields
-/// except the buttons, for the driver to fork.
-pub fn from_block<N: Arithmetic, D: Domain<A = N>, E: Domain>(
-    d: &mut D,
-    rt2: &Rt2<N>,
-    lane: usize,
-    fn_info: &FnInfo,
-    base: &State<E>,
-) -> Result<(State<D>, Vec<(TableId, String)>)> {
+/// `base`'s globals, which a block drops).
+pub fn from_block<N: Arithmetic, D: Domain<A = N>, E: Domain>(d: &mut D, rt2: &Rt2<N>, lane: usize, fn_info: &FnInfo, base: &State<E>) -> Result<State<D>> {
     ensure!(lane < rt2.width, "lane {lane} of a {}-lane block", rt2.width);
-    let mut cx = FromBlock { d, rt2, lane, fn_info, heap: Heap::default(), memo: HashMap::new(), unknown: Vec::new() };
+    let mut cx = FromBlock { d, rt2, lane, fn_info, heap: Heap::default(), memo: HashMap::new() };
     let globals = cx.heap.new_table();
     let scope = cx.heap.new_scope(None);
     let mut named: Vec<(&str, u32)> =
         gen::GLOBAL_NAMES.iter().zip(rt2.shape.globals()).filter(|(_, &c)| c != NONE).map(|(n, &c)| (*n, c)).collect();
     named.sort();
     for (name, c) in named {
-        if cx.is_unknown(c) {
-            cx.unknown.push((globals, name.to_string()));
-        }
         let v = cx.slot(c)?;
         cx.heap.tables.get_mut(&globals).expect("just made").hash.insert(name.to_string(), v);
     }
@@ -372,11 +363,6 @@ pub fn from_block<N: Arithmetic, D: Domain<A = N>, E: Domain>(
             cx.heap.tables.get_mut(&globals).expect("just made").hash.entry(k.clone()).or_insert(Value::Builtin(n));
         }
     }
-    let buttons = match cx.heap.tables[&globals].hash.get(super::game::BUTTONS) {
-        Some(Value::Table(t)) => Some(*t),
-        _ => None,
-    };
-    let unknown = cx.unknown.into_iter().filter(|(t, _)| Some(*t) != buttons).collect();
     let (guard, ended) = (cx.d.boolean(true), cx.d.boolean(false));
     let st = State {
         heap: cx.heap,
@@ -389,7 +375,7 @@ pub fn from_block<N: Arithmetic, D: Domain<A = N>, E: Domain>(
         frag: Vec::new(),
         arc: None,
     };
-    Ok((st, unknown))
+    Ok(st)
 }
 
 struct FromBlock<'a, N: Arithmetic, D: Domain> {
@@ -399,14 +385,9 @@ struct FromBlock<'a, N: Arithmetic, D: Domain> {
     fn_info: &'a FnInfo,
     heap: Heap<D>,
     memo: HashMap<u32, Value<D>>,
-    unknown: Vec<(TableId, String)>,
 }
 
 impl<N: Arithmetic, D: Domain<A = N>> FromBlock<'_, N, D> {
-    fn is_unknown(&self, cell: u32) -> bool {
-        matches!(self.rt2.cells()[cell as usize], Cell::Val) && self.rt2.cols[cell as usize].at(self.lane) == AV::UBool
-    }
-
     fn slot(&mut self, cell: u32) -> Result<Value<D>> {
         match self.rt2.cells()[cell as usize] {
             Cell::Val => self.value(self.rt2.cols[cell as usize].at(self.lane)),
@@ -443,9 +424,6 @@ impl<N: Arithmetic, D: Domain<A = N>> FromBlock<'_, N, D> {
                 let mut named: Vec<(&str, u32)> = fields.iter().map(|&(f, c)| (gen::FIELD_NAMES[f as usize], c)).collect();
                 named.sort();
                 for (name, c) in named {
-                    if self.is_unknown(c) {
-                        self.unknown.push((t, name.to_string()));
-                    }
                     let v = self.slot(c)?;
                     self.heap.tables.get_mut(&t).expect("just made").hash.insert(name.to_string(), v);
                 }

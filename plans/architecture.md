@@ -590,9 +590,12 @@ forward's row observer (`frame::RowCheck`, `check keys`).
   the clean form, a nil-or-number column, would re-pin everything.
 - **`check reference` at `n` under the split frame** is refused: the
   block side's near floors are not the kernels' mid-frame ones
-  (`Hook::NearFloor`). At `f` it agrees since C5 (the reference reads and
-  stores its rows widened at the level), but costly past room (6,0)'s
-  spawn (20 GB by step 50).
+  (`Hook::NearFloor`), and the reference cannot read a mid-frame floor's
+  unknown `collideable` (a block's unknown boolean reads as a placeholder:
+  `RefDomain::read_known_else_both` refuses it). At `f` it agrees since C5
+  (the reference reads its rows through the kernels' input side,
+  `widen::read_inputs`, and stores them widened at the level), but costly
+  past room (6,0)'s spawn (20 GB by step 50).
 - **`check arcs` at object levels** forks every straddling comparison on a
   widened phase (balloons, springs): room (7,0) `r0sxn` exceeds its path
   cap. A different probe (concrete members of the row) is needed.

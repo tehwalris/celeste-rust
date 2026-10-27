@@ -229,7 +229,8 @@ fn trace<'a, A: GraphArith>(it: &mut Interp<'a, Symbolic<A>>, chunks: &'a super:
     let mut st = st;
     // The level's widened slots read as the table says, after the input
     // shape, before any read.
-    super::widen::read_inputs(&mut st, &mut it.d)?;
+    let level = it.d.level;
+    super::widen::read_inputs(&mut st, &mut it.d, level)?;
     // THE KERNEL'S ADMISSIBLE INPUTS: every pin holds; a lane outside is an
     // error of the whole frame.
     let admissible = super::error::pins_hold(&mut it.d);

@@ -248,6 +248,36 @@ impl<A: Arithmetic> Domain for RefDomain<A> {
         Ok(A::ival(lo, hi))
     }
 
+    fn read_both_ways(&mut self, _origin: &str) -> Result<bool> {
+        Ok(self.cursor.choose(2) == 1)
+    }
+    fn read_atom(&mut self) -> Result<bool> {
+        Ok(self.cursor.choose(2) == 1)
+    }
+    /// As a block's `UNum` reads (`block::from_block`).
+    fn read_unknown(&mut self, _countdown: bool) -> A::Ival {
+        let (lo, hi) = A::bounds(A::unknown());
+        A::ival(lo, hi)
+    }
+    /// Outside it, the kernels' pin fails the whole frame.
+    fn read_literal(&mut self, v: &A::Ival, lo: A, hi: A) -> Result<A::Ival> {
+        let (a, b) = A::bounds(*v);
+        anyhow::ensure!(A::le(lo, a) && A::le(b, hi), "{} read as the literal [{}, {}], outside it", show::<A>(v), A::show(lo), A::show(hi));
+        Ok(A::ival(lo, hi))
+    }
+    /// Each whole number in `v`, on the cursor.
+    fn read_by_cases(&mut self, v: &A::Ival) -> Result<A::Ival> {
+        let (lo, hi) = A::bounds(*v);
+        let int = |n: A| A::as_i16(n).ok_or_else(|| anyhow::anyhow!("{} read by cases is not an integer", A::show(n)));
+        let (lo, hi) = (int(lo)?, int(hi)?);
+        let k = lo + self.cursor.choose((hi - lo + 1) as u32) as i16;
+        Ok(A::point(A::from_i16(k)))
+    }
+    /// A block's unknown boolean reads here as a placeholder `false`.
+    fn read_known_else_both(&mut self, _c: &bool, _origin: &str) -> Result<bool> {
+        bail!("mid split frame at a near level a floor's `collideable` may be unknown on a lane, which the reference reads as a placeholder: not modelled (`Hook::NearFloor`)")
+    }
+
     fn as_const(&self, v: &A::Ival) -> Option<A> {
         A::as_point(*v)
     }

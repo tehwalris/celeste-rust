@@ -44,8 +44,8 @@ pub enum Command {
     ///
     /// Every recorded edge carries a transfer; then `--samples` records per
     /// frame, the source row stepped by the REFERENCE engine at the tree's
-    /// level (all 64 inputs, the row's unknowns forked as the kernels fork
-    /// them: `ReferenceEngine::step_at`): at remainders INSIDE the guard some
+    /// level (all 64 inputs, the row read as the kernels read it:
+    /// `ReferenceEngine::step_at`): at remainders INSIDE the guard some
     /// input must reach the target with the predicted remainder and every
     /// one that reaches it must land where some record of that (pred,
     /// target) taking the point predicts, and at points no record of the

@@ -36,8 +36,8 @@ pub struct ReferenceEngine<A: Arithmetic> {
     base: State<RefDomain<A>>,
     fn_info: FnInfo,
     path_cap: usize,
-    /// The level `run_lane` (the engine as a `FrameStep`) forks a row's
-    /// unknowns at: `Level::EXACT` unless `at_level`.
+    /// The level `run_lane` (the engine as a `FrameStep`) reads a row at
+    /// (`widen::read_inputs`): `Level::EXACT` unless `at_level`.
     level: Level,
     settings: std::sync::Arc<crate::settings::Settings>,
 }
@@ -84,7 +84,7 @@ impl<A: Arithmetic> ReferenceEngine<A> {
             for st in &out {
                 let mut st = st.clone();
                 set_buttons(&mut st, byte)?;
-                next.extend(run_frame_all(&mut self.it, self.body_concrete, &st, &[], Level::EXACT, self.path_cap)?);
+                next.extend(run_frame_all(&mut self.it, self.body_concrete, &st, &|_, _| Ok(()), self.path_cap)?);
             }
             out = next;
         }
@@ -99,8 +99,8 @@ impl<A: Arithmetic> ReferenceEngine<A> {
     }
 
     /// One CONCRETE frame of row 0 of `row` under input `byte`: every leaf,
-    /// keyed. It forks only where no input decides (`rnd`); unknown fields of
-    /// the row are read as their placeholder, not forked.
+    /// keyed. It forks only where no input decides (`rnd`); the row is read
+    /// as it is (an unknown boolean as its placeholder), at no level.
     pub fn step(&mut self, row: &Rt2<A>, byte: u8) -> Result<Vec<Rt2<A>>> {
         Ok(self.step_reads(row, byte)?.0)
     }
@@ -111,17 +111,17 @@ impl<A: Arithmetic> ReferenceEngine<A> {
     /// (`block::to_rt2`) - so an input that agrees with `byte` on the mask has
     /// the same successors.
     fn step_reads(&mut self, row: &Rt2<A>, byte: u8) -> Result<(Vec<Rt2<A>>, u8)> {
-        let (mut st, _) = from_block(row, 0, &self.fn_info, &self.base)?;
-        let (leaves, mask) = self.under_buttons(&mut st, byte, &[], Level::EXACT)?;
+        let mut st = from_block(row, 0, &self.fn_info, &self.base)?;
+        let (leaves, mask) = self.under_buttons(&mut st, byte, &|_, _| Ok(()))?;
         Ok((self.blocks(&leaves)?, mask))
     }
 
-    /// One frame of `st` under input `byte`, its `unknown` fields forked
-    /// at `level`: every leaf, and the buttons the frame read.
-    fn under_buttons(&mut self, st: &mut State<RefDomain<A>>, byte: u8, unknown: &[(crate::trace::heap::TableId, String)], level: Level) -> Result<(Vec<State<RefDomain<A>>>, u8)> {
+    /// One frame of `st` under input `byte`, each path's state first `read`
+    /// (`run_frame_all`): every leaf, and the buttons the frame read.
+    fn under_buttons(&mut self, st: &mut State<RefDomain<A>>, byte: u8, read: &Reading<'_, A>) -> Result<(Vec<State<RefDomain<A>>>, u8)> {
         let buttons = set_buttons(st, byte)?;
         self.it.button_reads = Some((buttons, 0));
-        let leaves = run_frame_all(&mut self.it, self.body_concrete, st, unknown, level, self.path_cap);
+        let leaves = run_frame_all(&mut self.it, self.body_concrete, st, read, self.path_cap);
         let (_, mask) = self.it.button_reads.take().expect("set above");
         Ok((leaves.map_err(|e| e.context(ran_from(st, Some(byte))))?, mask))
     }
@@ -154,8 +154,8 @@ impl<A: Arithmetic> ReferenceEngine<A> {
         Ok((out, mask))
     }
 
-    /// `step` at an abstract `level` (`rewrite arc-check`): the row's
-    /// unknowns are forked as the level's kernels fork them (each unknown
+    /// `step` at an abstract `level` (`rewrite arc-check`): the row read as
+    /// the level's kernels read it (`widen::read_inputs`: each widened
     /// boolean both ways, a near floor's `state` per value, a comparison
     /// that reads an unknown number or a straddling range both ways), so the
     /// leaves PROJECTED onto `level` are every successor the level's kernels
@@ -167,30 +167,26 @@ impl<A: Arithmetic> ReferenceEngine<A> {
     /// (`pin_fly_fruit_motion`), at a near level a floor isolated from the
     /// player is in state 0 (`pin_isolated_floors`).
     pub fn step_at(&mut self, row: &Rt2<A>, byte: u8, level: Level) -> Result<(Vec<Rt2<A>>, u8)> {
-        self.step_at_pinned(row, byte, level, true)
+        self.step_at_pinned(row, byte, level, true, &|_| true)
     }
 
     /// `step_at`, the pins (`pin_fly_fruit_motion`, `pin_isolated_floors`)
-    /// optional: the test compares the two.
-    fn step_at_pinned(&mut self, row: &Rt2<A>, byte: u8, level: Level, pin: bool) -> Result<(Vec<Rt2<A>>, u8)> {
-        let (mut st, mut unknown) = from_block(row, 0, &self.fn_info, &self.base)?;
-        let mut pinned_floors = false;
-        if level.floors_near {
-            // `concretize_near_floors` writes every floor's `collideable` from
-            // its `state`: forking a stored unknown one first only repeats paths.
-            let floors: Vec<_> = objects_of_type(&st, "fall_floor").iter().filter_map(|o| match iface::get(&st, o) {
-                Some(Value::Table(t)) => Some(t),
-                _ => None,
-            }).collect();
-            unknown.retain(|(t, k)| !(k == "collideable" && floors.contains(t)));
-            if pin {
-                pinned_floors = pin_isolated_floors(&mut st)?;
+    /// optional, and only the table's entries `keep` picks read as the
+    /// level's (the others as the row holds them): the test compares pinned
+    /// and unpinned with the buttons' memory as a route has it.
+    fn step_at_pinned(&mut self, row: &Rt2<A>, byte: u8, level: Level, pin: bool, keep: &dyn Fn(&celeste_engine::widening::Entry) -> bool) -> Result<(Vec<Rt2<A>>, u8)> {
+        let mut st = from_block(row, 0, &self.fn_info, &self.base)?;
+        let pinned_floors = pin && level.floors_near && pin_isolated_floors(&mut st)?;
+        let fruit = pin && level.fruit;
+        // The fruit's pin after the reading, which reads the literal ranges.
+        let read = |st: &mut State<RefDomain<A>>, d: &mut RefDomain<A>| -> Result<()> {
+            crate::trace::widen::read_entries(st, d, level, keep)?;
+            if fruit {
+                pin_fly_fruit_motion(st)?;
             }
-        }
-        if pin && level.fruit {
-            pin_fly_fruit_motion(&mut st)?;
-        }
-        let (leaves, mask) = self.under_buttons(&mut st, byte, &unknown, level)?;
+            Ok(())
+        };
+        let (leaves, mask) = self.under_buttons(&mut st, byte, &read)?;
         if pinned_floors {
             // What the floors' pin assumes: no player went far this frame.
             let before = players(&st)?;
@@ -219,15 +215,17 @@ where
     A: Rem,
 {
     /// One frame of lane `lane` at the engine's level: every fork leaf (the
-    /// buttons and each unknown boolean of the row forked per path), each with
+    /// buttons, and the row read as the level's kernels read it per path:
+    /// `widen::read_inputs`), each with
     /// its remainder TRANSFER - the interpreter's arc capture, as the tracer
     /// captures it for the kernels, decoded by the arithmetic's decoder
     /// (`Rem::transfer`; a refusal is fatal, as theirs).
     pub fn run_lane(&mut self, block: &Rt2<A>, lane: usize) -> Result<Vec<(Rt2<A>, Pair<A>)>> {
-        let (mut st, unknown) = from_block(block, lane, &self.fn_info, &self.base)?;
+        let mut st = from_block(block, lane, &self.fn_info, &self.base)?;
         st.arc = Some(Box::new([ArcAxis::none(&mut self.it.d), ArcAxis::none(&mut self.it.d)]));
         self.it.arc_capture = true;
-        let leaves = run_frame_all(&mut self.it, self.body, &st, &unknown, self.level, self.path_cap);
+        let level = self.level;
+        let leaves = run_frame_all(&mut self.it, self.body, &st, &|st, d| crate::trace::widen::read_inputs(st, d, level), self.path_cap);
         self.it.arc_capture = false;
         let leaves = leaves.map_err(|e| e.context(ran_from(&st, None)))?;
         leaves
@@ -384,7 +382,7 @@ fn position<A: Arithmetic>(st: &State<RefDomain<A>>, obj: &iface::Path) -> Resul
 /// At a near level, every widened fall floor (`state` a range) ISOLATED -
 /// every player and spawn `PLAYER_FAR` away, no other object but floors and
 /// the fly fruit within `OTHERS_FAR` - pinned to `state` 0 (`collideable`
-/// true, as `concretize_near_floors` derives it). Exact for a successor
+/// true, as the near floors' input side derives it). Exact for a successor
 /// projected onto the level: such a floor's update writes only its own fields
 /// (`check(player)` misses, so it never breaks itself or a spring), which
 /// the projection widens again (no player overlaps it at the end); the
@@ -521,40 +519,32 @@ impl<N: Rem> crate::frame::FrameStep<N> for RefFrameStep<N> {
     }
 }
 
+/// How a path reads its input state first: nothing (a concrete step), or
+/// a level's input side (`widen::read_inputs`) on the path's cursor.
+pub type Reading<'r, A> = dyn Fn(&mut State<RefDomain<A>>, &mut RefDomain<A>) -> Result<()> + 'r;
+
 /// One frame of `body` from `input` along every fork path, one output state
 /// per leaf (a game frame's `body` resets the buttons: they are forks too).
 /// `it` must have the cart's functions registered; its `d.cursor` is the DFS
-/// state. A path that REFUSES (a fork premise a lane cannot satisfy) is an
-/// error; a path that RAISES has no successor. `unknown`: the input's
-/// unknown-boolean fields (`block::from_block`), each a cursor choice made
-/// before the frame runs, as the kernels fork them. More than `cap` paths is
-/// `TooManyPaths` (every path's output is held: the cap bounds the memory).
+/// state. Each path's copy of `input` is `read` first, its choices the
+/// path's first. A path that REFUSES (a fork premise a lane cannot satisfy)
+/// is an error; a path that RAISES has no successor. More than `cap` paths
+/// is `TooManyPaths` (every path's output is held: the cap bounds the memory).
 pub fn run_frame_all<'a, A: Arithmetic>(
     it: &mut Interp<'a, RefDomain<A>>,
     body: &'a ast::Ast,
     input: &State<RefDomain<A>>,
-    unknown: &[(crate::trace::heap::TableId, String)],
-    level: crate::abstraction::Level,
+    read: &Reading<'_, A>,
     cap: usize,
 ) -> Result<Vec<State<RefDomain<A>>>> {
     it.d.cursor = Cursor::new();
     let mut outputs = Vec::new();
     let mut paths = 0usize;
-    // An unknown fly fruit needs nothing here: its `fly` is an unknown boolean
-    // (forked below), `step`/`y` the unknown number and `spd.y`/`rem.y`
-    // intervals, whose comparisons the domain forks as the kernels' undecided
-    // atoms do.
     loop {
         it.d.cursor.reset();
         it.prints.clear();
         let mut st = input.clone();
-        for (t, k) in unknown {
-            let b = it.d.cursor.choose(2) == 1;
-            st.heap.tables.get_mut(t).expect("an unknown field's table").hash.insert(k.clone(), crate::trace::heap::Value::Bool(b));
-        }
-        if level.floors_near {
-            concretize_near_floors(&mut st, &mut it.d)?;
-        }
+        read(&mut st, &mut it.d)?;
         // A path that RAISES (`Interp::poison`) ends in no state, and only then.
         it.raised.clear();
         let ended = it.exec_block(body.nodes(), st).map_err(|e| e.context(format!("fork path {}", paths + 1)))?;
@@ -592,36 +582,9 @@ impl std::fmt::Display for TooManyPaths {
 
 impl std::error::Error for TooManyPaths {}
 
-/// A near level's floors, concretized per path as the kernels read them
-/// (`widen::read_near_floors`): a widened `state` is each whole number in it,
-/// by the cursor, and `collideable` is `state ~= 2` (the cart keeps the two
-/// in step, so a stored unknown `collideable` is no separate choice).
-fn concretize_near_floors<A: Arithmetic>(st: &mut State<RefDomain<A>>, d: &mut RefDomain<A>) -> Result<()> {
-    use crate::trace::heap::Value;
-    use crate::trace::iface;
-    use crate::trace::widen::{field, objects_of_type};
-    for obj in objects_of_type(st, "fall_floor") {
-        let (ps, pc) = (field(&obj, &["state"]), field(&obj, &["collideable"]));
-        let Some(Value::Num(v)) = iface::get(st, &ps) else { bail!("{}: not a number", iface::show(&ps)) };
-        let int = |n| A::as_i16(n).ok_or_else(|| anyhow::anyhow!("{}: {} is not an integer", iface::show(&ps), A::show(n)));
-        let (lo, hi) = A::bounds(v);
-        let (lo, hi) = (int(lo)?, int(hi)?);
-        let k = lo + d.cursor.choose((hi - lo + 1) as u32) as i16;
-        iface::set(st, &ps, Value::Num(A::point(A::from_i16(k))))?;
-        iface::set(st, &pc, Value::Bool(k != 2))?;
-    }
-    Ok(())
-}
-
 /// Lane `lane` of a block as a reference state of the block's arithmetic
-/// (plus the base state's builtins), and its unknown-boolean fields except
-/// the buttons, for the driver to fork (`block::from_block`).
-pub fn from_block<N: Arithmetic>(
-    rt2: &Rt2<N>,
-    lane: usize,
-    fn_info: &FnInfo,
-    base: &State<RefDomain<N>>,
-) -> Result<(State<RefDomain<N>>, Vec<(TableId, String)>)> {
+/// (plus the base state's builtins: `block::from_block`).
+pub fn from_block<N: Arithmetic>(rt2: &Rt2<N>, lane: usize, fn_info: &FnInfo, base: &State<RefDomain<N>>) -> Result<State<RefDomain<N>>> {
     block::from_block(&mut RefDomain::<N>::new(), rt2, lane, fn_info, base)
 }
 
@@ -668,10 +631,10 @@ fn check_agreement<A: crate::transpile::garith::GraphArith>(rt2: &Rt2<A>, fn_inf
     use celeste_engine::exact::exact_rows;
     use celeste_engine::runtime2::Col;
     for lane in 0..rt2.width {
-        let (reference, _) = from_block(rt2, lane, fn_info, base)?;
+        let reference = from_block(rt2, lane, fn_info, base)?;
         let mut a: Rt2<A> = to_block(&reference, rt2.room)?;
         let mut d = Symbolic::<A>::default();
-        let (traced, _) = block::from_block(&mut d, rt2, lane, fn_info, base)?;
+        let traced = block::from_block(&mut d, rt2, lane, fn_info, base)?;
         let g = &d.graph;
         let num = |n: &NodeId| match g.get(*n).op {
             Op::Const(lo, hi) if lo == hi => Ok(AV::Num(A::from_lit(lo))),
@@ -826,13 +789,15 @@ mod tests {
                         }
                     }
                 }
-                if !objects_of_type(&from_block(&abs, 0, &eng.fn_info, &eng.base).expect("state").0, what).is_empty() {
+                if !objects_of_type(&from_block(&abs, 0, &eng.fn_info, &eng.base).expect("state"), what).is_empty() {
                     with += 1;
                 }
                 sampled.push((f, abs));
             }
             row = eng.step_one(&row, byte).expect("frame");
         }
+        // The buttons' memory read as the route holds it, the rest as the level's.
+        let held_as_route = |e: &celeste_engine::widening::Entry| e.name != "held buttons";
         let (leaves_pinned, leaves_full) = crate::par::Pool::new(16)
             .map_with(
                 sampled.len(),
@@ -845,8 +810,8 @@ mod tests {
                         if ran.iter().any(|(r, m)| (r ^ b) & m == 0) {
                             continue;
                         }
-                        let (pinned, read) = eng.step_at_pinned(abs, b, level, true)?;
-                        let (full, read_full) = eng.step_at_pinned(abs, b, level, false)?;
+                        let (pinned, read) = eng.step_at_pinned(abs, b, level, true, &held_as_route)?;
+                        let (full, read_full) = eng.step_at_pinned(abs, b, level, false, &held_as_route)?;
                         assert_eq!(projected(&pinned), projected(&full), "f{f} input {b}: the pins changed the projected successors");
                         ran.push((b, read | read_full));
                         pinned_n += pinned.len();

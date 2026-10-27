@@ -257,17 +257,23 @@ fn contain<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, (lo, hi): (A, A)) -> O
     Some(bounds_inside(d, v, lo, hi))
 }
 
-/// The INPUT side: every entry of the tracer's level read as its slots'
-/// `Input` says, in table order, before the frame reads anything.
-pub fn read_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>) -> Result<()> {
+/// THE INPUT SIDE: every entry of `level` read as its slots' `Input` says,
+/// in table order, before the frame reads anything: by the kernels, and so
+/// by the reference engine at a level (`Domain::read_both_ways` ..).
+pub fn read_inputs<D: Domain>(st: &mut State<D>, d: &mut D, level: Level) -> Result<()> {
+    read_entries(st, d, level, |_| true)
+}
+
+/// `read_inputs` of the entries `keep` picks.
+pub(crate) fn read_entries<D: Domain>(st: &mut State<D>, d: &mut D, level: Level, keep: impl Fn(&Entry) -> bool) -> Result<()> {
     let mid = mid_frame(st);
     // A near level reads an absent countdown as the unknown number too: the
     // absent field is 0 (`Stored::AbsentAsZero`), which the unknown holds.
     // Mid split frame the countdowns stay as the first step left them.
-    if d.level.floors_near && !mid {
+    if level.floors_near && !mid {
         materialize_absent_fields(st, d)?;
     }
-    for e in d.level.entries() {
+    for e in level.entries().filter(|e| keep(e)) {
         match e.hook {
             Some(Hook::NearFloor) => read_near_floors(st, d, e, mid)?,
             None => {
@@ -282,31 +288,20 @@ pub fn read_inputs<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<
     Ok(())
 }
 
-/// An input `v` READ AS the literal `[lo, hi]` (`Input::Literal`, the fly
-/// fruit's `rem.y`): pinned to it (`Op::Pin`, the input disconnected, its
-/// check `v` inside the literal), unless the graph proves it inside.
-fn pin_literal<A: GraphArith>(d: &mut Symbolic<A>, v: NodeId, lo: i32, hi: i32) {
-    let (l, h) = range::<A>(lo, hi);
-    if !within(&d.graph, v, l, h) {
-        d.pin(v, crate::transpile::graph::Pinned::Num(A::lit(l), A::lit(h)));
-    }
-}
-
-fn read_slot<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, e: &Entry, s: &Slot, p: &Path) -> Result<()> {
+fn read_slot<D: Domain>(st: &mut State<D>, d: &mut D, e: &Entry, s: &Slot, p: &Path) -> Result<()> {
     let what = |kind: &str| anyhow::anyhow!("{}: not a {kind} (widening {:?})", iface::show(p), e.name);
     let new = match (s.input, iface::get(st, p)) {
         (Input::Stored, _) => return Ok(()),
         (Input::Hook, _) => bail!("{}: widening {:?} reads it in a hook it does not have", iface::show(p), e.name),
         (_, None) if s.optional => return Ok(()),
-        (Input::BothWays, Some(Value::Bool(_))) => Value::Bool(d.both_values(s.field.last().expect("a field"))),
-        (Input::Atom, Some(Value::Bool(_))) => Value::Bool(d.unknown_bool_atom()),
+        (Input::BothWays, Some(Value::Bool(_))) => Value::Bool(d.read_both_ways(s.field.last().expect("a field"))?),
+        (Input::Atom, Some(Value::Bool(_))) => Value::Bool(d.read_atom()?),
         (Input::BothWays | Input::Atom, _) => return Err(what("boolean")),
-        (Input::Unknown, Some(Value::Num(_))) => Value::Num(d.unknown_num(matches!(s.stored, Stored::UnknownNum { countdown: true }))),
+        (Input::Unknown, Some(Value::Num(_))) => Value::Num(d.read_unknown(matches!(s.stored, Stored::UnknownNum { countdown: true }))),
         (Input::Literal, Some(Value::Num(v))) => {
             let Stored::Range { lo, hi, .. } = s.stored else { bail!("{}: a literal input reads a range", iface::show(p)) };
-            pin_literal(d, v, lo, hi);
-            let r = ival(d, lo, hi);
-            return iface::set(st, p, Value::Num(r));
+            let (lo, hi) = range::<D::A>(lo, hi);
+            Value::Num(d.read_literal(&v, lo, hi).map_err(|err| err.context(format!("{} (widening {:?})", iface::show(p), e.name)))?)
         }
         (Input::Unknown | Input::Literal, _) => return Err(what("number")),
     };
@@ -331,30 +326,29 @@ pub fn near_floor_states<A: GraphArith>(st: &State<Symbolic<A>>, level: Level) -
     level.entries().filter(|e| e.hook == Some(Hook::NearFloor)).flat_map(|e| entry_paths(st, e)).map(|paths| paths[0].clone()).collect()
 }
 
-/// `Hook::NearFloor`, INPUT: a floor's `state` as stored (split by
-/// `split::split_undecided_selects`), `collideable` DERIVED as `state ~= 2`
+/// `Hook::NearFloor`, INPUT: a floor's `state` as stored, read by cases
+/// (`Domain::read_by_cases`), `collideable` DERIVED as `state ~= 2`
 /// (the cart keeps them in step; an independent unknown `collideable` would
 /// admit players inside solid floors). Mid split frame a lane may hold an
-/// unknown `collideable`, but a boolean slot binds as a decided cell that
-/// would read it as false: the cell where the lane knows it, else a fork of
-/// both values.
-fn read_near_floors<A: GraphArith>(st: &mut State<Symbolic<A>>, d: &mut Symbolic<A>, e: &Entry, mid: bool) -> Result<()> {
+/// unknown `collideable`: the cell where the lane knows it, else a fork of
+/// both values (`Domain::read_known_else_both`).
+fn read_near_floors<D: Domain>(st: &mut State<D>, d: &mut D, e: &Entry, mid: bool) -> Result<()> {
     use super::domain::Cmp;
     let two = if mid { None } else { Some(d.int(2)) };
     for paths in entry_paths(st, e) {
         let [ps, pc] = &paths[..] else { bail!("the near floors' entry has two slots") };
-        match two {
+        match &two {
             None => {
                 let Some(Value::Bool(c)) = iface::get(st, pc) else { bail!("{}: not a boolean", iface::show(pc)) };
-                let known = d.graph.fold(Op::Known, vec![c]);
-                let both = d.both_values(&format!("{} unknown", iface::show(pc)));
-                let v = d.sel_bool(&known, &c, &both);
+                let v = d.read_known_else_both(&c, &format!("{} unknown", iface::show(pc)))?;
                 iface::set(st, pc, Value::Bool(v))?;
             }
             Some(two) => {
                 let Some(Value::Num(state)) = iface::get(st, ps) else { bail!("{}: not a number", iface::show(ps)) };
-                let hidden = d.compare(Cmp::Eq, &state, &two)?;
+                let state = d.read_by_cases(&state)?;
+                let hidden = d.compare(Cmp::Eq, &state, two)?;
                 let solid = d.not(&hidden);
+                iface::set(st, ps, Value::Num(state))?;
                 iface::set(st, pc, Value::Bool(solid))?;
             }
         }

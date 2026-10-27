@@ -5,7 +5,7 @@
 //! remainder the action predicts, and only at remainders some record of the
 //! pair predicts; one point past a guard's end (doubles: one ulp), OUTSIDE
 //! every guard of the pair, not at all. The probe steps the row at the level
-//! (`ReferenceEngine::step_at`: unknowns forked as the kernels do).
+//! (`ReferenceEngine::step_at`: the row read as the kernels read it).
 
 use anyhow::{anyhow, Result};
 use celeste_engine::runtime2::{Col, Rt2, AV};
