@@ -182,6 +182,15 @@ faultcheck() {
     grep -q 'check arcs: disagreement' "$C/fault-$1.err" || { tail -5 "$C/fault-$1.err" >&2; return 1; }
 }
 
+# replaycheck NAME: the fixture's tree replayed from its recorded graph
+# (`check replay`): the start's hull pushed along the recorded edges under
+# the forward's prunes (level -1 at every push) reaches exactly its states
+# and frontiers (states, layers, hulls) at every frame. A level -1 fixture:
+# the room (1,0) replays (t2's hull10) have no level -1 to apply.
+replaycheck() {
+    ./safe-run.sh --memory "$MEM" -- "$B" check replay --tree "$F/$1" --threads "$TH"
+}
+
 # backward NAME: one backward frame of a search fixture (W f45 of h56).
 backward() {
     ./safe-run.sh --memory "$MEM" -- "$B" bench backward --tree "$F/$1/level00" --steps 56 --step 45 --threads "$TH" --reps 3 > "$C/backward-$1.txt" || return 1
@@ -205,6 +214,7 @@ t1() {
     for s in r10 r62h r42n f10 f42n; do grep -h '^\[check widen\] step' "$C/widen-$s.out" | sed 's/^/    /'; done
     for s in refcheck-r10 refcheck-r42x refcheck-f10 refcheck-f42x; do grep -h '^\[check ref\] [0-9]' "$C/$s.out" | sed "s/^/    /"; done
     for s in arccheck-r10 arccheck-r42x arccheck-f10 arccheck-f42x; do grep -h '^agreement' "$C/$s.out" | sed "s/^/    /" | cut -c1-200; done
+    for s in replay-r42n replay-f42n; do grep -h '^\[check replay\]' "$C/$s.out" | sed "s/^/    /" | cut -c1-220; done
 }
 t1_r10() {
     step frame-r10 frame r10 55
@@ -223,6 +233,7 @@ t1_r42() {
     step frame-r42n frame r42n 60
     step keycheck-r42n keycheck r42n 60
     step widen-r42n widencheck r42n 60
+    step replay-r42n replaycheck r42n
     step refcheck-r42x refcheck r42x 55
     step arccheck-r42x arccheck r42x
 }
@@ -245,6 +256,7 @@ t1_f42() {
     step frame-f42n frame f42n 60
     step keycheck-f42n keycheck f42n 60
     step widen-f42n widencheck f42n 60
+    step replay-f42n replaycheck f42n
     step refcheck-f42x refcheck f42x 55
     step arccheck-f42x arccheck f42x
 }
@@ -352,8 +364,9 @@ reference10() {
 }
 # THE HULL FORWARD'S TREE REPLAYS FROM ITS RECORDED GRAPH [ARITH]:
 # reference10's kernels' tree (to f36), its hulls pushed along its recorded
-# edges and transfers from the start, reaches exactly its states at every
-# frame (`check replay`): every edge was recorded.
+# edges and transfers from the start, reaches exactly its states and
+# frontiers at every frame (`check replay`): every edge was recorded. The
+# level -1 replays are t1's (replaycheck).
 hull10() {
     ./safe-run.sh --memory "$MEM" -- "$B" check replay --tree "$C/t2/reference10${1:+-float}-kernels" --steps 36
 }

@@ -33,7 +33,9 @@ byte-identical, or re-pins them on evidence.
   - t2: `reference10[f]`, the reference engine's forward tree equal to the
     kernels', f0-f27 with edges and hulls, fixed and float; `reference60f`,
     the same at the fruit level (the r60s fixture to step 48);
-  - t2: `hull10[f]`, the hull replay over the recorded edges.
+  - the hull replay over the recorded edges under the forward's prunes
+    (`check replay`): t1's `replay-r42n`/`-f42n` (level -1), t2's
+    `hull10[f]` (room (1,0)).
 - **A platform room** (t2): its forward to step 71. Big has its frame.
 - **The instruction budget** (perf).
 
@@ -104,6 +106,7 @@ them from its records (and refuse them as flags).
 | arccheck-, arcfault- (r10, f10; arccheck also r42x, f42x) | `check arcs`: 32 recorded transfers against the reference; with `--fault action` it must fail |
 | widen-r10, -r62h, -r42n, -f10, -f42n | `check widen`: the widening table's two sides agree on every stored row and 64 rows' emissions |
 | backward-r10arc, -f10arc | one arc backward step, W f45 of h56 |
+| replay-r42n, -f42n | `check replay`: the tree replayed from its recorded graph under level -1 reaches exactly its states, and its frontiers by content (states, layers, hulls), at every frame |
 
 ### t2: end to end
 
@@ -118,7 +121,7 @@ The steps run in four lanes:
   reference engine's forward against the kernels', `ckhash --edges --hulls`
   f0-f27), and
   `hull10[f]` (`check replay` over the kernels' tree to f36: its recorded
-  edges reproduce its states at every frame);
+  edges reproduce its states and frontiers at every frame);
 - **platforms**: `forward60-platforms` (room (6,0) `r0sxf` split frame to
   step 71, its ten platforms exact and keyed by the first one's; its
   `ckhash --edges --hulls` the r60s pin), `widen-r60s`, and `reference60f`

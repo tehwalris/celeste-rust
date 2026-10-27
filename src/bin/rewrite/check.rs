@@ -92,9 +92,14 @@ pub enum Command {
     /// THE TREE REPLAYS FROM ITS RECORDED GRAPH (`check::replay`).
     ///
     /// The start's hull pushed along the recorded edges through their
-    /// transfers, frame by frame, must reach exactly the tree's states first
-    /// at each frame (else an error: an edge was not recorded). Prints per
-    /// frame the states first reached and the edges recorded into it.
+    /// transfers, frame by frame, under every prune the forward applied
+    /// (level -1 at every push; the cuts and wins have no edges), must reach
+    /// exactly the tree's states first at each frame, and each frame's
+    /// frontier (states, layers, hulls) must be the frame file's (else an
+    /// error: an edge was not recorded, or a prune differs). A tree the
+    /// objects ladder filtered is refused. Prints per frame the states first
+    /// reached, the edges recorded into it, the pushes level -1 dropped and
+    /// the frontier's size.
     Replay(ReplayArgs),
     /// THE REFERENCE ENGINE'S FORWARD IS THE KERNELS': the tree's first
     /// `--steps` grown again from the start by the reference engine (as
@@ -266,12 +271,13 @@ pub fn run(run: &Settings, c: Command) -> Result<()> {
             let to = t.frame(a.steps)?;
             let tm = std::time::Instant::now();
             let frames = celeste_rust::with_arith!(t.run.settings.arith, N => replay::<N>(&t.dir, to, t.run.settings.threads())?);
-            println!("frame states edges");
+            println!("frame states edges dropped frontier");
             for (f, x) in frames.iter().enumerate() {
-                println!("f{f:03} {} {}", x.states, x.edges);
+                println!("f{f:03} {} {} {} {}", x.states, x.edges, x.dropped, x.frontier.0);
             }
             verdict(&t.dir, &frames)?;
-            println!("[check replay] {}: the replay reaches the tree's states at every frame to f{to} ({:.1} s)", t.dir.display(), tm.elapsed().as_secs_f64());
+            let (states, dropped): (u64, u64) = frames.iter().fold((0, 0), |a, x| (a.0 + x.states, a.1 + x.dropped));
+            println!("[check replay] {}: the replay reaches the tree's {states} states and frontiers (states, layers, hulls) at every frame to f{to}, level -1 dropping {dropped} pushes ({:.1} s)", t.dir.display(), tm.elapsed().as_secs_f64());
             Ok(())
         }
     }
