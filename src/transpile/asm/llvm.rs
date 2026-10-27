@@ -52,6 +52,14 @@ pub(crate) const OPT_PASSES: &str = "";
 ///   (`codegen` emits none; the epilogue's stays);
 /// - `-no-integrated-as`: text for GNU as (it assembles it after the scan,
 ///   as `codegen`'s), without LLVM-only directives (`.prefalign`).
+///
+/// Measured alternatives (2026-10-27): adding `-combiner-disabled
+/// -enable-misched=false -pre-RA-sched=list-burr` cut `llc`'s CPU by 35-42%
+/// (r10, r62h, r60s) with the kernels' speed unchanged within noise and the
+/// check ladder green; `-O1` and `-O3` emit what `-O2` does; `-O0`,
+/// `-regalloc=fast` and `-regalloc=basic` cost 15-26% more instructions and
+/// twice the spills; `opt -passes=early-cse,instcombine` saves 9% of the
+/// instructions for 5x `opt`'s cost.
 pub(crate) const LLC_FLAGS: &[&str] = &["-O2", "-mattr=+avx512f,+avx512bw,+avx512dq,+avx512vl", "-relocation-model=pic", "-x86-use-vzeroupper=false", "-no-integrated-as"];
 
 /// The pipeline the builds run: `OPT_PASSES` and `LLC_FLAGS`, or
